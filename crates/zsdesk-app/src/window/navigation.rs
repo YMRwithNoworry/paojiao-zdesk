@@ -1,4 +1,6 @@
 use super::*;
+use std::{ffi::OsString, os::windows::ffi::OsStringExt, path::Path, process::Command};
+use windows::{core::PCWSTR, Win32::{Foundation::{HLOCAL, LocalFree}, UI::Shell::CommandLineToArgvW}};
 
 #[derive(Clone)]
 pub(super) struct NavigationRequest { pub tab:ExplorerTab }
@@ -214,15 +216,60 @@ impl WindowState {
             self.show_message("SFTP/SSH 访问需要先安装 SSHFS-Win（WinFsp），安装后可直接输入 sftp:// 地址".into());
             return;
         }
-        match parse_address(&text) {
-            Some(location)=>{
+        let working_directory = match self.current_location() {
+            ShellLocation::Path(path) => Some(path.as_path()),
+            ShellLocation::Search { scope: Some(path), .. } => Some(path.as_path()),
+            _ => None,
+        };
+        if let Some(mut command) = address_command(&text, working_directory) {
+            if command.spawn().is_ok() {
                 self.end_address_edit();
-                unsafe {self.navigate_to(location);}
-                if let Some(browser)=&self.browser {unsafe {browser.focus();}}
-            },
-            None=>{self.show_message("请输入文件夹路径".into());}
+                if let Some(browser) = &self.browser { unsafe { browser.focus(); } }
+                return;
+            }
+        }
+        match parse_address(&text) {
+            Some(location) => {
+                self.end_address_edit();
+                unsafe { self.navigate_to(location); }
+                if let Some(browser) = &self.browser { unsafe { browser.focus(); } }
+            }
+            None => self.show_message("请输入文件夹路径或可执行命令".into()),
         }
     }
+}
+/// Parses and prepares any Windows executable command, not a list of known shells.
+fn address_command(text: &str, working_directory: Option<&Path>) -> Option<Command> {
+    let args = address_command_args(text)?;
+    let executable = args.first()?;
+    let name = executable.to_string_lossy();
+    let has_path = name.contains('\\') || name.contains('/');
+    if name.contains(':') && !has_path { return None; }
+    if has_path && !matches!(Path::new(executable).extension()?.to_string_lossy().to_ascii_lowercase().as_str(), "exe" | "com") {
+        return None;
+    }
+    let mut command = Command::new(executable);
+    command.args(&args[1..]);
+    if let Some(directory) = working_directory { command.current_dir(directory); }
+    Some(command)
+}
+
+fn address_command_args(text: &str) -> Option<Vec<OsString>> {
+    let text = text.trim();
+    if text.is_empty() || text.contains('\0') { return None; }
+    let wide: Vec<u16> = text.encode_utf16().chain(Some(0)).collect();
+    let mut count = 0;
+    let arguments = unsafe { CommandLineToArgvW(PCWSTR(wide.as_ptr()), &mut count) };
+    if arguments.is_null() { return None; }
+    let result = if count > 0 {
+        Some(unsafe { std::slice::from_raw_parts(arguments, count as usize) }.iter().map(|argument| {
+            let mut length = 0;
+            unsafe { while *argument.0.add(length) != 0 { length += 1; } }
+            OsString::from_wide(unsafe { std::slice::from_raw_parts(argument.0, length) })
+        }).collect())
+    } else { None };
+    unsafe { let _ = LocalFree(Some(HLOCAL(arguments.cast()))); }
+    result
 }
 pub(super) fn parse_address(text:&str)->Option<ShellLocation> {
     let text=text.trim().trim_matches('"');
@@ -294,5 +341,20 @@ pub(super) fn window_text(hwnd:HWND)->String {
         assert_eq!(sftp_to_unc("sftp://host:22/"),Some(PathBuf::from(r"\\sshfs.r\host")));
         assert_eq!(sftp_to_unc("sftp://"),None);
         assert_eq!(sftp_to_unc(r"C:\sftp"),None);
+    }
+    #[test]
+    fn address_commands_accept_arbitrary_executables_and_windows_quoted_arguments() {
+        let args = address_command_args(r#"nu --config "C:\Users\A B\config.toml" -c "print hello""#).unwrap();
+        assert_eq!(args, ["nu", "--config", r"C:\Users\A B\config.toml", "-c", "print hello"].map(OsString::from));
+        assert!(address_command("any-terminal-name", None).is_some());
+        assert!(address_command(r#""C:\Program Files\Nu\nu.exe" --version"#, None).is_some());
+    }
+
+    #[test]
+    fn address_command_starts_an_executable_in_the_current_folder() {
+        let directory = std::env::current_dir().unwrap();
+        let output = address_command("cmd.exe /C cd", Some(&directory)).unwrap().output().unwrap();
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim().to_ascii_lowercase(), directory.to_string_lossy().to_ascii_lowercase());
     }
 }
