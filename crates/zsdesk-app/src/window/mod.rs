@@ -1,10 +1,10 @@
 //! Windows 11 style Explorer window.
 //!
 //! The title bar is replaced by the tab strip: `WM_NCCALCSIZE` removes the
-//! caption, the DWM frame is extended over the strip so DWM keeps drawing the
-//! real caption buttons (with Snap Layouts) and the Mica backdrop on Windows
-//! 11. The rest of the chrome is painted with Direct2D using ZSUI Fluent
-//! tokens; the folder view, tree and text boxes stay native Shell / Win32.
+//! caption while the DWM frame retains system caption-button metrics, Snap
+//! Layouts and Mica. Measured button bounds are routed as native nonclient hits
+//! before custom frame hit testing. The remaining chrome is painted with
+//! Direct2D using ZSUI Fluent tokens; the folder view and controls stay native.
 
 mod bookmarks;
 mod input;
@@ -365,18 +365,7 @@ impl WindowState {
     }
 
     /// Caption buttons (minimize, maximize, close) in client coordinates.
-    pub(super) fn caption_buttons(&self) -> Option<[LayoutRect; 3]> {
-        let bounds = theme::caption_button_bounds(self.hwnd)?;
-        let mut window = RECT::default();
-        let _ = unsafe { GetWindowRect(self.hwnd, &mut window) };
-        let mut origin = POINT::default();
-        let _ = unsafe { ClientToScreen(self.hwnd, &mut origin) };
-        let (dx, dy) = (origin.x - window.left, origin.y - window.top);
-        let (x, y) = (bounds.left - dx, (bounds.top - dy).max(0));
-        let width = (bounds.right - bounds.left) / 3;
-        let height = bounds.bottom - dy - y;
-        Some([0, 1, 2].map(|i| LayoutRect::new(x + width * i, y, width, height)))
-    }
+    pub(super) fn caption_buttons(&self) -> Option<[LayoutRect; 3]> { caption_button_rects(self.hwnd) }
 
     /// Width covered by the DWM caption buttons, in client pixels.
     fn caption_width(&self) -> i32 {
@@ -572,7 +561,10 @@ fn frame_size(dpi: u32) -> (i32, i32) {
 unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     if let Some(result) = zsdesk_windows::shell::menu::forward_menu_message(msg, wp, lp) { return result; }
     track_caption_buttons(hwnd, msg, wp);
-    // DWM draws and hit-tests the caption buttons in the extended frame.
+    if msg == WM_NCHITTEST {
+        let point = POINT { x: x_lparam(lp.0), y: y_lparam(lp.0) };
+        if let Some(code) = caption_button_hit(hwnd, point) { return LRESULT(code as isize); }
+    }
     let mut dwm_result = LRESULT(0);
     if unsafe { DwmDefWindowProc(hwnd, msg, wp, lp, &mut dwm_result) }.as_bool() { return dwm_result; }
     match msg {
@@ -670,8 +662,8 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
     result.unwrap_or_else(|| unsafe { DefWindowProcW(hwnd, msg, wp, lp) })
 }
 
-/// Hover/press state of the caption buttons. Without Mica the strip is opaque and
-/// ZSDesk paints the buttons itself, while DWM keeps hit-testing them.
+/// Hover/press state of the caption buttons. The app paints them without Mica;
+/// their measured bounds still produce native nonclient button hit codes.
 fn track_caption_buttons(hwnd: HWND, msg: u32, wp: WPARAM) {
     let code = wp.0 as u32;
     let is_button = [HTMINBUTTON, HTMAXBUTTON, HTCLOSE].contains(&code);
@@ -742,6 +734,28 @@ fn flush_deferred(hwnd:HWND,live:bool){
             _=>{},
         }}
     }
+}
+
+fn caption_button_rects(hwnd: HWND) -> Option<[LayoutRect; 3]> {
+    let bounds = theme::caption_button_bounds(hwnd)?;
+    let mut window = RECT::default();
+    let _ = unsafe { GetWindowRect(hwnd, &mut window) };
+    let mut origin = POINT::default();
+    let _ = unsafe { ClientToScreen(hwnd, &mut origin) };
+    let (dx, dy) = (origin.x - window.left, origin.y - window.top);
+    let (x, y) = (bounds.left - dx, (bounds.top - dy).max(0));
+    let width = (bounds.right - bounds.left) / 3;
+    let height = bounds.bottom - dy - y;
+    Some([0, 1, 2].map(|i| LayoutRect::new(x + width * i, y, width, height)))
+}
+
+fn caption_button_hit(hwnd: HWND, mut point: POINT) -> Option<u32> {
+    unsafe { ScreenToClient(hwnd, &mut point).ok()?; }
+    caption_button_hit_code(&caption_button_rects(hwnd)?, point.x, point.y)
+}
+
+fn caption_button_hit_code(buttons: &[LayoutRect; 3], x: i32, y: i32) -> Option<u32> {
+    buttons.iter().position(|button| button.contains(x, y)).map(|index| [HTMINBUTTON, HTMAXBUTTON, HTCLOSE][index])
 }
 
 unsafe fn hit_test(hwnd: HWND, lp: LPARAM) -> LRESULT {
@@ -1051,5 +1065,13 @@ unsafe extern "system" fn edit_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
         defer_message(h,WM_ACTION,WPARAM(10),LPARAM(1));defer_message(h,WM_ACTION,WPARAM(11),LPARAM(2));
         let q=DEFERRED_MESSAGES.with(|q|std::mem::take(&mut *q.borrow_mut()));
         assert_eq!(q.len(),3);assert_eq!(q[1].2.0,10);assert_eq!(q[2].3.0,2);
+    }
+    #[test]
+    fn caption_button_rectangles_return_native_nonclient_codes() {
+        let buttons = [LayoutRect::new(10, 0, 10, 20), LayoutRect::new(20, 0, 10, 20), LayoutRect::new(30, 0, 10, 20)];
+        assert_eq!(caption_button_hit_code(&buttons, 15, 10), Some(HTMINBUTTON));
+        assert_eq!(caption_button_hit_code(&buttons, 25, 10), Some(HTMAXBUTTON));
+        assert_eq!(caption_button_hit_code(&buttons, 35, 10), Some(HTCLOSE));
+        assert_eq!(caption_button_hit_code(&buttons, 40, 10), None);
     }
 }
