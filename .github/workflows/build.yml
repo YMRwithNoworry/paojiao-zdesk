@@ -1,16 +1,20 @@
-name: Windows build
+name: Windows build and release
 
 on:
   push:
+    branches:
+      - '**'
   pull_request:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   windows:
     runs-on: windows-latest
     env:
+      CARGO_TARGET_DIR: ${{ runner.temp }}/ZSDesk-target
+      CARGO_PROFILE_RELEASE_DEBUG: '0'
       CARGO_INCREMENTAL: '0'
       CARGO_PROFILE_DEV_DEBUG: '0'
       CARGO_PROFILE_TEST_DEBUG: '0'
@@ -43,3 +47,49 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           cargo build --locked --release -p zsdesk-app
           exit $LASTEXITCODE
+      - name: Package all Windows editions
+        if: github.event_name == 'push'
+        working-directory: zsdesk
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $innoCompiler = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'
+          if (-not (Test-Path -LiteralPath $innoCompiler)) {
+            & choco install innosetup --no-progress --yes
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          if (-not (Test-Path -LiteralPath $innoCompiler)) { throw 'Inno Setup 6 ISCC.exe was not found after installation' }
+          $routing = Join-Path $env:RUNNER_TEMP 'ZSDesk-routing'
+          $routingBuild = Join-Path $env:RUNNER_TEMP 'ZSDesk-routing-build'
+          $work = Join-Path $env:RUNNER_TEMP 'ZSDesk-package'
+          $output = Join-Path $env:RUNNER_TEMP 'ZSDesk-release'
+          & .\native\routing\build.ps1 -OutputDir $routing -BuildDir $routingBuild
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & .\scripts\package.ps1 -WorkDir $work -TargetDir $env:CARGO_TARGET_DIR -OutputDir $output -RoutingDir $routing -InnoCompiler $innoCompiler
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Prepare release metadata
+        if: github.event_name == 'push'
+        id: release
+        working-directory: zsdesk
+        shell: pwsh
+        run: |
+          $version = [regex]::Match((Get-Content -LiteralPath Cargo.toml -Raw), '(?m)^version\s*=\s*"([^"]+)"').Groups[1].Value
+          if (-not $version) { throw 'Could not read the Cargo workspace version' }
+          $tag = "v$version-build.$($env:GITHUB_RUN_NUMBER).$($env:GITHUB_RUN_ATTEMPT)"
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+      - name: Publish automatic prerelease
+        if: github.event_name == 'push'
+        uses: softprops/action-gh-release@v3
+        with:
+          token: ${{ github.token }}
+          tag_name: ${{ steps.release.outputs.tag }}
+          name: ZSDesk ${{ steps.release.outputs.version }} build ${{ github.run_number }}.${{ github.run_attempt }}
+          target_commitish: ${{ github.sha }}
+          prerelease: true
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            ${{ runner.temp }}/ZSDesk-release/*.zip
+            ${{ runner.temp }}/ZSDesk-release/*-setup.exe
+

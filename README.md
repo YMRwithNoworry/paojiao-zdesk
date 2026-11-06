@@ -19,6 +19,8 @@ Windows 原生多标签文件管理器与桌面格子，使用 Rust、Win32/COM�
 每个版本提供 Windows x64 便携 ZIP 和安装器，文件名为
 `ZSDesk-<版本>-<standard|network|desktop|full>-x64`。
 安装器默认按当前用户安装，保留个人数据，文件夹接管和登录启动均由软件内设置。
+每次向任意分支推送都会自动测试、打包四个版本，并创建 GitHub 预发布版；Release notes 由 GitHub 根据提交自动生成。
+自动构建标签格式为 `v<版本>-build.<运行号>.<重跑次数>`。
 
 ## 文件管理
 
