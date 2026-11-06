@@ -750,7 +750,7 @@ fn caption_button_rects(hwnd: HWND) -> Option<[LayoutRect; 3]> {
 }
 
 fn caption_button_hit(hwnd: HWND, mut point: POINT) -> Option<u32> {
-    unsafe { ScreenToClient(hwnd, &mut point).ok()?; }
+    if !unsafe { ScreenToClient(hwnd, &mut point) }.as_bool() { return None; }
     caption_button_hit_code(&caption_button_rects(hwnd)?, point.x, point.y)
 }
 
