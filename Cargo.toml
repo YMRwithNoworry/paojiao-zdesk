@@ -6,6 +6,7 @@ members = [
     "crates/zsdesk-app",
     "crates/zsdesk-ui",
     "crates/zsdesk-windows",
+    "crates/zsdesk-plugin",
 ]
 
 [workspace.package]

@@ -48,6 +48,10 @@ Windows 原生多标签文件管理器与桌面格子，使用 Rust、Win32/COM�
 输入框和文件重命名编辑框保留文本编辑快捷键；隐藏右键菜单项目不会禁用文件快捷键。
 普通删除遵循系统回收站规则；永久删除、不可回收位置及系统未记录的操作不能撤销。
 
+## WASM 右键菜单插件
+
+桌面格子条目的 Windows Shell 右键菜单保留原有 `IContextMenu` 动词和第三方扩展；插件 action 用 ZSUI `MenuItemSpec` 生成并插入原生菜单顶部，Windows Shell 继续负责绘制、懒加载子菜单和命令调用。将清单与模块放在用户配置目录的 `plugins` 子目录，重启桌面格子宿主后生效。插件 ABI、资源限制与操作说明见 [`crates/zsdesk-plugin/README.md`](crates/zsdesk-plugin/README.md)。插件清单读取、WASM 编译不发生在右键时；第三方 Shell 扩展可同步阻塞，无法承诺绝对零延迟。
+
 ## 搜索与预览
 
 快速搜索默认查找本地固定磁盘中的文件名，也可在界面设置中切换到当前目录及子目录。

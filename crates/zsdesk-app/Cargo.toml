@@ -11,6 +11,7 @@ zsdesk-core = { path = "../zsdesk-core" }
 zsdesk-platform = { path = "../zsdesk-platform" }
 zsdesk-ui = { path = "../zsdesk-ui" }
 zsdesk-windows = { path = "../zsdesk-windows" }
+zsdesk-plugin = { path = "../zsdesk-plugin" }
 anyhow.workspace = true
 dirs.workspace = true
 serde_json.workspace = true
