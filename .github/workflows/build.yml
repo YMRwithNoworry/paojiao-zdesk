@@ -90,6 +90,42 @@ jobs:
           $tag = "v$version-build.$($env:GITHUB_RUN_NUMBER).$($env:GITHUB_RUN_ATTEMPT)"
           "version=$version" >> $env:GITHUB_OUTPUT
           "tag=$tag" >> $env:GITHUB_OUTPUT
+      - name: Prepare direct release notes
+        if: github.event_name == 'push'
+        id: release_notes
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const currentTag = `${{ steps.release.outputs.tag }}`;
+            const { data: releases } = await github.rest.repos.listReleases({
+              owner, repo, per_page: 100
+            });
+            const previous = releases.find(release =>
+              !release.draft && !release.prerelease && release.tag_name !== currentTag
+            );
+            let commits;
+            if (previous) {
+              const comparison = await github.rest.repos.compareCommits({
+                owner, repo, base: previous.tag_name, head: context.sha
+              });
+              commits = comparison.data.commits;
+            } else {
+              const current = await github.rest.repos.getCommit({
+                owner, repo, ref: context.sha
+              });
+              commits = [current.data];
+            }
+            const updates = commits
+              .map(item => item.commit.message.split(/\r?\n/, 1)[0].trim())
+              .filter(Boolean)
+              .map(message => `- ${message}`);
+            const body = [
+              '## 更新内容',
+              '',
+              ...(updates.length ? updates : ['- 本次构建没有新增提交。'])
+            ].join('\n');
+            core.setOutput('body', body);
       - name: Publish automatic release
         if: github.event_name == 'push'
         uses: softprops/action-gh-release@v3
@@ -99,7 +135,8 @@ jobs:
           name: ZSDesk ${{ steps.release.outputs.version }} build ${{ github.run_number }}.${{ github.run_attempt }}
           target_commitish: ${{ github.sha }}
           prerelease: false
-          generate_release_notes: true
+          generate_release_notes: false
+          body: ${{ steps.release_notes.outputs.body }}
           fail_on_unmatched_files: true
           files: |
             ${{ runner.temp }}/ZSDesk-release/*.zip
