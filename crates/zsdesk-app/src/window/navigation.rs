@@ -92,7 +92,6 @@ impl WindowState {
         unsafe {self.rebuild_tabs();}
         if self.queued.is_none() {
             let current=self.current_location().clone();
-            if !matches!(&current,ShellLocation::Search{..}){if let Some(tree)=self.tree.as_ref().filter(|_|self.session.ui.show_tree) {unsafe {tree.select_location(&current);}}}
             self.theme_children();
             self.refresh_status();
             if completed_request{if let ShellLocation::Search{query,scope:None}=&current{self.start_fast_search(query);}}
