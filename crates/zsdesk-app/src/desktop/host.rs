@@ -1292,6 +1292,7 @@ impl DesktopHost {
             entry("文件夹格子内打开子文件夹", "browse-inside", true, s.browse_inside),
             entry("鼠标悬停展开折叠的格子", "hover-expand", true, s.hover_expand),
             entry("隐藏托盘图标", "hide-tray", true, s.hide_tray),
+            entry("ZSUI 即时右键菜单", "zsui-fast-context-menu", true, s.zsui_fast_context_menu),
             entry("开机自动启动", "autostart", true, autostart),
             MenuItemSpec::Separator,
             entry("打开 ZSDesk 文件管理器", "open-zsdesk", true, false),
@@ -1347,6 +1348,7 @@ impl DesktopHost {
             "browse-inside" => { self.config.settings.browse_inside = !self.config.settings.browse_inside; self.schedule_save(); }
             "hover-expand" => { self.config.settings.hover_expand = !self.config.settings.hover_expand; self.schedule_save(); }
             "show-counts" => { self.config.settings.show_counts = !self.config.settings.show_counts; self.schedule_save(); self.render_all(); }
+            "zsui-fast-context-menu" => { self.config.settings.zsui_fast_context_menu = !self.config.settings.zsui_fast_context_menu; self.schedule_save(); }
             "hide-tray" => {
                 if self.config.settings.hide_tray { self.show_tray(); }
                 else {

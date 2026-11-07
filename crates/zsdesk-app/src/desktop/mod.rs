@@ -38,7 +38,7 @@ use windows::{
         },
     },
 };
-use zsdesk_ui::menus::{MenuItemSpec, MenuSpec, UiCommand};
+use zsdesk_ui::menus::{entry, MenuItemSpec, MenuSpec, UiCommand};
 use zsdesk_windows::{desktop::{self, DesktopHit}, gfx::Gfx, ole::DropHandler, shell::{menu::{forward_menu_message, HistoryAction, ShellMenu, APP_FIRST}, notify::read_change}};
 
 use host::{After, DesktopHost, TIMER_DESKTOP, TIMER_FOLDER, TIMER_PEEK, TIMER_SAVE, TIMER_ICONS, WM_DESKTOP_CHANGED, WM_DESKTOP_DBLCLICK, WM_FOLDER_CHANGED,
@@ -467,9 +467,51 @@ fn run_after(after: After) {
     }
 }
 
+fn fast_context_menu_enabled() -> bool {
+    with_host(|h| h.config.settings.zsui_fast_context_menu).unwrap_or(false)
+}
+fn add_shell_menu_entry(spec: &mut MenuSpec) {
+    spec.items.insert(0, entry("完整 Windows Shell 菜单…", "windows-shell-menu", true, false));
+    spec.items.insert(1, MenuItemSpec::Separator);
+}
+
 fn item_menu(fence: u64, point: POINT) {
+    if fast_context_menu_enabled() {
+        fast_item_menu(fence, point);
+    } else {
+        item_menu_native(fence, point);
+    }
+}
+
+fn fast_item_menu(fence: u64, point: POINT) {
     let _layer = MenuLayerRepair;
-    let Some((hwnd, pidls, extra)) = with_host(|h| h.win_index(fence).map(|i| (h.fences[i].hwnd, h.selected_pidls(fence), h.item_menu_items(fence)))).flatten() else { return };
+    let Some((hwnd, items)) = with_host(|h| {
+        h.win_index(fence).map(|i| (h.fences[i].hwnd, h.item_menu_items(fence)))
+    }).flatten() else { return };
+    let mut spec = MenuSpec { id: None, title: None, items };
+    add_shell_menu_entry(&mut spec);
+    if let Some(id) = popup(hwnd, &spec, point) {
+        if id == "windows-shell-menu" {
+            item_menu_shell_native(fence, point);
+        } else if let Some(after) = with_host(|h| h.menu_command(Some(fence), &id, point)) {
+            run_after(after);
+        }
+    }
+}
+
+fn item_menu_native(fence: u64, point: POINT) {
+    item_menu_with_shell(fence, point, true);
+}
+
+fn item_menu_shell_native(fence: u64, point: POINT) {
+    item_menu_with_shell(fence, point, false);
+}
+
+fn item_menu_with_shell(fence: u64, point: POINT, include_app_items: bool) {
+    let _layer = MenuLayerRepair;
+    let Some((hwnd, pidls, extra)) = with_host(|h| h.win_index(fence).map(|i| {
+        (h.fences[i].hwnd, h.selected_pidls(fence), if include_app_items { h.item_menu_items(fence) } else { Vec::new() })
+    })).flatten() else { return };
     if pidls.is_empty() { return fence_menu(fence, point); }
     apply_context_preferences();
     let menu = match ShellMenu::for_items(hwnd, &pidls) {
@@ -506,6 +548,33 @@ fn item_menu(fence: u64, point: POINT) {
 }
 
 fn fence_menu(fence: u64, point: POINT) {
+    if fast_context_menu_enabled() {
+        fast_fence_menu(fence, point);
+    } else {
+        fence_menu_native(fence, point);
+    }
+}
+
+fn fast_fence_menu(fence: u64, point: POINT) {
+    let _layer = MenuLayerRepair;
+    let Some((hwnd, mut spec, has_folder)) = with_host(|h| {
+        h.win_index(fence).map(|i| {
+            (h.fences[i].hwnd, h.fence_menu(fence), h.target_folder(fence).is_some())
+        })
+    }).flatten() else { return };
+    if has_folder {
+        add_shell_menu_entry(&mut spec);
+    }
+    if let Some(id) = popup(hwnd, &spec, point) {
+        if id == "windows-shell-menu" {
+            fence_menu_native(fence, point);
+        } else if let Some(after) = with_host(|h| h.menu_command(Some(fence), &id, point)) {
+            run_after(after);
+        }
+    }
+}
+
+fn fence_menu_native(fence: u64, point: POINT) {
     let _layer = MenuLayerRepair;
     apply_context_preferences();
     let Some((hwnd, spec, folder)) = with_host(|h| h.win_index(fence).map(|i| (h.fences[i].hwnd, h.fence_menu(fence), h.target_folder(fence)))).flatten() else { return };
@@ -657,7 +726,9 @@ fn insert_item(hmenu: HMENU, position: &mut u32, item: &MenuItemSpec, ids: &mut 
 fn popup(owner: HWND, spec: &MenuSpec, point: POINT) -> Option<String> {
     let menu = unsafe { CreatePopupMenu() }.ok()?;
     let ids = { let mut ids = Vec::new(); let mut p = 0; for item in &spec.items { insert_item(menu, &mut p, item, &mut ids); } ids };
+    let _ = unsafe { SetForegroundWindow(owner) };
     let chosen = unsafe { TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, point.x, point.y, None, owner, None) }.0 as u32;
+    let _ = unsafe { PostMessageW(Some(owner), WM_NULL, WPARAM(0), LPARAM(0)) };
     let _ = unsafe { DestroyMenu(menu) };
     chosen.checked_sub(APP_FIRST).and_then(|i| ids.get(i as usize)).cloned()
 }
@@ -832,5 +903,20 @@ mod tests {
     #[test]
     fn instance_keys_ignore_case() {
         assert_eq!(instance_key(std::path::Path::new(r"C:\A\b.json")), instance_key(std::path::Path::new(r"c:\a\B.json")));
+    }
+    #[test]
+    fn fast_menu_keeps_plugin_actions_and_adds_full_shell_entry_first() {
+        let mut spec = MenuSpec::new();
+        spec.items.push(entry("Run plugin", "plugin.demo.run", true, false));
+        add_shell_menu_entry(&mut spec);
+        assert!(matches!(
+            &spec.items[0],
+            MenuItemSpec::Command { command: UiCommand::Custom { id, .. }, .. } if id == "windows-shell-menu"
+        ));
+        assert!(matches!(spec.items[1], MenuItemSpec::Separator));
+        assert!(matches!(
+            &spec.items[2],
+            MenuItemSpec::Command { command: UiCommand::Custom { id, .. }, .. } if id == "plugin.demo.run"
+        ));
     }
 }

@@ -15,6 +15,7 @@ mod reveal;
 mod context_preferences;
 mod routing_control;
 mod fast_search;
+mod win_e_agent;
 
 /// Lets the installer wait for all application windows and desktop guards to
 /// finish before replacing or uninstalling their files.

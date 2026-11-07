@@ -145,6 +145,9 @@ pub struct DesktopSettings {
     /// Show the item count in a fence header; hidden by default.
     #[serde(default)]
     pub show_counts: bool,
+    /// Use the immediate ZSUI menu; the full Shell context menu opens on demand.
+    #[serde(default)]
+    pub zsui_fast_context_menu: bool,
 }
 
 fn default_true() -> bool { true }
@@ -152,7 +155,7 @@ fn default_true() -> bool { true }
 impl Default for DesktopSettings {
     fn default() -> Self {
         Self { organize: false, icons_hidden_by_zsdesk: false, hidden: false, double_click_toggle: true,
-            theme: FenceTheme::Dark, opacity: 55, browse_inside: true, hover_expand: true, hide_tray: false, show_counts: false }
+            theme: FenceTheme::Dark, opacity: 55, browse_inside: true, hover_expand: true, hide_tray: false, show_counts: false, zsui_fast_context_menu: false }
     }
 }
 
@@ -345,6 +348,16 @@ mod tests {
         config.settings.show_counts = true;
         let restored: DesktopConfig = serde_json::from_slice(&serde_json::to_vec(&config).unwrap()).unwrap();
         assert!(restored.settings.show_counts);
+    }
+    #[test]
+    fn old_profiles_default_to_native_shell_context_menus() {
+        let mut value = serde_json::to_value(DesktopConfig::default()).unwrap();
+        value["settings"].as_object_mut().unwrap().remove("zsui_fast_context_menu");
+        let mut config: DesktopConfig = serde_json::from_value(value).unwrap();
+        assert!(!config.settings.zsui_fast_context_menu);
+        config.settings.zsui_fast_context_menu = true;
+        let restored: DesktopConfig = serde_json::from_slice(&serde_json::to_vec(&config).unwrap()).unwrap();
+        assert!(restored.settings.zsui_fast_context_menu);
     }
 
     fn info(key: &str, folder: bool) -> ItemInfo {

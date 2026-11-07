@@ -1,6 +1,6 @@
 # WASM 插件包
 
-将每个插件的 `*.json` 清单与同目录 `*.wasm` 模块放入 ZSDesk 配置目录下的 `plugins` 文件夹。桌面格子宿主启动时读取清单并预编译模块；右键菜单只读取已缓存的 action 列表。卸载插件即删除其清单和模块并重启宿主。
+将每个插件的 `*.json` 清单与同目录 `*.wasm` 模块放入 ZSDesk 配置目录下的 `plugins` 文件夹。桌面格子宿主启动时读取清单并预编译模块；右键路径只读取缓存的 action 描述，不执行 WASM。默认模式把 action 插入完整 Shell 菜单；可选“ZSUI 即时右键菜单”将缓存 action 显示在首屏，并把完整 Shell 菜单延迟到“完整 Windows Shell 菜单…”命令。卸载插件即删除其清单和模块并重启宿主。
 
 清单格式：
 
@@ -23,4 +23,4 @@ Rust 插件须编译为 `wasm32-unknown-unknown`，不导入 WASI，并导出：
 
 每次调用有 2,000,000 fuel、16 MiB 内存及 64 KiB 输入上限。插件只获得所选项目的标识；无文件系统、网络或进程能力。插件运行失败不会阻止原生 Shell 菜单。
 
-所有 Windows Shell 动词和已注册扩展仍由 Windows `IContextMenu` 处理，ZSDesk 在其顶部加入 WASM action。第三方 Shell 扩展的 `QueryContextMenu` 可同步执行任意代码，因此 Windows 原生菜单本身不能保证零延迟；插件清单读取、WASM 编译和菜单项生成不在右键路径。
+默认模式保留全部 Windows Shell 动词、第三方扩展及其原生菜单处理。ZSUI 即时模式首屏不查询 Shell；通过“完整 Windows Shell 菜单…”可打开同一完整 `IContextMenu` 菜单，因此不丢 Shell 功能。第三方扩展的 `QueryContextMenu` 可同步执行任意代码，打开完整 Shell 菜单时仍可能延迟；无法承诺该路径绝对零延迟。

@@ -99,10 +99,22 @@ pub fn shell_open_target() -> Option<OsString> {
 
 /// Used before parsing succeeds so malformed background commands never show UI.
 pub fn is_import_cli() -> bool {
-    std::env::args_os().skip(1).any(|arg| arg == "--import-tencent" || arg == "--import-report" || arg == "--apply-import" || arg == "--diagnostics" || arg == "--diagnostics-main" || arg == "--build-info" || arg == "--uninstall-integration" || arg == "--routing-apply")
+    std::env::args_os().skip(1).any(|arg| arg == "--import-tencent" || arg == "--import-report" || arg == "--apply-import" || arg == "--diagnostics" || arg == "--diagnostics-main" || arg == "--build-info" || arg == "--uninstall-integration" || arg == "--routing-apply" || arg == "--win-e-agent" || arg == "--win-e-agent-stop")
 }
 
 pub fn run() -> Result<()> {
+    let mut args = std::env::args_os().skip(1);
+    if let Some(mode) = args.next() {
+        if mode == "--win-e-agent" {
+            if args.next().is_some() { bail!("--win-e-agent 不能与其它参数混用"); }
+            return crate::win_e_agent::run();
+        }
+        if mode == "--win-e-agent-stop" {
+            if args.next().is_some() { bail!("--win-e-agent-stop 不能与其它参数混用"); }
+            let _ = crate::win_e_agent::stop()?;
+            return Ok(());
+        }
+    }
     if std::env::args_os().nth(1).is_some_and(|arg| arg == "--build-info") {
         if std::env::args_os().count() != 2 { bail!("--build-info 不能与其他参数混用"); }
         println!("{}", serde_json::json!({"product":"ZSDesk", "version":env!("CARGO_PKG_VERSION"),
@@ -121,6 +133,8 @@ pub fn run() -> Result<()> {
         let exe = std::env::current_exe()?;
         crate::routing_control::uninstall_owned(&config, &exe)?;
         zsdesk_windows::integration::restore_owned(&exe, &config.with_file_name("takeover-backup.json"))?;
+        let _ = zsdesk_windows::desktop::set_win_e_agent_autostart(None);
+        let _ = crate::win_e_agent::stop()?;
         return Ok(());
     }
     if let Some(report)=opts.diagnostics_main{return crate::instance::diagnose(&config,&std::path::absolute(report)?);}

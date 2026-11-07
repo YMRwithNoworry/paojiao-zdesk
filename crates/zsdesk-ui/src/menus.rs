@@ -221,8 +221,10 @@ pub fn apply_context_menu_setting(options: &mut ContextMenuPreferences, choice: 
 pub struct AppMenuState {
     /// `None` when this edition has no desktop fences.
     pub desktop_running: Option<bool>,
-    /// 0 = 不接管, 1 = 右键菜单, 2 = 默认打开.
+    /// 0 = 不接管, 1 = 右键菜单, 2 = 默认打开文件夹与磁盘.
     pub integration: u8,
+    /// Whether a background login agent is registered to intercept Win+E.
+    pub win_e_agent: bool,
 }
 
 /// Application menu (≡) next to the window buttons.
@@ -242,6 +244,8 @@ pub fn app_menu(state: AppMenuState) -> MenuSpec {
         entry("不接管", "integration-off", true, state.integration == 0),
         entry("右键菜单“使用 ZSDesk 打开”", "integration-context", true, state.integration == 1),
         entry("默认用 ZSDesk 打开文件夹和磁盘", "integration-default", true, state.integration == 2),
+        MenuItemSpec::Separator,
+        entry("Win+E 打开 ZSDesk（需后台常驻）", "integration-win-e", true, state.win_e_agent),
         MenuItemSpec::Separator,
         entry("恢复系统资源管理器", "integration-restore", state.integration != 0, false),
         MenuItemSpec::Separator,
@@ -311,6 +315,27 @@ mod tests {
         result
     }
 
+
+    #[test]
+    fn win_e_agent_choice_is_visible_and_reflects_registration_state() {
+        fn integration_entry(spec: &MenuSpec) -> Option<(bool, bool)> {
+            for item in &spec.items {
+                match item {
+                    MenuItemSpec::Submenu { label, menu, .. } if label == "系统集成" => {
+                        return menu.items.iter().find_map(|item| match item {
+                            MenuItemSpec::Command { label, enabled, checked, command: UiCommand::Custom { id, .. }, .. }
+                                if id == "integration-win-e" => Some((label.contains("Win+E"), *enabled && *checked)),
+                            _ => None,
+                        });
+                    }
+                    _ => {}
+                }
+            }
+            None
+        }
+        assert_eq!(integration_entry(&app_menu(AppMenuState::default())), Some((true, false)));
+        assert_eq!(integration_entry(&app_menu(AppMenuState { win_e_agent: true, ..Default::default() })), Some((true, true)));
+    }
     #[test]
     fn settings_remain_reachable_when_every_command_button_is_hidden() {
         let mut ui = ExplorerUi::default();

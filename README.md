@@ -31,6 +31,8 @@ Windows 原生多标签文件管理器与桌面格子，使用 Rust、Win32/COM�
 - 界面遵循系统缩放；Windows 11 22H2 及以上支持 Mica 和系统窗口按钮。
 - 地址栏也可输入任意终端命令及参数（如 `pwsh`、`nu`、`wt`、`cmd`）启动终端；控制台程序会在独立控制台中运行，在文件夹中启动时以该文件夹为工作目录，参数遵循 Windows 命令行引号规则。
 
+- “≡ → 系统集成 → Win+E 打开 ZSDesk”可选择接管当前用户的 Win+E；启用后启动独立低级键盘钩子进程，并通过 `shell:MyComputerFolder` 在 ZSDesk 打开“此电脑”。关闭选项会移除登录启动并向后台进程发送停止信号；此功能与桌面格子自启动独立。
+
 “≡ → 界面设置”可控制整排命令栏以及新建、剪切、复制、粘贴、重命名、共享、删除、
 排序、查看、更多和预览的显示。隐藏项目后自动重排，窄窗口使用紧凑布局。
 
@@ -50,7 +52,7 @@ Windows 原生多标签文件管理器与桌面格子，使用 Rust、Win32/COM�
 
 ## WASM 右键菜单插件
 
-桌面格子条目的 Windows Shell 右键菜单保留原有 `IContextMenu` 动词和第三方扩展；插件 action 用 ZSUI `MenuItemSpec` 生成并插入原生菜单顶部，Windows Shell 继续负责绘制、懒加载子菜单和命令调用。将清单与模块放在用户配置目录的 `plugins` 子目录，重启桌面格子宿主后生效。插件 ABI、资源限制与操作说明见 [`crates/zsdesk-plugin/README.md`](crates/zsdesk-plugin/README.md)。插件清单读取、WASM 编译不发生在右键时；第三方 Shell 扩展可同步阻塞，无法承诺绝对零延迟。
+桌面格子右键菜单默认保留原生 Windows Shell 菜单与第三方扩展。在格子菜单的“桌面格子”设置中可选开启“ZSUI 即时右键菜单”：首屏只组装已缓存的格子命令和 WASM 插件 action，由 ZSUI `MenuSpec` 转为 Windows 原生弹出菜单；插件清单读取、WASM 编译/执行及 Shell 扩展查询都不在首屏右键路径。选择“完整 Windows Shell 菜单…”后才查询并显示原有 Shell 菜单，完整 Shell 动词及扩展仍可访问。第三方扩展可同步阻塞完整 Shell 菜单，因此不能保证该子菜单绝对零延迟。插件包与资源限制见 [`crates/zsdesk-plugin/README.md`](crates/zsdesk-plugin/README.md)。
 
 ## 搜索与预览
 

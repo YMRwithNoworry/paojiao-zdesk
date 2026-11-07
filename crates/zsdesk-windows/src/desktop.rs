@@ -354,3 +354,24 @@ pub fn set_autostart(command: Option<&str>) -> bool {
         None => unsafe { RegDeleteKeyValueW(HKEY_CURRENT_USER, RUN_KEY, RUN_VALUE) }.is_ok(),
     }
 }
+
+const WIN_E_RUN_VALUE: PCWSTR = w!("ZSDesk.WinE");
+
+pub fn win_e_agent_command() -> Option<String> {
+    let mut buffer = vec![0u16; 2048];
+    let mut size = (buffer.len() * 2) as u32;
+    unsafe { RegGetValueW(HKEY_CURRENT_USER, RUN_KEY, WIN_E_RUN_VALUE, RRF_RT_REG_SZ, None, Some(buffer.as_mut_ptr().cast()), Some(&mut size)) }.ok().ok()?;
+    let end = buffer.iter().position(|&c| c == 0).unwrap_or(buffer.len());
+    Some(String::from_utf16_lossy(&buffer[..end]))
+}
+
+/// Registers only the opt-in keyboard agent; it is independent of the desktop-fence autostart value.
+pub fn set_win_e_agent_autostart(command: Option<&str>) -> bool {
+    match command {
+        Some(command) => {
+            let data: Vec<u16> = command.encode_utf16().chain(Some(0)).collect();
+            unsafe { RegSetKeyValueW(HKEY_CURRENT_USER, RUN_KEY, WIN_E_RUN_VALUE, REG_SZ.0, Some(data.as_ptr().cast()), (data.len() * 2) as u32) }.is_ok()
+        }
+        None => unsafe { RegDeleteKeyValueW(HKEY_CURRENT_USER, RUN_KEY, WIN_E_RUN_VALUE) }.is_ok(),
+    }
+}

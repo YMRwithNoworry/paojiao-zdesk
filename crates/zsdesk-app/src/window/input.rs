@@ -443,6 +443,7 @@ impl WindowState {
         let state = menus::AppMenuState {
             desktop_running: crate::edition::DESKTOP.then(desktop_host_running),
             integration: match integration::current() { Integration::Off => 0, Integration::ContextMenu => 1, Integration::Default => 2 },
+            win_e_agent: zsdesk_windows::desktop::win_e_agent_command().is_some(),
         };
         let anchor = Some(self.layout.app_menu);
         let choice = popup(self.hwnd, &menus::app_menu(state), anchor);
@@ -487,6 +488,7 @@ impl WindowState {
             },
             Some("desktop-quit") => self.launch_desktop(&["--quit".into()]),
             Some("desktop-tray") => self.launch_desktop(&["--tray".into()]),
+            Some("integration-win-e") => self.toggle_win_e_agent(),
             Some(id @ ("integration-off" | "integration-context" | "integration-default" | "integration-restore")) => self.set_integration(id),
             Some("bookmark") => self.add_current_bookmark(),
             Some("folder-options") => open_folder_options(),
@@ -503,6 +505,45 @@ impl WindowState {
                 unsafe { MessageBoxW(Some(self.hwnd), pcwstr(&text), PCWSTR(wide("关于 ZSDesk").as_ptr()), MB_OK | MB_ICONINFORMATION); }
             }
             _ => {}
+        }
+    }
+
+    fn toggle_win_e_agent(&mut self) {
+        use zsdesk_windows::desktop::{set_win_e_agent_autostart, win_e_agent_command};
+        if win_e_agent_command().is_some() {
+            if !set_win_e_agent_autostart(None) {
+                self.show_message("无法移除 Win+E 登录启动项".into());
+                return;
+            }
+            match crate::win_e_agent::stop() {
+                Ok(_) => self.show_message("已关闭 Win+E 接管和登录启动项；此电脑仍可从 ZSDesk 菜单打开".into()),
+                Err(error) => self.show_message(format!("已移除登录启动项，但停止当前 Agent 失败：{error}")),
+            }
+            return;
+        }
+        let text = wide("启用后，当前用户登录时会启动一个轻量后台进程拦截 Win+E，并在 ZSDesk 中打开“此电脑”。该进程只处理 Win+E；关闭 ZSDesk 窗口不会停止它。可随时在此关闭。继续？");
+        if unsafe { MessageBoxW(Some(self.hwnd), pcwstr(&text), PCWSTR(wide("接管 Win+E").as_ptr()), MB_OKCANCEL | MB_ICONQUESTION) } != IDOK { return; }
+        let Ok(exe) = std::env::current_exe() else { return };
+        let startup = format!("\"{}\" --win-e-agent", exe.display());
+        if !set_win_e_agent_autostart(Some(&startup)) {
+            self.show_message("无法写入当前用户登录启动项".into());
+            return;
+        }
+        let child = std::process::Command::new(&exe).arg("--win-e-agent").spawn();
+        match child {
+            Ok(mut child) => {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                if child.try_wait().ok().flatten().is_some() {
+                    let _ = set_win_e_agent_autostart(None);
+                    self.show_message("Win+E 后台钩子启动失败，已撤销登录启动项".into());
+                } else {
+                    self.show_message("Win+E 已接管；此电脑将在 ZSDesk 中打开".into());
+                }
+            }
+            Err(error) => {
+                let _ = set_win_e_agent_autostart(None);
+                self.show_message(format!("无法启动 Win+E 后台进程，已撤销登录启动项：{error}"));
+            }
         }
     }
 
