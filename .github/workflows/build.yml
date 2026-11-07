@@ -13,7 +13,7 @@ jobs:
   windows:
     runs-on: windows-latest
     env:
-      CARGO_TARGET_DIR: ${{ runner.temp }}/ZSDesk-target
+      CARGO_TARGET_DIR: ${{ github.workspace }}/ZSDesk-target
       CARGO_PROFILE_RELEASE_DEBUG: '0'
       CARGO_INCREMENTAL: '0'
       CARGO_PROFILE_DEV_DEBUG: '0'
