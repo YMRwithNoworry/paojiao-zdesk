@@ -1,5 +1,5 @@
 use super::*;
-use std::{ffi::OsString, os::windows::ffi::OsStringExt, path::Path, process::Command};
+use std::{ffi::OsString, os::windows::{ffi::OsStringExt, process::CommandExt}, path::Path, process::Command};
 use windows::{core::PCWSTR, Win32::{Foundation::{HLOCAL, LocalFree}, UI::Shell::CommandLineToArgvW}};
 
 #[derive(Clone)]
@@ -222,6 +222,9 @@ impl WindowState {
             _ => None,
         };
         if let Some(mut command) = address_command(&text, working_directory) {
+            // ZSDesk is a GUI-subsystem process; explicitly give console shells
+            // their own console so interactive shells such as Nushell can attach.
+            command.creation_flags(0x0000_0010); // CREATE_NEW_CONSOLE
             if command.spawn().is_ok() {
                 self.end_address_edit();
                 if let Some(browser) = &self.browser { unsafe { browser.focus(); } }
