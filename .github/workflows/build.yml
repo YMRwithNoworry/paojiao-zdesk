@@ -53,12 +53,15 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $innoCompiler = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'
-          if (-not (Test-Path -LiteralPath $innoCompiler)) {
-            & choco install innosetup --no-progress --yes
+          $innoDirectory = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6'
+          $innoCompiler = Join-Path $innoDirectory 'ISCC.exe'
+          $chineseMessages = Join-Path $innoDirectory 'Languages\ChineseSimplified.isl'
+          if (-not (Test-Path -LiteralPath $innoCompiler) -or -not (Test-Path -LiteralPath $chineseMessages)) {
+            & choco install innosetup --no-progress --yes --force
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
           if (-not (Test-Path -LiteralPath $innoCompiler)) { throw 'Inno Setup 6 ISCC.exe was not found after installation' }
+          if (-not (Test-Path -LiteralPath $chineseMessages)) { throw 'Inno Setup Chinese Simplified language file was not found after installation' }
           $routing = Join-Path $env:RUNNER_TEMP 'ZSDesk-routing'
           $routingBuild = Join-Path $env:RUNNER_TEMP 'ZSDesk-routing-build'
           $work = Join-Path $env:RUNNER_TEMP 'ZSDesk-package'
