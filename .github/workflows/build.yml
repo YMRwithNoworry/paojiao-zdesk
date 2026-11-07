@@ -78,7 +78,7 @@ jobs:
           $tag = "v$version-build.$($env:GITHUB_RUN_NUMBER).$($env:GITHUB_RUN_ATTEMPT)"
           "version=$version" >> $env:GITHUB_OUTPUT
           "tag=$tag" >> $env:GITHUB_OUTPUT
-      - name: Publish automatic prerelease
+      - name: Publish automatic release
         if: github.event_name == 'push'
         uses: softprops/action-gh-release@v3
         with:
@@ -86,7 +86,7 @@ jobs:
           tag_name: ${{ steps.release.outputs.tag }}
           name: ZSDesk ${{ steps.release.outputs.version }} build ${{ github.run_number }}.${{ github.run_attempt }}
           target_commitish: ${{ github.sha }}
-          prerelease: true
+          prerelease: false
           generate_release_notes: true
           fail_on_unmatched_files: true
           files: |
