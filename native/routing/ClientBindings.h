@@ -30,7 +30,7 @@ inline DWORD ReadClientBindings(const std::wstring& file,std::vector<Spec>& spec
         spec.profile=GetPrivateProfileIntW(section.c_str(),L"Profile",0,file.c_str());
         spec.enabled=GetPrivateProfileIntW(section.c_str(),L"Enabled",0,file.c_str())!=0;
         spec.path=RoutingIni(file,section.c_str(),L"Executable");spec.support=RoutingIni(file,section.c_str(),L"CallerModule");
-        if(spec.role<2||!ids.insert(spec.role).second||spec.profile<1||spec.profile>3||!RoutingLocalPath(spec.path)||!RoutingLocalPath(spec.support))return ERROR_INVALID_DATA;
+        if(spec.role<2||!ids.insert(spec.role).second||spec.profile<1||spec.profile>4||!RoutingLocalPath(spec.path)||!RoutingLocalPath(spec.support))return ERROR_INVALID_DATA;
         if(!RoutingHash(RoutingIni(file,section.c_str(),L"ExecutableSHA256"),spec.hash)||!RoutingHash(RoutingIni(file,section.c_str(),L"CallerSHA256"),spec.supportHash))return ERROR_INVALID_DATA;
         std::wstring lower=spec.path;std::transform(lower.begin(),lower.end(),lower.begin(),[](wchar_t c){return wchar_t(towlower(c));});if(!paths.insert(lower).second)return ERROR_INVALID_DATA;
         spec.name=BaseName(spec.path.c_str());specs.push_back(std::move(spec));

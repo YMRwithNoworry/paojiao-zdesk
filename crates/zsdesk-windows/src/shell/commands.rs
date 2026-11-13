@@ -1,7 +1,5 @@
-//! Command bar operations on the hosted Shell view. Every action goes through
-//! the view's own `IContextMenu` / `IFolderView2`, so copy, paste, delete,
-//! rename and "新建" behave exactly like File Explorer (undo, conflicts,
-//! progress UI, recycle bin and third-party handlers included).
+//! Command bar operations on the hosted Shell view. Common file transfers use
+//! native batch operations; extension-specific verbs retain Shell dispatch.
 
 use windows::{
     core::{Interface, Result, BOOL},
@@ -68,6 +66,15 @@ impl ExplorerBrowserHost {
     /// Runs a verb on the selection ("cut", "copy", "delete", "properties" …).
     pub fn invoke_selection(&self, owner: HWND, verb: &str, shift: bool) -> Result<()> {
         let view = unsafe { self.current_view()? };
+        let direct=match verb {
+            "copy"=>Some(super::file_transfer::copy_view(&view,owner,false)),
+            "cut"=>Some(super::file_transfer::copy_view(&view,owner,true)),
+            "delete"=>Some(super::file_transfer::delete_view(&view,owner,shift)),
+            _=>None,
+        };
+        // MTP and archive entries have Shell identities, not filesystem paths.
+        // An accepted asynchronous filesystem operation never runs twice.
+        if direct.is_some_and(|result|result.is_ok()){return Ok(());}
         let menu = ShellMenu::for_view(&view, true)?;
         menu.populate_for_invoke(shift)?;
         menu.invoke_verb(owner, verb, shift)
@@ -76,6 +83,12 @@ impl ExplorerBrowserHost {
     /// Runs a verb on the folder background ("paste", "NewFolder", "properties").
     pub fn invoke_background(&self, owner: HWND, verb: &str) -> Result<()> {
         let view = unsafe { self.current_view()? };
+        if verb=="paste"&&super::file_transfer::paste_view(&view,owner).is_ok(){return Ok(());}
+        if verb.eq_ignore_ascii_case("NewFolder"){
+            if let Ok(path)=super::file_transfer::folder_path(&view){
+                if path.is_dir(){return super::file_transfer::new_folder(owner,&path);}
+            }
+        }
         let menu = ShellMenu::for_view(&view, false)?;
         menu.populate_for_invoke(false)?;
         menu.invoke_verb(owner, verb, false)
@@ -104,16 +117,8 @@ impl ExplorerBrowserHost {
         for i in 0..count.min(100_000) { let _ = unsafe { view.SelectItem(i, flag) }; }
     }
 
-    pub fn invert_selection(&self) {
-        let Ok(view) = self.folder_view() else { return };
-        let count = unsafe { view.ItemCount(SVGIO_ALLVIEW) }.unwrap_or(0);
-        for i in 0..count.min(100_000) {
-            let Ok(pidl) = (unsafe { view.Item(i) }) else { continue };
-            let state = unsafe { view.GetSelectionState(pidl) }.unwrap_or(0) as i32;
-            unsafe { windows::Win32::System::Com::CoTaskMemFree(Some(pidl.cast())) };
-            let flag = if state & SVSI_SELECT.0 != 0 { SVSI_DESELECT.0 } else { SVSI_SELECT.0 };
-            let _ = unsafe { view.SelectItem(i, flag as u32) };
-        }
+    pub fn invert_selection(&self) -> Result<()> {
+        invert_view_selection(&unsafe { self.current_view()? })
     }
 
     pub fn sort(&self) -> Option<(Column, bool)> {
@@ -203,6 +208,42 @@ impl ExplorerBrowserHost {
         let value=unsafe{item.GetDisplayName(SIGDN_FILESYSPATH).ok()?};
         Some(std::path::PathBuf::from(unsafe{super::shell_item::take_pwstr(value)}))
     }
+}
+
+/// Inverts the original selection, independently of the menu presentation.
+pub fn invert_view_selection(shell: &windows::Win32::UI::Shell::IShellView) -> Result<()> {
+    let view: IFolderView2 = shell.cast()?;
+    let count = unsafe { view.ItemCount(SVGIO_ALLVIEW)? }.max(0);
+    let mut original = Vec::new();
+    original.try_reserve_exact(count as usize).map_err(|_| windows::core::Error::new(
+        windows::core::HRESULT(0x8007000Eu32 as i32), "无法为反向选择分配状态缓冲区"))?;
+    // Do not interpret a failed query as an unselected item, or query the next
+    // item after changing the current selection. No UI state changes until the
+    // complete original state has been read successfully.
+    for index in 0..count {
+        let pidl = unsafe { view.Item(index)? };
+        if pidl.is_null() { return Err(windows::core::Error::new(windows::core::HRESULT(0x80004005u32 as i32), "无法读取项目的选择状态")); }
+        let mut state = 0;
+        let result = unsafe { (view.vtable().GetSelectionState)(view.as_raw(), pidl, &mut state) };
+        unsafe { windows::Win32::System::Com::CoTaskMemFree(Some(pidl.cast())); }
+        if result != windows::core::HRESULT(0) {
+            return Err(windows::core::Error::new(if result.is_err() {result} else {windows::core::HRESULT(0x80004005u32 as i32)}, "无法读取完整的选择状态"));
+        }
+        original.push(state & SVSI_SELECT.0 as u32 != 0);
+    }
+    if unsafe { view.ItemCount(SVGIO_ALLVIEW)? } != count {
+        return Err(windows::core::Error::new(windows::core::HRESULT(0x8000000Au32 as i32), "文件列表已更新，请重试反向选择"));
+    }
+    struct Redraw<'a>(&'a IFolderView2);
+    impl Drop for Redraw<'_> { fn drop(&mut self) { let _ = unsafe { self.0.SetRedraw(true) }; } }
+    let _redraw = Redraw(&view);
+    let _ = unsafe { view.SetRedraw(false) };
+    for (index, selected) in original.into_iter().enumerate() {
+        let flags = (if selected {SVSI_DESELECT.0} else {SVSI_SELECT.0}) as u32
+            | windows::Win32::UI::Shell::SVSI_NOTAKEFOCUS.0 as u32;
+        unsafe { view.SelectItem(index as i32, flags)?; }
+    }
+    Ok(())
 }
 
 fn selection_size(array: &IShellItemArray, still_current: impl Fn() -> bool) -> Option<u64> {

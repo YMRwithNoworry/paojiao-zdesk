@@ -1,0 +1,25 @@
+{
+  "schema": "ZSDesk.EverythingPackage.v1",
+  "product": "Everything",
+  "version": "1.4.1.1032",
+  "platform": "windows-x64",
+  "edition": "standard",
+  "source_url": "https://www.voidtools.com/Everything-1.4.1.1032.x64.zip",
+  "archive_sha256": "698df475ec44e638f66f1b6a32d28fea613cec78d3b6310e6abe53431eeb940c",
+  "license_url": "https://www.voidtools.com/License.txt",
+  "executable_sha256": "f191f756996a14a11e5445fa7103d302efd510cf2fbf920e6c0c8ed51d512e36",
+  "files": {
+    "Everything.exe": {
+      "bytes": 2272424,
+      "sha256": "f191f756996a14a11e5445fa7103d302efd510cf2fbf920e6c0c8ed51d512e36"
+    },
+    "Everything.lng": {
+      "bytes": 1033107,
+      "sha256": "84e0ae09a9e268424ce85a85135c704c534ff60f92e150413b9df05a88979be7"
+    },
+    "License.txt": {
+      "bytes": 2699,
+      "sha256": "c13d19adcbfd5d07e9512de9df99956a3423399ed1fadc5fd33186697ad8df2f"
+    }
+  }
+}

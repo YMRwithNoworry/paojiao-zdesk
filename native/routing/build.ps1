@@ -38,7 +38,11 @@ try {
     $release=Join-Path $buildRoot 'Release';$controllerObj=Join-Path $buildRoot 'controller-obj';$adapterObj=Join-Path $buildRoot 'adapter-obj'
     foreach($path in @($release,$controllerObj,$adapterObj)){[IO.Directory]::CreateDirectory($path)|Out-Null}
     $common=@('/nologo','/std:c++17','/utf-8','/O2','/MT','/EHsc','/W4','/WX','/wd4505','/DUNICODE','/D_UNICODE')
-    & $cl @common (Join-Path $PSScriptRoot 'ShellRoutingControl.cpp') ('/Fe'+(Join-Path $release 'ShellRoutingControl.exe')) ('/Fo'+$controllerObj.Replace('\','/')+'/') /link /SUBSYSTEM:WINDOWS /ENTRY:wmainCRTStartup '/PDBALTPATH:%_PDB%' user32.lib advapi32.lib shell32.lib ole32.lib bcrypt.lib shlwapi.lib version.lib
+    $rc=Join-Path $kits ('bin\'+$sdk+'\x64\rc.exe')
+    $resource=Join-Path $controllerObj 'controller.res'
+    & $rc /nologo /c65001 ('/fo'+$resource) (Join-Path $PSScriptRoot 'controller.rc')
+    if($LASTEXITCODE -ne 0){throw 'Routing resource build failed'}
+    & $cl @common (Join-Path $PSScriptRoot 'ShellRoutingControl.cpp') $resource ('/Fe'+(Join-Path $release 'ShellRoutingControl.exe')) ('/Fo'+$controllerObj.Replace('\','/')+'/') /link /SUBSYSTEM:WINDOWS /ENTRY:wmainCRTStartup '/PDBALTPATH:%_PDB%' user32.lib advapi32.lib shell32.lib ole32.lib bcrypt.lib shlwapi.lib version.lib
     if($LASTEXITCODE -ne 0){throw 'Routing controller build failed'}
     $minhook=[IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..\crates\zsdesk-windows\native\minhook'))
     $upstream=@((Join-Path $minhook 'src\buffer.c'),(Join-Path $minhook 'src\hook.c'),(Join-Path $minhook 'src\trampoline.c'),(Join-Path $minhook 'src\hde\hde64.c'))
@@ -57,7 +61,7 @@ try {
     }
     $license=Join-Path $PSScriptRoot '..\..\crates\zsdesk-windows\native\minhook\LICENSE.txt'
     Copy-Item -LiteralPath $license -Destination (Join-Path $outputRoot 'MinHook-LICENSE.txt')
-    $manifest=[ordered]@{schema='ZSDesk.RoutingPackage.v1';adapter_abi=2;controller=[ordered]@{file=$files[0];sha256=(Get-FileHash -LiteralPath (Join-Path $outputRoot $files[0])).Hash.ToLowerInvariant()};adapter=[ordered]@{file=$files[1];sha256=(Get-FileHash -LiteralPath (Join-Path $outputRoot $files[1])).Hash.ToLowerInvariant()};licenses=@('MinHook-LICENSE.txt');profiles=@('native-shell','chromium','wechat');default_enabled=$false;default_startup=$false}
+    $manifest=[ordered]@{schema='ZSDesk.RoutingPackage.v1';adapter_abi=2;controller=[ordered]@{file=$files[0];sha256=(Get-FileHash -LiteralPath (Join-Path $outputRoot $files[0])).Hash.ToLowerInvariant()};adapter=[ordered]@{file=$files[1];sha256=(Get-FileHash -LiteralPath (Join-Path $outputRoot $files[1])).Hash.ToLowerInvariant()};licenses=@('MinHook-LICENSE.txt');profiles=@('native-shell','chromium','wechat','explicit-module');default_enabled=$false;default_startup=$false}
     [IO.File]::WriteAllText((Join-Path $outputRoot 'manifest.json'),($manifest|ConvertTo-Json -Depth 5)+"`n",[Text.UTF8Encoding]::new($false))
     $manifest|ConvertTo-Json -Depth 5
 } finally {$env:TEMP=$oldTemp;$env:TMP=$oldTmp;$env:PATH=$oldPath;$env:INCLUDE=$oldInclude;$env:LIB=$oldLib;$lock.Dispose()}

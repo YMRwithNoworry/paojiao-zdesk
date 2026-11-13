@@ -9,3 +9,6 @@ description = "ZSDesk native window layout."
 [dependencies]
 zsui = { path = "../../../zsui", default-features = false }
 zsdesk-core = { path = "../zsdesk-core" }
+
+[target.'cfg(windows)'.dependencies]
+zsui = { path = "../../../zsui", default-features = false, features = ["windows-win32"] }

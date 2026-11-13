@@ -46,6 +46,18 @@ jobs:
           cargo check --locked --release -p zsdesk-app --no-default-features --features desktop
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           cargo build --locked --release -p zsdesk-app
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cargo check --locked --release -p zsdesk-app --no-default-features --features themed
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cargo check --locked --release -p zsdesk-app --no-default-features --features desktop-box
+          exit $LASTEXITCODE
+      - name: Test theme and desktop-only editions
+        working-directory: zsdesk
+        shell: pwsh
+        run: |
+          cargo test --locked --release -p zsdesk-app --no-default-features --features themed
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cargo test --locked --release -p zsdesk-app --no-default-features --features desktop-box
           exit $LASTEXITCODE
       - name: Package all Windows editions
         if: github.event_name == 'push'

@@ -10,6 +10,7 @@
 /shell-routing*.json
 /takeover-backup*.json
 /search-index.sqlite*
+/quick-search*.json
 /clients.ini
 /package.ini
 

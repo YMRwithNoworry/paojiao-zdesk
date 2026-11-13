@@ -1,0 +1,9 @@
+<Project>
+  <PropertyGroup Condition="'$(ZSDeskBuildRoot)' != ''">
+    <BaseIntermediateOutputPath>$(ZSDeskBuildRoot)\$(MSBuildProjectName)\obj\</BaseIntermediateOutputPath>
+    <BaseOutputPath>$(ZSDeskBuildRoot)\$(MSBuildProjectName)\bin\</BaseOutputPath>
+  </PropertyGroup>
+  <Target Name="RequireExternalBuildRoot" BeforeTargets="Restore;PrepareForBuild">
+    <Error Condition="'$(ZSDeskBuildRoot)' == ''" Text="Set ZSDeskBuildRoot to an absolute build/cache directory outside the source tree." />
+  </Target>
+</Project>

@@ -107,14 +107,22 @@ pub struct Fence {
     #[serde(default)] pub catch_all: bool,
     /// 文件夹格子当前浏览的子目录（None 表示根目录）。
     #[serde(default)] pub browse: Option<PathBuf>,
+    /// 标签组：同组格子共用一个位置，作为标签显示在同一个标题栏。0 表示独立格子。
+    /// 组内标签顺序即它们在 `DesktopConfig::fences` 中的顺序。
+    #[serde(default)] pub group: u64,
+    /// 组内当前显示的标签。
+    #[serde(default)] pub tab_active: bool,
 }
 
 impl Fence {
     pub fn new(id: u64, title: impl Into<String>, source: FenceSource, placement: Placement) -> Self {
         let sort = if source == FenceSource::Desktop { FenceSort::Manual } else { FenceSort::Name };
         Self { id, title: title.into(), source, placement, collapsed: false, locked: false, view: FenceView::Icons,
-            icon_size: IconSize::Medium, sort, descending: false, members: Vec::new(), rule: None, catch_all: false, browse: None }
+            icon_size: IconSize::Medium, sort, descending: false, members: Vec::new(), rule: None, catch_all: false, browse: None,
+            group: 0, tab_active: false }
     }
+    /// An inactive tab: its window stays hidden behind the group's active tab.
+    pub fn is_hidden_tab(&self) -> bool { self.group != 0 && !self.tab_active }
     pub fn is_desktop(&self) -> bool { self.source == FenceSource::Desktop }
     pub fn folder(&self) -> Option<&PathBuf> {
         match &self.source { FenceSource::Folder { root } => Some(self.browse.as_ref().unwrap_or(root)), _ => None }
@@ -148,6 +156,9 @@ pub struct DesktopSettings {
     /// Use the immediate ZSUI menu; the full Shell context menu opens on demand.
     #[serde(default)]
     pub zsui_fast_context_menu: bool,
+    /// Frosted glass: the desktop behind a fence is blurred.
+    #[serde(default)]
+    pub blur: bool,
 }
 
 fn default_true() -> bool { true }
@@ -155,7 +166,8 @@ fn default_true() -> bool { true }
 impl Default for DesktopSettings {
     fn default() -> Self {
         Self { organize: false, icons_hidden_by_zsdesk: false, hidden: false, double_click_toggle: true,
-            theme: FenceTheme::Dark, opacity: 55, browse_inside: true, hover_expand: true, hide_tray: false, show_counts: false, zsui_fast_context_menu: false }
+            theme: FenceTheme::Dark, opacity: 55, browse_inside: true, hover_expand: true, hide_tray: false, show_counts: false,
+            zsui_fast_context_menu: false, blur: false }
     }
 }
 
@@ -164,19 +176,22 @@ pub struct DesktopConfig {
     pub version: u32,
     #[serde(default)] pub settings: DesktopSettings,
     #[serde(default)] pub fences: Vec<Fence>,
+    /// Desktop items explicitly taken out of automatic grouping. Each entry
+    /// reuses a one-item icon layout, but is never a titled fence or tab.
+    #[serde(default)] pub released_items: Vec<Fence>,
     /// 退出整理模式时保存的桌面格子，再次整理时恢复。
     #[serde(default)] pub stash: Vec<Fence>,
     pub next_id: u64,
 }
 
 impl Default for DesktopConfig {
-    fn default() -> Self { Self { version: CONFIG_VERSION, settings: DesktopSettings::default(), fences: Vec::new(), stash: Vec::new(), next_id: 1 } }
+    fn default() -> Self { Self { version: CONFIG_VERSION, settings: DesktopSettings::default(), fences: Vec::new(), released_items: Vec::new(), stash: Vec::new(), next_id: 1 } }
 }
 
 impl DesktopConfig {
     pub fn take_id(&mut self) -> u64 { let id = self.next_id; self.next_id += 1; id }
     pub fn normalize(&mut self) {
-        let largest = self.fences.iter().chain(&self.stash).map(|f| f.id).max().unwrap_or(0);
+        let largest = self.fences.iter().chain(&self.stash).chain(&self.released_items).map(|f| f.id.max(f.group)).max().unwrap_or(0);
         self.next_id = self.next_id.max(largest + 1);
         for fence in self.fences.iter_mut().chain(self.stash.iter_mut()) {
             fence.placement.width = fence.placement.width.max(MIN_FENCE_W);
@@ -184,16 +199,183 @@ impl DesktopConfig {
             fence.members.dedup();
             fence.members.truncate(5000);
         }
+        normalize_groups(&mut self.fences);
+        normalize_groups(&mut self.stash);
+        self.released_items.retain(|item| item.members.len() == 1 && item.is_desktop());
+        let mut released_keys=std::collections::HashSet::new();
+        self.released_items.retain(|item|released_keys.insert(item.members[0].to_lowercase()));
+        for item in &mut self.released_items {
+            item.title.clear(); item.group = 0; item.tab_active = false;
+            item.collapsed = false; item.locked = true; item.rule = None; item.catch_all = false;
+            item.view = FenceView::Icons;
+            item.placement.width = item.placement.width.clamp(72, 192);
+            item.placement.height = item.placement.height.clamp(84, 224);
+        }
         self.settings.opacity = self.settings.opacity.clamp(10, 100);
     }
-    pub fn fence(&self, id: u64) -> Option<&Fence> { self.fences.iter().find(|f| f.id == id) }
-    pub fn fence_mut(&mut self, id: u64) -> Option<&mut Fence> { self.fences.iter_mut().find(|f| f.id == id) }
+    pub fn fence(&self, id: u64) -> Option<&Fence> { self.fences.iter().chain(&self.released_items).find(|f| f.id == id) }
+    pub fn fence_mut(&mut self, id: u64) -> Option<&mut Fence> { self.fences.iter_mut().chain(&mut self.released_items).find(|f| f.id == id) }
+    pub fn is_released(&self, id: u64) -> bool { self.released_items.iter().any(|item| item.id == id) }
+    pub fn is_released_key(&self, key: &str) -> bool {
+        self.released_items.iter().any(|item| item.members.iter().any(|member| member.eq_ignore_ascii_case(key)))
+    }
+    pub fn distributed_items(&self,items:&[ItemInfo])->Vec<Vec<usize>> {
+        let mut groups=distribute(&self.fences,items);
+        for group in &mut groups { group.retain(|index|!self.is_released_key(&items[*index].key)); }
+        groups
+    }
+    /// A visual move only: the file itself and its path are never changed here.
+    pub fn release_item(&mut self, key: String, placement: Placement) -> u64 {
+        for fence in self.fences.iter_mut().chain(&mut self.stash) {
+            fence.members.retain(|member| !member.eq_ignore_ascii_case(&key));
+        }
+        if let Some(item) = self.released_items.iter_mut().find(|item| item.members.first().is_some_and(|member| member.eq_ignore_ascii_case(&key))) {
+            item.placement = placement;
+            return item.id;
+        }
+        let id = self.take_id();
+        let mut item = Fence::new(id, "", FenceSource::Desktop, placement);
+        item.members.push(key); item.locked = true;
+        self.released_items.push(item);
+        id
+    }
+
+    // ---- tab groups ----------------------------------------------------------
+
+    /// Ids of the tabs shown together with `id`, in tab order (just `[id]` for a plain fence).
+    pub fn tab_ids(&self, id: u64) -> Vec<u64> {
+        match self.fence(id) {
+            Some(f) if f.group != 0 => self.fences.iter().filter(|o| o.group == f.group).map(|o| o.id).collect(),
+            Some(_) => vec![id],
+            None => Vec::new(),
+        }
+    }
+
+    /// The tab currently shown for `id`'s group.
+    pub fn active_tab(&self, id: u64) -> Option<u64> {
+        let fence = self.fence(id)?;
+        if fence.group == 0 { return Some(id); }
+        self.fences.iter().find(|o| o.group == fence.group && o.tab_active).map(|o| o.id).or(Some(id))
+    }
+
+    /// Shows `id` in its group; the other tabs become hidden.
+    pub fn activate_tab(&mut self, id: u64) {
+        let Some(group) = self.fence(id).map(|f| f.group).filter(|g| *g != 0) else { return };
+        for fence in self.fences.iter_mut().filter(|f| f.group == group) { fence.tab_active = fence.id == id; }
+    }
+
+    /// Copies the shared window state of `id` (position, size, roll-up, lock) to its other tabs.
+    pub fn sync_group(&mut self, id: u64) {
+        let Some(source) = self.fence(id).filter(|f| f.group != 0).cloned() else { return };
+        for fence in self.fences.iter_mut().filter(|f| f.group == source.group && f.id != id) {
+            fence.placement = source.placement.clone();
+            fence.collapsed = source.collapsed;
+            fence.locked = source.locked;
+        }
+    }
+
+    /// Adds `fence` as a new, active tab after the last tab of `to`'s group.
+    pub fn add_tab(&mut self, to: u64, mut fence: Fence) {
+        let Some(group) = self.ensure_group(to) else { return };
+        let Some(host) = self.fence(to).cloned() else { return };
+        fence.group = group;
+        fence.placement = host.placement;
+        fence.collapsed = host.collapsed;
+        fence.locked = host.locked;
+        let id = fence.id;
+        let at = self.fences.iter().rposition(|f| f.group == group).map_or(self.fences.len(), |i| i + 1);
+        self.fences.insert(at, fence);
+        self.activate_tab(id);
+    }
+
+    /// Moves the tabs of `source` (a plain fence or a whole group) into `target`'s
+    /// group. The dragged `source` becomes the active tab at the target's position.
+    pub fn merge_into(&mut self, source: u64, target: u64) -> bool {
+        let source_ids = self.tab_ids(source);
+        if source_ids.is_empty() || source_ids.contains(&target) || self.fence(target).is_none() { return false; }
+        let Some(group) = self.ensure_group(target) else { return false };
+        let Some(host) = self.fence(target).cloned() else { return false };
+        let mut moved: Vec<Fence> = Vec::new();
+        self.fences.retain(|f| if source_ids.contains(&f.id) { moved.push(f.clone()); false } else { true });
+        for fence in &mut moved {
+            fence.group = group;
+            fence.placement = host.placement.clone();
+            fence.collapsed = host.collapsed;
+            fence.locked = host.locked;
+        }
+        let at = self.fences.iter().rposition(|f| f.group == group).map_or(self.fences.len(), |i| i + 1);
+        self.fences.splice(at..at, moved);
+        self.activate_tab(source);
+        true
+    }
+
+    /// Takes `id` out of its group as a plain fence at `placement`. The group
+    /// keeps a neighbouring tab active and dissolves when one tab remains.
+    pub fn split_tab(&mut self, id: u64, placement: Placement) {
+        let Some(group) = self.fence(id).map(|f| f.group).filter(|g| *g != 0) else { return };
+        let order = self.tab_ids(id);
+        let was_active = self.fence(id).is_some_and(|f| f.tab_active);
+        if let Some(fence) = self.fence_mut(id) {
+            fence.group = 0;
+            fence.tab_active = false;
+            fence.placement = placement;
+            fence.collapsed = false;
+        }
+        // Keep the tab as its own fence right after its former group.
+        if let Some(from) = self.fences.iter().position(|f| f.id == id) {
+            let fence = self.fences.remove(from);
+            let at = self.fences.iter().rposition(|f| f.group == group).map_or(self.fences.len(), |i| i + 1);
+            self.fences.insert(at, fence);
+        }
+        if was_active { self.activate_neighbour(group, &order, id); }
+        normalize_groups(&mut self.fences);
+    }
+
+    /// Before `id` is removed: shows the tab next to it if it was the visible one.
+    pub fn release_tab(&mut self, id: u64) {
+        let Some(fence) = self.fence(id).filter(|f| f.group != 0 && f.tab_active) else { return };
+        let group = fence.group;
+        let order = self.tab_ids(id);
+        self.activate_neighbour(group, &order, id);
+    }
+
+    /// Reorders `id` within its group so it comes before `before` (or last).
+    pub fn move_tab(&mut self, id: u64, before: Option<u64>) {
+        let Some(group) = self.fence(id).map(|f| f.group).filter(|g| *g != 0) else { return };
+        if before == Some(id) { return; }
+        let Some(from) = self.fences.iter().position(|f| f.id == id) else { return };
+        let fence = self.fences.remove(from);
+        let at = before.and_then(|b| self.fences.iter().position(|f| f.id == b && f.group == group))
+            .or_else(|| self.fences.iter().rposition(|f| f.group == group).map(|i| i + 1))
+            .unwrap_or(self.fences.len());
+        self.fences.insert(at, fence);
+    }
+
+    fn activate_neighbour(&mut self, group: u64, order: &[u64], leaving: u64) {
+        let Some(at) = order.iter().position(|o| *o == leaving) else { return };
+        let next = order.get(at + 1).or_else(|| at.checked_sub(1).and_then(|i| order.get(i)))
+            .copied().filter(|n| self.fence(*n).is_some_and(|f| f.group == group));
+        if let Some(next) = next { self.activate_tab(next); }
+    }
+
+    /// Group id of `id`, creating a one-tab group for a plain fence.
+    fn ensure_group(&mut self, id: u64) -> Option<u64> {
+        let current = self.fence(id)?.group;
+        if current != 0 { return Some(current); }
+        let group = self.take_id();
+        let fence = self.fence_mut(id)?;
+        fence.group = group;
+        fence.tab_active = true;
+        Some(group)
+    }
 
     /// Puts `keys` into fence `target` (manual membership), removing them from other desktop fences.
     /// `before` inserts ahead of an existing member to support manual reordering.
     pub fn assign(&mut self, target: u64, keys: &[String], before: Option<&str>) {
+        if !self.fences.iter().any(|f| f.id == target && f.is_desktop()) { return; }
+        self.released_items.retain(|item| !item.members.iter().any(|member| keys.iter().any(|key| member.eq_ignore_ascii_case(key))));
         for fence in self.fences.iter_mut().filter(|f| f.is_desktop()) {
-            fence.members.retain(|m| !keys.contains(m));
+            fence.members.retain(|member| !keys.iter().any(|key|member.eq_ignore_ascii_case(key)));
         }
         let Some(fence) = self.fence_mut(target).filter(|f| f.is_desktop()) else { return };
         let at = before.and_then(|b| fence.members.iter().position(|m| m == b)).unwrap_or(fence.members.len());
@@ -203,10 +385,35 @@ impl DesktopConfig {
     /// Updates manual memberships after a rename.
     pub fn rename_member(&mut self, old: &str, new: &str) -> bool {
         let mut changed = false;
-        for fence in self.fences.iter_mut() {
+        for fence in self.fences.iter_mut().chain(&mut self.released_items) {
             for member in fence.members.iter_mut().filter(|m| m.eq_ignore_ascii_case(old)) { *member = new.to_string(); changed = true; }
         }
         changed
+    }
+}
+
+/// Repairs tab groups after loading, stashing or removing fences: a group of
+/// one becomes a plain fence, every group shows exactly one tab, and the tabs
+/// share the active tab's position, size, roll-up and lock state.
+fn normalize_groups(fences: &mut [Fence]) {
+    let mut groups: Vec<u64> = fences.iter().map(|f| f.group).filter(|g| *g != 0).collect();
+    groups.sort_unstable();
+    groups.dedup();
+    for fence in fences.iter_mut().filter(|f| f.group == 0) { fence.tab_active = false; }
+    for group in groups {
+        let members: Vec<usize> = (0..fences.len()).filter(|&i| fences[i].group == group).collect();
+        if members.len() < 2 {
+            for &i in &members { fences[i].group = 0; fences[i].tab_active = false; }
+            continue;
+        }
+        let active = members.iter().copied().find(|&i| fences[i].tab_active).unwrap_or(members[0]);
+        let (placement, collapsed, locked) = (fences[active].placement.clone(), fences[active].collapsed, fences[active].locked);
+        for &i in &members {
+            fences[i].tab_active = i == active;
+            fences[i].placement = placement.clone();
+            fences[i].collapsed = collapsed;
+            fences[i].locked = locked;
+        }
     }
 }
 
@@ -340,6 +547,31 @@ pub fn auto_layout(count: usize, area_w: i32, area_h: i32) -> Vec<Bounds> {
 mod tests {
     use super::*;
     #[test]
+    fn released_desktop_items_survive_rules_restart_and_explicit_reassignment() {
+        let key=r"C:\Users\Test\Desktop\报告.txt";
+        let mut config=DesktopConfig{fences:vec![fence(1,Some(Category::Documents),true)],next_id:2,..Default::default()};
+        config.fences[0].members.push(key.into());
+        let position=Placement{monitor:"DISPLAY1".into(),x:200,y:100,width:96,height:104};
+        let id=config.release_item(key.into(),position.clone());
+        assert!(config.fences[0].members.is_empty());
+        assert_eq!(config.distributed_items(&[info(key,false)]),vec![Vec::<usize>::new()]);
+        let mut restored:DesktopConfig=serde_json::from_slice(&serde_json::to_vec(&config).unwrap()).unwrap();
+        restored.normalize();
+        assert_eq!(restored.fence(id).unwrap().placement,position);
+        assert!(restored.fence(id).unwrap().title.is_empty());
+        assert_eq!(restored.release_item(key.to_uppercase(),position),id);
+        assert_eq!(restored.released_items.len(),1);
+        restored.assign(1,&[key.into()],None);
+        assert!(restored.released_items.is_empty());
+        assert_eq!(restored.distributed_items(&[info(key,false)]),vec![vec![0]]);
+    }
+    #[test]
+    fn old_desktop_profiles_default_to_no_released_items() {
+        let mut value=serde_json::to_value(DesktopConfig::default()).unwrap();
+        value.as_object_mut().unwrap().remove("released_items");
+        assert!(serde_json::from_value::<DesktopConfig>(value).unwrap().released_items.is_empty());
+    }
+    #[test]
     fn existing_profiles_hide_counts_until_enabled() {
         let mut value = serde_json::to_value(DesktopConfig::default()).unwrap();
         value["settings"].as_object_mut().unwrap().remove("show_counts");
@@ -458,6 +690,106 @@ mod tests {
         for (i, a) in rects.iter().enumerate() {
             for b in &rects[i + 1..] { assert!(a.right() <= b.x || b.right() <= a.x || a.bottom() <= b.y || b.bottom() <= a.y); }
         }
+    }
+
+    fn config_with(n: u64) -> DesktopConfig {
+        let mut config = DesktopConfig::default();
+        for _ in 0..n {
+            let id = config.take_id();
+            config.fences.push(Fence::new(id, format!("f{id}"), FenceSource::Desktop,
+                Placement { x: id as i32 * 100, y: 0, width: 300, height: 200, ..Default::default() }));
+        }
+        config
+    }
+
+    #[test]
+    fn existing_profiles_load_as_plain_fences() {
+        let mut value = serde_json::to_value(config_with(2)).unwrap();
+        for fence in value["fences"].as_array_mut().unwrap() {
+            let fence = fence.as_object_mut().unwrap();
+            fence.remove("group");
+            fence.remove("tab_active");
+        }
+        let mut config: DesktopConfig = serde_json::from_value(value).unwrap();
+        config.normalize();
+        assert!(config.fences.iter().all(|f| f.group == 0 && !f.is_hidden_tab()));
+        assert_eq!(config.tab_ids(1), vec![1]);
+        assert_eq!(config.active_tab(1), Some(1));
+    }
+
+    #[test]
+    fn merging_groups_tabs_at_the_target_and_shows_the_dragged_fence() {
+        let mut config = config_with(3);
+        assert!(config.merge_into(1, 2));
+        assert_eq!(config.tab_ids(2), vec![2, 1]);
+        assert_eq!(config.active_tab(2), Some(1));
+        assert!(config.fence(2).unwrap().is_hidden_tab());
+        assert_eq!(config.fence(1).unwrap().placement.x, 200, "tabs take the target position");
+        // A whole group merges into another fence in order.
+        assert!(config.merge_into(1, 3));
+        assert_eq!(config.tab_ids(3), vec![3, 2, 1]);
+        assert_eq!(config.active_tab(3), Some(1));
+        assert!(!config.merge_into(3, 1), "a group never merges into itself");
+        let group = config.fence(3).unwrap().group;
+        assert!(group > 3, "group ids never reuse fence ids");
+        assert!(config.next_id > group);
+    }
+
+    #[test]
+    fn splitting_and_closing_keep_one_visible_tab() {
+        let mut config = config_with(3);
+        config.merge_into(2, 1);
+        config.merge_into(3, 1);
+        assert_eq!(config.tab_ids(1), vec![1, 2, 3]);
+        config.activate_tab(2);
+        config.split_tab(2, Placement { x: 900, width: 300, height: 200, ..Default::default() });
+        let split = config.fence(2).unwrap();
+        assert_eq!((split.group, split.tab_active, split.placement.x), (0, false, 900));
+        assert_eq!(config.tab_ids(1), vec![1, 3]);
+        assert_eq!(config.active_tab(1), Some(3), "the next tab is shown");
+        config.release_tab(3);
+        config.fences.retain(|f| f.id != 3);
+        config.normalize();
+        let last = config.fence(1).unwrap();
+        assert_eq!((last.group, last.tab_active), (0, false), "a group of one becomes a plain fence");
+    }
+
+    #[test]
+    fn tabs_share_window_state_and_reorder() {
+        let mut config = config_with(3);
+        config.merge_into(2, 1);
+        config.merge_into(3, 1);
+        config.fence_mut(3).unwrap().placement.y = 77;
+        config.fence_mut(3).unwrap().collapsed = true;
+        config.sync_group(3);
+        assert!(config.tab_ids(1).iter().all(|id| config.fence(*id).unwrap().placement.y == 77 && config.fence(*id).unwrap().collapsed));
+        config.move_tab(3, Some(1));
+        assert_eq!(config.tab_ids(1), vec![3, 1, 2]);
+        config.move_tab(3, None);
+        assert_eq!(config.tab_ids(1), vec![1, 2, 3]);
+        let mut extra = Fence::new(config.take_id(), "new", FenceSource::Desktop, Placement::default());
+        extra.placement.x = -1;
+        let new_id = extra.id;
+        config.add_tab(2, extra);
+        assert_eq!(config.tab_ids(1), vec![1, 2, 3, new_id]);
+        assert_eq!(config.active_tab(1), Some(new_id));
+        assert_eq!(config.fence(new_id).unwrap().placement.y, 77);
+        // Broken groups from older or edited profiles are repaired.
+        for fence in &mut config.fences { fence.tab_active = true; }
+        config.normalize();
+        assert_eq!(config.fences.iter().filter(|f| f.tab_active).count(), 1);
+    }
+
+    #[test]
+    fn distribution_includes_hidden_tabs() {
+        let mut config = config_with(2);
+        config.fence_mut(1).unwrap().catch_all = true;
+        config.fence_mut(2).unwrap().members.push(r"C:\D\a.txt".into());
+        config.merge_into(1, 2);
+        let out = distribute(&config.fences, &[info(r"C:\D\a.txt", false), info(r"C:\D\b.txt", false)]);
+        let hidden = config.fences.iter().position(|f| f.id == 2).unwrap();
+        assert!(config.fences[hidden].is_hidden_tab());
+        assert_eq!(out[hidden], vec![0], "items of an inactive tab are not taken by the catch-all tab");
     }
 
     #[test]

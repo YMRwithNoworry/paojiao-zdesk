@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net48</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <AssemblyName>Listary.FileAppPlugin.ZSDesk</AssemblyName>
+    <Version>1.0.0</Version>
+    <Deterministic>true</Deterministic>
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Listary.FileAppPlugin" Version="1.0.0" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Update="ListaryPluginManifest.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Update="Icon.png" CopyToOutputDirectory="PreserveNewest" />
+    <Compile Remove="tests\**\*.cs" />
+  </ItemGroup>
+</Project>

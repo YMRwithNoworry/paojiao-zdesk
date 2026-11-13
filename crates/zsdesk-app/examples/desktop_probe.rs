@@ -14,7 +14,7 @@ fn main() {
     for e in items.iter().take(6) { println!("  {} | {} | folder={} link={} fs={}", e.name, e.key, e.is_folder, e.is_link, e.is_file_system); }
     let args: Vec<String> = std::env::args().collect();
     if let Some(i) = args.iter().position(|a| a == "--parse") {
-        let name = zsdesk_core::model::explorer::ShellLocation::Shell { parsing_name: args[i + 1].clone(), title: String::new() };
+        let name = zsdesk_core::model::explorer::ShellLocation::Shell { pidl:None, parsing_name: args[i + 1].clone(), title: String::new() };
         match unsafe { zsdesk_windows::shell::shell_item(&name) } {
             Ok(item) => println!("parse ok: {:?}", unsafe { zsdesk_windows::shell::location_from_shell_item(&item) }),
             Err(e) => println!("parse failed: {e}"),

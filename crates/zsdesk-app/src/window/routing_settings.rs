@@ -79,6 +79,10 @@ impl WindowState {
             ),
         ]);
         if !settings.applications.is_empty() {
+            items.push(submenu("补充程序组件（高级）", settings.applications.iter().map(|app| {
+                entry(&format!("{}{}", app.label.replace('&', "&&"), if app.profile == 4 { "（已配置）" } else { "" }),
+                    &format!("caller-{}", app.id), available, false)
+            }).collect()));
             items.push(submenu(
                 "移除应用",
                 settings
@@ -135,6 +139,15 @@ impl WindowState {
                 routing_control::save_draft(&self.config_path, &settings)
                     .map(|_| self.show_message("应用已从选择中移除，应用设置后更新转发规则".into()))
             }
+            Some(value) if value.starts_with("caller-") => {
+                match value[7..].parse::<u32>().ok().and_then(|id| settings.applications.iter().find(|app| app.id == id)) {
+                    Some(app) => match pick_module(self.hwnd) {
+                        Some(module) => routing_control::request_add_with_caller(&self.config_path, app.executable.clone(), module, self.hwnd),
+                        None => Ok(()),
+                    },
+                    None => Ok(()),
+                }
+            }
             _ => Ok(()),
         };
         if let Err(error) = result {
@@ -144,6 +157,14 @@ impl WindowState {
 }
 
 fn pick_executable(owner: HWND) -> Option<PathBuf> {
+    pick_component(owner, false)
+}
+
+fn pick_module(owner: HWND) -> Option<PathBuf> {
+    pick_component(owner, true)
+}
+
+fn pick_component(owner: HWND, module: bool) -> Option<PathBuf> {
     use windows::{
         core::w,
         Win32::{
@@ -161,7 +182,8 @@ fn pick_executable(owner: HWND) -> Option<PathBuf> {
         dialog
             .SetOptions(flags | FOS_FILEMUSTEXIST | FOS_FORCEFILESYSTEM)
             .ok()?;
-        let _ = dialog.SetTitle(w!("选择需要转发文件定位的程序（.exe）"));
+        let _ = dialog.SetTitle(if module { w!("选择该程序目录内负责打开文件夹的组件（.dll）") }
+            else { w!("选择需要转发文件定位的程序（.exe）") });
         dialog.Show(Some(owner)).ok()?;
         let item = dialog.GetResult().ok()?;
         let path = item.GetDisplayName(SIGDN_FILESYSPATH).ok()?;
@@ -170,7 +192,7 @@ fn pick_executable(owner: HWND) -> Option<PathBuf> {
         let path = PathBuf::from(text.ok()?);
         if path
             .extension()
-            .is_some_and(|e| e.eq_ignore_ascii_case("exe"))
+            .is_some_and(|e| e.eq_ignore_ascii_case(if module { "dll" } else { "exe" }))
         {
             Some(path)
         } else {

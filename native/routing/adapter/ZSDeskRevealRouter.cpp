@@ -1,4 +1,5 @@
 #include "RouteRequest.h"
+#include "ProcessLaunch.h"
 #include "../RoutingProtocol.h"
 #include "../support/AdapterCommon.h"
 #include "../AdapterConfig.h"
@@ -23,15 +24,23 @@ constexpr DWORD kSendTimeout = 1000;
 using ShellW = HINSTANCE(WINAPI*)(HWND,LPCWSTR,LPCWSTR,LPCWSTR,LPCWSTR,INT);
 using ShellExW = BOOL(WINAPI*)(SHELLEXECUTEINFOW*);
 using SelectItems = HRESULT(WINAPI*)(PCIDLIST_ABSOLUTE,UINT,PCUITEMID_CHILD_ARRAY,DWORD);
+using ProcessW = BOOL(WINAPI*)(LPCWSTR,LPWSTR,LPSECURITY_ATTRIBUTES,LPSECURITY_ATTRIBUTES,BOOL,DWORD,LPVOID,LPCWSTR,LPSTARTUPINFOW,LPPROCESS_INFORMATION);
+using ProcessA = BOOL(WINAPI*)(LPCSTR,LPSTR,LPSECURITY_ATTRIBUTES,LPSECURITY_ATTRIBUTES,BOOL,DWORD,LPVOID,LPCSTR,LPSTARTUPINFOA,LPPROCESS_INFORMATION);
+using ExecuteA = UINT(WINAPI*)(LPCSTR,UINT);
 ShellW gOriginalW = nullptr;
 ShellExW gOriginalEx = nullptr;
 SelectItems gOriginalSelect = nullptr;
-void* gTargets[3]{};
+ProcessW gOriginalProcessW=nullptr;
+ProcessA gOriginalProcessA=nullptr;
+ExecuteA gOriginalWinExec=nullptr;
+void* gTargets[6]{};
 bool gCreated = false;
 bool gIdentified = false;
 HMODULE gModule = nullptr;
 uintptr_t gClientBase = 0;
 DWORD gClientSize = 0;
+uintptr_t gMainBase=0;
+DWORD gMainSize=0;
 std::wstring gWindows;
 std::atomic<DWORD> gRole{0};
 std::atomic<bool> gEnabled{false};
@@ -40,12 +49,22 @@ std::atomic<ULONGLONG> gSerial{0};
 thread_local unsigned gDepth = 0;
 SRWLOCK gInstallLock = SRWLOCK_INIT;
 SRWLOCK gStatusLock = SRWLOCK_INIT;
-DWORD gLastError = 0,gLastKind = 0,gLastCount = 0;
+DWORD gLastError = 0,gLastKind = 0,gLastCount = 0,gLastReason=0;
 ULONGLONG gLastId = 0;
 HWND gLastWindow = nullptr;
 wchar_t gLastFolder[1024]{};
 
-struct ActiveScope { ActiveScope(){gActive.fetch_add(1);++gDepth;} ~ActiveScope(){--gDepth;gActive.fetch_sub(1);} };
+bool CallerAllowed(void* caller);
+struct ActiveScope {
+    bool entered=false;
+    explicit ActiveScope(void* caller){
+        AcquireSRWLockShared(&gInstallLock);
+        if(gEnabled.load()&&CallerAllowed(caller)){gActive.fetch_add(1);++gDepth;entered=true;}
+        ReleaseSRWLockShared(&gInstallLock);
+    }
+    explicit operator bool()const{return entered;}
+    ~ActiveScope(){if(entered){--gDepth;gActive.fetch_sub(1);}}
+};
 struct HandleCloser {void operator()(void* value) const {if(value&&value!=INVALID_HANDLE_VALUE)CloseHandle(value);}};
 using Handle = std::unique_ptr<void,HandleCloser>;
 struct TaskFree {void operator()(void* value) const {CoTaskMemFree(value);}};
@@ -70,7 +89,7 @@ bool CopyString(const wchar_t* value,std::wstring& result,size_t limit=32780) {
     size_t length=0;if(!StringLengthSafe(value,limit,length))return false;
     result.resize(length);return !length||CopyMemorySafe(result.data(),value,length*sizeof(wchar_t));
 }
-void RecordError(DWORD error) {AcquireSRWLockExclusive(&gStatusLock);gLastError=error;ReleaseSRWLockExclusive(&gStatusLock);}
+void RecordError(DWORD error,routing::Reason reason=routing::Reason::None) {AcquireSRWLockExclusive(&gStatusLock);gLastError=error;gLastReason=static_cast<DWORD>(reason);ReleaseSRWLockExclusive(&gStatusLock);}
 bool HashMatches(const wchar_t* path,const char* expected) {std::string actual;return FileSha256(path,actual)&&actual==expected;}
 bool SameUser(HANDLE process) {
     HANDLE rawFirst=nullptr,rawSecond=nullptr;
@@ -104,7 +123,7 @@ bool ExistingRequest(const RouteRequest& request) {
 }
 DispatchResult SendRequest(const RouteRequest& request,DWORD kind) {
     HWND window=FindReceiver();
-    if(!window){gDeclined.fetch_add(1);RecordError(ERROR_NOT_FOUND);return DispatchResult::Declined;}
+    if(!window){gDeclined.fetch_add(1);RecordError(ERROR_NOT_FOUND,routing::Reason::ReceiverUnavailable);return DispatchResult::Declined;}
     DWORD receiverPid=0;
     GetWindowThreadProcessId(window,&receiverPid);
     if(receiverPid)AllowSetForegroundWindow(receiverPid);
@@ -130,22 +149,39 @@ DispatchResult SendRequest(const RouteRequest& request,DWORD kind) {
     if(result&&reply==0){gDeclined.fetch_add(1);RecordError(ERROR_NOT_READY);return DispatchResult::Declined;}
     const DWORD error=GetLastError();
     if(!result&&(error==ERROR_ACCESS_DENIED||error==ERROR_INVALID_WINDOW_HANDLE)){
-        gDeclined.fetch_add(1);RecordError(error);return DispatchResult::Declined;
+        DWORD own=0,receiver=0;Handle process(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,FALSE,receiverPid));
+        const bool higher=process&&!routing::ProcessIntegrity(GetCurrentProcess(),own)&&!routing::ProcessIntegrity(process.get(),receiver)&&receiver>own;
+        gDeclined.fetch_add(1);RecordError(error,error==ERROR_ACCESS_DENIED?(higher?routing::Reason::HigherIntegrity:routing::Reason::AccessDenied):routing::Reason::ReceiverUnavailable);return DispatchResult::Declined;
     }
-    gIndeterminate.fetch_add(1);RecordError(error?error:ERROR_TIMEOUT);return DispatchResult::Indeterminate;
+    gIndeterminate.fetch_add(1);RecordError(error?error:ERROR_TIMEOUT,routing::Reason::Indeterminate);return DispatchResult::Indeterminate;
 }
 bool CallerAllowed(void* caller) {
     uintptr_t address=reinterpret_cast<uintptr_t>(caller);
-    return address>=gClientBase&&address-gClientBase<gClientSize;
+    const bool allowed=(address>=gClientBase&&address-gClientBase<gClientSize)||(address>=gMainBase&&address-gMainBase<gMainSize);
+    if(!allowed)RecordError(ERROR_NOT_SUPPORTED,routing::Reason::CallerNotBound);
+    return allowed;
 }
-bool BuildExplorer(const wchar_t* executable,const wchar_t* operation,const wchar_t* parameters,int show,RouteRequest& request,DWORD& kind,bool extended) {
-    std::wstring file,verb,args;
-    if(!CopyString(executable,file)||!CopyString(operation,verb)||!CopyString(parameters,args))return false;
+bool VerifiedExplorer(std::wstring_view file,std::wstring_view directory,bool applicationName,bool shellLookup=false);
+bool BuildExplorer(const wchar_t* executable,const wchar_t* operation,const wchar_t* parameters,const wchar_t* directory,int show,RouteRequest& request,DWORD& kind,bool extended) {
+    std::wstring file,verb,args,cwd;
+    if(!CopyString(executable,file)||!CopyString(operation,verb)||!CopyString(parameters,args)||!CopyString(directory,cwd)){
+        RecordError(ERROR_INVALID_PARAMETER,routing::Reason::InvalidInput);return false;
+    }
+    if(!shell_route::FolderOpenVerb(verb)){RecordError(ERROR_NOT_SUPPORTED,routing::Reason::UnsupportedVerb);return false;}
+    if(!shell_route::VisibleOpenCommand(show)){RecordError(ERROR_NOT_SUPPORTED,routing::Reason::UnsupportedShow);return false;}
+    // An explicit working directory can change Shell relative-name resolution.
+    // Full system paths remain unambiguous and retain the supplied directory.
+    if(shell_route::EqualPath(file,L"explorer.exe")&&!cwd.empty()){
+        RecordError(ERROR_NOT_SUPPORTED,routing::Reason::NotSystemExplorer);return false;
+    }
+    if(shell_route::IsExplorer(file,gWindows)&&!VerifiedExplorer(file,L"",false,true)){
+        RecordError(ERROR_NOT_SUPPORTED,routing::Reason::NotSystemExplorer);return false;
+    }
     if(shell_route::ExplorerSelect(file,verb,args,show,gWindows,request))kind=extended?3:2;
     else if(shell_route::ExplorerDirectory(file,verb,args,show,gWindows,request))kind=4;
     else if(shell_route::DirectDirectory(file,verb,args,show,request))kind=extended?9:8;
-    else return false;
-    return ExistingRequest(request);
+    else {RecordError(ERROR_NOT_SUPPORTED,routing::Reason::UnsupportedArguments);return false;}
+    if(!ExistingRequest(request)){RecordError(ERROR_PATH_NOT_FOUND,routing::Reason::PathUnavailable);return false;}return true;
 }
 bool FileSystemPath(PCIDLIST_ABSOLUTE pidl,std::wstring& path) {
     if(!pidl)return false;PWSTR text=nullptr;
@@ -213,21 +249,21 @@ bool BuildFolderIdList(const SHELLEXECUTEINFOW& info,RouteRequest& request) {
 
 HINSTANCE WINAPI HookW(HWND owner,LPCWSTR operation,LPCWSTR file,LPCWSTR parameters,LPCWSTR directory,INT show) {
     const DWORD saved=GetLastError();
-    if(gDepth||!gEnabled.load()||!CallerAllowed(_ReturnAddress()))return gOriginalW(owner,operation,file,parameters,directory,show);
-    ActiveScope active;
+    if(gDepth)return gOriginalW(owner,operation,file,parameters,directory,show);
+    ActiveScope active(_ReturnAddress());if(!active)return gOriginalW(owner,operation,file,parameters,directory,show);
     try {
         RouteRequest request;DWORD kind=0;
-        if(BuildExplorer(file,operation,parameters,show,request,kind,false)) {
+        if(BuildExplorer(file,operation,parameters,directory,show,request,kind,false)) {
             const auto result=SendRequest(request,kind);
-            if(result!=DispatchResult::Declined){SetLastError(result==DispatchResult::Accepted?ERROR_SUCCESS:ERROR_TIMEOUT);return reinterpret_cast<HINSTANCE>(static_cast<INT_PTR>(33));}
+            if(result!=DispatchResult::Declined){SetLastError(result==DispatchResult::Accepted?ERROR_SUCCESS:ERROR_TIMEOUT);return reinterpret_cast<HINSTANCE>(static_cast<INT_PTR>(result==DispatchResult::Accepted?33:SE_ERR_DDETIMEOUT));}
         }
     } catch(...) {gFailed.fetch_add(1);RecordError(ERROR_NOT_ENOUGH_MEMORY);}
     SetLastError(saved);return gOriginalW(owner,operation,file,parameters,directory,show);
 }
 BOOL WINAPI HookEx(SHELLEXECUTEINFOW* info) {
     const DWORD saved=GetLastError();
-    if(gDepth||!gEnabled.load()||!CallerAllowed(_ReturnAddress()))return gOriginalEx(info);
-    ActiveScope active;
+    if(gDepth)return gOriginalEx(info);
+    ActiveScope active(_ReturnAddress());if(!active)return gOriginalEx(info);
     try {
         SHELLEXECUTEINFOW copy{};
         constexpr ULONG allowed=SEE_MASK_FLAG_NO_UI|SEE_MASK_NOASYNC|SEE_MASK_UNICODE|SEE_MASK_NO_CONSOLE|
@@ -235,14 +271,15 @@ BOOL WINAPI HookEx(SHELLEXECUTEINFOW* info) {
         if(info&&CopyMemorySafe(&copy,info,sizeof(copy))&&copy.cbSize==sizeof(copy)) {
             RouteRequest request;DWORD kind=0;
             bool supported=false;
-            if(!(copy.fMask&~allowed))supported=BuildExplorer(copy.lpFile,copy.lpVerb,copy.lpParameters,copy.nShow,request,kind,true);
+            if(!(copy.fMask&~allowed))supported=BuildExplorer(copy.lpFile,copy.lpVerb,copy.lpParameters,copy.lpDirectory,copy.nShow,request,kind,true);
             else if(BuildFolderIdList(copy,request)){supported=true;kind=7;}
+            else RecordError(ERROR_NOT_SUPPORTED,routing::Reason::UnsupportedFlags);
             if(supported) {
                 const auto result=SendRequest(request,kind);
                 if(result!=DispatchResult::Declined) {
-                    HINSTANCE success=reinterpret_cast<HINSTANCE>(static_cast<INT_PTR>(33));HANDLE empty=nullptr;
+                    HINSTANCE success=reinterpret_cast<HINSTANCE>(static_cast<INT_PTR>(result==DispatchResult::Accepted?33:SE_ERR_DDETIMEOUT));HANDLE empty=nullptr;
                     CopyMemorySafe(&info->hInstApp,&success,sizeof(success));CopyMemorySafe(&info->hProcess,&empty,sizeof(empty));
-                    SetLastError(result==DispatchResult::Accepted?ERROR_SUCCESS:ERROR_TIMEOUT);return TRUE;
+                    SetLastError(result==DispatchResult::Accepted?ERROR_SUCCESS:ERROR_TIMEOUT);return result==DispatchResult::Accepted;
                 }
             }
         }
@@ -251,17 +288,19 @@ BOOL WINAPI HookEx(SHELLEXECUTEINFOW* info) {
 }
 HRESULT WINAPI HookSelect(PCIDLIST_ABSOLUTE folder,UINT count,PCUITEMID_CHILD_ARRAY children,DWORD flags) {
     const DWORD saved=GetLastError();
-    if(gDepth||!gEnabled.load()||!CallerAllowed(_ReturnAddress()))return gOriginalSelect(folder,count,children,flags);
-    ActiveScope active;
+    if(gDepth)return gOriginalSelect(folder,count,children,flags);
+    ActiveScope active(_ReturnAddress());if(!active)return gOriginalSelect(folder,count,children,flags);
     try {
         RouteRequest request;bool absoluteChild=false;
         if(BuildPidls(folder,count,children,flags,request,absoluteChild)) {
             const auto result=SendRequest(request,count>1?5:absoluteChild?6:1);
-            if(result!=DispatchResult::Declined){SetLastError(result==DispatchResult::Accepted?ERROR_SUCCESS:ERROR_TIMEOUT);return S_OK;}
-        }
+            if(result!=DispatchResult::Declined){SetLastError(result==DispatchResult::Accepted?ERROR_SUCCESS:ERROR_TIMEOUT);return result==DispatchResult::Accepted?S_OK:HRESULT_FROM_WIN32(ERROR_TIMEOUT);}
+        }else RecordError(ERROR_NOT_SUPPORTED,flags?routing::Reason::UnsupportedFlags:routing::Reason::UnsupportedArguments);
     } catch(...) {gFailed.fetch_add(1);RecordError(ERROR_NOT_ENOUGH_MEMORY);}
         SetLastError(saved);return gOriginalSelect(folder,count,children,flags);
 }
+#include "ProcessHooks.h"
+
 bool ValidHash(const char* text,size_t capacity) {
     const char* end=static_cast<const char*>(memchr(text,0,capacity));if(!end||end-text!=64)return false;
     for(const char* p=text;p!=end;++p)if(!((*p>='0'&&*p<='9')||(*p>='a'&&*p<='f')||(*p>='A'&&*p<='F')))return false;return true;
@@ -284,6 +323,12 @@ DWORD Identify() {
         case routing_config::Profile::NativeShell:if(!shell_route::EqualPath(path,gBinding.callerModule))return ERROR_NOT_SUPPORTED;break;
         case routing_config::Profile::Chromium:if(_wcsicmp(BaseName(gBinding.callerModule),L"chrome.dll"))return ERROR_NOT_SUPPORTED;break;
         case routing_config::Profile::WeChat:if(_wcsicmp(BaseName(gBinding.callerModule),L"Weixin.dll"))return ERROR_NOT_SUPPORTED;break;
+        case routing_config::Profile::ExplicitModule:{
+            std::wstring executable,caller;if(!shell_route::NormalizeAbsolute(path,executable)||!shell_route::NormalizeAbsolute(gBinding.callerModule,caller))return ERROR_NOT_SUPPORTED;
+            executable.resize(executable.find_last_of(L'\\')+1);
+            if(caller.size()<=executable.size()||!shell_route::EqualPath(caller.substr(0,executable.size()),executable)||caller.size()<4||!shell_route::EqualPath(caller.substr(caller.size()-4),L".dll"))return ERROR_NOT_SUPPORTED;
+            break;
+        }
         default:return ERROR_NOT_SUPPORTED;
     }
     HMODULE module=shell_route::EqualPath(path,gBinding.callerModule)?GetModuleHandleW(nullptr):GetModuleHandleW(gBinding.callerModule);
@@ -291,16 +336,19 @@ DWORD Identify() {
     if(!GetModuleFileNameW(module,loaded,DWORD(std::size(loaded)))||!shell_route::EqualPath(loaded,gBinding.callerModule)||!HashMatches(loaded,gBinding.callerSHA256))return ERROR_REVISION_MISMATCH;
     MODULEINFO info{};if(!GetModuleInformation(GetCurrentProcess(),module,&info,sizeof(info)))return GetLastError();
     gClientBase=reinterpret_cast<uintptr_t>(info.lpBaseOfDll);gClientSize=info.SizeOfImage;gRole=gBinding.applicationId;
+    MODULEINFO main{};if(!GetModuleInformation(GetCurrentProcess(),GetModuleHandleW(nullptr),&main,sizeof(main)))return GetLastError();
+    gMainBase=reinterpret_cast<uintptr_t>(main.lpBaseOfDll);gMainSize=main.SizeOfImage;
     wchar_t windows[32768]{};UINT length=GetWindowsDirectoryW(windows,DWORD(std::size(windows)));if(!length||length>=std::size(windows))return ERROR_BUFFER_OVERFLOW;gWindows=windows;return 0;
 }
 DWORD PrepareHooks() {
     HMODULE shell=LoadLibraryExW(L"shell32.dll",nullptr,LOAD_LIBRARY_SEARCH_SYSTEM32);if(!shell)return GetLastError();
     MH_STATUS state=MH_Initialize();if(state!=MH_OK&&state!=MH_ERROR_ALREADY_INITIALIZED)return ERROR_NOT_SUPPORTED;
-    const char* names[]{"ShellExecuteW","ShellExecuteExW","SHOpenFolderAndSelectItems"};
-    void* detours[]{reinterpret_cast<void*>(HookW),reinterpret_cast<void*>(HookEx),reinterpret_cast<void*>(HookSelect)};
-    void** originals[]{reinterpret_cast<void**>(&gOriginalW),reinterpret_cast<void**>(&gOriginalEx),reinterpret_cast<void**>(&gOriginalSelect)};
-    for(unsigned index=0;index<3;++index) {
-        gTargets[index]=reinterpret_cast<void*>(GetProcAddress(shell,names[index]));
+    HMODULE kernel=GetModuleHandleW(L"kernel32.dll");if(!kernel)return ERROR_MOD_NOT_FOUND;
+    const char* names[]{"ShellExecuteW","ShellExecuteExW","SHOpenFolderAndSelectItems","CreateProcessW","CreateProcessA","WinExec"};
+    void* detours[]{reinterpret_cast<void*>(HookW),reinterpret_cast<void*>(HookEx),reinterpret_cast<void*>(HookSelect),reinterpret_cast<void*>(HookProcessW),reinterpret_cast<void*>(HookProcessA),reinterpret_cast<void*>(HookWinExec)};
+    void** originals[]{reinterpret_cast<void**>(&gOriginalW),reinterpret_cast<void**>(&gOriginalEx),reinterpret_cast<void**>(&gOriginalSelect),reinterpret_cast<void**>(&gOriginalProcessW),reinterpret_cast<void**>(&gOriginalProcessA),reinterpret_cast<void**>(&gOriginalWinExec)};
+    for(unsigned index=0;index<std::size(gTargets);++index) {
+        gTargets[index]=reinterpret_cast<void*>(GetProcAddress(index<3?shell:kernel,names[index]));
         if(!gTargets[index])return ERROR_PROC_NOT_FOUND;
         state=MH_CreateHook(gTargets[index],detours[index],originals[index]);
         if(state!=MH_OK&&state!=MH_ERROR_ALREADY_CREATED)return ERROR_NOT_SUPPORTED;
@@ -318,7 +366,7 @@ extern "C" __declspec(dllexport) DWORD WINAPI RouterConfigure(void* parameter) {
     AcquireSRWLockExclusive(&gInstallLock);
     if(gConfigured&&!memcmp(&incoming,&gBinding,sizeof(incoming))){ReleaseSRWLockExclusive(&gInstallLock);return 0;}
     if(gEnabled.load()||gActive.load()){ReleaseSRWLockExclusive(&gInstallLock);return ERROR_BUSY;}
-    gBinding=incoming;gConfigured=true;gIdentified=false;gClientBase=0;gClientSize=0;
+    gBinding=incoming;gConfigured=true;gIdentified=false;gClientBase=0;gClientSize=0;gMainBase=0;gMainSize=0;
     ReleaseSRWLockExclusive(&gInstallLock);return 0;
 }
 extern "C" __declspec(dllexport) DWORD WINAPI RouterInstall(void*) {
@@ -348,7 +396,7 @@ extern "C" __declspec(dllexport) DWORD WINAPI RouterGetStatus(routing::Status* o
     if(!output)return ERROR_INVALID_PARAMETER;routing::Status result;
     result.role=gRole;result.installed=gEnabled.load()?1:0;result.activeCalls=gActive.load();result.received=gReceived.load();result.completed=gCompleted.load();
     result.failed=gFailed.load();result.declined=gDeclined.load();result.indeterminate=gIndeterminate.load();
-    AcquireSRWLockShared(&gStatusLock);result.lastError=gLastError;result.lastSourceKind=gLastKind;result.lastItemCount=gLastCount;
+    AcquireSRWLockShared(&gStatusLock);result.lastError=gLastError;result.lastSourceKind=gLastKind;result.lastItemCount=gLastCount;result.reserved=gLastReason;
     result.lastId=gLastId;result.bridgeWindow=reinterpret_cast<ULONG_PTR>(gLastWindow);memcpy(result.lastFolder,gLastFolder,sizeof(gLastFolder));ReleaseSRWLockShared(&gStatusLock);
     return CopyMemorySafe(output,&result,sizeof(result))?0:ERROR_NOACCESS;
 }

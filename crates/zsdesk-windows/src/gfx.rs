@@ -35,7 +35,7 @@ use windows::{
             Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
             Gdi::{
                 CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, SelectObject, BITMAPINFO,
-                BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HBITMAP, HDC, HGDIOBJ,
+                BITMAPINFOHEADER, BITMAP, DIBSECTION, GetObjectW, GetBitmapBits, BI_RGB, DIB_RGB_COLORS, HBITMAP, HDC, HGDIOBJ,
             },
             Imaging::{
                 CLSID_WICImagingFactory, GUID_WICPixelFormat32bppPBGRA, IWICBitmapSource,
@@ -266,10 +266,38 @@ impl Gfx {
 
     /// Converts a 32-bit HBITMAP. `alpha` selects straight alpha, premultiplied alpha or opaque pixels.
     pub fn wic_from_hbitmap(&self, bitmap: HBITMAP, alpha: BitmapAlpha) -> Option<IWICBitmapSource> {
+        let mut section=DIBSECTION::default();
+        let read=unsafe{GetObjectW(bitmap.into(),std::mem::size_of::<DIBSECTION>()as i32,Some((&mut section as*mut DIBSECTION).cast()))};
+        if read as usize==std::mem::size_of::<BITMAP>()&&section.dsBm.bmBitsPixel==24&&section.dsBm.bmPlanes==1{
+            return self.wic_from_rgb_ddb(bitmap,&section.dsBm);
+        }
         let option: WICBitmapAlphaChannelOption = match alpha {
             BitmapAlpha::Straight => WICBitmapUseAlpha, BitmapAlpha::Premultiplied => WICBitmapUsePremultipliedAlpha,
             BitmapAlpha::Ignore => WICBitmapIgnoreAlpha };
         let source = unsafe { self.imaging_factory()?.CreateBitmapFromHBITMAP(bitmap, Default::default(), option).ok()? };
+        self.convert(&source.cast().ok()?)
+    }
+
+    fn wic_from_rgb_ddb(&self,bitmap:HBITMAP,metadata:&BITMAP)->Option<IWICBitmapSource>{
+        // GDI may retain a 24-bit DDB's bytes although the current display
+        // cannot convert that device format through GetDIBits. WIC can report
+        // success with black pixels in that case. Normalize this known RGB
+        // layout explicitly; the unused alpha byte is always fully opaque.
+        let width=usize::try_from(metadata.bmWidth).ok().filter(|width|*width>0)?;
+        let height=usize::try_from(metadata.bmHeight).ok().filter(|height|*height>0)?;
+        let stride=usize::try_from(metadata.bmWidthBytes).ok()?;
+        let rgb_row=width.checked_mul(3)?;if stride<rgb_row{return None;}
+        let size=stride.checked_mul(height)?;let output_size=width.checked_mul(height)?.checked_mul(4)?;
+        if size>8*1024*1024||output_size>8*1024*1024{return None;}
+        let mut rgb=vec![0u8;size];
+        if unsafe{GetBitmapBits(bitmap,size as i32,rgb.as_mut_ptr().cast())}!=size as i32{return None;}
+        let mut bgra=vec![0u8;output_size];
+        for (source,destination) in rgb.chunks_exact(stride).zip(bgra.chunks_exact_mut(width*4)){
+            for (source,destination) in source[..rgb_row].chunks_exact(3).zip(destination.chunks_exact_mut(4)){
+                destination[..3].copy_from_slice(source);destination[3]=255;
+            }
+        }
+        let source=unsafe{self.imaging_factory()?.CreateBitmapFromMemory(width as u32,height as u32,&GUID_WICPixelFormat32bppPBGRA,(width*4)as u32,&bgra)}.ok()?;
         self.convert(&source.cast().ok()?)
     }
 

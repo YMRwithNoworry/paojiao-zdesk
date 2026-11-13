@@ -44,7 +44,7 @@ struct Status {
     DWORD queued = 0;
     DWORD lastSourceKind = 0;
     DWORD lastItemCount = 0;
-    DWORD reserved = 0;
+    DWORD reserved = 0; // RoutingDiagnostics::Reason; zero for older adapters.
     ULONGLONG lastId = 0;
     ULONG_PTR bridgeWindow = 0;
     wchar_t lastFolder[1024]{};
@@ -59,6 +59,9 @@ enum class ProbeKind : DWORD {
     SelectMultiple = 5,
     SelectAbsoluteChild = 6,
     FolderViaIdList = 7,
+    ProcessExplorerW = 10,
+    ProcessExplorerA = 11,
+    WinExecExplorer = 12,
 };
 struct Probe {
     DWORD magic = kMagic;

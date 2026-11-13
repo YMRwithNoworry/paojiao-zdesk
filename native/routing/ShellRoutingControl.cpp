@@ -1,5 +1,7 @@
 #include "support/RemoteAdapter.h"
 #include "RoutingProtocol.h"
+#include "RoutingDiagnostics.h"
+#include "adapter/RouteRequest.h"
 #include "AdapterConfig.h"
 #include "ClientBindings.h"
 #include "Compatibility.h"
@@ -16,6 +18,7 @@
 #include <thread>
 #include <cstdio>
 #include <tuple>
+#include <climits>
 
 namespace {
 constexpr wchar_t kRunKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
@@ -249,7 +252,7 @@ bool AuthorizedSender(DWORD pid,ULONGLONG* creation=nullptr) {
 }
 void SaveStats() {
     routing::Status stats;{std::lock_guard<std::mutex> lock(gStatsMutex);stats=gStats;}
-    std::ostringstream output;output<<"N360ROUTE1\n"<<GetCurrentProcessId()<<'\t'<<stats.received<<'\t'<<stats.completed<<'\t'<<stats.failed<<'\t'<<stats.declined<<'\t'<<stats.indeterminate<<'\t'<<stats.lastError<<'\t'<<stats.queued<<'\t'<<stats.lastId<<'\n';WriteText(kStatusState,output.str());
+    std::ostringstream output;output<<"N360ROUTE1\n"<<GetCurrentProcessId()<<'\t'<<stats.received<<'\t'<<stats.completed<<'\t'<<stats.failed<<'\t'<<stats.declined<<'\t'<<stats.indeterminate<<'\t'<<stats.lastError<<'\t'<<stats.queued<<'\t'<<stats.lastId<<'\t'<<stats.reserved<<'\n';WriteText(kStatusState,output.str());
 }
 // The destination is pinned by canonical path and SHA-256 for each request.
 // The file handle denies replacement while the process/window is selected and
@@ -340,8 +343,18 @@ DWORD Forward(const std::vector<BYTE>& packet,bool& uncertain,bool allowForegrou
     Target checked;DWORD owner=0;GetWindowThreadProcessId(window,&owner);
     if(owner!=target.pid||!DestinationProcess(owner,destination,checked)||checked.created!=target.created)return ERROR_INVALID_WINDOW_HANDLE;
     COPYDATASTRUCT data{};data.dwData=routing::kCopyDataTag;data.cbData=DWORD(packet.size());data.lpData=const_cast<BYTE*>(packet.data());DWORD_PTR result=0;SetLastError(0);
-    if(!SendMessageTimeoutW(window,WM_COPYDATA,0,reinterpret_cast<LPARAM>(&data),SMTO_ABORTIFHUNG|SMTO_BLOCK,1500,&result)){error=GetLastError();uncertain=error==ERROR_TIMEOUT||error==0;return error?error:ERROR_TIMEOUT;}
+    if(!SendMessageTimeoutW(window,WM_COPYDATA,0,reinterpret_cast<LPARAM>(&data),SMTO_ABORTIFHUNG|SMTO_BLOCK,1500,&result)){
+        error=GetLastError();uncertain=error==ERROR_TIMEOUT||error==0;
+        auto reason=uncertain?routing::Reason::Indeterminate:routing::Reason::AccessDenied;
+        if(error==ERROR_ACCESS_DENIED){
+            Handle process(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,FALSE,target.pid));DWORD own=0,other=0;
+            if(process&&!routing::ProcessIntegrity(GetCurrentProcess(),own)&&!routing::ProcessIntegrity(process.get(),other)&&other>own)reason=routing::Reason::HigherIntegrity;
+        }
+        {std::lock_guard<std::mutex> lock(gStatsMutex);gStats.reserved=static_cast<DWORD>(reason);}
+        return error?error:ERROR_TIMEOUT;
+    }
     if(result!=1)return ERROR_NOT_SUPPORTED;
+    {std::lock_guard<std::mutex> lock(gStatsMutex);gStats.reserved=0;}
     // Permission belongs to a process, not the target HWND. Once delegated,
     // the receiver must perform activation on its own UI thread. Asking this
     // worker to activate after delegation loses the inherited permission.
@@ -490,10 +503,17 @@ bool WatcherRunning() {
     Handle mutex(OpenMutexW(SYNCHRONIZE|MUTEX_MODIFY_STATE,FALSE,(gPrefix+L".Watch").c_str()));if(!mutex)return false;DWORD waited=WaitForSingleObject(mutex.get(),0);if(waited==WAIT_OBJECT_0||waited==WAIT_ABANDONED)ReleaseMutex(mutex.get());return waited==WAIT_TIMEOUT&&OwnWatcherWindow();
 }
 DWORD Status() {
+    DWORD integrity=0,elevated=0;const DWORD tokenError=routing::ProcessIntegrity(GetCurrentProcess(),integrity,&elevated);
+    Out(L"controller integrity="+std::to_wstring(integrity)+L" elevated="+std::to_wstring(elevated)+L" token-error="+Hex(tokenError));
     Out(WatcherRunning()?L"routing watcher: running":L"routing watcher: stopped");Value startup;DWORD first=ReadStartup(startup);if(first)return first;Out(Equal(startup,ExpectedStartup())?L"routing startup: enabled":L"routing startup: not owned/enabled");
     OperationLock operation;if(operation.error)return operation.error;std::vector<Target> targets;DWORD error=Scan(targets);if(error)return error;
-    for(const auto& target:targets){routing::Status status;bool loaded=false;error=TargetStatus(target,status,loaded);std::wstring row=std::wstring(Specification(target.role)->name.c_str())+L" PID="+std::to_wstring(target.pid);if(error)row+=L" status-error="+Hex(error);else if(!loaded)row+=L" adapter=not-loaded";else row+=L" role="+std::to_wstring(status.role)+L" installed="+std::to_wstring(status.installed)+L" active="+std::to_wstring(status.activeCalls)+L" received="+std::to_wstring(status.received)+L" completed="+std::to_wstring(status.completed)+L" failed="+std::to_wstring(status.failed)+L" declined="+std::to_wstring(status.declined)+L" uncertain="+std::to_wstring(status.indeterminate)+L" queued="+std::to_wstring(status.queued)+L" last="+Hex(status.lastError)+L" items="+std::to_wstring(status.lastItemCount)+L" folder="+status.lastFolder;Out(row);if(error&&!first)first=error;}
-    std::vector<BYTE> state;if(!ReadFileBytes(Join(kStatusState),state)){std::string text(state.begin(),state.end());int n=MultiByteToWideChar(CP_UTF8,0,text.data(),int(text.size()),nullptr,0);std::wstring wide(size_t(n),L'\0');MultiByteToWideChar(CP_UTF8,0,text.data(),int(text.size()),wide.data(),n);Out(wide);}return first;
+    for(const auto& target:targets){routing::Status status;bool loaded=false;error=TargetStatus(target,status,loaded);std::wstring row=std::wstring(Specification(target.role)->name.c_str())+L" PID="+std::to_wstring(target.pid);if(error)row+=L" status-error="+Hex(error);else if(!loaded)row+=L" adapter=not-loaded";else row+=L" role="+std::to_wstring(status.role)+L" installed="+std::to_wstring(status.installed)+L" active="+std::to_wstring(status.activeCalls)+L" received="+std::to_wstring(status.received)+L" completed="+std::to_wstring(status.completed)+L" failed="+std::to_wstring(status.failed)+L" declined="+std::to_wstring(status.declined)+L" uncertain="+std::to_wstring(status.indeterminate)+L" queued="+std::to_wstring(status.queued)+L" last="+Hex(status.lastError)+L" reason="+std::to_wstring(status.reserved)+L":"+routing::ReasonName(static_cast<routing::Reason>(status.reserved))+L" items="+std::to_wstring(status.lastItemCount)+L" folder="+status.lastFolder;
+        Handle process(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,FALSE,target.pid));DWORD sourceIntegrity=0;
+        if(process&&!routing::ProcessIntegrity(process.get(),sourceIntegrity))row+=L" integrity="+std::to_wstring(sourceIntegrity);
+        Out(row);if(error&&!first)first=error;}
+    for(const wchar_t* file:{kStatusState,L"routing-launch.current.tsv"}){
+        std::vector<BYTE> state;if(!ReadFileBytes(Join(file),state)){std::string text(state.begin(),state.end());int n=MultiByteToWideChar(CP_UTF8,0,text.data(),int(text.size()),nullptr,0);std::wstring wide(size_t(n),L'\0');MultiByteToWideChar(CP_UTF8,0,text.data(),int(text.size()),wide.data(),n);Out(wide);}
+    }return first;
 }
 DWORD Reveal(const wchar_t* item) {
     std::wstring full=item;if(!AbsolutePath(full))return ERROR_BAD_PATHNAME;DWORD attributes=GetFileAttributesW(full.c_str());if(attributes==INVALID_FILE_ATTRIBUTES)return ErrorOr();
@@ -551,12 +571,82 @@ DWORD ForwardTest(const wchar_t* path) {
     bool uncertain=false;error=Forward(packet,uncertain,false);
     Out(L"forward-test result="+Hex(error)+L" uncertain="+std::to_wstring(uncertain)+L" activation=disabled");return error;
 }
+bool UnsignedArgument(const wchar_t* text,ULONGLONG& value){
+    if(!text||!*text)return false;value=0;
+    for(const wchar_t* at=text;*at;++at){if(*at<L'0'||*at>L'9'||value>(ULLONG_MAX-ULONGLONG(*at-L'0'))/10)return false;value=value*10+ULONGLONG(*at-L'0');}
+    return true;
+}
+DWORD ParentProcess(){
+    Handle snapshot(CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS,0));if(snapshot.get()==INVALID_HANDLE_VALUE)return 0;
+    PROCESSENTRY32W process{};process.dwSize=sizeof(process);
+    if(Process32FirstW(snapshot.get(),&process))do{if(process.th32ProcessID==GetCurrentProcessId())return process.th32ParentProcessID;}while(Process32NextW(snapshot.get(),&process));
+    return 0;
+}
+DWORD RouteLaunch(int argc,wchar_t** argv){
+    if(argc<6||argc>int(routing::kMaxItems)+6)return ERROR_INVALID_PARAMETER;
+    ULONGLONG source=0,kind=0,id=0;
+    if(!UnsignedArgument(argv[2],source)||!source||source>MAXDWORD||!UnsignedArgument(argv[3],kind)||kind<10||kind>12||!UnsignedArgument(argv[4],id)||!id||ParentProcess()!=source)return ERROR_INVALID_PARAMETER;
+    Handle parent(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,FALSE,DWORD(source)));if(!parent)return ErrorOr();
+    Target origin;const Spec* binding=nullptr;
+    for(const auto& spec:gSpecs)if(spec.enabled&&!Identify(parent.get(),DWORD(source),spec.role,origin)){binding=&spec;break;}
+    if(!binding)return ERROR_ACCESS_DENIED;
+    std::vector<RemoteModule> modules;DWORD error=ReadModules(DWORD(source),modules);if(error)return error;
+    error=VerifyTarget(origin,modules);if(error)return error;
+    shell_route::RouteRequest request;
+    if(!shell_route::NormalizeAbsolute(argv[5],request.folder))return ERROR_BAD_PATHNAME;
+    for(int index=6;index<argc;++index)request.items.emplace_back(argv[index]);
+    if(!request.items.empty()){
+        shell_route::RouteRequest checked;if(!shell_route::Selection(request.folder,request.items,0,checked))return ERROR_INVALID_DATA;request=std::move(checked);
+    }
+    const DWORD attributes=GetFileAttributesW(request.folder.c_str());if(attributes==INVALID_FILE_ATTRIBUTES||!(attributes&FILE_ATTRIBUTE_DIRECTORY))return ERROR_PATH_NOT_FOUND;
+    for(const auto& item:request.items)if(GetFileAttributesW(item.c_str())==INVALID_FILE_ATTRIBUTES)return ERROR_FILE_NOT_FOUND;
+    size_t characters=request.folder.size()+1;for(const auto& item:request.items)characters+=item.size()+1;
+    if(characters>(routing::kMaxPacketBytes-sizeof(routing::PacketHeader))/sizeof(wchar_t))return ERROR_BUFFER_OVERFLOW;
+    routing::PacketHeader header;header.sourcePid=DWORD(source);header.sourceKind=DWORD(kind);header.requestId=id;header.itemCount=DWORD(request.items.size());header.bytes=DWORD(sizeof(header)+characters*sizeof(wchar_t));
+    std::vector<BYTE> packet(header.bytes);memcpy(packet.data(),&header,sizeof(header));size_t offset=sizeof(header);
+    auto append=[&](const std::wstring& value){const size_t bytes=(value.size()+1)*sizeof(wchar_t);memcpy(packet.data()+offset,value.c_str(),bytes);offset+=bytes;};append(request.folder);for(const auto& item:request.items)append(item);
+    bool uncertain=false;error=Forward(packet,uncertain);
+    return error;
+}
+void RecordLaunchResult(int argc,wchar_t** argv,DWORD error){
+    // Creation succeeded before this method ran. Failures are exposed through
+    // the real process exit code and one bounded diagnostic record, never replayed.
+    ULONGLONG source=0,kind=0,id=0;if(argc>=5){UnsignedArgument(argv[2],source);UnsignedArgument(argv[3],kind);UnsignedArgument(argv[4],id);}
+    DWORD reason=0;{std::lock_guard<std::mutex> lock(gStatsMutex);reason=gStats.reserved;}
+    Handle mutex(CreateMutexW(nullptr,FALSE,(gPrefix+L".LaunchStatus").c_str()));
+    if(mutex){const DWORD wait=WaitForSingleObject(mutex.get(),200);if(wait==WAIT_OBJECT_0||wait==WAIT_ABANDONED){
+        std::ostringstream record;record<<"ZSDesk.RouteLaunch.v1\n"<<source<<'\t'<<kind<<'\t'<<id<<'\t'<<error<<'\t'<<(reason==static_cast<DWORD>(routing::Reason::Indeterminate))<<'\t'<<reason<<'\n';WriteText(L"routing-launch.current.tsv",record.str());ReleaseMutex(mutex.get());
+    }}
+}
+DWORD UpgradeCheck(const wchar_t* clients,const wchar_t* previous){
+    std::vector<Spec> bindings;DWORD error=ReadClientBindings(clients,bindings);if(error)return error;
+    if(previous){std::vector<Spec> old;error=ReadClientBindings(previous,old);if(error)return error;
+        for(auto& entry:old)if(entry.enabled&&std::none_of(bindings.begin(),bindings.end(),[&](const Spec& current){return !_wcsicmp(current.path.c_str(),entry.path.c_str());}))bindings.push_back(std::move(entry));
+    }
+    std::wstring json=L"{\"schema\":\"ZSDesk.RoutingUpgrade.v1\",\"processes\":[";bool first=true;unsigned blocked=0;
+    Handle snapshot(CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS,0));if(snapshot.get()==INVALID_HANDLE_VALUE)return ErrorOr();
+    PROCESSENTRY32W entry{};entry.dwSize=sizeof(entry);if(!Process32FirstW(snapshot.get(),&entry))return ErrorOr();
+    do{for(const auto& binding:bindings){
+        if(!binding.enabled||_wcsicmp(entry.szExeFile,binding.name.c_str()))continue;
+        Handle process(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,FALSE,entry.th32ProcessID));if(!process)return ErrorOr();
+        wchar_t path[32768]{};DWORD length=DWORD(std::size(path));if(!QueryFullProcessImageNameW(process.get(),0,path,&length))return ErrorOr();
+        if(_wcsicmp(path,binding.path.c_str()))continue;
+        std::vector<RemoteModule> modules;error=ReadModules(entry.th32ProcessID,modules);if(error)return error;
+        for(const auto& module:modules)if(!_wcsicmp(BaseName(module.path.c_str()),L"ZSDeskRevealRouter.dll")||!_wcsicmp(BaseName(module.path.c_str()),L"FileRevealRouter.dll")){
+            if(!first)json+=L",";first=false;++blocked;
+            json+=L"{\"pid\":"+std::to_wstring(entry.th32ProcessID)+L",\"application\":"+RoutingJson(binding.name)+L",\"module\":"+RoutingJson(module.path)+L"}";break;
+        }
+        break;
+    }}while(Process32NextW(snapshot.get(),&entry));
+    json+=L"],\"restart_required\":"+std::wstring(blocked?L"true":L"false")+L"}";Out(json);return blocked?ERROR_RESTART_APPLICATION:0;
+}
 } // namespace
 
 #ifndef ZSDESK_ROUTING_NO_MAIN
 int wmain(int argc,wchar_t** argv) {
     if(argc<2){std::fwprintf(stderr,L"ShellRoutingControl --apply-once | --status | --watch | --stop | --enable-startup | --disable-startup | --restore | --reveal path | --forward-test packet | --self-test\n");return ERROR_INVALID_PARAMETER;}
-    gQuiet=!wcscmp(argv[1],L"--watch");DWORD error=Initialize();if(error){Out(L"initialization: "+Hex(error));return int(error);}
+    const bool watching=!wcscmp(argv[1],L"--watch");
+    gQuiet=watching||!wcscmp(argv[1],L"--route-launch");DWORD error=Initialize();if(error){Out(L"initialization: "+Hex(error));return int(error);}
     try {
         if(argc==2&&!wcscmp(argv[1],L"--discover"))error=Discover();
         else if((argc==3||argc==4)&&!wcscmp(argv[1],L"--inspect"))error=Inspect(argv[2],argc==4?argv[3]:nullptr);
@@ -568,9 +658,11 @@ int wmain(int argc,wchar_t** argv) {
         else if(argc==2&&(!wcscmp(argv[1],L"--enable-startup")||!wcscmp(argv[1],L"--disable-startup"))){OperationLock operation;error=operation.error;if(!error)error=Startup(!wcscmp(argv[1],L"--enable-startup"));}
         else if(argc==3&&!wcscmp(argv[1],L"--reveal"))error=Reveal(argv[2]);
         else if(argc==3&&!wcscmp(argv[1],L"--forward-test"))error=ForwardTest(argv[2]);
+        else if(argc>=6&&!wcscmp(argv[1],L"--route-launch")){error=RouteLaunch(argc,argv);RecordLaunchResult(argc,argv,error);}
+        else if((argc==3||argc==4)&&!wcscmp(argv[1],L"--upgrade-check"))error=UpgradeCheck(argv[2],argc==4?argv[3]:nullptr);
         else if(argc==2&&!wcscmp(argv[1],L"--self-test"))error=SelfTest();
         else error=ERROR_INVALID_PARAMETER;
     } catch(...) {error=ERROR_UNHANDLED_EXCEPTION;}
-    if(error&&!(gQuiet&&error==ERROR_ALREADY_EXISTS))Out(L"result="+Hex(error));return int(gQuiet&&error==ERROR_ALREADY_EXISTS?0:error);
+    if(error&&!(watching&&error==ERROR_ALREADY_EXISTS))Out(L"result="+Hex(error));return int(watching&&error==ERROR_ALREADY_EXISTS?0:error);
 }
 #endif

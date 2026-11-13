@@ -5,3 +5,5 @@
 *.ps1 text eol=crlf
 *.rc text eol=crlf
 *.ico binary
+# Preserve upstream license files byte for byte.
+packaging/licenses/** -text whitespace=-blank-at-eol,-blank-at-eof

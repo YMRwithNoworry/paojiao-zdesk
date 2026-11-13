@@ -5,12 +5,13 @@ Builds verified Windows x64 editions, portable ZIPs, and optional installers.
 ./scripts/package.ps1 -WorkDir C:\Build\ZSDesk -TargetDir C:\Build\ZSDesk-target -InnoCompiler 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe'
 #>
 param(
-    [ValidateSet('standard','network','desktop','full')][string[]]$Editions = @('standard','network','desktop','full'),
+    [ValidateSet('standard','network','desktop','full','themed','desktop-box')][string[]]$Editions = @('standard','network','desktop','full','themed','desktop-box'),
     [string]$WorkDir = (Join-Path ([IO.Path]::GetTempPath()) 'ZSDesk-build'),
     [string]$TargetDir = $env:CARGO_TARGET_DIR,
     [string]$OutputDir,
     [string]$RoutingDir,
     [string]$RuntimeDir,
+    [string]$EverythingDir = $env:ZSDESK_EVERYTHING_DIR,
     [string]$InnoCompiler,
     [switch]$SkipBuild,
     [string]$BinaryPath
@@ -27,10 +28,12 @@ $OutputDir = [IO.Path]::GetFullPath($OutputDir)
 if ($SkipBuild -and ($Editions.Count -ne 1 -or -not $BinaryPath)) { throw '-SkipBuild requires one edition and an explicit -BinaryPath' }
 if ((New-Object IO.DriveInfo ([IO.Path]::GetPathRoot($TargetDir))).AvailableFreeSpace -lt 10GB) { throw 'Less than 10 GiB available on the build volume' }
 $definitions = @{
-    standard = @{ Name='标准版'; Features=@(); Network=$false; Desktop=$false }
-    network = @{ Name='网络版'; Features=@('network'); Network=$true; Desktop=$false }
-    desktop = @{ Name='桌面版'; Features=@('desktop'); Network=$false; Desktop=$true }
-    full = @{ Name='全量版'; Features=@('network','desktop'); Network=$true; Desktop=$true }
+    standard = @{ Name='标准版'; Features=@(); Network=$false; Desktop=$false; Themed=$false }
+    network = @{ Name='网络版'; Features=@('network'); Network=$true; Desktop=$false; Themed=$false }
+    desktop = @{ Name='桌面版'; Features=@('desktop'); Network=$false; Desktop=$true; Themed=$false }
+    full = @{ Name='全量版'; Features=@('network','desktop'); Network=$true; Desktop=$true; Themed=$false }
+    themed = @{ Name='主题版'; Features=@('network','desktop','themed'); Network=$true; Desktop=$true; Themed=$true }
+    'desktop-box' = @{ Name='桌面盒子独立版'; Features=@('desktop-box'); Network=$false; Desktop=$true; Themed=$false; DesktopOnly=$true }
 }
 if (-not $RuntimeDir) {
     $candidates=@()
@@ -55,6 +58,24 @@ if (-not $RuntimeDir) { throw 'Visual C++ x64 Redistributable files are required
 $RuntimeDir=[IO.Path]::GetFullPath($RuntimeDir)
 $runtimeFiles=@('msvcp140.dll','vcruntime140.dll','vcruntime140_1.dll')
 foreach ($name in $runtimeFiles) { if (-not (Test-Path -LiteralPath (Join-Path $RuntimeDir $name) -PathType Leaf)) { throw "Redistributable file missing: $name" } }
+$enginePinPath=Join-Path $root 'packaging\engines\everything.json'
+$enginePin=Get-Content -LiteralPath $enginePinPath -Raw | ConvertFrom-Json -AsHashtable
+if($enginePin.schema -ne 'ZSDesk.EverythingPackage.v1' -or $enginePin.product -ne 'Everything' -or $enginePin.platform -ne 'windows-x64' -or $enginePin.edition -ne 'standard') { throw 'Everything package identity is invalid' }
+$engineFiles=@('Everything.exe','Everything.lng','License.txt')
+if(@($enginePin.files.Keys).Count -ne $engineFiles.Count -or @($enginePin.files.Keys | Where-Object { $_ -notin $engineFiles }).Count) { throw 'Unexpected Everything package member' }
+if(@($Editions | Where-Object { $_ -ne 'desktop-box' }).Count) {
+if(-not $EverythingDir) { throw 'Official Everything runtime files are required; supply -EverythingDir' }
+$EverythingDir=[IO.Path]::GetFullPath($EverythingDir)
+if((Get-Item -LiteralPath $EverythingDir).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Everything source must be a real directory' }
+if((Get-FileHash -LiteralPath (Join-Path $EverythingDir 'manifest.json')).Hash -ne (Get-FileHash -LiteralPath $enginePinPath).Hash) { throw 'Everything source manifest differs from the pinned manifest' }
+foreach($name in $engineFiles) {
+    $file=Get-Item -LiteralPath (Join-Path $EverythingDir $name)
+    $entry=$enginePin.files[$name]
+    if($file.Attributes -band [IO.FileAttributes]::ReparsePoint -or $file.PSIsContainer -or $file.Length -ne $entry.bytes -or (Get-FileHash -LiteralPath $file.FullName).Hash.ToLowerInvariant() -ne $entry.sha256) { throw "Everything source identity mismatch: $name" }
+}
+if((Get-Item -LiteralPath (Join-Path $EverythingDir 'Everything.exe')).VersionInfo.ProductVersion -ne $enginePin.version) { throw 'Everything resource version differs from its manifest' }
+if($enginePin.executable_sha256 -ne $enginePin.files['Everything.exe'].sha256) { throw 'Everything executable hash declaration differs' }
+}
 foreach ($path in @($WorkDir,$TargetDir,$OutputDir)) { [IO.Directory]::CreateDirectory($path) | Out-Null }
 $lock = [IO.File]::Open((Join-Path $TargetDir 'zsdesk-package.lock'),[IO.FileMode]::OpenOrCreate,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None)
 $env:CARGO_TARGET_DIR=$TargetDir
@@ -70,6 +91,12 @@ $env:TMP=$env:TEMP
 
 function Get-BuildInfo([string]$Path) {
     if ((Get-Item -LiteralPath $Path).VersionInfo.ProductVersion -ne $version) { throw 'The executable resource version differs from the workspace version' }
+    $resource=(Get-Item -LiteralPath $Path).VersionInfo
+    $numeric=[version](($version -split '[-+]')[0])
+    if($resource.FileMajorPart -ne $numeric.Major -or $resource.FileMinorPart -ne $numeric.Minor -or $resource.FileBuildPart -ne $numeric.Build -or $resource.FilePrivatePart -ne 0 -or
+       $resource.ProductMajorPart -ne $numeric.Major -or $resource.ProductMinorPart -ne $numeric.Minor -or $resource.ProductBuildPart -ne $numeric.Build -or $resource.ProductPrivatePart -ne 0){
+        throw 'The executable numeric resource version differs from the workspace version'
+    }
     $start = New-Object Diagnostics.ProcessStartInfo
     $start.FileName=$Path; $start.Arguments='--build-info'; $start.UseShellExecute=$false
     $start.CreateNoWindow=$true; $start.WindowStyle=[Diagnostics.ProcessWindowStyle]::Hidden
@@ -119,7 +146,7 @@ try {
             $flags += '--no-default-features'
             if ($definition.Features.Count) { $flags += @('--features',($definition.Features -join ',')) }
         }
-        $state=[ordered]@{project='ZSDesk';version=$version;edition=$edition;source=$root;target=$TargetDir;profile='release';features=$definition.Features;runtime_source=$RuntimeDir;pid=$PID;state='running';started=[DateTimeOffset]::Now.ToString('o')}
+        $state=[ordered]@{project='ZSDesk';version=$version;edition=$edition;source=$root;target=$TargetDir;profile='release';features=$definition.Features;runtime_source=$RuntimeDir;everything_source=$EverythingDir;everything_version=$enginePin.version;pid=$PID;state='running';started=[DateTimeOffset]::Now.ToString('o')}
         Write-Json (Join-Path $WorkDir 'package-state.current.json') $state
         if (-not $SkipBuild) {
             & cargo @flags --message-format=json-render-diagnostics 1>(Join-Path $WorkDir "cargo.$edition.current.jsonl")
@@ -127,7 +154,7 @@ try {
             $exe=Join-Path $TargetDir 'release\zsdesk-app.exe'
         } else { $exe=[IO.Path]::GetFullPath($BinaryPath) }
         $identity=Get-BuildInfo $exe
-        if ($identity.product -ne 'ZSDesk' -or $identity.version -ne $version -or $identity.edition -ne $edition -or $identity.network -ne $definition.Network -or $identity.desktop -ne $definition.Desktop) { throw "Executable edition/version mismatch: $edition" }
+        if ($identity.product -ne 'ZSDesk' -or $identity.version -ne $version -or $identity.edition -ne $edition -or $identity.network -ne $definition.Network -or $identity.desktop -ne $definition.Desktop -or $identity.themed -ne $definition.Themed -or [bool]$identity.desktop_only -ne [bool]$definition.DesktopOnly) { throw "Executable edition/version mismatch: $edition" }
         [IO.Directory]::CreateDirectory($stage) | Out-Null
         Copy-Item -LiteralPath $exe -Destination (Join-Path $stage 'ZSDesk.exe')
         foreach ($runtime in $runtimeFiles) {
@@ -135,21 +162,48 @@ try {
         }
         Copy-Item -LiteralPath (Join-Path $root 'packaging\licenses') -Destination (Join-Path $stage 'licenses') -Recurse
         Copy-Item -LiteralPath (Join-Path $root 'LICENSE') -Destination (Join-Path $stage 'LICENSE.txt')
-        if ($RoutingDir) {
+        Copy-Item -LiteralPath (Join-Path $root 'THIRD-PARTY-NOTICES.txt') -Destination (Join-Path $stage 'THIRD-PARTY-NOTICES.txt')
+        if (-not $definition.DesktopOnly) {
+            $listaryStage=Join-Path $stage 'integrations\listary'
+            [IO.Directory]::CreateDirectory($listaryStage) | Out-Null
+            Copy-Item -LiteralPath (Join-Path $root 'native\listary\Prepare-Listary7.ps1') -Destination (Join-Path $listaryStage 'Prepare-Listary7.ps1')
+            Copy-Item -LiteralPath (Join-Path $root 'native\listary\README.md') -Destination (Join-Path $listaryStage 'README.md')
+        }
+        if (-not $definition.DesktopOnly) {
+        $engineStage=Join-Path $stage 'engines\everything'
+        [IO.Directory]::CreateDirectory($engineStage) | Out-Null
+        foreach($file in $engineFiles) { Copy-Item -LiteralPath (Join-Path $EverythingDir $file) -Destination (Join-Path $engineStage $file) }
+        Copy-Item -LiteralPath $enginePinPath -Destination (Join-Path $engineStage 'manifest.json')
+        }
+        if ($RoutingDir -and -not $definition.DesktopOnly) {
             $routingFiles=@('ShellRoutingControl.exe','ZSDeskRevealRouter.dll','manifest.json','MinHook-LICENSE.txt')
             [IO.Directory]::CreateDirectory((Join-Path $stage 'routing')) | Out-Null
             foreach ($file in $routingFiles) { Copy-Item -LiteralPath (Join-Path $RoutingDir $file) -Destination (Join-Path $stage "routing\$file") }
         }
         $readme=@("ZSDesk $version $($definition.Name) — Windows x64",'',
             '运行 ZSDesk.exe 打开文件管理器；--classic-menu 使用原版菜单。',
-            'Ctrl+F 搜索文件名；Alt+P 切换预览窗格；空格打开快速预览。',
-            '≡ → 界面设置：命令栏显示项目、搜索范围和预览选项。',
-            '≡ → 右键菜单设置：选择菜单样式和显示功能。',
+            'Ctrl+F 在主窗口搜索文件；Alt+P 切换预览窗格；空格打开快速预览。',
+            'Ctrl+Shift+A 反向选择；地址栏支持 pwsh、powershell、nu 和 nushell。',
+            '≡ → 系统集成 → 开机启动与全局快捷键：设置登录常驻及唤起主窗口搜索的全局快捷键。',
+            '≡ → 布局、标签页、预览与操作、搜索：界面与搜索选项。',
+            '≡ → 右键菜单：选择菜单样式和显示的命令。',
             '≡ → 系统集成：文件夹默认打开方式。')
-        if ($RoutingDir) { $readme += '≡ → 系统集成 → 文件位置转发：选择应用并接入文件定位。' }
-        if ($definition.Desktop) { $readme += @('','桌面格子：ZSDesk.exe --desktop，或从主菜单启动。','支持文件夹映射、腾讯布局导入、悬停展开、分组和屏幕布局。') }
+        if ($definition.DesktopOnly) {$readme=@("ZSDesk $version 桌面盒子独立版 — Windows x64",'','运行 ZSDesk.exe 启动桌面格子。','支持文件夹映射、格子标签页、拖放整理、预览、主题与独立登录启动。','配置目录：%APPDATA%\ZSDesk-DesktopBox；与文件管理版和主题版分别保存。','外部文件夹使用系统资源管理器打开。','此版本不包含文件管理主窗口、全盘搜索和文件夹接管。')}
+        if ($RoutingDir -and -not $definition.DesktopOnly) { $readme += '≡ → 系统集成 → 文件位置转发：选择应用并接入文件定位。' }
+        if ($definition.Desktop -and -not $definition.DesktopOnly) { $readme += @('','桌面格子：ZSDesk.exe --desktop，或从主菜单启动。','支持文件夹映射、腾讯布局导入、悬停展开、分组和屏幕布局。') }
         if ($definition.Network) { $readme += @('','支持 SMB/UNC、系统 FTP；SFTP/SSH 地址需要 SSHFS-Win/WinFsp。') }
-        $readme += @('','配置默认保存在用户 AppData\Roaming\ZSDesk。','portable.flag 使用程序旁 data 目录；--profile-dir 指定独立配置。','安装包与便携包不包含用户路径、桌面布局、搜索索引或系统接管记录。','源码与许可证：https://github.com/qiu7824/zsdesk')
+        if($definition.Themed){$readme+=@('','主题版支持亚克力、Mica 和纯色深浅主题；配置独立存放在 AppData\Roaming\ZSDesk-Theme。')}
+        elseif(-not $definition.DesktopOnly){$readme+=@('','配置默认保存在用户 AppData\Roaming\ZSDesk。')}
+        if(-not $definition.DesktopOnly){
+        $readme += @('','≡ → 搜索：选择自带搜索或 Everything 搜索；新配置默认使用自带搜索，已有配置保留原来的选择。',
+            '自带搜索使用共享的内存索引和本地快照；普通权限下遍历目录，管理员权限下使用只读 MFT 枚举。',
+            '可用的 USN 日志用于增量更新；默认空闲 5 分钟保存快照并释放内存，再次搜索时恢复并补齐变更。',
+            '开发和缓存目录内容默认不收录，可在搜索设置中开启；文件大小、修改时间索引和拼音首字母匹配默认关闭。',
+            ('随附的 Everything '+$enginePin.version+' 是可选搜索后端，也可复用已运行的 Everything；只有选中此后端才会按需连接或启动。'),
+            'Everything 快速全盘索引需要兼容服务或管理员权限；未配置可用索引时会显示设置提示。',
+            'Everything 版权与完整许可位于 engines\everything\License.txt。')
+        }
+        $readme+=@('portable.flag 使用程序旁 data 目录；--profile-dir 指定独立配置。','安装包与便携包不包含用户路径、桌面布局、搜索索引或系统接管记录。','源码与许可证：https://github.com/qiu7824/zsdesk')
         $readme -join "`r`n" | Set-Content -LiteralPath (Join-Path $stage '说明.txt') -Encoding utf8BOM
         $files=[ordered]@{}
         foreach ($file in (Get-ChildItem -LiteralPath $stage -File -Recurse | Sort-Object FullName)) {
@@ -157,7 +211,11 @@ try {
             $relative=$file.FullName.Substring($stage.Length+1).Replace('\','/')
             $files[$relative]=[ordered]@{bytes=$file.Length;sha256=(Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()}
         }
-        $manifest=[ordered]@{product='ZSDesk';version=$version;edition=$edition;edition_name=$definition.Name;platform='windows-x64';features=$definition.Features;files=$files}
+        $searchEngine=if($definition.DesktopOnly){$null}else{[ordered]@{product='Everything';version=$enginePin.version;manifest='engines/everything/manifest.json';manifest_sha256=(Get-FileHash -LiteralPath $enginePinPath).Hash.ToLowerInvariant()}}
+        $defaultSearchBackend=if($definition.DesktopOnly){$null}else{'native_ntfs'}
+        $searchBackends=@();if(-not $definition.DesktopOnly){$searchBackends=@('native_ntfs','everything')}
+        $manifest=[ordered]@{product='ZSDesk';version=$version;edition=$edition;edition_name=$definition.Name;platform='windows-x64';features=$definition.Features;desktop_only=[bool]$definition.DesktopOnly;
+            search_engine=$searchEngine;search_default_backend=$defaultSearchBackend;search_backends=@($searchBackends);files=$files}
         Write-Json (Join-Path $stage 'manifest.json') $manifest
         Assert-Payload $stage $manifest
         $zip=Join-Path $WorkDir "$name.zip"

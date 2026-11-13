@@ -14,8 +14,20 @@ pub struct FileEntry {
     pub identity_key: Option<u64>,
 }
 
-/// 自然排序比较器：文件夹优先 + 数字感知。
+/// 与 Windows 资源管理器一致的本地语言、大小写及数字排序。
 pub fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    #[cfg(windows)]
+    if !a.contains('\0')&&!b.contains('\0') {
+        #[link(name="shlwapi")]
+        unsafe extern "system"{fn StrCmpLogicalW(left:*const u16,right:*const u16)->i32;}
+        let left:Vec<u16>=a.encode_utf16().chain(Some(0)).collect();
+        let right:Vec<u16>=b.encode_utf16().chain(Some(0)).collect();
+        return unsafe{StrCmpLogicalW(left.as_ptr(),right.as_ptr())}.cmp(&0);
+    }
+    portable_natural_cmp(a,b)
+}
+
+fn portable_natural_cmp(a:&str,b:&str)->std::cmp::Ordering {
     let mut ai = a.chars().peekable();
     let mut bi = b.chars().peekable();
     loop {
@@ -145,6 +157,7 @@ mod tests {
 
     #[test]
     fn natural_order_leading_zeros() {
-        assert_eq!(natural_cmp("a01", "a1"), std::cmp::Ordering::Equal);
+        assert_eq!(portable_natural_cmp("a01", "a1"), std::cmp::Ordering::Equal);
+        assert_eq!(natural_cmp("a01", "a1"),natural_cmp("a1","a01").reverse());
     }
 }

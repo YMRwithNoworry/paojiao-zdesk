@@ -3,6 +3,7 @@
 pub enum Command {
     NewTab,
     CloseTab,
+    CloseOtherTabs,
     NextTab,
     PreviousTab,
     Back,
@@ -17,11 +18,26 @@ pub enum Command {
     CopyPath,
     TogglePreview,
     ToggleDetails,
+    ToggleDualPane,
+    SwitchPane,
+    NewWindow,
+    ToggleFullscreen,
+    FocusNext,
+    FocusPrevious,
+    ZoomIn,
+    ZoomOut,
+    ResetZoom,
+    ViewPreset(u8),
     /// Ctrl+1 … Ctrl+9 (9 selects the last tab, like browsers).
     SelectTab(u8),
 }
 
 impl Command {
+    pub const fn pane_specific(self)->bool {
+        matches!(self,Self::NewTab|Self::CloseTab|Self::CloseOtherTabs|Self::NextTab|Self::PreviousTab|Self::Back|Self::Forward|Self::Up|
+            Self::Refresh|Self::ReopenTab|Self::NewFolder|Self::CopyPath|Self::ZoomIn|Self::ZoomOut|Self::ResetZoom|
+            Self::ViewPreset(_)|Self::SelectTab(_))
+    }
     pub const fn id(self) -> u16 {
         match self {
             Self::NewTab => 2001,
@@ -40,6 +56,17 @@ impl Command {
             Self::CopyPath => 2014,
             Self::TogglePreview => 2015,
             Self::ToggleDetails => 2016,
+            Self::ToggleDualPane => 2017,
+            Self::SwitchPane => 2018,
+            Self::NewWindow => 2030,
+            Self::ToggleFullscreen => 2031,
+            Self::FocusNext => 2032,
+            Self::FocusPrevious => 2033,
+            Self::ZoomIn => 2034,
+            Self::ZoomOut => 2035,
+            Self::ResetZoom => 2036,
+            Self::CloseOtherTabs => 2037,
+            Self::ViewPreset(n) => 2040 + n as u16,
             Self::SelectTab(n) => 2020 + n as u16,
         }
     }
@@ -62,6 +89,17 @@ impl Command {
             2014 => Some(Self::CopyPath),
             2015 => Some(Self::TogglePreview),
             2016 => Some(Self::ToggleDetails),
+            2017 => Some(Self::ToggleDualPane),
+            2018 => Some(Self::SwitchPane),
+            2030 => Some(Self::NewWindow),
+            2031 => Some(Self::ToggleFullscreen),
+            2032 => Some(Self::FocusNext),
+            2033 => Some(Self::FocusPrevious),
+            2034 => Some(Self::ZoomIn),
+            2035 => Some(Self::ZoomOut),
+            2036 => Some(Self::ResetZoom),
+            2037 => Some(Self::CloseOtherTabs),
+            2041..=2048 => Some(Self::ViewPreset((id - 2040) as u8)),
             2021..=2029 => Some(Self::SelectTab((id - 2020) as u8)),
             _ => None,
         }
@@ -73,7 +111,7 @@ mod tests {
     use super::Command;
     #[test]
     fn ids_round_trip() {
-        for c in [Command::NewTab, Command::NewFolder, Command::ToggleDetails, Command::SelectTab(1), Command::SelectTab(9)] {
+        for c in [Command::NewTab, Command::CloseOtherTabs, Command::NewFolder, Command::ToggleDetails,Command::ToggleDualPane,Command::SwitchPane, Command::SelectTab(1), Command::SelectTab(9)] {
             assert_eq!(Command::from_id(c.id()), Some(c));
         }
         assert_eq!(Command::from_id(2020), None);

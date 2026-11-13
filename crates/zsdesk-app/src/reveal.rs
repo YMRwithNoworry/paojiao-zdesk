@@ -1,6 +1,18 @@
 //! Bounded UTF-16 folder-location requests from the per-user shell router.
 use std::{ffi::OsString,path::PathBuf};
 pub const COPYDATA_TAG:usize=0x3152464e;
+pub const VERIFY_TAG:usize=0x3252464e;
+pub const VERIFY_THIS_PC:usize=0x3352464e;
+pub fn encode(folder:&std::path::Path,items:&[PathBuf])->Option<Vec<u8>>{
+    use std::os::windows::ffi::OsStrExt;
+    if !folder.is_absolute()||items.len()>128{return None;}
+    let payload:Vec<u16>=std::iter::once(folder).chain(items.iter().map(PathBuf::as_path)).flat_map(|path|path.as_os_str().encode_wide().chain(Some(0))).collect();
+    if payload.len()>((1024*1024-32)/2){return None;}
+    let mut data=Vec::with_capacity(32+payload.len()*2);
+    for n in [COPYDATA_TAG as u32,1,(32+payload.len()*2)as u32,items.len()as u32,std::process::id(),1,1,0]{data.extend(n.to_le_bytes());}
+    for n in payload{data.extend(n.to_le_bytes());}
+    decode(&data).map(|_|data)
+}
 pub fn decode(bytes:&[u8])->Option<(PathBuf,Vec<OsString>)>{
     if bytes.len()<34 || bytes.len()>1024*1024 || (bytes.len()-32)%2!=0{return None;}
     let u32_at=|at|u32::from_le_bytes(bytes[at..at+4].try_into().ok().unwrap());

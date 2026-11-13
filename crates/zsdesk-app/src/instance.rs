@@ -10,6 +10,18 @@ impl Drop for Instance {fn drop(&mut self){let _=unsafe {CloseHandle(self.0)};}}
 pub const OPEN_MAGIC:usize=0x5a534432;
 pub const DIAGNOSTICS_MAGIC:usize=0x5a534449;
 pub const ACTIVATE_MAGIC:usize=0x5a534441;
+pub const FOCUS_SEARCH_MAGIC:usize=0x5a534453;
+
+pub fn focus_search(profile:&Path,settings:bool)->Result<bool>{
+    let key=property(profile);let mut previous=None;
+    while let Ok(hwnd)=unsafe{FindWindowExW(None,previous,w!("ZSDesk.Native.Explorer"),None)}{
+        previous=Some(hwnd);if unsafe{GetPropW(hwnd,PCWSTR(key.as_ptr()))}.0 as usize!=1{continue;}
+        let flags=u8::from(settings);let data=COPYDATASTRUCT{dwData:FOCUS_SEARCH_MAGIC,cbData:1,lpData:(&flags as*const u8).cast_mut().cast()};let mut accepted=0;
+        let sent=unsafe{SendMessageTimeoutW(hwnd,WM_COPYDATA,windows::Win32::Foundation::WPARAM(0),windows::Win32::Foundation::LPARAM(&data as*const _ as isize),SMTO_ABORTIFHUNG,2500,Some(&mut accepted))};
+        if sent.0==0||accepted!=1{bail!("文件窗口暂时无法接收搜索请求");}
+        let _=request_activation(hwnd);return Ok(true);
+    }Ok(false)
+}
 
 fn show_command(visible:bool,iconic:bool,preferred:isize)->SHOW_WINDOW_CMD{
     if iconic {SW_RESTORE}

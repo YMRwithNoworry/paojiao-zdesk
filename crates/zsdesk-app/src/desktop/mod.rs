@@ -1,16 +1,53 @@
 //! Desktop fences (桌面格子).
 //!
-//! Runs as `ZSDesk.exe --desktop` in its own single-instance process with a
+//! Runs as a single-instance desktop component for each profile with a
 //! tray icon. Fences are top-level layered windows owned by `Progman`, so they
 //! stay on the desktop layer and survive "显示桌面". Organize mode hides
 //! Explorer's desktop icons through the Shell view only after a watchdog
-//! process (`--desktop-guard`) confirmed it will restore them if this process
-//! dies.
+//! process (`--desktop-guard`) confirmed it will restore them if the host
+//! process or its desktop thread exits unexpectedly.
 
 mod fence;
 mod host;
+mod menu_worker;
+mod return_to_desktop;
+#[cfg(test)]mod window_message_regression;
+#[cfg(test)]mod context_menu_regression;
+
+/// Reads the existing desktop entry without starting a desktop host.
+pub fn startup_enabled(config: &std::path::Path) -> anyhow::Result<bool> {
+    let executable = std::env::current_exe()?;
+    let expected = host::fence_startup_command(&executable, config)
+        .ok_or_else(|| anyhow::anyhow!("无法确定桌面格子的程序和配置目录"))?;
+    Ok(zsdesk_windows::desktop::autostart_command(crate::edition::desktop_startup_value())?
+        .as_deref().is_some_and(|current| zsdesk_windows::desktop::autostart_owned(current, &expected)))
+}
+
+/// Applies the same ownership checks as the desktop tray's login switch.
+pub fn set_startup_enabled(config: &std::path::Path, enabled: bool) -> anyhow::Result<()> {
+    anyhow::ensure!(crate::edition::DESKTOP, "当前版本不包含桌面格子");
+    let executable = std::env::current_exe()?;
+    let expected = host::fence_startup_command(&executable, config)
+        .ok_or_else(|| anyhow::anyhow!("无法确定桌面格子的程序和配置目录"))?;
+    zsdesk_windows::desktop::set_autostart(crate::edition::desktop_startup_value(), &expected, enabled)?;
+    Ok(())
+}
+
+/// Removes only this installation's exact desktop logon command.
+pub fn uninstall_owned_startup(config: &std::path::Path, executable: &std::path::Path) -> anyhow::Result<()> {
+    let Some(expected) = host::fence_startup_command(executable, config) else { return Ok(()); };
+    let value = crate::edition::desktop_startup_value();
+    if zsdesk_windows::desktop::autostart_command(value)?.as_deref()
+        .is_some_and(|current| zsdesk_windows::desktop::autostart_owned(current, &expected)) {
+        zsdesk_windows::desktop::set_autostart(value, &expected, false)?;
+    }
+    Ok(())
+}
 pub(crate) mod migration;
 mod tencent_import;
+
+/// Shell extension calls still retiring after the bounded desktop shutdown.
+pub(crate) fn pending_menu_threads()->usize{menu_worker::retiring_count()+return_to_desktop::pending()}
 
 use std::{cell::{Cell, RefCell}, collections::hash_map::DefaultHasher, hash::{Hash, Hasher}, path::PathBuf};
 
@@ -27,7 +64,7 @@ use windows::{
             LibraryLoader::GetModuleHandleW,
             Ole::{OleInitialize, OleUninitialize, DROPEFFECT, DROPEFFECT_COPY, DROPEFFECT_LINK, DROPEFFECT_MOVE, DROPEFFECT_NONE},
             SystemServices::MODIFIERKEYS_FLAGS,
-            Threading::{CreateMutexW, OpenEventW, OpenProcess, SetEvent, WaitForSingleObject, EVENT_MODIFY_STATE, INFINITE, PROCESS_SYNCHRONIZE},
+            Threading::{CreateMutexW, OpenEventW, OpenProcess, SetEvent, EVENT_MODIFY_STATE, INFINITE, PROCESS_SYNCHRONIZE},
         },
         UI::{
             Controls::WM_MOUSELEAVE,
@@ -39,9 +76,9 @@ use windows::{
     },
 };
 use zsdesk_ui::menus::{entry, MenuItemSpec, MenuSpec, UiCommand};
-use zsdesk_windows::{desktop::{self, DesktopHit}, gfx::Gfx, ole::DropHandler, shell::{menu::{forward_menu_message, HistoryAction, ShellMenu, APP_FIRST}, notify::read_change}};
+use zsdesk_windows::{desktop::{self, DesktopHit}, gfx::Gfx, ole::DropHandler, shell::{menu::{forward_menu_message, HistoryAction, MenuInterceptions, MenuOutcome, ShellMenu, APP_FIRST}, notify::read_change}};
 
-use host::{After, DesktopHost, TIMER_DESKTOP, TIMER_FOLDER, TIMER_PEEK, TIMER_SAVE, TIMER_ICONS, WM_DESKTOP_CHANGED, WM_DESKTOP_DBLCLICK, WM_FOLDER_CHANGED,
+use host::{After, DesktopHost, TIMER_AUTOSCROLL, TIMER_DESKTOP, TIMER_FOLDER, TIMER_PEEK, TIMER_SAVE, TIMER_ICONS, WM_DESKTOP_CHANGED, WM_DESKTOP_DBLCLICK, WM_FOLDER_CHANGED,
     WM_ICON_READY, WM_RENAME_DONE, WM_TRAY};
 
 const HOST_CLASS: &str = "ZSDesk.Native.DesktopHost";
@@ -52,6 +89,8 @@ const WM_FOREGROUND: u32 = WM_APP + 22;
 const WM_REPAIR_LAYER: u32 = WM_APP + 23;
 const TIMER_RAISE: usize = 9;
 const TIMER_REPAIR_LAYER: usize = 10;
+const TIMER_FOREGROUND: usize = 11;
+const TIMER_CANCEL_INTERACTION:usize=6;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct DesktopClick { root: isize, time: u32, x: i32, y: i32 }
@@ -67,6 +106,39 @@ thread_local! {
     static LAST_CLICK: Cell<Option<DesktopClick>> = const { Cell::new(None) };
     /// Only explicit desktop-layer updates may change a fence's z-order.
     static ALLOW_Z: Cell<bool> = const { Cell::new(false) };
+    static LAYER_EVENTS: RefCell<std::collections::VecDeque<(u64, HWND, u32, u32)>> = const { RefCell::new(std::collections::VecDeque::new()) };
+    static NEXT_LAYER_EVENT: Cell<u64> = const { Cell::new(1) };
+    static MENU_WORKER: RefCell<Option<menu_worker::Worker>> = const { RefCell::new(None) };
+    static DEFERRED_QUIT: Cell<bool> = const { Cell::new(false) };
+}
+
+fn queue_foreground(host: HWND, window: HWND) {
+    if !unsafe { IsWindow(Some(window)) }.as_bool() {request_layer_repair();return;}
+    let mut process = 0;
+    let thread = unsafe { GetWindowThreadProcessId(window, Some(&mut process)) };
+    let sequence = NEXT_LAYER_EVENT.with(|next| { let value=next.get(); next.set(value.wrapping_add(1)); value });
+    LAYER_EVENTS.with(|events| {
+        let mut events=events.borrow_mut();
+        if events.back().is_some_and(|event| event.1==window && event.2==process && event.3==thread) { return; }
+        if events.len()==32 { events.pop_front(); }
+        events.push_back((sequence,window,process,thread));
+    });
+    flush_foreground(host);
+}
+
+fn flush_foreground(host: HWND) {
+    let events:Vec<_>=LAYER_EVENTS.with(|events| events.borrow().iter().copied().collect());
+    if events.is_empty() { let _=unsafe { KillTimer(Some(host),TIMER_FOREGROUND) }; return; }
+    if with_host(|desktop| {
+        // Delayed WinEvents describe history. Reconcile the current foreground
+        // once instead of replaying stale screenshot/menu HWNDs in order.
+        desktop.repair_layer();
+    }).is_some() {
+        let last=events.last().unwrap().0;
+        LAYER_EVENTS.with(|queue| queue.borrow_mut().retain(|event|event.0>last));
+    }
+    if LAYER_EVENTS.with(|events|!events.borrow().is_empty()) { unsafe { SetTimer(Some(host),TIMER_FOREGROUND,30,None); } }
+    else { let _=unsafe { KillTimer(Some(host),TIMER_FOREGROUND) }; }
 }
 
 /// Moves a fence in the z-order without the layer guard interfering.
@@ -80,6 +152,7 @@ fn request_layer_repair() {
     let host = HOST_HWND.with(Cell::get);
     if host != 0 { let _ = unsafe { PostMessageW(Some(HWND(host as *mut _)), WM_REPAIR_LAYER, WPARAM(0), LPARAM(0)) }; }
 }
+pub(super) fn schedule_desktop_raise(host:HWND){unsafe{SetTimer(Some(host),TIMER_RAISE,180,None);}}
 
 struct MenuLayerRepair;
 impl Drop for MenuLayerRepair { fn drop(&mut self) { request_layer_repair(); } }
@@ -155,13 +228,14 @@ fn run_host(config_path: PathBuf, explorer_config: PathBuf, command: DesktopComm
     HOST_HWND.with(|h| h.set(hwnd.0 as isize));
     let (family, _) = zsdesk_windows::gfx::system_ui_font(None);
     let gfx = Gfx::new(&family).context("Direct2D 初始化失败")?;
+    zsdesk_windows::flyout::prepare();
     let config = host::load_config(&config_path);
     let hook = config.settings.double_click_toggle;
     HOST.with(|h| *h.borrow_mut() = Some(DesktopHost::new(hwnd, config_path, explorer_config, config, gfx)));
     with_host(|h| h.start());
     update_hook(hook);
     let foreground = unsafe { windows::Win32::UI::Accessibility::SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, None,
-        Some(foreground_hook), 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS) };
+        Some(foreground_hook), 0, 0, WINEVENT_OUTOFCONTEXT) };
     execute(command);
     let mut msg = MSG::default();
     while unsafe { GetMessageW(&mut msg, None, 0, 0) }.0 > 0 {
@@ -170,6 +244,8 @@ fn run_host(config_path: PathBuf, explorer_config: PathBuf, command: DesktopComm
     update_hook(false);
     if !foreground.is_invalid() { let _ = unsafe { windows::Win32::UI::Accessibility::UnhookWinEvent(foreground) }; }
     if let Some(mut host) = HOST.with(|h| h.borrow_mut().take()) { host.shutdown(); }
+    let menu = MENU_WORKER.with(|worker| worker.borrow_mut().take());
+    drop(menu);
     Ok(())
 }
 
@@ -177,6 +253,7 @@ fn execute(command: DesktopCommand) {
     // DestroyWindow dispatches WM_DESTROY synchronously. End the HOST borrow
     // before calling it so shutdown can actually borrow and clean up the host.
     if command == DesktopCommand::Quit {
+        if return_to_desktop::pending()!=0 { DEFERRED_QUIT.with(|pending|pending.set(true)); return; }
         if let Some(hwnd) = with_host(|h| h.hwnd) { let _ = unsafe { DestroyWindow(hwnd) }; }
         return;
     }
@@ -196,23 +273,44 @@ fn execute(command: DesktopCommand) {
     if let Some(after) = after { run_after(after); }
 }
 
+fn finish_deferred_quit() {
+    if return_to_desktop::pending()==0 && DEFERRED_QUIT.with(|pending|pending.replace(false)) { execute(DesktopCommand::Quit); }
+}
+
 /// Watchdog: restores desktop icons if the host process exits while they are hidden.
-pub fn guard(config_path: PathBuf, pid: u32) -> Result<()> {
-    let process = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, pid)? };
+pub fn guard(config_path: PathBuf, pid: u32, desktop_thread: Option<u32>) -> Result<()> {
+    use windows::Win32::System::Threading::{GetProcessIdOfThread,OpenThread,WaitForMultipleObjects,
+        THREAD_QUERY_LIMITED_INFORMATION,THREAD_SYNCHRONIZE};
+    struct Owned(HANDLE);
+    impl Drop for Owned { fn drop(&mut self) { let _=unsafe{CloseHandle(self.0)}; } }
+    let process = Owned(unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, pid)? });
+    let thread = if let Some(id)=desktop_thread {
+        let handle=Owned(unsafe{OpenThread(THREAD_SYNCHRONIZE|THREAD_QUERY_LIMITED_INFORMATION,false,id)}?);
+        anyhow::ensure!(unsafe{GetProcessIdOfThread(handle.0)}==pid,"桌面监护线程不属于目标进程");
+        Some(handle)
+    } else { None };
+    let mut handles=vec![process.0];
+    if let Some(thread)=&thread { handles.push(thread.0); }
     let name = wide(&format!("Local\\ZSDesk.DesktopGuard.{pid}"));
-    if let Ok(event) = unsafe { OpenEventW(EVENT_MODIFY_STATE, false, PCWSTR(name.as_ptr())) } {
-        let _ = unsafe { SetEvent(event) };
-        let _ = unsafe { CloseHandle(event) };
-    }
-    unsafe { WaitForSingleObject(process, INFINITE) };
-    let _ = unsafe { CloseHandle(process) };
+    let ready=Owned(unsafe { OpenEventW(EVENT_MODIFY_STATE, false, PCWSTR(name.as_ptr())) }?);
+    // The parent may hide system icons only after both lifetime handles are
+    // open and the desktop thread's ownership has been checked.
+    unsafe { SetEvent(ready.0)?; }
+    drop(ready);
+    let waited=unsafe { WaitForMultipleObjects(&handles, false, INFINITE) }.0;
+    anyhow::ensure!((waited as usize)<handles.len(),"桌面监护等待失败：{waited:#x}");
+    drop(thread);drop(process);
     let mut config = host::load_config(&config_path);
     if config.settings.icons_hidden_by_zsdesk {
         unsafe { OleInitialize(None)?; }
-        desktop::set_icons_visible(true);
+        let restored=desktop::set_icons_visible(true);
         unsafe { OleUninitialize(); }
-        config.settings.icons_hidden_by_zsdesk = false;
-        host::save_config(&config_path, &config)?;
+        if restored {
+            config.settings.icons_hidden_by_zsdesk = false;
+            host::save_config(&config_path, &config)?;
+        } else {
+            anyhow::bail!("系统桌面图标恢复失败，恢复标记已保留");
+        }
     }
     Ok(())
 }
@@ -227,6 +325,8 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
         return LRESULT(0);
     }
     match msg {
+        WM_CLOSE => { execute(DesktopCommand::Quit); return LRESULT(0); }
+        menu_worker::READY => { finish_menu_work(); return LRESULT(0); }
         WM_COPYDATA if lp.0 != 0 => {
             let data = unsafe { &*(lp.0 as *const COPYDATASTRUCT) };
             if data.dwData != DESKTOP_MAGIC || data.cbData > 65536 || data.lpData.is_null() { return LRESULT(0); }
@@ -244,16 +344,8 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             return LRESULT(0);
         }
         WM_TRAY => {
-            let event = (lp.0 & 0xFFFF) as u32;
-            if event == WM_RBUTTONUP || event == WM_CONTEXTMENU {
-                let mut p = POINT::default();
-                let _ = unsafe { GetCursorPos(&mut p) };
-                run_after(After::TrayMenu(p));
-            } else if event == WM_LBUTTONDBLCLK {
-                with_host(|h| h.menu_command(None, "open-zsdesk", POINT::default()));
-            } else if event == WM_LBUTTONUP {
-                with_host(|h| h.show_all());
-            }
+            let version4=with_host(|host|host.tray_version4).unwrap_or(false);
+            if let Some(action)=tray_action(version4,wp,lp){dispatch_tray(action);}
             return LRESULT(0);
         }
         WM_DESKTOP_CHANGED => {
@@ -273,6 +365,7 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             if matches!(class_name(window).as_str(), "WorkerW" | "Progman") { with_host(|h| h.raise_above(window)); }
             return LRESULT(0);
         }
+        WM_TIMER if wp.0 == TIMER_FOREGROUND => { flush_foreground(hwnd); return LRESULT(0); }
         WM_REPAIR_LAYER | WM_TIMER if msg == WM_REPAIR_LAYER || wp.0 == TIMER_REPAIR_LAYER => {
             let _ = unsafe { KillTimer(Some(hwnd), TIMER_REPAIR_LAYER) };
             if with_host(|h| h.repair_layer()).is_none() { unsafe { SetTimer(Some(hwnd), TIMER_REPAIR_LAYER, 30, None); } }
@@ -289,7 +382,7 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             return LRESULT(0);
         }
         WM_ICON_READY => {
-            if with_host(|h| h.icons_ready()).is_none() { unsafe { SetTimer(Some(hwnd), TIMER_ICONS, 50, None); } }
+            if with_host(|h| if h.accept_icon_notification(wp.0) { h.icons_ready(); }).is_none() { unsafe { SetTimer(Some(hwnd), TIMER_ICONS, 50, None); } }
             return LRESULT(0);
         }
         WM_DESKTOP_DBLCLICK => {
@@ -305,25 +398,30 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
         WM_FOREGROUND => {
             let window = HWND(lp.0 as *mut _);
             let class = class_name(window);
+            queue_foreground(hwnd,window);
             if class == "WorkerW" || class == "Progman" {
-                with_host(|h| h.raise_above(window));
                 // "显示桌面" may finish raising its WorkerW after the event: raise again shortly.
                 unsafe { SetTimer(Some(hwnd), TIMER_RAISE, 180, None); }
             }
-            else if !class.starts_with("ZSDesk.") && class != "#32768" { with_host(|h| h.lower_all(window)); }
             return LRESULT(0);
         }
         WM_DISPLAYCHANGE => { with_host(|h| h.place_all()); return LRESULT(0); }
+        WM_THEMECHANGED|WM_DWMCOMPOSITIONCHANGED|WM_SYSCOLORCHANGE => {
+            with_host(|host|{host.update_palette();for window in &host.fences{fence::apply_glass(window.hwnd);}host.render_all();});return LRESULT(0);
+        }
         WM_SETTINGCHANGE => {
             let area = if lp.0 != 0 { unsafe { PCWSTR(lp.0 as *const u16).to_string() }.unwrap_or_default() } else { String::new() };
             if wp.0 as u32 == SPI_SETWORKAREA.0 { with_host(|h| h.place_all()); }
-            if area == "ImmersiveColorSet" { with_host(|h| { h.update_palette(); h.render_all(); }); }
+            if area == "ImmersiveColorSet"||wp.0 as u32==SPI_SETHIGHCONTRAST.0 { with_host(|h| { h.update_palette();for window in &h.fences{fence::apply_glass(window.hwnd);}h.render_all(); }); }
             if area == "ShellState" { unsafe { SetTimer(Some(hwnd), TIMER_DESKTOP, 250, None); } }
             return LRESULT(0);
         }
         WM_QUERYENDSESSION => return LRESULT(1),
         WM_ENDSESSION => { if wp.0 != 0 { with_host(|h| h.shutdown()); } return LRESULT(0); }
         WM_DESTROY => {
+            MENU_WORKER.with(|worker| { if let Some(worker)=worker.borrow().as_ref(){worker.stop();} });
+            LAYER_EVENTS.with(|events| events.borrow_mut().clear());
+            let _=unsafe { KillTimer(Some(hwnd),TIMER_FOREGROUND) };
             with_host(|h| h.shutdown());
             unsafe { PostQuitMessage(0); }
             return LRESULT(0);
@@ -345,6 +443,7 @@ unsafe extern "system" fn fence_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
     if let Some(result) = forward_menu_message(msg, wp, lp) { return result; }
     let id = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as u64;
     if id == 0 { return unsafe { DefWindowProcW(hwnd, msg, wp, lp) }; }
+    if msg==zsdesk_windows::shell::file_transfer::result_message(){file_operation_finished(id,hwnd,wp.0 as u32);return LRESULT(0);}
     match msg {
         WM_MOUSEMOVE => { if let Some(a) = with_host(|h| h.mouse_move(id, point_of(lp))) { run_after(a); } return LRESULT(0); }
         WM_ACTIVATE | WM_SETFOCUS | WM_ENTERMENULOOP | WM_EXITMENULOOP => { request_layer_repair(); }
@@ -355,14 +454,14 @@ unsafe extern "system" fn fence_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
         WM_LBUTTONUP => { if let Some(a) = with_host(|h| h.mouse_up(id, point_of(lp))) { run_after(a); } return LRESULT(0); }
         WM_RBUTTONUP => { if let Some(a) = with_host(|h| h.right_click(id, point_of(lp))) { run_after(a); } return LRESULT(0); }
         WM_CONTEXTMENU => return LRESULT(0),
-        WM_MOUSEWHEEL => { with_host(|h| h.wheel(id, ((wp.0 >> 16) as i16) as i32)); return LRESULT(0); }
+        WM_MOUSEWHEEL => { with_host(|h| h.wheel(id, ((wp.0 >> 16) as i16) as i32, point_of(lp))); return LRESULT(0); }
         WM_MOUSELEAVE => { with_host(|h| h.mouse_leave(id)); return LRESULT(0); }
-        WM_CAPTURECHANGED => {
-            with_host(|h| if let Some(i) = h.win_index(id) {
-                if h.fences[i].interaction.take().is_some() { let r = h.fences[i].window_rect(); let _ = r; h.render(id); }
-            });
+        WM_CANCELMODE|WM_CAPTURECHANGED => {
+            cancel_fence_interaction(hwnd,id);
+            if msg==WM_CANCELMODE{return unsafe{DefWindowProcW(hwnd,msg,wp,lp)};}
             return LRESULT(0);
         }
+        WM_TIMER if wp.0==TIMER_CANCEL_INTERACTION=>{cancel_fence_interaction(hwnd,id);return LRESULT(0);}
         WM_KEYDOWN | WM_SYSKEYDOWN if msg == WM_KEYDOWN => {
             if let Some(a) = with_host(|h| h.key(id, wp.0 as u16)) { run_after(a); }
             return LRESULT(0);
@@ -414,6 +513,7 @@ unsafe extern "system" fn fence_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
             return LRESULT(0);
         }
         WM_TIMER if wp.0 == TIMER_PEEK => { with_host(|h| h.peek_check(id)); return LRESULT(0); }
+        WM_TIMER if wp.0 == TIMER_AUTOSCROLL => { with_host(|h| h.rubber_autoscroll(id)); return LRESULT(0); }
         WM_TIMER if wp.0 == TIMER_FOLDER => {
             let _ = unsafe { KillTimer(Some(hwnd), TIMER_FOLDER) };
             if with_host(|h| h.refresh_folder(id)).is_none() { unsafe { SetTimer(Some(hwnd), TIMER_FOLDER, 500, None); } }
@@ -424,6 +524,8 @@ unsafe extern "system" fn fence_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
             return LRESULT(0);
         }
         WM_MOUSEACTIVATE => return LRESULT(MA_ACTIVATE as isize),
+        // Resizes happen inside host calls, so the shape is kept here, outside the host borrow.
+        WM_SIZE => fence::shape_window(hwnd),
         _ => {}
     }
     unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
@@ -433,10 +535,65 @@ unsafe extern "system" fn fence_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
 
 fn key_down(key: windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY) -> bool { (unsafe { GetKeyState(key.0 as i32) }) < 0 }
 
+fn cancel_fence_interaction(hwnd:HWND,id:u64){
+    if with_host(|host|host.capture_lost(id)).is_some(){let _=unsafe{KillTimer(Some(hwnd),TIMER_CANCEL_INTERACTION)};}
+    else{unsafe{SetTimer(Some(hwnd),TIMER_CANCEL_INTERACTION,30,None);}}
+    // WM_CAPTURECHANGED can name another window. Release only capture still
+    // owned by this fence, after the mutable host borrow has ended.
+    if unsafe{windows::Win32::UI::Input::KeyboardAndMouse::GetCapture()}==hwnd{let _=unsafe{windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture()};}
+}
+
 fn fence_hwnd(fence: u64) -> Option<HWND> { with_host(|h| h.win_index(fence).map(|i| h.fences[i].hwnd)).flatten() }
 
 fn refresh_fence(fence: u64) {
     with_host(|h| if h.config.fence(fence).is_some_and(|f| f.is_desktop()) { h.refresh_desktop(); } else { h.refresh_folder(fence); });
+}
+
+fn file_operation_finished(fence:u64,owner:HWND,code:u32){
+    use zsdesk_windows::shell::file_transfer;
+    if code!=0{
+        file_action_error(owner,&windows::core::Error::from_hresult(windows::core::HRESULT(code as i32)));
+        refresh_fence(fence);return;
+    }
+    let created=file_transfer::take_created_folder(owner);
+    if let Some(path)=&created{
+        let name=path.file_name().map(|name|name.to_string_lossy().into_owned()).into_iter().collect();
+        with_host(|host|host.expect_new_items(fence,name));
+    }
+    refresh_fence(fence);
+    let Some(path)=created else{return;};
+    with_host(|host|{
+        if host.target_folder(fence).as_deref()!=path.parent(){return;}
+        let Some(index)=host.win_index(fence)else{return;};
+        let Some(item)=host.fences[index].entries.iter().position(|entry|entry.path.as_ref()==Some(&path))else{return;};
+        let key=host.fences[index].entries[item].key.clone();
+        if let Some(config)=host.config.fence(fence).cloned(){
+            let window=&mut host.fences[index];window.selection.clear();window.selection.insert(key.clone());window.focus=Some(item);window.anchor=Some(item);
+            let geometry=window.geometry(&config);
+            if let Some(cell)=geometry.cells.get(item){
+                if cell.cell.y<geometry.content.y{window.scroll-=(geometry.content.y-cell.cell.y).max(0);}
+                else if cell.cell.bottom()>geometry.content.bottom(){window.scroll+=cell.cell.bottom()-geometry.content.bottom();}
+                window.scroll=window.scroll.clamp(0,geometry.max_scroll);
+            }
+        }
+        host.render(fence);
+        if unsafe{IsWindowVisible(owner)}.as_bool()&&unsafe{GetForegroundWindow()}==owner{host.begin_rename(fence,fence::RenameTarget::Item(key));}
+    });
+}
+
+fn file_action_error(owner: HWND, error: &windows::core::Error) {
+    if matches!(error.code().0 as u32, 0x800704c7 | 0x80004004) || !unsafe { IsWindow(Some(owner)) }.as_bool() { return; }
+    let text = wide(&format!("无法完成文件操作：{}（0x{:08X}）", error.message(), error.code().0 as u32));
+    unsafe { MessageBoxW(Some(owner), PCWSTR(text.as_ptr()), w!("ZSDesk 桌面格子"), MB_OK | MB_ICONWARNING); }
+}
+
+fn dispatch_application_menu(fence: u64, owner: HWND, command: u32, ids: &[String], point: POINT) {
+    if !unsafe { IsWindow(Some(owner)) }.as_bool() { return; }
+    let Some(id) = command.checked_sub(APP_FIRST).and_then(|offset| ids.get(offset as usize)) else {
+        file_action_error(owner, &windows::core::Error::new(windows::core::HRESULT(0x80070057u32 as i32), "菜单命令已失效"));
+        return;
+    };
+    if let Some(after) = with_host(|host| host.menu_command(Some(fence), id, point)) { run_after(after); }
 }
 
 fn run_after(after: After) {
@@ -444,23 +601,40 @@ fn run_after(after: After) {
         After::Nothing => {}
         After::ItemMenu { fence, point } => item_menu(fence, point),
         After::FenceMenu { fence, point } => fence_menu(fence, point),
+        After::FolderSystemMenu { fence, point } => folder_system_menu(fence, point),
         After::TrayMenu(point) => tray_menu(point),
         After::Drag { fence } => drag(fence),
+        After::ReturnToDesktop { fence, point } => { return_to_desktop::return_selection(fence, point); finish_deferred_quit(); },
         After::Open { fence, index, explorer } => open(fence, index, explorer),
         After::Verb { fence, verb, background } => run_verb(fence, verb, background),
         After::History { fence, action } => run_history(fence, action),
+        After::Quit => execute(DesktopCommand::Quit),
+        After::Notice(message) => {
+            let owner = with_host(|host| host.hwnd).unwrap_or_default();
+            let text = wide(message);
+            unsafe { MessageBoxW(Some(owner), PCWSTR(text.as_ptr()), w!("ZSDesk 桌面格子"), MB_OK | MB_ICONINFORMATION); }
+        }
         After::Rename { fence, key, name } => {
             let target = with_host(|h| h.win_index(fence).and_then(|i| h.fences[i].entries.iter().find(|e| e.key == key).map(|e| (h.fences[i].hwnd, e.pidl.clone())))).flatten();
-            if let Some((hwnd, pidl)) = target { let _ = desktop::rename(hwnd, &pidl, &name); }
+            if let Some((hwnd, pidl)) = target {
+                if let Err(error) = desktop::rename(hwnd, &pidl, &name) { file_action_error(hwnd, &error); }
+            }
             refresh_fence(fence);
         }
         After::PickFolder { replace } => {
             let owner = with_host(|h| h.hwnd).unwrap_or_default();
             if let Some(path) = desktop::pick_folder(owner, "选择要映射到桌面格子的文件夹") { with_host(|h| h.add_folder_fence(path, replace)); }
         }
+        After::PickFolderTab { to } => {
+            let owner = with_host(|h| h.hwnd).unwrap_or_default();
+            if let Some(path) = desktop::pick_folder(owner, "选择要映射为标签的文件夹") { with_host(|h| h.add_folder_tab(to, path)); }
+        }
+        After::AddTab { fence, point } => tab_popup(fence, point, |h| h.add_tab_menu()),
+        After::TabList { fence, point } => tab_popup(fence, point, |h| h.tab_list_menu(fence)),
         After::DeleteFence(id) => {
-            let Some((hwnd, title)) = with_host(|h| h.config.fence(id).map(|f| (h.hwnd, f.title.clone()))).flatten() else { return };
-            let text = wide(&format!("删除格子“{title}”？\n\n格子中的文件和文件夹不会被删除。"));
+            let Some((hwnd, title, tab)) = with_host(|h| h.config.fence(id).map(|f| (h.hwnd, f.title.clone(), f.group != 0))).flatten() else { return };
+            let text = wide(&if tab { format!("关闭标签“{title}”？\n\n标签中的文件和文件夹不会被删除。") }
+                else { format!("删除格子“{title}”？\n\n格子中的文件和文件夹不会被删除。") });
             let answer = unsafe { MessageBoxW(Some(hwnd), PCWSTR(text.as_ptr()), w!("ZSDesk 桌面格子"), MB_OKCANCEL | MB_ICONQUESTION) };
             if answer == IDOK { with_host(|h| h.delete_fence(id)); }
         }
@@ -468,7 +642,7 @@ fn run_after(after: After) {
 }
 
 fn fast_context_menu_enabled() -> bool {
-    with_host(|h| h.config.settings.zsui_fast_context_menu).unwrap_or(false)
+    with_host(|host| host.config.settings.zsui_fast_context_menu).unwrap_or(false)
 }
 fn add_shell_menu_entry(spec: &mut MenuSpec) {
     spec.items.insert(0, entry("完整 Windows Shell 菜单…", "windows-shell-menu", true, false));
@@ -485,135 +659,210 @@ fn item_menu(fence: u64, point: POINT) {
 
 fn fast_item_menu(fence: u64, point: POINT) {
     let _layer = MenuLayerRepair;
-    let Some((hwnd, items)) = with_host(|h| {
-        h.win_index(fence).map(|i| (h.fences[i].hwnd, h.item_menu_items(fence)))
-    }).flatten() else { return };
+    let Some((hwnd, items)) = with_host(|host| host.win_index(fence).map(|index| (host.fences[index].hwnd, host.item_menu_items(fence)))).flatten() else { return };
     let mut spec = MenuSpec { id: None, title: None, items };
     add_shell_menu_entry(&mut spec);
     if let Some(id) = popup(hwnd, &spec, point) {
         if id == "windows-shell-menu" {
-            item_menu_shell_native(fence, point);
-        } else if let Some(after) = with_host(|h| h.menu_command(Some(fence), &id, point)) {
+            item_menu_native(fence, point);
+        } else if let Some(after) = with_host(|host| host.menu_command(Some(fence), &id, point)) {
             run_after(after);
         }
     }
 }
 
 fn item_menu_native(fence: u64, point: POINT) {
-    item_menu_with_shell(fence, point, true);
-}
-
-fn item_menu_shell_native(fence: u64, point: POINT) {
-    item_menu_with_shell(fence, point, false);
-}
-
-fn item_menu_with_shell(fence: u64, point: POINT, include_app_items: bool) {
-    let _layer = MenuLayerRepair;
-    let Some((hwnd, pidls, extra)) = with_host(|h| h.win_index(fence).map(|i| {
-        (h.fences[i].hwnd, h.selected_pidls(fence), if include_app_items { h.item_menu_items(fence) } else { Vec::new() })
+    let input_started = with_host(|host| host.menu_input_started.take().filter(|(id, _)| *id == fence).map(|(_, time)| time)).flatten().unwrap_or_else(std::time::Instant::now);
+    let Some((hwnd, pidls, target_key, profile)) = with_host(|host| host.win_index(fence).map(|index| {
+        let window = &host.fences[index];
+        let target = host.focused_entry(fence).filter(|entry| window.selection.contains(&entry.key))
+            .or_else(|| window.entries.iter().find(|entry| window.selection.contains(&entry.key)));
+        (window.hwnd, host.selected_pidls(fence), target.map(|entry| entry.key.clone()), host.explorer_config.clone())
     })).flatten() else { return };
     if pidls.is_empty() { return fence_menu(fence, point); }
-    apply_context_preferences();
-    let menu = match ShellMenu::for_items(hwnd, &pidls) {
-        Ok(menu) => menu,
-        Err(error) => { zsdesk_windows::shell::menu::report_failure(hwnd, error.code()); return; }
-    };
-    let shift = key_down(VK_SHIFT);
-    if let Err(error) = menu.populate(true, shift) { zsdesk_windows::shell::menu::report_failure(hwnd, error.code()); return; }
-    let ids = insert_top(menu.hmenu(), &extra);
-    let _ = unsafe { SetForegroundWindow(hwnd) };
+    let mut request = menu_worker::Request::new(fence, hwnd, point, profile, Vec::new(), menu_worker::Target::Items { pidls, key: target_key }, key_down(VK_SHIFT));
+    request.input_started = input_started;
+    quick_fence_menu(request);
+}
+
+
+fn quick_fence_menu(mut request:menu_worker::Request){
+    request.mode=crate::context_menu_process::Mode::More;
+    queue_menu(request);
+}
+
+fn queue_menu(mut request:menu_worker::Request){
+    let owner=HWND(request.owner as*mut _);
+    let Some(host)=with_host(|host|host.hwnd)else{return;};
+    let _=unsafe{SetForegroundWindow(owner)};
+    request.foreground=unsafe{GetForegroundWindow()}.0 as isize;
+    let result=MENU_WORKER.with(|worker|->anyhow::Result<()>{
+        let mut worker=worker.borrow_mut();if worker.is_none(){*worker=Some(menu_worker::Worker::new(host)?);}
+        worker.as_ref().unwrap().submit(request);Ok(())
+    });
+    if let Err(error)=result{file_action_error(owner,&windows::core::Error::new(windows::core::HRESULT(0x80004005u32 as i32),error.to_string()));}
     request_layer_repair();
-    let Some(chosen) = menu.track_selected(hwnd, point, &pidls) else { refresh_fence(fence); return };
-    if chosen >= APP_FIRST {
-        if let Some(id) = ids.get((chosen - APP_FIRST) as usize) {
-            if let Some(a) = with_host(|h| h.menu_command(Some(fence), id, point)) { run_after(a); }
+}
+
+fn menu_target_current(request:&menu_worker::Request)->bool{
+    with_host(|host|host.win_index(request.fence).is_some_and(|index|{
+        if host.fences[index].hwnd.0 as isize!=request.owner||!unsafe{IsWindowVisible(host.fences[index].hwnd)}.as_bool(){return false;}
+        match &request.target{
+            menu_worker::Target::Items{pidls,..}=>host.selected_pidls(request.fence)==*pidls,
+            menu_worker::Target::Background{folder}=>host.target_folder(request.fence)==*folder,
         }
-        return;
-    }
-    let verb = menu.verb(chosen).unwrap_or_default().to_ascii_lowercase();
-    match verb.as_str() {
-        "rename" => {
-            let key = with_host(|h| h.focused_entry(fence).map(|e| e.key.clone())).flatten();
-            if let Some(key) = key { with_host(|h| h.begin_rename(fence, fence::RenameTarget::Item(key))); }
+    })).unwrap_or(false)
+}
+
+fn menu_diagnostics()->serde_json::Value{MENU_WORKER.with(|worker|worker.borrow().as_ref().map_or(serde_json::Value::Null,menu_worker::Worker::diagnostics))}
+fn menu_request_current(generation:u64)->bool{MENU_WORKER.with(|worker|worker.borrow().as_ref().is_some_and(|worker|worker.is_current(generation)))}
+
+fn finish_menu_work(){
+    let events=MENU_WORKER.with(|worker|worker.borrow_mut().as_mut().map(menu_worker::Worker::drain).unwrap_or_default());
+    for event in events{match event{
+        menu_worker::Event::Validate{request,before_invoke,answer}=>{
+            let valid=menu_request_current(request.generation)&&menu_target_current(&request);
+            if valid&&before_invoke&&matches!(request.target,menu_worker::Target::Background{..}){with_host(|host|host.expect_new_items(request.fence,Vec::new()));}
+            let _=answer.try_send(valid);
         }
-        "open" | "explore" if pidls.len() == 1 && with_host(|h| h.focused_entry(fence).is_some_and(|e| e.is_container() && !e.is_link)).unwrap_or(false) => {
-            let index = with_host(|h| h.win_index(fence).and_then(|i| h.fences[i].focus)).flatten().unwrap_or(0);
-            open(fence, index, verb == "explore");
+        menu_worker::Event::Finished{request,ids,outcome,..}=>{
+            let _layer=MenuLayerRepair;
+            let owner=HWND(request.owner as*mut _);
+            // Shell commands already ran against their captured PIDLs. Only
+            // application actions require the current selection to still match.
+            let actionable=matches!(&outcome,Ok(MenuOutcome::Application(_)|MenuOutcome::Rename|MenuOutcome::Open|MenuOutcome::Explore));
+            // A superseded construction can fail after another menu was
+            // requested. Its error must not interrupt the newer interaction.
+            if outcome.is_err()&&!menu_request_current(request.generation){continue;}
+            if actionable&&(!menu_request_current(request.generation)||!menu_target_current(&request)){continue;}
+            let target_key=match request.target{menu_worker::Target::Items{key,..}=>key,_=>None};
+            finish_menu(request.fence,owner,request.point,target_key,&ids,outcome.map_err(|(code,message)|windows::core::Error::new(windows::core::HRESULT(code),message)));
         }
-        _ => {
-            let _ = menu.invoke(hwnd, chosen, Some(point), shift, key_down(VK_CONTROL));
-            refresh_fence(fence);
+    }}
+}
+
+fn finish_menu(fence:u64,hwnd:HWND,point:POINT,target_key:Option<String>,ids:&[String],outcome:windows::core::Result<MenuOutcome>){
+    match outcome {
+        Ok(MenuOutcome::Application(command)) => dispatch_application_menu(fence, hwnd, command, &ids, point),
+        Ok(action @ (MenuOutcome::Rename | MenuOutcome::Open | MenuOutcome::Explore)) => {
+            let index = target_key.as_ref().and_then(|key| with_host(|h| h.win_index(fence)
+                .and_then(|i| h.fences[i].entries.iter().position(|entry| &entry.key == key))).flatten());
+            let Some(index) = index else {
+                file_action_error(hwnd, &windows::core::Error::new(windows::core::HRESULT(0x80070490u32 as i32), "所选项目已变化，请重新选择"));
+                return;
+            };
+            if action == MenuOutcome::Rename {
+                if let Some(key) = target_key { with_host(|h| h.begin_rename(fence, fence::RenameTarget::Item(key))); }
+            } else {
+                open_with_verb(fence, index, action == MenuOutcome::Explore, Some(if action == MenuOutcome::Explore { "explore" } else { "open" }));
+            }
         }
+        Ok(MenuOutcome::Dismissed) => {},
+        Ok(_) => refresh_fence(fence),
+        Err(error) if matches!(error.code().0 as u32,0x80004004|0x800704c7)=>{},
+        Err(error) => { file_action_error(hwnd, &error); refresh_fence(fence); }
     }
 }
 
 fn fence_menu(fence: u64, point: POINT) {
+    with_host(|host| host.menu_input_started = None);
     if fast_context_menu_enabled() {
         fast_fence_menu(fence, point);
     } else {
-        fence_menu_native(fence, point);
+        native_fence_menu(fence, point);
     }
 }
 
 fn fast_fence_menu(fence: u64, point: POINT) {
     let _layer = MenuLayerRepair;
-    let Some((hwnd, mut spec, has_folder)) = with_host(|h| {
-        h.win_index(fence).map(|i| {
-            (h.fences[i].hwnd, h.fence_menu(fence), h.target_folder(fence).is_some())
-        })
-    }).flatten() else { return };
-    if has_folder {
-        add_shell_menu_entry(&mut spec);
-    }
+    let Some((hwnd, mut spec, has_folder)) = with_host(|host| host.win_index(fence).map(|index|
+        (host.fences[index].hwnd, host.fence_menu(fence), host.target_folder(fence).is_some()))).flatten() else { return };
+    if has_folder { add_shell_menu_entry(&mut spec); }
     if let Some(id) = popup(hwnd, &spec, point) {
         if id == "windows-shell-menu" {
-            fence_menu_native(fence, point);
-        } else if let Some(after) = with_host(|h| h.menu_command(Some(fence), &id, point)) {
+            folder_system_menu(fence, point);
+        } else if let Some(after) = with_host(|host| host.menu_command(Some(fence), &id, point)) {
             run_after(after);
         }
     }
 }
 
-fn fence_menu_native(fence: u64, point: POINT) {
+fn native_fence_menu(fence: u64, point: POINT) {
+    MENU_WORKER.with(|worker| if let Some(worker) = worker.borrow().as_ref() { worker.cancel_current(); });
+    tab_popup(fence, point, |host| host.fence_menu(fence));
+}
+
+fn folder_system_menu(fence: u64, point: POINT) {
+    let input_started = std::time::Instant::now();
+    let Some((hwnd, folder, profile)) = with_host(|host| host.win_index(fence).map(|index|
+        (host.fences[index].hwnd, host.target_folder(fence), host.explorer_config.clone()))).flatten() else { return };
+    if folder.is_none() { return; }
+    let mut request = menu_worker::Request::new(fence, hwnd, point, profile, Vec::new(), menu_worker::Target::Background { folder }, key_down(VK_SHIFT));
+    request.input_started = input_started;
+    quick_fence_menu(request);
+}
+
+/// Small ZSUI menus anchored under a title-bar button ("+", "⌄ N").
+fn tab_popup(fence: u64, point: POINT, spec: impl FnOnce(&DesktopHost) -> MenuSpec) {
     let _layer = MenuLayerRepair;
-    apply_context_preferences();
-    let Some((hwnd, spec, folder)) = with_host(|h| h.win_index(fence).map(|i| (h.fences[i].hwnd, h.fence_menu(fence), h.target_folder(fence)))).flatten() else { return };
-    let shell = folder.as_ref().and_then(|f| desktop::folder_for_path(f).ok()).and_then(|f| ShellMenu::for_folder_background(hwnd, &f).ok())
-        .filter(|m| m.populate(false, key_down(VK_SHIFT)).is_ok());
+    let Some((hwnd, spec)) = with_host(|h| h.win_index(fence).map(|i| (h.fences[i].hwnd, spec(h)))).flatten() else { return };
     let _ = unsafe { SetForegroundWindow(hwnd) };
     request_layer_repair();
-    match shell {
-        Some(menu) => {
-            let ids = insert_top(menu.hmenu(), &spec.items);
-            let chosen = folder.as_ref().and_then(|folder| menu.track_folder_background(hwnd, point, folder));
-            let Some(chosen) = chosen else { refresh_fence(fence); return };
-            if chosen >= APP_FIRST {
-                if let Some(id) = ids.get((chosen - APP_FIRST) as usize) {
-                    if let Some(a) = with_host(|h| h.menu_command(Some(fence), id, point)) { run_after(a); }
-                }
-                return;
-            }
-            // "新建" / "粘贴" create items in the backing folder; desktop fences claim them.
-            with_host(|h| h.expect_new_items(fence, Vec::new()));
-            let _ = menu.invoke(hwnd, chosen, Some(point), key_down(VK_SHIFT), false);
-            refresh_fence(fence);
-        }
-        None => {
-            if let Some(id) = popup(hwnd, &spec, point) {
-                if let Some(a) = with_host(|h| h.menu_command(Some(fence), &id, point)) { run_after(a); }
-            }
-        }
+    if let Some(id) = popup(hwnd, &spec, point) {
+        if let Some(a) = with_host(|h| h.menu_command(Some(fence), &id, point)) { run_after(a); }
     }
+    let _ = unsafe { PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0)) };
+}
+
+/// Appearance and behaviour switches of the tray menu: applied in place while
+/// the menu stays open. Everything else (windows, dialogs, quit) closes it.
+fn tray_toggle(id: &str) -> bool {
+    id.starts_with("theme-") || id.starts_with("opacity-") || matches!(id, "blur" | "browse-inside" | "hover-expand" | "autostart")
 }
 
 fn tray_menu(point: POINT) {
     apply_context_preferences();
     let Some((hwnd, spec)) = with_host(|h| (h.hwnd, h.tray_menu())) else { return };
     let _ = unsafe { SetForegroundWindow(hwnd) };
-    if let Some(id) = popup(hwnd, &spec, point) {
+    let dark = with_host(|host| host.menu_dark()).unwrap_or_else(zsdesk_windows::theme::system_dark_mode);
+    let chosen = crate::flyout_menu::show_persistent(hwnd, &spec, crate::flyout_menu::MenuAnchor::Point { x: point.x, y: point.y }, dark, &mut |id| {
+        if !tray_toggle(id) { return None; }
+        // Toggles never need modal follow-up work; a notice (autostart failure) does.
+        match with_host(|h| h.menu_command(None, id, point))? {
+            After::Nothing => with_host(|h| h.tray_menu()),
+            other => { run_after(other); None }
+        }
+    });
+    if let Some(id) = chosen.filter(|id| !tray_toggle(id)) {
         if let Some(a) = with_host(|h| h.menu_command(None, &id, point)) { run_after(a); }
-    }
+    }else{with_host(|host|host.restore_tray_focus());}
     let _ = unsafe { PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0)) };
+}
+
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+enum TrayAction{Open,Menu{anchor:Option<(i32,i32)>}}
+fn tray_action(version4:bool,wp:WPARAM,lp:LPARAM)->Option<TrayAction>{
+    use windows::Win32::UI::Shell::{NIN_SELECT,NINF_KEY};
+    let(icon,event)=if version4{(((lp.0 as usize>>16)&0xffff)as u32,(lp.0 as u32)&0xffff)}else{(wp.0 as u32,lp.0 as u32)};
+    if icon!=host::TRAY_ID{return None;}
+    if version4{
+        if event==NIN_SELECT||event==(NIN_SELECT|NINF_KEY){return Some(TrayAction::Open);}
+        if event==WM_CONTEXTMENU{let point=point_of(LPARAM(wp.0 as isize));return Some(TrayAction::Menu{anchor:Some((point.x,point.y))});}
+        // Version 4 can report the raw mouse up as well as semantic activation;
+        // dispatch only the semantic event so one click opens one window.
+        None
+    }else{match event{WM_LBUTTONUP=>Some(TrayAction::Open),WM_RBUTTONUP|WM_CONTEXTMENU=>Some(TrayAction::Menu{anchor:None}),_=>None}}
+}
+fn dispatch_tray(action:TrayAction){
+    #[cfg(test)]if window_message_regression::capture_tray_action(action){return;}
+    match action{
+        TrayAction::Open=>{with_host(|host|host.menu_command(None,"open-zsdesk",POINT::default()));}
+        TrayAction::Menu{anchor}=>{
+            let mut point=anchor.map(|(x,y)|POINT{x,y}).unwrap_or_default();
+            if anchor.is_none()||anchor==Some((-1,-1)){let _=unsafe{GetCursorPos(&mut point)};}
+            run_after(After::TrayMenu(point));
+        }
+    }
 }
 
 fn apply_context_preferences() {
@@ -623,16 +872,27 @@ fn apply_context_preferences() {
 }
 
 fn drag(fence: u64) {
-    let Some((hwnd, pidls, keys)) = with_host(|h| h.win_index(fence).map(|i| (h.fences[i].hwnd, h.selected_pidls(fence), h.selected_keys(fence)))).flatten() else { return };
+    let Some((hwnd, owner, pidls, keys, entries)) = with_host(|h| h.win_index(fence).map(|i| (h.fences[i].hwnd, h.hwnd, h.selected_pidls(fence), h.selected_keys(fence),
+        h.selected_entries_owned(fence)))).flatten() else { return };
     if pidls.is_empty() { return; }
     let Ok(data) = desktop::data_object(hwnd, &pidls) else { return };
     with_host(|h| h.internal_drag = Some((fence, keys)));
-    let _ = unsafe { SHDoDragDrop(Some(hwnd), &data, None, DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK) };
+    let surfaces = return_to_desktop::DesktopDropSurfaces::new(owner, fence, &data, entries);
+    let result = unsafe { SHDoDragDrop(Some(hwnd), &data, None, DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK) };
+    let returned = surfaces.completed();
+    drop(surfaces);
     with_host(|h| h.internal_drag = None);
+    if let Err(error) = result { file_action_error(owner, &error); }
+    with_host(|host| { host.sync_windows(); if returned { host.repair_layer(); } });
     refresh_fence(fence);
+    finish_deferred_quit();
 }
 
 fn open(fence: u64, index: usize, explorer: bool) {
+    open_with_verb(fence, index, explorer, None);
+}
+
+fn open_with_verb(fence: u64, index: usize, explorer: bool, verb: Option<&str>) {
     let Some((hwnd, entry, is_desktop, inside)) = with_host(|h| {
         let i = h.win_index(fence)?;
         let entry = h.fences[i].entries.get(index)?.clone();
@@ -647,7 +907,7 @@ fn open(fence: u64, index: usize, explorer: bool) {
             .iter().any(|c| entry.key.to_ascii_uppercase().contains(c));
         if hostable { with_host(|h| h.open_entry_in_explorer(&entry)); return; }
     }
-    let _ = desktop::open(hwnd, &entry.pidl, None);
+    if let Err(error) = desktop::open(hwnd, &entry.pidl, verb) { file_action_error(hwnd, &error); }
 }
 
 fn run_history(fence: u64, action: HistoryAction) {
@@ -671,20 +931,34 @@ fn run_history(fence: u64, action: HistoryAction) {
 fn run_verb(fence: u64, verb: &'static str, background: bool) {
     let Some(hwnd) = fence_hwnd(fence) else { return };
     let shift = key_down(VK_SHIFT);
-    if background {
-        let Some(folder) = with_host(|h| h.target_folder(fence)).flatten() else { return };
-        let Ok(folder) = desktop::folder_for_path(&folder) else { return };
-        let Ok(menu) = ShellMenu::for_folder_background(hwnd, &folder) else { return };
-        if menu.populate_for_invoke(false).is_ok() {
-            with_host(|h| h.expect_new_items(fence, Vec::new()));
-            let _ = menu.invoke_verb(hwnd, verb, false);
+    let result = (|| -> windows::core::Result<()> {
+        use zsdesk_windows::shell::file_transfer;
+        if background&&verb=="paste"{
+            let folder=with_host(|host|host.target_folder(fence)).flatten().ok_or_else(||windows::core::Error::from_hresult(windows::core::HRESULT(0x80070490u32 as i32)))?;
+            with_host(|host|host.expect_new_items(fence,Vec::new()));
+            return file_transfer::paste(hwnd,&folder);
         }
-    } else {
-        let pidls = with_host(|h| h.selected_pidls(fence)).unwrap_or_default();
-        if pidls.is_empty() { return; }
-        let Ok(menu) = ShellMenu::for_items(hwnd, &pidls) else { return };
-        if menu.populate_for_invoke(shift).is_ok() { let _ = menu.invoke_verb(hwnd, verb, shift); }
-    }
+        if !background&&matches!(verb,"copy"|"cut"|"delete"){
+            let pidls=with_host(|host|host.selected_pidls(fence)).unwrap_or_default();if pidls.is_empty(){return Ok(());}
+            return if verb=="delete"{file_transfer::delete_paths(hwnd,file_transfer::paths_from_pidls(&pidls)?,shift)}else{file_transfer::copy_items(hwnd,&pidls,verb=="cut")};
+        }
+        if background {
+            let folder = with_host(|h| h.target_folder(fence)).flatten()
+                .ok_or_else(|| windows::core::Error::from_hresult(windows::core::HRESULT(0x80070490u32 as i32)))?;
+            let folder = desktop::folder_for_path(&folder)?;
+            let menu = ShellMenu::for_folder_background(hwnd, &folder)?;
+            menu.populate_for_invoke(false)?;
+            with_host(|h| h.expect_new_items(fence, Vec::new()));
+            menu.invoke_verb(hwnd, verb, false)
+        } else {
+            let pidls = with_host(|h| h.selected_pidls(fence)).unwrap_or_default();
+            if pidls.is_empty() { return Ok(()); }
+            let menu = ShellMenu::for_items(hwnd, &pidls)?;
+            menu.populate_for_invoke(shift)?;
+            menu.invoke_verb(hwnd, verb, shift)
+        }
+    })();
+    if let Err(error) = result { file_action_error(hwnd, &error); }
     refresh_fence(fence);
 }
 
@@ -711,7 +985,9 @@ fn insert_item(hmenu: HMENU, position: &mut u32, item: &MenuItemSpec, ids: &mut 
             let mut inner = 0u32;
             for child in &menu.items { insert_item(sub, &mut inner, child, ids); }
             let flags = MF_BYPOSITION | MF_POPUP | if *enabled { MF_ENABLED } else { MF_GRAYED };
-            unsafe { let _ = InsertMenuW(hmenu, *position, flags, sub.0 as usize, PCWSTR(wide(label).as_ptr())); }
+            if unsafe { InsertMenuW(hmenu, *position, flags, sub.0 as usize, PCWSTR(wide(label).as_ptr())) }.is_err() {
+                let _ = unsafe { DestroyMenu(sub) };
+            }
             *position += 1;
         }
         MenuItemSpec::Separator => {
@@ -722,15 +998,10 @@ fn insert_item(hmenu: HMENU, position: &mut u32, item: &MenuItemSpec, ids: &mut 
     }
 }
 
-/// Plain popup for a ZSUI menu spec.
+/// Fence, tab and tray menus as Windows 11 style flyouts at `point`.
 fn popup(owner: HWND, spec: &MenuSpec, point: POINT) -> Option<String> {
-    let menu = unsafe { CreatePopupMenu() }.ok()?;
-    let ids = { let mut ids = Vec::new(); let mut p = 0; for item in &spec.items { insert_item(menu, &mut p, item, &mut ids); } ids };
-    let _ = unsafe { SetForegroundWindow(owner) };
-    let chosen = unsafe { TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, point.x, point.y, None, owner, None) }.0 as u32;
-    let _ = unsafe { PostMessageW(Some(owner), WM_NULL, WPARAM(0), LPARAM(0)) };
-    let _ = unsafe { DestroyMenu(menu) };
-    chosen.checked_sub(APP_FIRST).and_then(|i| ids.get(i as usize)).cloned()
+    let dark = with_host(|host| host.menu_dark()).unwrap_or_else(zsdesk_windows::theme::system_dark_mode);
+    crate::flyout_menu::show(owner, spec, crate::flyout_menu::MenuAnchor::Point { x: point.x, y: point.y }, dark)
 }
 
 // ---- drag and drop target ---------------------------------------------------------

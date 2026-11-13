@@ -203,7 +203,7 @@ pub fn enumerate_folder(path: &Path) -> Result<Vec<ShellEntry>> {
 /// Resolves a saved member even when the live desktop view is hidden or omits it.
 pub fn entry_from_parsing_name(key: &str) -> Option<ShellEntry> {
     let location = if key.starts_with("::{") || key.starts_with("shell:") {
-        zsdesk_core::model::explorer::ShellLocation::Shell { parsing_name: key.into(), title: String::new() }
+        zsdesk_core::model::explorer::ShellLocation::Shell { pidl:None, parsing_name: key.into(), title: String::new() }
     } else { zsdesk_core::model::explorer::ShellLocation::Path(PathBuf::from(key)) };
     let absolute = pidl::location_pidl(&location)?;
     let mut child: *mut ITEMIDLIST = std::ptr::null_mut();
@@ -334,24 +334,90 @@ pub fn pick_folder(owner: HWND, title: &str) -> Option<PathBuf> {
 }
 
 const RUN_KEY: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
-const RUN_VALUE: PCWSTR = w!("ZSDesk.Desktop");
 
-pub fn autostart_command() -> Option<String> {
-    let mut buffer = vec![0u16; 2048];
-    let mut size = (buffer.len() * 2) as u32;
-    unsafe { RegGetValueW(HKEY_CURRENT_USER, RUN_KEY, RUN_VALUE, RRF_RT_REG_SZ, None, Some(buffer.as_mut_ptr().cast()), Some(&mut size)) }.ok().ok()?;
-    let end = buffer.iter().position(|&c| c == 0).unwrap_or(buffer.len());
-    Some(String::from_utf16_lossy(&buffer[..end]))
+/// The original edition retains its established registry value name.
+pub const fn autostart_value(themed:bool)->&'static str {
+    if themed {"ZSDesk.Theme.Desktop"} else {"ZSDesk.Desktop"}
 }
 
-/// Adds or removes the per-user autostart entry for the desktop fences host.
-pub fn set_autostart(command: Option<&str>) -> bool {
-    match command {
-        Some(command) => {
-            let data: Vec<u16> = command.encode_utf16().chain(Some(0)).collect();
-            unsafe { RegSetKeyValueW(HKEY_CURRENT_USER, RUN_KEY, RUN_VALUE, REG_SZ.0, Some(data.as_ptr().cast()), (data.len() * 2) as u32) }.is_ok()
+pub fn autostart_command(value_name:&str) -> Result<Option<String>> {
+    let name:Vec<u16>=value_name.encode_utf16().chain(Some(0)).collect();
+    let mut size=0;
+    let status=unsafe {RegGetValueW(HKEY_CURRENT_USER,RUN_KEY,PCWSTR(name.as_ptr()),RRF_RT_REG_SZ,None,None,Some(&mut size))};
+    if status.0==2 {return Ok(None);}
+    status.ok()?;
+    if !(2..=65_536).contains(&size) || size%2!=0 {
+        return Err(windows::core::Error::new(windows::core::HRESULT(0x8007000Du32 as i32),"登录启动项格式无效"));
+    }
+    let mut buffer=vec![0u16;size as usize/2+1];
+    unsafe {RegGetValueW(HKEY_CURRENT_USER,RUN_KEY,PCWSTR(name.as_ptr()),RRF_RT_REG_SZ,None,
+        Some(buffer.as_mut_ptr().cast()),Some(&mut size))}.ok()?;
+    let end = buffer.iter().position(|&c| c == 0).unwrap_or(buffer.len());
+    Ok(Some(String::from_utf16_lossy(&buffer[..end])))
+}
+
+/// Commands include both the absolute executable and explicit profile directory.
+/// Extra arguments or another executable/profile never count as owned state.
+pub fn autostart_owned(current:&str,expected:&str)->bool {
+    !expected.trim().is_empty() && current.trim().eq_ignore_ascii_case(expected.trim())
+}
+
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+enum AutostartChange { Unchanged, Write, Delete }
+fn autostart_change(current:Option<&str>,expected:&str,enabled:bool)->Result<AutostartChange> {
+    if expected.trim().is_empty() || current.is_some_and(|value|!autostart_owned(value,expected)) {
+        return Err(windows::core::Error::new(windows::core::HRESULT(0x800700B7u32 as i32),"登录启动项属于另一安装或配置，现有设置已保留"));
+    }
+    Ok(match (current.is_some(),enabled) {
+        (true,false)=>AutostartChange::Delete,(false,true)=>AutostartChange::Write,_=>AutostartChange::Unchanged,
+    })
+}
+
+/// Changes only an absent entry or the exact command owned by this installation
+/// and profile. Conflicting entries are neither replaced nor removed.
+pub fn set_autostart(value_name:&str,expected:&str,enabled:bool)->Result<()> {
+    let current=autostart_command(value_name)?;
+    let change=autostart_change(current.as_deref(),expected,enabled)?;
+    if change==AutostartChange::Unchanged {return Ok(());}
+    // A second read prevents acting on an entry changed while the menu was open.
+    if autostart_command(value_name)?!=current {
+        return Err(windows::core::Error::new(windows::core::HRESULT(0x800700AAu32 as i32),"登录启动项已变化，请重新打开设置"));
+    }
+    let name:Vec<u16>=value_name.encode_utf16().chain(Some(0)).collect();
+    match change {
+        AutostartChange::Write => {
+            let data: Vec<u16> = expected.encode_utf16().chain(Some(0)).collect();
+            unsafe { RegSetKeyValueW(HKEY_CURRENT_USER, RUN_KEY, PCWSTR(name.as_ptr()), REG_SZ.0, Some(data.as_ptr().cast()), (data.len() * 2) as u32) }.ok()
         }
-        None => unsafe { RegDeleteKeyValueW(HKEY_CURRENT_USER, RUN_KEY, RUN_VALUE) }.is_ok(),
+        AutostartChange::Delete => unsafe { RegDeleteKeyValueW(HKEY_CURRENT_USER, RUN_KEY, PCWSTR(name.as_ptr())) }.ok(),
+        AutostartChange::Unchanged=>Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod autostart_tests {
+    use super::*;
+    const OWN:&str=r#""C:\Apps\ZSDesk\ZSDesk.exe" --desktop --profile-dir "C:\Profiles\Main""#;
+    #[test]
+    fn themed_and_original_entries_are_distinct_and_original_name_is_stable() {
+        assert_eq!(autostart_value(false),"ZSDesk.Desktop");
+        assert_eq!(autostart_value(true),"ZSDesk.Theme.Desktop");
+        assert_ne!(autostart_value(false),autostart_value(true));
+    }
+    #[test]
+    fn only_the_exact_executable_and_profile_can_be_changed() {
+        assert_eq!(autostart_change(None,OWN,true).unwrap(),AutostartChange::Write);
+        assert_eq!(autostart_change(Some(OWN),OWN,true).unwrap(),AutostartChange::Unchanged);
+        assert_eq!(autostart_change(Some(OWN),OWN,false).unwrap(),AutostartChange::Delete);
+        assert_eq!(autostart_change(None,OWN,false).unwrap(),AutostartChange::Unchanged);
+        assert!(autostart_owned(&OWN.to_ascii_lowercase(),OWN));
+        for foreign in [OWN.replace("Main","Other"),OWN.replace("ZSDesk.exe","Other.exe"),
+            format!("{OWN} --other"),r#""C:\Apps\ZSDesk\ZSDesk.exe" --desktop"#.into()] {
+            assert!(!autostart_owned(&foreign,OWN));
+            assert!(autostart_change(Some(&foreign),OWN,true).is_err());
+            assert!(autostart_change(Some(&foreign),OWN,false).is_err());
+        }
+        assert!(!autostart_owned("",""));
     }
 }
 

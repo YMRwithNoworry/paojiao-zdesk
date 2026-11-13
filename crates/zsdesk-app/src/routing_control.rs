@@ -119,6 +119,7 @@ struct Discovery {
 enum Action {
     Discover,
     Add(PathBuf),
+    AddWithCaller(PathBuf, PathBuf),
     Apply,
     Disable,
     Refresh,
@@ -332,7 +333,8 @@ fn control(exe: &Path, arg: &str) -> Result<()> {
         match result.status.code() {
             Some(5) => "应用权限不匹配".to_string(),
             Some(50) => "应用接口不兼容".into(),
-            Some(183) => "应用中已加载另一份转发组件，请重启该应用后重试".into(),
+            Some(183) => "应用中已加载另一份转发组件，请关闭该应用、应用接管设置后再重新打开".into(),
+            Some(1467) => "应用中仍有旧转发组件，原有转发保持不变；请关闭对应应用、应用接管设置后再重新打开".into(),
             Some(1306) => "程序已变化，请重新检查绑定".into(),
             _ => format!(
                 "组件执行失败：{}",
@@ -393,7 +395,7 @@ fn legacy_default_selection(value: &Inspection) -> bool {
 }
 fn add(settings: &mut Settings, value: Inspection, selected: bool) -> Result<()> {
     ensure!(
-        value.supported && matches!(value.profile, 1..=3),
+        value.supported && matches!(value.profile, 1..=4),
         "应用不兼容"
     );
     ensure!(
@@ -437,6 +439,21 @@ pub fn request_discovery(profile: &Path, window: HWND) -> Result<()> {
 }
 pub fn request_add(profile: &Path, path: PathBuf, window: HWND) -> Result<()> {
     enqueue(profile, Action::Add(path), window)
+}
+/// Pins an explicitly chosen helper DLL in the selected application's directory.
+pub fn request_add_with_caller(profile: &Path, executable: PathBuf, caller_module: PathBuf, window: HWND) -> Result<()> {
+    enqueue(profile, Action::AddWithCaller(executable, caller_module), window)
+}
+pub fn diagnostic_reason(code: u32) -> (&'static str, bool) {
+    (match code {
+        0 => "暂无拒绝记录", 1 => "调用来自尚未绑定的辅助模块", 2 => "此打开方式保持系统处理",
+        3 => "隐藏、最小化或特殊显示方式保持系统处理", 4 => "目标不是已核验的系统 Explorer",
+        5 => "参数不是受支持的文件夹或定位请求", 6 => "特殊启动标志保持原调用", 7 => "特殊启动信息保持原调用",
+        8 => "ANSI 参数无法无损转换", 9 => "文件或目录当前不可用", 10 => "未找到已核验的转发服务",
+        11 => "进程访问被拒绝", 12 => "访问较高权限进程被拒绝", 13 => "请求结果超时，未重复发送",
+        14 => "请求参数无效", 15 => "转发器文件身份已变化", 16 => "无法创建转发进程",
+        17 | 1467 => "请关闭对应应用、应用接管设置后再重新打开，原有转发保持不变", _ => "当前入口未提供具体诊断",
+    }, matches!(code, 17 | 1467))
 }
 pub fn request_apply(profile: &Path, window: HWND) -> Result<()> {
     enqueue(profile, Action::Apply, window)
@@ -594,6 +611,12 @@ fn apply_request(request: &Request) -> Result<String> {
             add(&mut settings, inspect(&bundle, path, None)?, true)?;
             save_draft(&request.profile, &settings)?;
             Ok("应用已加入选择，点击“一键启用所选应用”生效".into())
+        }
+        Action::AddWithCaller(path, caller) => {
+            let bundle = bundled()?;
+            add(&mut settings, inspect(&bundle, path, Some(caller))?, true)?;
+            save_draft(&request.profile, &settings)?;
+            Ok("辅助模块已加入草稿，应用后仅允许该模块和已核验的主程序转发文件导航".into())
         }
         Action::Apply => apply_settings(&request.profile, settings),
         Action::Disable => {
@@ -770,6 +793,43 @@ fn require_selected_applications(settings: &Settings) -> Result<()> {
             "请先勾选需要接管的应用");
     Ok(())
 }
+#[derive(Deserialize)]
+struct RestartProcess { pid: u32, application: String }
+#[derive(Deserialize)]
+struct UpgradeCheck { schema: String, restart_required: bool, processes: Vec<RestartProcess> }
+struct UpgradeInput { path: PathBuf, bytes: Vec<u8> }
+impl Drop for UpgradeInput {
+    fn drop(&mut self) {
+        if fs::read(&self.path).ok().as_deref() == Some(self.bytes.as_slice()) { let _ = fs::remove_file(&self.path); }
+    }
+}
+fn preflight_component_replacement(profile: &Path, bundle: &Bundle, settings: &Settings, directory: &Path) -> Result<()> {
+    // Include selected validated bindings; installed bindings are independently
+    // read by the controller so a newly deselected running app is also retained.
+    let applications: Vec<_> = settings.applications.iter().filter(|app| app.enabled && valid_hash(&app.executable_sha256) && valid_hash(&app.caller_sha256)).collect();
+    let mut ini = format!("[Clients]\r\nCount={}\r\n", applications.len());
+    for (index, app) in applications.into_iter().enumerate() {
+        ini.push_str(&format!("\r\n[Client.{index}]\r\nId={}\r\nProfile={}\r\nEnabled=1\r\nExecutable={}\r\nExecutableSHA256={}\r\nCallerModule={}\r\nCallerSHA256={}\r\n",
+            app.id, app.profile, app.executable.display(), app.executable_sha256, app.caller_module.display(), app.caller_sha256));
+    }
+    let path = profile.with_file_name(format!("routing-upgrade-{}.pending.ini", std::process::id()));
+    let mut bytes = vec![255, 254];for value in ini.encode_utf16() { bytes.extend(value.to_le_bytes()); }
+    let mut file = fs::OpenOptions::new().write(true).create_new(true).open(&path).context("无法创建组件预检查输入")?;
+    let input = UpgradeInput { path, bytes };
+    file.write_all(&input.bytes)?;file.sync_all()?;drop(file);
+    let controller = component(&bundle.root, &bundle.manifest.controller)?;
+    let previous = directory.join("clients.ini");
+    let mut args = vec![std::ffi::OsStr::new("--upgrade-check"), input.path.as_os_str()];
+    if previous.is_file() { args.push(previous.as_os_str()); }
+    let result = output(&controller, &args)?;
+    ensure!(result.status.success() || result.status.code() == Some(1467), "无法核验已加载的组件，当前接管未更改：{}", String::from_utf8_lossy(&result.stdout).trim());
+    let check: UpgradeCheck = json_output(&result)?;
+    ensure!(check.schema == "ZSDesk.RoutingUpgrade.v1", "组件预检查协议不兼容");
+    let names = check.processes.iter().map(|process| format!("{}（PID {}）", process.application, process.pid)).collect::<Vec<_>>().join("、");
+    ensure!(!check.restart_required, "请先关闭 {names}，应用新版接管后再重新打开；当前转发服务和绑定保持不变");
+    ensure!(result.status.success(), "无法核验已加载的转发组件，未更改当前接管");
+    Ok(())
+}
 fn apply_settings(profile: &Path, mut settings: Settings) -> Result<String> {
     validate_settings(&settings)?;
     require_selected_applications(&settings)?;
@@ -803,13 +863,10 @@ fn apply_settings(profile: &Path, mut settings: Settings) -> Result<String> {
     fs::create_dir_all(&directory)?;
     let controller = directory.join(&bundle.manifest.controller.file);
     let adapter = directory.join(&bundle.manifest.adapter.file);
-    if adapter.exists() && !digest(&adapter)?.eq_ignore_ascii_case(&bundle.manifest.adapter.sha256)
-    {
-        let _probe = fs::OpenOptions::new()
-            .write(true)
-            .open(&adapter)
-            .context("组件仍被应用使用，请重启所选应用后重试")?;
-    }
+    let replacing = settings.legacy
+        || !adapter.is_file()
+        || !digest(&adapter)?.eq_ignore_ascii_case(&bundle.manifest.adapter.sha256);
+    if old.is_some() && replacing { preflight_component_replacement(profile, &bundle, &settings, &directory)?; }
     let old_ini = read_ini(&directory.join("package.ini"))?;
     let was_running = old.as_ref().is_some_and(|p| service_running(p));
     let old_start = settings

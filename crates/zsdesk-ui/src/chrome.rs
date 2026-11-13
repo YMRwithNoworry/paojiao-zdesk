@@ -79,6 +79,7 @@ const COMMAND_GROUPS: &[&[CommandId]] = &[
 /// Inputs the host measures or owns.
 #[derive(Clone, Debug)]
 pub struct ChromeInput<'a> {
+    pub tab_placement:zsdesk_core::model::explorer::TabPlacement,
     pub width: i32,
     pub height: i32,
     pub dpi: u32,
@@ -91,6 +92,8 @@ pub struct ChromeInput<'a> {
     pub show_tree: bool,
     pub tree_width: i32,
     pub show_bookmarks: bool,
+    /// Search is active; show the close action beside the fixed native edit.
+    pub search_panel_open: bool,
     pub command_bar: &'a CommandBarPreferences,
     /// Own status bar; the hosted Shell view normally draws the native one.
     pub status_bar: bool,
@@ -101,10 +104,107 @@ pub struct ChromeInput<'a> {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct TabSlot { pub index: usize, pub rect: Rect, pub close: Rect, pub show_close: bool }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SearchPanelHit {
+    Category(u8), Scope, Sort, Previous, Next, Clear, Close, Submit, IndexSettings, Retry,
+}
+
+/// Search action geometry shared by native edit placement and hit testing.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SearchPanelLayout {
+    pub card: Rect,
+    pub title: Rect,
+    pub query: Rect,
+    pub submit: Rect,
+    pub clear: Rect,
+    pub close: Rect,
+    pub scope: Rect,
+    pub categories: Vec<Rect>,
+    pub status: Rect,
+    pub sort: Rect,
+    pub previous: Rect,
+    pub page: Rect,
+    pub next: Rect,
+    pub index_settings: Rect,
+    pub retry: Rect,
+}
+
+impl SearchPanelLayout {
+    fn new(width: i32, top: i32, dpi: u32) -> Self {
+        let s = |v| scale(v, dpi);
+        let margin = s(10).min(width / 2);
+        let x = margin + s(12);
+        let right = (width - margin - s(12)).max(x);
+        let inner = right - x;
+        let mut y = top + s(8) + s(12);
+        let mut panel = Self::default();
+        panel.close = Rect::clamped(right - s(28), y, s(28), s(26));
+        panel.title = Rect::clamped(x, y, s(98).min(inner), s(26));
+        panel.scope = Rect::clamped(panel.title.right() + s(8), y,
+            panel.close.x - s(8) - panel.title.right() - s(8), s(26));
+        y += s(32);
+        panel.clear = Rect::clamped(right - s(30), y + s(4), s(30), s(30));
+        panel.query = Rect::clamped(x, y, panel.clear.x - s(8) - x, s(38));
+        panel.submit = Rect::clamped(panel.query.right() - s(32), y + s(3), s(30), s(32));
+        y += s(48);
+        let mut cx = x;
+        for dip_width in [52, 68, 56, 56, 56, 56] {
+            let chip_width = s(dip_width).min(inner);
+            if cx > x && cx + chip_width > right { cx = x; y += s(34); }
+            panel.categories.push(Rect::clamped(cx, y, chip_width, s(28)));
+            cx += chip_width + s(6);
+        }
+        y += s(34);
+        panel.retry = Rect::clamped(right - s(56), y, s(56), s(22));
+        panel.status = Rect::clamped(x, y, panel.retry.x - s(8) - x, s(22));
+        y += s(26);
+        // The fixed-width controls fit the 440 DIP content region beside side tabs.
+        panel.sort = Rect::clamped(x, y, s(112).min(inner), s(28));
+        panel.index_settings = Rect::clamped(panel.sort.right() + s(6), y, s(88), s(28));
+        panel.next = Rect::clamped(right - s(28), y, s(28), s(28));
+        panel.page = Rect::clamped(panel.next.x - s(4) - s(68), y, s(68), s(28));
+        panel.previous = Rect::clamped(panel.page.x - s(4) - s(28), y, s(28), s(28));
+        if panel.index_settings.right() + s(10) > panel.previous.x {
+            y += s(34);
+            panel.previous.y = y;
+            panel.page.y = y;
+            panel.next.y = y;
+        }
+        panel.card = Rect::clamped(margin, top + s(8), width - margin * 2,
+            y + s(28) + s(12) - (top + s(8)));
+        panel
+    }
+
+    fn translate_x(&mut self, dx: i32) {
+        for rect in [&mut self.card, &mut self.title, &mut self.query, &mut self.submit,
+            &mut self.clear, &mut self.close, &mut self.scope, &mut self.status, &mut self.sort,
+            &mut self.previous, &mut self.page, &mut self.next, &mut self.index_settings, &mut self.retry] {
+            rect.x += dx;
+        }
+        for rect in &mut self.categories { rect.x += dx; }
+    }
+
+    pub fn hit(&self, x: i32, y: i32) -> Hit {
+        if !self.card.contains(x, y) { return Hit::None; }
+        for (rect, action) in [(self.submit, SearchPanelHit::Submit), (self.clear, SearchPanelHit::Clear),
+            (self.close, SearchPanelHit::Close), (self.scope, SearchPanelHit::Scope),
+            (self.sort, SearchPanelHit::Sort), (self.previous, SearchPanelHit::Previous),
+            (self.next, SearchPanelHit::Next), (self.index_settings, SearchPanelHit::IndexSettings),
+            (self.retry, SearchPanelHit::Retry)] {
+            if rect.contains(x, y) { return Hit::SearchPanel(action); }
+        }
+        if self.query.contains(x, y) { return Hit::Search; }
+        self.categories.iter().position(|r| r.contains(x, y))
+            .map_or(Hit::None, |index| Hit::SearchPanel(SearchPanelHit::Category(index as u8)))
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ChromeLayout {
     pub dpi: u32,
     pub strip: Rect,
+    pub tab_panel: Rect,
+    pub vertical_tabs: bool,
     pub tabs: Vec<TabSlot>,
     pub new_tab: Rect,
     pub tab_list: Rect,
@@ -116,6 +216,7 @@ pub struct ChromeLayout {
     pub refresh: Rect,
     pub address: Rect,
     pub search: Rect,
+    pub search_panel: SearchPanelLayout,
     pub command_row: Rect,
     pub commands: Vec<(CommandId, Rect)>,
     /// Icon-only command buttons when their normal labels do not fit one row.
@@ -127,9 +228,13 @@ pub struct ChromeLayout {
     pub tree: Rect,
     pub splitter: Rect,
     pub browser: Rect,
+    pub other_browser: Rect,
+    pub pane_splitter: Rect,
+    pub pane_headers: [Rect; 2],
     pub status: Rect,
     pub status_details: Rect,
     pub status_tiles: Rect,
+    pub status_dual_pane: Rect,
     /// Bottom of the top chrome (start of the content area).
     pub top: i32,
 }
@@ -150,13 +255,17 @@ pub enum Hit {
     Refresh,
     Address,
     Search,
+    SearchPanel(SearchPanelHit),
     Command(CommandId),
     Bookmark(usize),
     BookmarkOverflow,
     BookmarksBar,
     Splitter,
+    PaneSplitter,
+    PaneHeader(usize),
     StatusDetails,
     StatusTiles,
+    StatusDualPane,
     Status,
 }
 
@@ -206,6 +315,10 @@ impl ChromeLayout {
             layout.new_tab = Rect::clamped(x + s(4), tab_y, button, tab_h);
         }
 
+        let full_width=width;
+        let panel_width=if input.tab_placement==zsdesk_core::model::explorer::TabPlacement::Top{0}else{s(210).min((width-s(440)).max(s(140))).min(width)};
+        let content_offset=if input.tab_placement==zsdesk_core::model::explorer::TabPlacement::Left{panel_width}else{0};
+        let width=(width-panel_width).max(0);
         // Bookmarks bar, directly under the tabs.
         let mut nav_y = layout.strip.bottom();
         if input.show_bookmarks {
@@ -240,7 +353,8 @@ impl ChromeLayout {
         let field_y = nav_y + (s(NAV_H) - field_h) / 2;
         layout.search = Rect::clamped(width - s(12) - search_w, field_y, search_w, field_h);
         let address_x = nx + s(6);
-        layout.address = Rect::clamped(address_x, field_y, layout.search.x - s(8) - address_x, field_h);
+        let address_right = layout.search.x - s(8);
+        layout.address = Rect::clamped(address_x, field_y, address_right - address_x, field_h);
 
         // Command bar: compact labels first, then wrap without losing actions.
         let cmd_y = layout.nav_row.bottom();
@@ -291,6 +405,14 @@ impl ChromeLayout {
         let command_height = if layout.commands.is_empty() { 0 } else { (row + 1) * s(COMMAND_H) };
         layout.command_row = Rect::clamped(0, cmd_y, width, command_height);
         layout.top = layout.command_row.bottom().min(height);
+        // The native edit stays beside the address bar while results replace
+        // the current folder view. Search never inserts a second input panel.
+        layout.search_panel.query = layout.search;
+        layout.search_panel.scope = layout.search;
+        layout.search_panel.sort = layout.command_rect(CommandId::Sort).unwrap_or(layout.search);
+        if input.search_panel_open {
+            layout.search_panel.close = Rect::clamped(layout.search.right()-s(34),field_y,s(30),field_h);
+        }
 
         // Status bar and content.
         let status_h = if input.status_bar { s(STATUS_H) } else { 0 };
@@ -299,6 +421,7 @@ impl ChromeLayout {
         let toggle = Rect::clamped(0, status_y + (status_h - s(22)) / 2, s(28), s(22));
         layout.status_tiles = Rect { x: width - s(8) - toggle.width, ..toggle };
         layout.status_details = Rect { x: layout.status_tiles.x - s(2) - toggle.width, ..toggle };
+        layout.status_dual_pane = Rect { x: layout.status_details.x - s(2) - toggle.width, ..toggle };
         let content_h = (status_y - layout.top).max(0);
         if input.show_tree && width > s(MIN_TREE_W) * 2 {
             let tree_w = input.tree_width.clamp(s(MIN_TREE_W), (width / 2).max(s(MIN_TREE_W)));
@@ -309,22 +432,47 @@ impl ChromeLayout {
         } else {
             layout.browser = Rect::clamped(0, layout.top, width, content_h);
         }
+        if panel_width>0{
+            layout.vertical_tabs=true;
+            let x=if input.tab_placement==zsdesk_core::model::explorer::TabPlacement::Left{0}else{full_width-panel_width};
+            layout.tab_panel=Rect::clamped(x,layout.strip.bottom(),panel_width,height-layout.strip.bottom());
+            layout.tabs.clear();
+            let row=s(36);let top=layout.tab_panel.y+s(6);
+            let bottom=(layout.tab_panel.bottom()-row-s(10)).max(top);
+            let visible=((bottom-top)/row).max(0)as usize;
+            let first=first_visible(input.tab_count,input.active_tab,visible);
+            for (position,index) in (first..(first+visible).min(input.tab_count)).enumerate(){
+                let rect=Rect::clamped(x+s(6),top+position as i32*row,panel_width-s(12),row-s(2));
+                let close=Rect::clamped(rect.right()-s(28),rect.y+(rect.height-s(24))/2,s(24),s(24));
+                layout.tabs.push(TabSlot{index,rect,close,show_close:true});
+            }
+            layout.new_tab=Rect::clamped(x+s(6),(layout.tab_panel.bottom()-row-s(4)).max(layout.tab_panel.y),panel_width-s(12),row);
+            for rect in [&mut layout.nav_row,&mut layout.back,&mut layout.forward,&mut layout.up,&mut layout.refresh,&mut layout.address,&mut layout.search,
+                &mut layout.command_row,&mut layout.bookmarks_row,&mut layout.bookmark_overflow,&mut layout.tree,&mut layout.splitter,&mut layout.browser,
+                &mut layout.status,&mut layout.status_details,&mut layout.status_tiles,&mut layout.status_dual_pane]{rect.x+=content_offset;}
+            for (_,rect) in &mut layout.commands{rect.x+=content_offset;}
+            for rect in layout.bookmarks.iter_mut().chain(layout.separators.iter_mut()){rect.x+=content_offset;}
+            layout.search_panel.translate_x(content_offset);
+        }
         layout
     }
 
     /// Classifies a client point.
     pub fn hit(&self, x: i32, y: i32) -> Hit {
-        if self.strip.contains(x, y) {
+        if self.strip.contains(x, y)||self.tab_panel.contains(x,y) {
             for slot in &self.tabs {
-                if slot.show_close && slot.close.contains(x, y) { return Hit::TabClose(slot.index); }
-                if slot.rect.contains(x, y) { return Hit::Tab(slot.index); }
+                if slot.rect.contains(x, y) {
+                    if slot.show_close && slot.close.contains(x, y) { return Hit::TabClose(slot.index); }
+                    return Hit::Tab(slot.index);
+                }
             }
             if self.new_tab.contains(x, y) { return Hit::NewTab; }
             if self.tab_list.contains(x, y) { return Hit::TabList; }
             if self.app_menu.contains(x, y) { return Hit::AppMenu; }
-            return Hit::Caption;
+            return if self.strip.contains(x,y){Hit::Caption}else{Hit::None};
         }
         if self.nav_row.contains(x, y) {
+            if self.search_panel.close.contains(x,y) { return Hit::SearchPanel(SearchPanelHit::Close); }
             for (rect, hit) in [(self.back, Hit::Back), (self.forward, Hit::Forward), (self.up, Hit::Up),
                 (self.refresh, Hit::Refresh), (self.address, Hit::Address), (self.search, Hit::Search)] {
                 if rect.contains(x, y) { return hit; }
@@ -334,15 +482,21 @@ impl ChromeLayout {
         if self.command_row.contains(x, y) {
             return self.commands.iter().find(|(_, r)| r.contains(x, y)).map_or(Hit::None, |(id, _)| Hit::Command(*id));
         }
+        if self.search_panel.card.contains(x, y) { return self.search_panel.hit(x, y); }
         if self.bookmarks_row.contains(x, y) {
             if let Some(i) = self.bookmarks.iter().position(|r| r.contains(x, y)) { return Hit::Bookmark(i); }
             if self.bookmark_overflow.contains(x, y) { return Hit::BookmarkOverflow; }
             return Hit::BookmarksBar;
         }
         if self.splitter.contains(x, y) { return Hit::Splitter; }
+        if self.pane_splitter.contains(x, y) { return Hit::PaneSplitter; }
+        for (index, rect) in self.pane_headers.iter().enumerate() {
+            if rect.contains(x, y) { return Hit::PaneHeader(index); }
+        }
         if !self.status.is_empty() && self.status.contains(x, y) {
             if self.status_details.contains(x, y) { return Hit::StatusDetails; }
             if self.status_tiles.contains(x, y) { return Hit::StatusTiles; }
+            if self.status_dual_pane.contains(x, y) { return Hit::StatusDualPane; }
             return Hit::Status;
         }
         Hit::None
@@ -350,6 +504,35 @@ impl ChromeLayout {
 
     pub fn command_rect(&self, id: CommandId) -> Option<Rect> {
         self.commands.iter().find(|(c, _)| *c == id).map(|(_, r)| *r)
+    }
+
+    /// Keep visible tabs stationary when selecting or reordering a tab that is
+    /// already on screen. Scroll only far enough to reveal an off-screen tab.
+    pub fn retain_tab_viewport(&mut self, previous: &Self, count: usize, active: usize) {
+        if self.vertical_tabs != previous.vertical_tabs || self.tabs.is_empty() { return; }
+        if self.vertical_tabs && (self.tab_panel.x == 0) != (previous.tab_panel.x == 0) { return; }
+        let Some(first) = previous.tabs.first().map(|tab| tab.index) else { return };
+        let visible = self.tabs.len();
+        let active = active.min(count.saturating_sub(1));
+        let mut first = first.min(count.saturating_sub(visible));
+        if active < first { first = active; }
+        else if active >= first + visible { first = active + 1 - visible; }
+        for (offset, slot) in self.tabs.iter_mut().enumerate() {
+            slot.index = first + offset;
+            slot.show_close = self.vertical_tabs || slot.rect.width >= scale(96, self.dpi) || slot.index == active;
+        }
+    }
+
+    /// A drag may move along the tab axis, but must not reorder tabs while the
+    /// pointer is in the address bar, folder tree or opposite edge of the window.
+    pub fn tab_drag_target(&self, x: i32, y: i32) -> Option<usize> {
+        if self.vertical_tabs {
+            if x < self.tab_panel.x || x >= self.tab_panel.right() { return None; }
+            self.tabs.iter().min_by_key(|tab| (i64::from(y) - i64::from(tab.rect.y + tab.rect.height / 2)).abs()).map(|tab| tab.index)
+        } else {
+            if y < self.strip.y || y >= self.strip.bottom() { return None; }
+            self.tabs.iter().min_by_key(|tab| (i64::from(x) - i64::from(tab.rect.x + tab.rect.width / 2)).abs()).map(|tab| tab.index)
+        }
     }
 
     /// Tab index whose slot center is nearest to `x` (used while dragging tabs).
@@ -386,9 +569,41 @@ mod tests {
     static DEFAULT_COMMAND_BAR: CommandBarPreferences = CommandBarPreferences { visible: true, hidden_items: Vec::new() };
 
     fn input(width: i32, tabs: usize, active: usize, dpi: u32) -> ChromeInput<'static> {
-        ChromeInput { width, height: 800, dpi, caption_width: scale(138, dpi), caption_button: None,
+        ChromeInput { tab_placement:zsdesk_core::model::explorer::TabPlacement::Top, width, height: 800, dpi, caption_width: scale(138, dpi), caption_button: None,
             tab_count: tabs, active_tab: active, show_tree: true, tree_width: scale(220, dpi), show_bookmarks: true,
-            command_bar: &DEFAULT_COMMAND_BAR, status_bar: true, bookmark_widths: &[] }
+            command_bar: &DEFAULT_COMMAND_BAR, status_bar: true, bookmark_widths: &[], search_panel_open: false }
+    }
+
+    #[test]
+    fn search_preserves_address_field_and_result_geometry() {
+        use zsdesk_core::model::explorer::TabPlacement;
+        for dpi in [96, 144, 192] { for width in [640, 960, 1280] {
+            for placement in [TabPlacement::Top, TabPlacement::Left, TabPlacement::Right] {
+                let layout = ChromeLayout::new(&ChromeInput { search_panel_open: true, tab_placement: placement,
+                    height: scale(900, dpi), ..input(scale(width, dpi), 6, 2, dpi) });
+                let idle=ChromeLayout::new(&ChromeInput { tab_placement:placement,
+                    height:scale(900,dpi),..input(scale(width,dpi),6,2,dpi) });
+                assert_eq!(layout.search,idle.search);
+                assert_eq!(layout.address,idle.address);
+                assert_eq!(layout.browser,idle.browser);
+                assert_eq!(layout.tree,idle.tree);
+                assert!(layout.search_panel.card.is_empty());
+                assert!(layout.address.right()<layout.search.x);
+                assert_eq!(layout.hit(layout.search.x+1,layout.search.y+1),Hit::Search);
+                let close=layout.search_panel.close;
+                assert!(!close.is_empty());
+                assert_eq!(layout.hit(close.x+1,close.y+1),Hit::SearchPanel(SearchPanelHit::Close));
+            }
+        }}
+    }
+
+    #[test]
+    fn expanded_search_wraps_filters_in_a_constrained_content_region() {
+        let panel = SearchPanelLayout::new(340, 0, 96);
+        assert_eq!(panel.categories.len(), 6);
+        assert!(panel.categories.last().unwrap().y > panel.categories[0].y);
+        assert!(panel.previous.y > panel.index_settings.y);
+        assert!(panel.categories.iter().all(|chip| chip.x >= panel.card.x && chip.right() <= panel.card.right()));
     }
 
     #[test]
@@ -408,6 +623,42 @@ mod tests {
             assert!(l.address.right() < l.search.x);
             assert!(l.tabs.iter().all(|t| t.rect.right() <= l.new_tab.x));
             assert!(l.app_menu.right() <= 1400 - scale(138, dpi));
+        }
+    }
+
+    #[test]
+    fn side_tabs_keep_active_tab_and_content_in_separate_regions(){
+        use zsdesk_core::model::explorer::TabPlacement;
+        for dpi in [96,120,144,192]{for placement in [TabPlacement::Left,TabPlacement::Right]{
+            let l=ChromeLayout::new(&ChromeInput{tab_placement:placement,..input(scale(1200,dpi),120,119,dpi)});
+            assert!(l.vertical_tabs&&!l.tab_panel.is_empty());
+            let active=l.tabs.iter().find(|tab|tab.index==119).unwrap();
+            assert_eq!(l.hit(active.rect.x+4,active.rect.y+4),Hit::Tab(119));
+            assert_eq!(l.hit(active.close.x+3,active.close.y+3),Hit::TabClose(119));
+            assert_eq!(l.hit(l.tab_list.x+3,l.tab_list.y+3),Hit::TabList);
+            if placement==TabPlacement::Left{assert!(l.browser.x>=l.tab_panel.right());assert!(l.address.x>=l.tab_panel.right());}
+            else{assert!(l.browser.right()<=l.tab_panel.x);assert!(l.search.right()<=l.tab_panel.x);}
+            assert!(l.browser.width>0&&l.new_tab.bottom()<=l.tab_panel.bottom());
+        }}
+    }
+
+    #[test]
+    fn selecting_and_dragging_visible_side_tabs_keeps_the_viewport_stationary() {
+        use zsdesk_core::model::explorer::TabPlacement;
+        for placement in [TabPlacement::Left, TabPlacement::Right] {
+            let before = ChromeLayout::new(&ChromeInput { tab_placement: placement, ..input(1100, 100, 99, 96) });
+            let first = before.tabs[0].index;
+            let active = first + 1;
+            let mut after = ChromeLayout::new(&ChromeInput { tab_placement: placement, ..input(1100, 100, active, 96) });
+            after.retain_tab_viewport(&before, 100, active);
+            assert_eq!(after.tabs[0].index, first);
+            for (a, b) in after.tabs.iter().zip(&before.tabs) { assert_eq!((a.index, a.rect), (b.index, b.rect)); }
+            let target = &after.tabs[2];
+            assert_eq!(after.tab_drag_target(target.rect.x + 8, target.rect.y + target.rect.height / 2), Some(target.index));
+            assert_eq!(after.tab_drag_target(after.address.x + 5, target.rect.y), None);
+            let mut offscreen = ChromeLayout::new(&ChromeInput { tab_placement: placement, ..input(1100, 100, 0, 96) });
+            offscreen.retain_tab_viewport(&after, 100, 0);
+            assert_eq!(offscreen.tabs[0].index, 0);
         }
     }
 

@@ -1,0 +1,13 @@
+{
+  "ManifestVersion": 1,
+  "Id": "ZSDesk",
+  "PluginType": "FileAppPlugin",
+  "PluginVersion": "1.0.0",
+  "DisplayName": "ZSdesk",
+  "Authors": [ "ZSdesk" ],
+  "Description": "Use the active ZSdesk folder in Listary Quick Switch and Currently Opened Folders.",
+  "Icon": "Icon.png",
+  "Api": "NetFramework",
+  "ApiVersion": 1,
+  "Entry": "Listary.FileAppPlugin.ZSDesk.dll"
+}

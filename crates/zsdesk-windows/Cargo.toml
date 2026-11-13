@@ -25,7 +25,9 @@ windows-sys = { version = "0.59", features = [
 ] }
 windows = { version = "0.62.2", features = [
   "Win32_Foundation",
+  "Win32_Globalization",
   "Win32_Graphics_Direct2D",
+  "Win32_Security",
   "Win32_Graphics_Direct2D_Common",
   "Win32_Graphics_DirectWrite",
   "Win32_Graphics_Dwm",
@@ -37,6 +39,7 @@ windows = { version = "0.62.2", features = [
   "Win32_System_Com_StructuredStorage",
   "Win32_System_DataExchange",
   "Win32_System_LibraryLoader",
+  "Win32_System_Memory",
   "Win32_System_Ole",
   "Win32_System_Registry",
   "Win32_System_Search",
@@ -56,6 +59,11 @@ windows = { version = "0.62.2", features = [
 ] }
 windows-core = "0.62.2"
 windows-numerics = "0.3"
+sha2 = "0.10.9"
 
 [build-dependencies]
 cc = "1"
+
+[dev-dependencies]
+anyhow.workspace = true
+sha2 = "0.10.9"

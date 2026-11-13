@@ -16,22 +16,41 @@
 #ifndef HasDesktop
 #define HasDesktop 1
 #endif
+#if Edition == "desktop-box"
+#define ProductAppId "{{A5AF6D62-4581-458B-9CC4-215C078FDDB6}"
+#define ProductName "ZSDesk 桌面盒子"
+#define ProductDirectory "ZSDeskDesktopBox"
+#define ProductMutex "Local\ZSDesk.DesktopBox.Application"
+#define ProductModelId "ZSDesk.DesktopBox"
+#elif Edition == "themed"
+#define ProductAppId "{{6C520A87-056A-4CD2-9989-F06398B6A284}"
+#define ProductName "ZSDesk 主题版"
+#define ProductDirectory "ZSDeskTheme"
+#define ProductMutex "Local\ZSDesk.Theme.Application"
+#define ProductModelId "ZSDesk.Theme"
+#else
+#define ProductAppId "{{470DF6E5-CCB7-4A3F-9ED0-F68009D5A91A}"
+#define ProductName "ZSDesk"
+#define ProductDirectory "ZSDesk"
+#define ProductMutex "Local\ZSDesk.Native.Application"
+#define ProductModelId "ZSDesk.Native"
+#endif
 #if !FileExists(SourceDir + "\ZSDesk.exe") || !FileExists(SourceDir + "\manifest.json")
 #error The executable or verified package manifest is missing
 #endif
 
 [Setup]
-AppId={{470DF6E5-CCB7-4A3F-9ED0-F68009D5A91A}
-AppName=ZSDesk
-AppMutex=Local\ZSDesk.Native.Application
+AppId={#ProductAppId}
+AppName={#ProductName}
+AppMutex={#ProductMutex}
 AppVersion={#MyAppVersion}
 AppVerName=ZSDesk {#MyAppVersion} {#EditionName}
 AppPublisher=ZSDesk contributors
 AppPublisherURL=https://github.com/qiu7824/zsdesk
 AppSupportURL=https://github.com/qiu7824/zsdesk/issues
 AppUpdatesURL=https://github.com/qiu7824/zsdesk/releases
-DefaultDirName={localappdata}\Programs\ZSDesk
-DefaultGroupName=ZSDesk
+DefaultDirName={localappdata}\Programs\{#ProductDirectory}
+DefaultGroupName={#ProductName}
 AllowNoIcons=yes
 UsePreviousAppDir=yes
 DisableWelcomePage=yes
@@ -68,9 +87,9 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
-Name: "{group}\ZSDesk"; Filename: "{app}\ZSDesk.exe"; Check: not WizardNoIcons
-Name: "{autodesktop}\ZSDesk"; Filename: "{app}\ZSDesk.exe"; Tasks: desktopicon; Check: not WizardNoIcons
-#if HasDesktop
+Name: "{group}\{#ProductName}"; Filename: "{app}\ZSDesk.exe"; AppUserModelID: "{#ProductModelId}"; Check: not WizardNoIcons
+Name: "{autodesktop}\{#ProductName}"; Filename: "{app}\ZSDesk.exe"; AppUserModelID: "{#ProductModelId}"; Tasks: desktopicon; Check: not WizardNoIcons
+#if (Int(HasDesktop) != 0) && (Edition != "desktop-box")
 Name: "{group}\{cm:Fences}"; Filename: "{app}\ZSDesk.exe"; Parameters: "--desktop"; Check: not WizardNoIcons
 #endif
 
@@ -80,18 +99,27 @@ Filename: "{app}\ZSDesk.exe"; Description: "{cm:LaunchProgram,ZSDesk}"; Flags: n
 [CustomMessages]
 chinesesimp.Fences=ZSDesk 桌面格子
 english.Fences=ZSDesk Desktop Fences
+#if Edition == "desktop-box"
+chinesesimp.LandingTitle=独立桌面盒子，分类整理。
+english.LandingTitle=Standalone desktop fences. Organize your workspace.
+chinesesimp.LandingDetail=文件夹映射 · 格子标签页 · 拖放整理
+english.LandingDetail=Folder mapping · Fence tabs · Drag and drop
+chinesesimp.KeepSettings=保留桌面盒子设置；配置与文件管理版独立。
+english.KeepSettings=Desktop box settings are kept separately from the file manager.
+#else
 chinesesimp.LandingTitle=原生文件管理，桌面有序。
 english.LandingTitle=Native file management. An organized desktop.
 chinesesimp.LandingDetail=多标签 · 快速搜索 · 文件预览
 english.LandingDetail=Tabs · Fast search · File preview
+chinesesimp.KeepSettings=保留现有个人设置；文件打开方式可在软件内设置。
+english.KeepSettings=Personal settings are kept. Folder integration is configured in the app.
+#endif
 chinesesimp.InstallFolder=安装位置
 english.InstallFolder=Install location
 chinesesimp.BrowseFolder=浏览…
 english.BrowseFolder=Browse…
 chinesesimp.InstallNow=立即安装
 english.InstallNow=Install now
-chinesesimp.KeepSettings=保留现有个人设置；文件打开方式可在软件内设置。
-english.KeepSettings=Personal settings are kept. Folder integration is configured in the app.
 chinesesimp.InvalidFolder=请输入完整的安装路径。
 english.InvalidFolder=Enter a full installation path.
 chinesesimp.RestoreFailed=当前安装的系统集成还原失败，卸载已停止；请在 ZSDesk 中恢复系统集成后重试。
@@ -110,8 +138,8 @@ begin
   Folder := Location.Text;
   if BrowseForFolder(CustomMessage('InstallFolder'), Folder, True) then
   begin
-    if CompareText(ExtractFileName(RemoveBackslashUnlessRoot(Folder)), 'ZSDesk') <> 0 then
-      Folder := AddBackslash(Folder) + 'ZSDesk';
+    if CompareText(ExtractFileName(RemoveBackslashUnlessRoot(Folder)), '{#ProductDirectory}') <> 0 then
+      Folder := AddBackslash(Folder) + '{#ProductDirectory}';
     Location.Text := Folder;
   end;
 end;
@@ -121,7 +149,7 @@ var
   Brand, Title, Detail, FolderLabel, Settings: TNewStaticText;
   Browse: TNewButton;
 begin
-  Landing := CreateCustomPage(wpWelcome, 'ZSDesk', '{#EditionName}  {#MyAppVersion}');
+  Landing := CreateCustomPage(wpWelcome, '{#ProductName}', '{#EditionName}  {#MyAppVersion}');
   Brand := TNewStaticText.Create(Landing);
   Brand.Parent := Landing.Surface;
   Brand.Caption := 'ZSDesk';

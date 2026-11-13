@@ -12,6 +12,10 @@ fn rf(r: LayoutRect) -> RectF { RectF::new(r.x as f32, r.y as f32, r.width as f3
 pub(super) const UI_TEXT: f32 = 12.0;
 const ICON_DIP: i32 = 16;
 
+fn pixel_aligned_icon(rect: RectF) -> RectF {
+    RectF::new(rect.x.round(), rect.y.round(), rect.w.round().max(1.0), rect.h.round().max(1.0))
+}
+
 impl WindowState {
     pub(super) fn sf(&self, v: f32) -> f32 { v * self.dpi as f32 / 96.0 }
     pub(super) fn ui_style(&self) -> TextStyle { TextStyle::ui(self.sf(UI_TEXT)) }
@@ -43,13 +47,14 @@ impl WindowState {
         let current = self.current_location().clone();
         let address_icon = self.icon_for(&current);
         let bookmark_icons: Vec<Option<ID2D1Bitmap>> = (0..self.layout.bookmarks.len())
-            .map(|i| { let t = self.session.bookmarks[i].target.clone(); self.icon_for(&t) }).collect();
+            .map(|i| {let index=self.bookmark_index(i)?;if self.session.bookmarks[index].is_folder{return None;}let t=self.session.bookmarks[index].target.clone();self.icon_for(&t)}).collect();
         let (Some(gfx), Some(surface)) = (self.gfx.as_ref(), self.surface.as_ref()) else { return };
         let result = gfx.draw(surface, |cv| {
             self.paint_strip(cv, &tab_icons);
             self.paint_nav(cv, address_icon.as_ref());
             self.paint_commands(cv);
             self.paint_bookmarks(cv, &bookmark_icons);
+            self.paint_search_panel(cv);
             self.paint_content(cv);
             self.paint_status(cv);
         });
@@ -63,37 +68,55 @@ impl WindowState {
         else if self.hover == hit { cv.round(rf(rect), radius, c(p.hover)); }
     }
 
+    fn paint_chrome_layer(&self, cv: &Canvas, rect: RectF) {
+        if crate::edition::THEMED && self.mica {
+            cv.clear_rect(rect);
+            cv.fill(rect, c(self.palette.layer).with_alpha(0.18));
+        } else { cv.fill(rect, c(self.palette.layer)); }
+    }
+
     fn paint_strip(&self, cv: &Canvas, icons: &[Option<ID2D1Bitmap>]) {
         let p = &self.palette;
         let strip = rf(self.layout.strip);
-        // With Mica, transparent pixels let DWM show the backdrop; elsewhere use the
+        // With a system material, transparent pixels expose the DWM backdrop; otherwise use the
         // Windows 11 tab-strip tint. DWM draws the caption buttons above either.
         cv.clear_rect(strip);
-        if !self.mica { cv.fill(strip, if self.active { c(p.strip) } else { c(p.layer) }); }
+        // Fullscreen has no extended DWM frame: transparent pixels otherwise
+        // become black and hide the dark caption glyphs.
+        if !self.mica || window_actions::fullscreen(self.hwnd) { cv.fill(strip, if self.active { c(p.strip) } else { c(p.layer) }); }
         let text = if self.active { c(p.text) } else { c(p.text_secondary) };
         let active = self.session.active_tab;
         let radius = self.sf(8.0);
         let foot = self.sf(6.0);
+        if self.layout.vertical_tabs{
+            cv.fill(rf(self.layout.tab_panel),c(p.strip));
+            let edge = if self.layout.nav_row.x > 0 { self.layout.tab_panel.right() as f32 - 0.5 } else { self.layout.tab_panel.x as f32 + 0.5 };
+            cv.line(edge, self.layout.tab_panel.y as f32, edge, self.layout.tab_panel.bottom() as f32, c(p.divider), 1.0);
+            let title=self.session.current_location().title();
+            cv.text(&title,RectF::new(self.sf(14.0),strip.y,(self.layout.tab_list.x as f32-self.sf(24.0)).max(0.0),strip.h),&self.ui_style(),text);
+        }
         for (n, slot) in self.layout.tabs.iter().enumerate() {
             let r = rf(slot.rect);
+            if self.layout.vertical_tabs { cv.push_clip(r); }
             let is_active = slot.index == active;
             let hovered = matches!(self.hover, Hit::Tab(i) | Hit::TabClose(i) if i == slot.index);
             if is_active {
-                cv.tab_shape(r, radius, foot, c(p.layer));
+                if self.layout.vertical_tabs{cv.round(r,self.sf(6.0),c(p.layer));}else{cv.tab_shape(r, radius, foot, c(p.layer));}
             } else if hovered {
                 cv.round(RectF::new(r.x + self.sf(2.0), r.y + self.sf(2.0), r.w - self.sf(4.0), r.h - self.sf(6.0)), self.sf(6.0), c(p.hover));
             } else {
                 // Separator unless the neighbour is active or hovered.
                 let next = self.layout.tabs.get(n + 1).map(|t| t.index);
                 let next_busy = next.is_some_and(|i| i == active || matches!(self.hover, Hit::Tab(h) | Hit::TabClose(h) if h == i));
-                if !next_busy && next.is_some() {
+                if !self.layout.vertical_tabs && !next_busy && next.is_some() {
                     let x = r.right() - 0.5;
                     cv.line(x, r.y + self.sf(9.0), x, r.bottom() - self.sf(9.0), c(p.inactive_tab_separator), 1.0);
                 }
             }
             let icon_size = self.sf(ICON_DIP as f32);
             let icon_rect = RectF::new(r.x + self.sf(12.0), r.y + (r.h - icon_size) / 2.0, icon_size, icon_size);
-            if let Some(Some(bitmap)) = icons.get(n) { cv.image(bitmap, icon_rect, 1.0); }
+            if self.session.tabs[slot.index].locked&&!slot.show_close{cv.glyph("\u{E72E}",icon_rect,self.sf(14.0),text);}
+            else if let Some(Some(bitmap)) = icons.get(n) { cv.image(bitmap, pixel_aligned_icon(icon_rect), 1.0); }
             else { cv.glyph(if matches!(self.session.tabs[slot.index].current(),ShellLocation::Search{..}){glyph::SEARCH}else{glyph::FOLDER}, icon_rect, self.sf(14.0), text); }
             let title_right = if slot.show_close { slot.close.x as f32 - self.sf(2.0) } else { r.right() - self.sf(10.0) };
             let title = self.session.tabs[slot.index].current().title();
@@ -102,35 +125,42 @@ impl WindowState {
             if slot.show_close {
                 let close = rf(slot.close);
                 if self.hover == Hit::TabClose(slot.index) { cv.round(close, self.sf(4.0), c(p.hover)); }
-                cv.glyph(glyph::CLOSE_SMALL, close, self.sf(10.0), text);
+                cv.glyph(if self.session.tabs[slot.index].locked{"\u{E72E}"}else{glyph::CLOSE_SMALL}, close, self.sf(10.0), text);
             }
+            if self.layout.vertical_tabs { cv.pop_clip(); }
         }
         // New tab, tab list (count) and app menu buttons.
         if !self.layout.new_tab.is_empty() {
             self.button_fill(cv, self.layout.new_tab, Hit::NewTab, self.sf(4.0));
-            cv.glyph(glyph::ADD, rf(self.layout.new_tab), self.sf(12.0), text);
+            let r=rf(self.layout.new_tab);
+            if self.layout.vertical_tabs{
+                cv.glyph(glyph::ADD,RectF::new(r.x,r.y,self.sf(32.0),r.h),self.sf(12.0),text);
+                cv.text("新建标签页",RectF::new(r.x+self.sf(34.0),r.y,(r.w-self.sf(38.0)).max(0.0),r.h),&self.ui_style(),text);
+            }else{cv.glyph(glyph::ADD,r,self.sf(12.0),text);}
         }
         if !self.layout.tab_list.is_empty() {
             self.button_fill(cv, self.layout.tab_list, Hit::TabList, self.sf(4.0));
             let r = rf(self.layout.tab_list);
-            let badge = RectF::new(r.x + (r.w - self.sf(18.0)) / 2.0, r.y + (r.h - self.sf(16.0)) / 2.0, self.sf(18.0), self.sf(16.0));
-            cv.stroke_round(badge, self.sf(3.0), text, self.sf(1.2).max(1.0));
-            let count = self.session.tabs.len();
-            let label = if count > 99 { "∞".to_string() } else { count.to_string() };
-            cv.text(&label, badge, &TextStyle::ui(self.sf(10.0)).weight(600).align(Align::Center), text);
+            if self.session.ui.show_tab_count {
+                let count=self.session.tabs.len();let label=count.to_string();
+                let badge_w=self.sf((label.len()as f32*7.0+8.0).max(18.0)).min(r.w-self.sf(6.0));
+                let badge = RectF::new(r.x+(r.w-badge_w)/2.0,r.y+(r.h-self.sf(18.0))/2.0,badge_w,self.sf(18.0));
+                cv.stroke_round(badge, self.sf(3.0), text, self.sf(1.2).max(1.0));
+                cv.text(&label, badge, &TextStyle::ui(self.sf(if label.len()>4{9.0}else{11.0})).weight(600).align(Align::Center), text);
+            } else { cv.glyph("\u{E70D}",r,self.sf(12.0),text); }
         }
         if !self.layout.app_menu.is_empty() {
             self.button_fill(cv, self.layout.app_menu, Hit::AppMenu, self.sf(4.0));
             cv.glyph(glyph::MENU, rf(self.layout.app_menu), self.sf(14.0), text);
         }
-        if !self.mica { self.paint_caption_buttons(cv, text); }
+        if !native_caption(self.hwnd) { self.paint_caption_buttons(cv, text); }
     }
 
     /// Windows 11 caption buttons drawn over the opaque strip (DWM still hit-tests them).
     fn paint_caption_buttons(&self, cv: &Canvas, text: Color) {
         let Some(buttons) = self.caption_buttons() else { return };
-        let (hover, pressed) = CAPTION_HOVER.with(Cell::get);
-        let maximized = unsafe { IsZoomed(self.hwnd) }.as_bool();
+        let (hover, pressed) = caption_visual(self.hwnd);
+        let maximized = unsafe { IsZoomed(self.hwnd) }.as_bool() || window_actions::fullscreen(self.hwnd);
         let glyphs = [("\u{E921}", HTMINBUTTON), (if maximized { "\u{E923}" } else { "\u{E922}" }, HTMAXBUTTON), ("\u{E8BB}", HTCLOSE)];
         for (rect, (g, code)) in buttons.iter().zip(glyphs) {
             let r = rf(*rect);
@@ -150,7 +180,7 @@ impl WindowState {
     fn paint_nav(&self, cv: &Canvas, address_icon: Option<&ID2D1Bitmap>) {
         let p = &self.palette;
         let l = &self.layout;
-        cv.fill(rf(LayoutRect::new(0, l.nav_row.y, l.nav_row.width, l.top - l.nav_row.y)), c(p.layer));
+        self.paint_chrome_layer(cv, rf(LayoutRect::new(l.nav_row.x, l.nav_row.y, l.nav_row.width, l.top - l.nav_row.y)));
         let tab = self.session.active_tab();
         let busy = self.pending.is_some();
         let buttons = [
@@ -170,7 +200,7 @@ impl WindowState {
         if !focused {
             let icon = self.sf(ICON_DIP as f32);
             let icon_rect = RectF::new(address.x + self.sf(10.0), address.y + (address.h - icon) / 2.0, icon, icon);
-            if let Some(bitmap) = address_icon { cv.image(bitmap, icon_rect, 1.0); }
+            if let Some(bitmap) = address_icon { cv.image(bitmap, pixel_aligned_icon(icon_rect), 1.0); }
             for slot in &self.crumb_slots {
                 let r = rf(slot.rect);
                 let hovered = self.hover_crumb == Some(slot.part);
@@ -187,11 +217,13 @@ impl WindowState {
             }
         }
         // Search box.
-        let search = rf(l.search);
-        let search_focused = unsafe { GetFocus() } == self.search_edit;
-        self.text_box(cv, search, search_focused, self.hover == Hit::Search && !search_focused);
-        let glyph_rect = RectF::new(search.right() - self.sf(34.0), search.y, self.sf(30.0), search.h);
-        cv.glyph(glyph::SEARCH, glyph_rect, self.sf(13.0), c(p.text_secondary));
+        {
+            let search = rf(l.search);
+            let search_focused = unsafe { GetFocus() } == self.search_edit;
+            self.text_box(cv, search, search_focused, self.hover == Hit::Search && !search_focused);
+            let glyph_rect = RectF::new(search.right() - self.sf(34.0), search.y, self.sf(30.0), search.h);
+            cv.glyph(if self.search_panel.open { glyph::CLOSE_SMALL } else { glyph::SEARCH }, glyph_rect, self.sf(13.0), c(p.text_secondary));
+        }
     }
 
     /// Windows 11 TextBox: rounded fill, hairline border and bottom stroke (accent when focused).
@@ -219,7 +251,7 @@ impl WindowState {
         let l = &self.layout;
         let row = l.command_row;
         if row.is_empty() { return; }
-        cv.line(0.0, row.y as f32 + 0.5, row.width as f32, row.y as f32 + 0.5, c(p.divider), 1.0);
+        cv.line(row.x as f32, row.y as f32 + 0.5, row.right() as f32, row.y as f32 + 0.5, c(p.divider), 1.0);
         let selected = self.view_status.selected > 0;
         let can_paste = clipboard_has_files();
         for (id, rect) in &l.commands {
@@ -266,38 +298,67 @@ impl WindowState {
         let p = &self.palette;
         let l = &self.layout;
         if l.bookmarks_row.is_empty() { return; }
-        cv.fill(rf(l.bookmarks_row), c(p.layer));
+        self.paint_chrome_layer(cv, rf(l.bookmarks_row));
         if self.session.bookmarks.is_empty() {
             let r = rf(l.bookmarks_row);
             cv.text("将文件夹拖到这里，或按 Ctrl+D 收藏当前文件夹", RectF::new(r.x + self.sf(14.0), r.y, r.w - self.sf(28.0), r.h), &self.ui_style(), c(p.text_secondary));
         }
         for (i, rect) in l.bookmarks.iter().enumerate() {
-            if self.rename_index == Some(i) {
+            let Some(index)=self.bookmark_index(i)else{continue;};
+            if self.rename_id == Some(self.session.bookmarks[index].id) {
                 let r = rf(LayoutRect::new(rect.x, rect.y, rect.width.max(self.s(140)), rect.height));
                 self.text_box(cv, r, true, false);
                 continue;
             }
             self.button_fill(cv, *rect, Hit::Bookmark(i), self.sf(4.0));
+            if let Some(drag)=self.bookmark_drag.filter(|drag|drag.moved){if self.hover==Hit::Bookmark(i){
+                if self.session.bookmarks[index].is_folder&&drag.point.x>=rect.x+rect.width/4&&drag.point.x<rect.right()-rect.width/4{
+                    cv.stroke_round(rf(*rect),self.sf(4.0),c(p.accent),self.sf(2.0));
+                }else{let x=if drag.point.x<rect.x+rect.width/2{rect.x}else{rect.right()}as f32;cv.line(x,rect.y as f32,x,rect.bottom()as f32,c(p.accent),self.sf(2.0));}
+            }}
             let r = rf(*rect);
             let icon = self.sf(ICON_DIP as f32);
             let icon_rect = RectF::new(r.x + self.sf(8.0), r.y + (r.h - icon) / 2.0, icon, icon);
-            match icons.get(i) { Some(Some(b)) => cv.image(b, icon_rect, 1.0), _ => cv.glyph(glyph::FOLDER, icon_rect, self.sf(14.0), c(p.text)) }
+            match icons.get(i) { Some(Some(b)) => cv.image(b, pixel_aligned_icon(icon_rect), 1.0), _ => cv.glyph(glyph::FOLDER, icon_rect, self.sf(14.0), c(p.text)) }
             let x = icon_rect.right() + self.sf(6.0);
-            cv.text(&self.session.bookmarks[i].display_name, RectF::new(x, r.y, r.right() - x - self.sf(6.0), r.h), &self.ui_style(), c(p.text));
+            cv.text(&self.bookmark_label(index), RectF::new(x, r.y, r.right() - x - self.sf(6.0), r.h), &self.ui_style(), c(p.text));
         }
         if !l.bookmark_overflow.is_empty() {
             self.button_fill(cv, l.bookmark_overflow, Hit::BookmarkOverflow, self.sf(4.0));
             cv.glyph("\u{E76C}", rf(l.bookmark_overflow), self.sf(10.0), c(p.text));
         }
+        if let Some(index)=self.renamed_bookmark_index(){if !self.bookmark_order.iter().take(l.bookmarks.len()).any(|i|*i==index){self.text_box(cv,rf(self.bookmark_rect(index)),true,false);}}
     }
 
     fn paint_content(&self, cv: &Canvas) {
         let p = &self.palette;
         let l = &self.layout;
-        cv.line(0.0, l.top as f32 - 0.5, l.strip.width as f32, l.top as f32 - 0.5, c(p.divider), 1.0);
+        cv.line(l.nav_row.x as f32, l.top as f32 - 0.5, l.nav_row.right() as f32, l.top as f32 - 0.5, c(p.divider), 1.0);
         // Visible only around the native children (splitter, empty tree area while loading).
-        let content = LayoutRect::new(0, l.top, l.strip.width, (l.status.y - l.top).max(0));
+        let content = LayoutRect::new(l.nav_row.x, l.top, l.nav_row.width, (l.status.y - l.top).max(0));
         cv.fill(rf(content), c(p.content));
+        if self.session.ui.dual_pane {
+            for (index,header) in l.pane_headers.iter().enumerate() {
+                let active=(index==1)==self.active_pane_right;
+                cv.fill(rf(*header),c(if active {p.layer}else{p.content}));
+                let title=self.pane_title(index==1);
+                cv.text(&title,RectF::new((header.x+self.s(10))as f32,header.y as f32,
+                    (header.width-self.s(20)).max(0)as f32,header.height as f32),&self.ui_style(),c(if active{p.text}else{p.text_secondary}));
+                cv.line(header.x as f32,header.bottom()as f32-1.0,header.right()as f32,header.bottom()as f32-1.0,
+                    c(if active{p.accent}else{p.divider}),if active{2.0}else{1.0});
+            }
+            // A hairline divider like Windows 11 split views; the full gap stays
+            // the drag target and shows a grip while hovered or dragged.
+            let split=rf(l.pane_splitter);
+            cv.fill(split,c(p.content));
+            let middle=(split.x+split.w/2.0).floor()+0.5;
+            if self.hover==Hit::PaneSplitter || self.pane_splitter_drag.is_some() {
+                let grip=self.sf(3.0);
+                cv.round(RectF::new(middle-grip/2.0,split.y,grip,split.h),grip/2.0,c(p.text_secondary).with_alpha(0.55));
+            } else {
+                cv.line(middle,split.y,middle,split.bottom(),c(p.divider),1.0);
+            }
+        }
         if !l.splitter.is_empty() && (self.hover == Hit::Splitter || self.splitter_drag.is_some()) {
             let x = l.splitter.x as f32 + l.splitter.width as f32 / 2.0;
             cv.line(x, l.splitter.y as f32, x, l.splitter.bottom() as f32, c(p.divider), 1.0);
@@ -314,7 +375,8 @@ impl WindowState {
             let panes = [CommandId::PreviewPane, CommandId::DetailsPane];
             let left = l.commands.iter().filter(|(id, _)| !panes.contains(id)).map(|(_, r)| r.right()).max().unwrap_or(0) as f32 + self.sf(16.0);
             let right = l.commands.iter().filter(|(id, _)| panes.contains(id)).map(|(_, r)| r.x).min().map_or(row.right() - self.sf(12.0), |x| x as f32 - self.sf(12.0));
-            cv.text(&self.status, RectF::new(left, row.y, (right - left).max(0.0), row.h), &self.ui_style().align(Align::End), c(p.danger));
+            cv.text(&self.status, RectF::new(left, row.y, (right - left).max(0.0), row.h), &self.ui_style().align(Align::End),
+                c(if status_is_error(&self.status) { p.danger } else { p.text_secondary }));
             return;
         }
         let r = rf(l.status);
@@ -331,10 +393,12 @@ impl WindowState {
         if !self.status.is_empty() || self.search_progress.is_some() {
             let x = left + w + self.sf(24.0);
             let text=if self.status.is_empty(){self.search_progress.as_deref().unwrap_or("")}else{&self.status};
-            cv.text(text, RectF::new(x, r.y, (l.status_details.x as f32 - x - self.sf(8.0)).max(0.0), r.h), &style, c(if self.status.is_empty(){p.text_secondary}else{p.danger}));
+            cv.text(text, RectF::new(x, r.y, (l.status_dual_pane.x as f32 - x - self.sf(8.0)).max(0.0), r.h), &style,
+                c(if status_is_error(&self.status) {p.danger} else {p.text_secondary}));
         }
         let (mode, _) = self.view_mode;
-        for (rect, hit, g, on) in [(l.status_details, Hit::StatusDetails, glyph::DETAILS_VIEW, mode == 4), (l.status_tiles, Hit::StatusTiles, glyph::TILES_VIEW, mode == 1)] {
+        for (rect, hit, g, on) in [(l.status_dual_pane,Hit::StatusDualPane,glyph::DUAL_PANE,self.session.ui.dual_pane),
+            (l.status_details, Hit::StatusDetails, glyph::DETAILS_VIEW, mode == 4), (l.status_tiles, Hit::StatusTiles, glyph::TILES_VIEW, mode == 1)] {
             if on { cv.round(rf(rect), self.sf(4.0), c(p.pressed)); cv.round(RectF::new(rect.x as f32 + self.sf(9.0), rect.bottom() as f32 - self.sf(3.0), rect.width as f32 - self.sf(18.0), self.sf(2.0)), self.sf(1.0), c(p.accent)); }
             self.button_fill(cv, rect, hit, self.sf(4.0));
             cv.glyph(g, rf(rect), self.sf(12.0), c(p.text));
@@ -349,44 +413,60 @@ impl WindowState {
         if a.is_empty() || self.crumbs.is_empty() { return; }
         let style = self.ui_style();
         let pad = self.s(6);
-        let chevron = self.s(18);
-        let height = a.height - self.s(8);
-        let y = a.y + self.s(4);
-        let start = a.x + self.s(10) + self.s(ICON_DIP) + self.s(4);
-        let end = a.right() - self.s(8);
         let widths: Vec<i32> = self.crumbs.iter().map(|c| gfx.measure(&c.title, &style, 2000.0).0 as i32 + pad * 2).collect();
-        let total = |from: usize| -> i32 { widths[from..].iter().map(|w| w + chevron).sum() };
-        let mut first = 0;
-        let overflow_w = self.s(26);
-        while first + 1 < self.crumbs.len() && start + total(first) + if first > 0 { overflow_w } else { 0 } > end { first += 1; }
-        let mut x = start;
-        if first > 0 {
-            self.crumb_slots.push(CrumbSlot { part: CrumbPart::Overflow, rect: LayoutRect::new(x, y, overflow_w, height) });
-            x += overflow_w;
-        }
-        for i in first..self.crumbs.len() {
-            let w = widths[i].min((end - x - chevron).max(self.s(24)));
-            self.crumb_slots.push(CrumbSlot { part: CrumbPart::Crumb(i), rect: LayoutRect::new(x, y, w, height) });
-            x += w;
-            if x + chevron <= end + chevron / 2 {
-                self.crumb_slots.push(CrumbSlot { part: CrumbPart::Chevron(i), rect: LayoutRect::new(x, y, chevron, height) });
-                x += chevron;
-            }
-        }
+        self.crumb_slots = breadcrumb_geometry(a, &widths, self.dpi);
     }
 
     pub(super) fn crumb_at(&self, x: i32, y: i32) -> Option<CrumbPart> {
-        if self.address_editing { return None; }
+        if self.address_editing || !self.layout.address.contains(x, y) { return None; }
         self.crumb_slots.iter().find(|s| s.rect.contains(x, y)).map(|s| s.part)
     }
 
     pub(super) fn measure_bookmarks(&mut self) {
+        self.bookmark_order=self.session.visible_bookmarks();
         let Some(gfx) = self.gfx.as_ref() else { return };
         let style = self.ui_style();
         let extra = self.s(8) + self.s(ICON_DIP) + self.s(6) + self.s(10);
-        self.bookmark_widths = self.session.bookmarks.iter()
-            .map(|b| (gfx.measure(&b.display_name, &style, 600.0).0 as i32 + extra).min(self.s(220))).collect();
+        self.bookmark_widths = self.bookmark_order.iter().map(|&index|
+            (gfx.measure(&self.bookmark_label(index), &style, 600.0).0 as i32 + extra).min(self.s(220))).collect();
     }
+}
+
+fn breadcrumb_geometry(address: LayoutRect, widths: &[i32], dpi: u32) -> Vec<CrumbSlot> {
+    let s = |value| scale(value, dpi);
+    let mut slots = Vec::new();
+    if address.is_empty() || widths.is_empty() { return slots; }
+    let mut x = address.x + s(10 + ICON_DIP + 4);
+    let end = address.right() - s(8);
+    let y = address.y + s(4);
+    let height = (address.height - s(8)).max(0);
+    if x >= end || height == 0 { return slots; }
+    let chevron = s(18);
+    let overflow = s(26);
+    let mut first = 0;
+    while first + 1 < widths.len()
+        && widths[first..].iter().map(|width| i64::from(*width + chevron)).sum::<i64>()
+            + if first > 0 { i64::from(overflow) } else { 0 } > i64::from(end - x) {
+        first += 1;
+    }
+    if first > 0 && end - x >= overflow + s(24) {
+        slots.push(CrumbSlot { part: CrumbPart::Overflow, rect: LayoutRect::new(x, y, overflow, height) });
+        x += overflow;
+    }
+    for (index, desired) in widths.iter().enumerate().skip(first) {
+        let remaining = end - x;
+        if remaining <= 0 { break; }
+        let arrow = if remaining >= s(24) + chevron { chevron } else { 0 };
+        let width = (*desired).max(0).min(remaining - arrow);
+        if width == 0 { break; }
+        slots.push(CrumbSlot { part: CrumbPart::Crumb(index), rect: LayoutRect::new(x, y, width, height) });
+        x += width;
+        if arrow > 0 {
+            slots.push(CrumbSlot { part: CrumbPart::Chevron(index), rect: LayoutRect::new(x, y, arrow, height) });
+            x += arrow;
+        }
+    }
+    slots
 }
 
 fn resolve_icon(location: &ShellLocation, px: i32) -> Option<icons::OwnedIcon> {
@@ -408,4 +488,47 @@ fn clipboard_has_files() -> bool {
     if unsafe { IsClipboardFormatAvailable(CF_HDROP.0 as u32) }.is_ok() { return true; }
     let shell = unsafe { RegisterClipboardFormatW(windows::core::w!("Shell IDList Array")) };
     shell != 0 && unsafe { IsClipboardFormatAvailable(shell) }.is_ok()
+}
+
+#[cfg(test)]
+mod icon_geometry_tests {
+    use super::*;
+    #[test]
+    fn bitmap_icons_keep_integer_pixel_edges_at_fractional_scale() {
+        let rect = pixel_aligned_icon(RectF::new(12.5, 7.5, 20.0, 20.0));
+        assert_eq!((rect.x, rect.y, rect.w, rect.h), (13.0, 8.0, 20.0, 20.0));
+    }
+
+    #[test]
+    fn long_breadcrumbs_never_escape_narrow_or_offset_address_fields() {
+        for dpi in [96, 120, 144, 192] { for offset in [0, 210] { for width in [30, 70, 120, 300] {
+            let bounds = LayoutRect::new(scale(offset + 160, dpi), scale(80, dpi), scale(width, dpi), scale(32, dpi));
+            let widths = [scale(90, dpi), scale(170, dpi), scale(700, dpi)];
+            let slots = breadcrumb_geometry(bounds, &widths, dpi);
+            for (index, slot) in slots.iter().enumerate() {
+                assert!(slot.rect.x >= bounds.x && slot.rect.right() <= bounds.right());
+                assert!(slot.rect.y >= bounds.y && slot.rect.bottom() <= bounds.bottom());
+                assert!(!slot.rect.is_empty());
+                if index > 0 { assert!(slots[index - 1].rect.right() <= slot.rect.x); }
+            }
+            if width >= 70 { assert!(slots.iter().any(|slot| slot.part == CrumbPart::Crumb(2))); }
+        }}}
+    }
+}
+
+/// Status text that reports a failure is drawn in the critical color; progress
+/// and confirmations ("已复制 3 个路径") stay neutral.
+fn status_is_error(text: &str) -> bool {
+    ["失败", "无法", "错误", "未找到", "不支持", "未保存", "未更新", "未启动", "异常", "超时", "需要修复"].iter().any(|word| text.contains(word))
+}
+
+#[cfg(test)]
+mod status_tests {
+    #[test]
+    fn confirmations_are_not_painted_as_errors() {
+        assert!(!super::status_is_error("已复制 3 个路径"));
+        assert!(!super::status_is_error("下次登录 Windows 时将启动桌面格子"));
+        assert!(super::status_is_error("操作失败：拒绝访问"));
+        assert!(super::status_is_error("无法预览：文件被占用"));
+    }
 }

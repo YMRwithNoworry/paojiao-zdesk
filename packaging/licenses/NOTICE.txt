@@ -3,17 +3,23 @@ Third-party components
 ZSUI 0.3.0-alpha.2: Mozilla Public License 2.0.
 Source: https://github.com/qiu7824/zsui
 Corresponding source revision:
-https://github.com/qiu7824/zsui/tree/1371ce10daebf42d40c8112c8f20d196f9f55b0a
+https://github.com/qiu7824/zsui/tree/a18557c8b845efd448936aa991f1a5271bc10143
 See ZSUI-MPL-2.0.txt.
 
 Native menu interface declarations: MIT; see Native-menu-MIT.txt.
+
+Everything 1.4.1.1032 x64 (standard, non-Lite): Copyright (C) 2018 David Carpenter.
+Official distribution: https://www.voidtools.com/Everything-1.4.1.1032.x64.zip
+The original executable and language pack are redistributed without modification.
+The complete Everything and Perl-Compatible Regular Expressions notices are
+included in Everything-1.4.1.1032-License.txt and engines/everything/License.txt.
 
 Layout migration dependencies (MIT): roxmltree 0.21.1, sha2 0.10.9,
 digest 0.10.7, block-buffer 0.10.4, crypto-common 0.1.7,
 generic-array 0.14.7, typenum 1.20.1, cpufeatures 0.2.17,
 version_check 0.9.5. See the corresponding package-named license files.
 
-File-name indexing dependencies (MIT): rusqlite 0.31.0, libsqlite3-sys 0.28.0,
+Additional Rust dependencies (MIT): rusqlite 0.31.0, libsqlite3-sys 0.28.0,
 ahash 0.8.12, bitflags 2.13.2, fallible-iterator 0.3.0,
 fallible-streaming-iterator 0.1.9, hashbrown 0.14.5, hashlink 0.9.1,
 once_cell 1.21.4, smallvec 1.16.2, zerocopy 0.8.59 and zerocopy-derive 0.8.59.
@@ -24,6 +30,10 @@ MinHook: BSD 2-Clause; see MinHook-BSD.txt.
 Other Rust dependencies retain their upstream license and notice texts in
 the package-named files in this directory. The dependency versions are
 recorded in the published Cargo.lock.
+
+HarfRust 0.5.2: MIT; see harfrust-0.5.2-LICENSE.txt.
+Corresponding source and license:
+https://github.com/harfbuzz/harfrust/tree/efdae3142ab76a2f1524d72cff9e3dfdc5afd7ca
 
 Microsoft Visual C++ x64 Runtime (msvcp140.dll, vcruntime140.dll,
 vcruntime140_1.dll): Copyright Microsoft Corporation.

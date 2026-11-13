@@ -8,7 +8,7 @@ inline constexpr DWORD kVersion=2;
 inline constexpr size_t kPathCharacters=2048;
 // Compatibility contracts: a native executable calling documented Shell APIs,
 // Chromium's chrome.dll, or WeChat's Weixin.dll. No private product offsets.
-enum class Profile : DWORD { NativeShell=1, Chromium=2, WeChat=3 };
+enum class Profile : DWORD { NativeShell=1, Chromium=2, WeChat=3, ExplicitModule=4 };
 struct AdapterConfig {
     DWORD magic=kMagic,version=kVersion,bytes=sizeof(AdapterConfig),applicationId=0;
     Profile profile=Profile::NativeShell;
