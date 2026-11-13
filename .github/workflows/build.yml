@@ -9,6 +9,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   windows:
     runs-on: windows-latest
@@ -22,6 +26,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           path: zsdesk
+          ref: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'refs/heads/main' || github.sha }}
       - name: Read the ZSUI revision
         id: dependency
         shell: pwsh
@@ -31,10 +36,99 @@ jobs:
           repository: qiu7824/zsui
           ref: ${{ steps.dependency.outputs.revision }}
           path: zsui
+      - name: Calculate release version
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        id: release
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const fs = require('fs');
+            const { execFileSync } = require('child_process');
+            process.chdir('zsdesk');
+            const { owner, repo } = context.repo;
+            const sourceSha = execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+            const manifest = fs.readFileSync('Cargo.toml', 'utf8');
+            const currentMatch = manifest.match(/^version\s*=\s*"(\d+)\.(\d+)\.(\d+)"\s*$/m);
+            if (!currentMatch) throw new Error('Could not read a numeric workspace version');
+            const current = currentMatch.slice(1).map(Number);
+            const parseTag = tag => {
+              const match = tag.match(/^v?(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$/);
+              return match ? match.slice(1).map(Number) : null;
+            };
+            const compare = (left, right) => {
+              for (let i = 0; i < 3; i++) {
+                if (left[i] !== right[i]) return left[i] - right[i];
+              }
+              return 0;
+            };
+            let latest;
+            try {
+              latest = (await github.rest.repos.getLatestRelease({ owner, repo })).data;
+            } catch (error) {
+              if (error.status !== 404) throw error;
+            }
+            let next = current;
+            if (latest) {
+              const releasedVersion = parseTag(latest.tag_name);
+              if (!releasedVersion) throw new Error(`Latest release tag is not a semantic version: ${latest.tag_name}`);
+              const releasedCommit = (await github.rest.repos.getCommit({ owner, repo, ref: latest.tag_name })).data.sha;
+              if (releasedCommit !== sourceSha && compare(current, releasedVersion) <= 0) {
+                next = [...releasedVersion];
+                next[2] += 1;
+              } else if (releasedCommit === sourceSha) {
+                next = releasedVersion;
+              }
+            }
+            const version = next.join('.');
+            core.setOutput('version', version);
+            core.setOutput('tag', `v${version}`);
+            core.info(`Preparing ${version} from ${sourceSha}`);
+      - name: Apply release version
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        working-directory: zsdesk
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = $env:RELEASE_VERSION
+          if ($version -notmatch '^\d+\.\d+\.\d+$') { throw 'Release version is invalid' }
+          $cargoPath = Join-Path $PWD 'Cargo.toml'
+          $cargo = [IO.File]::ReadAllText($cargoPath)
+          $versionPattern = '(?m)^version\s*=\s*"[^"]+"'
+          if ([regex]::Matches($cargo, $versionPattern).Count -ne 1) { throw 'Expected one workspace version in Cargo.toml' }
+          $cargo = [regex]::Replace($cargo, $versionPattern, ('version = "' + $version + '"'), 1)
+          [IO.File]::WriteAllText($cargoPath, $cargo, [Text.UTF8Encoding]::new($false))
+          $parts = $version.Split('.')
+          $commaVersion = ($parts -join ',') + ',0'
+          $resourcePath = Join-Path $PWD 'crates/zsdesk-app/resources/zsdesk.rc'
+          $resource = [IO.File]::ReadAllText($resourcePath)
+          $fileVersionPattern = '(?m)^(FILEVERSION[ \t]+)\d+,\d+,\d+,\d+(\r?)$'
+          $productVersionPattern = '(?m)^(PRODUCTVERSION[ \t]+)\d+,\d+,\d+,\d+(\r?)$'
+          $fileStringPattern = 'VALUE "FileVersion", "[^"]*\\0"'
+          $productStringPattern = 'VALUE "ProductVersion", "[^"]*\\0"'
+          if ([regex]::Matches($resource, $fileVersionPattern).Count -ne 1 -or
+              [regex]::Matches($resource, $productVersionPattern).Count -ne 1 -or
+              [regex]::Matches($resource, $fileStringPattern).Count -ne 1 -or
+              [regex]::Matches($resource, $productStringPattern).Count -ne 1) { throw 'Windows version resource fields are incomplete' }
+          $resource = [regex]::Replace($resource, $fileVersionPattern, ('${1}' + $commaVersion + '${2}'), 1)
+          $resource = [regex]::Replace($resource, $productVersionPattern, ('${1}' + $commaVersion + '${2}'), 1)
+          $resource = [regex]::Replace($resource, $fileStringPattern, ('VALUE "FileVersion", "' + $version + '\0"'), 1)
+          $resource = [regex]::Replace($resource, $productStringPattern, ('VALUE "ProductVersion", "' + $version + '\0"'), 1)
+          [IO.File]::WriteAllText($resourcePath, $resource, [Text.UTF8Encoding]::new($false))
       - uses: dtolnay/rust-toolchain@1.99.0
       - name: Test
         working-directory: zsdesk
-        run: cargo test --workspace --release --locked
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          if ($env:RELEASE_VERSION) {
+            cargo test --workspace --release
+          } else {
+            cargo test --workspace --release --locked
+          }
+          exit $LASTEXITCODE
       - name: Check all editions
         working-directory: zsdesk
         shell: pwsh
@@ -59,8 +153,34 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           cargo test --locked --release -p zsdesk-app --no-default-features --features desktop-box
           exit $LASTEXITCODE
+      - name: Fetch pinned Everything runtime
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        working-directory: zsdesk
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $pinPath = Join-Path $PWD 'packaging/engines/everything.json'
+          $pin = Get-Content -LiteralPath $pinPath -Raw | ConvertFrom-Json -AsHashtable
+          $archive = Join-Path $env:RUNNER_TEMP "Everything-$($pin.version).zip"
+          $extract = Join-Path $env:RUNNER_TEMP "Everything-$($pin.version)-extract"
+          $everything = Join-Path $env:RUNNER_TEMP 'ZSDesk-everything'
+          Invoke-WebRequest -Uri $pin.source_url -OutFile $archive
+          if ((Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant() -ne $pin.archive_sha256) { throw 'Everything archive checksum mismatch' }
+          Expand-Archive -LiteralPath $archive -DestinationPath $extract
+          New-Item -ItemType Directory -Path $everything | Out-Null
+          Copy-Item -LiteralPath (Join-Path $extract 'everything.exe') -Destination (Join-Path $everything 'Everything.exe')
+          Copy-Item -LiteralPath (Join-Path $extract 'Everything.lng') -Destination (Join-Path $everything 'Everything.lng')
+          Invoke-WebRequest -Uri $pin.license_url -OutFile (Join-Path $everything 'License.txt')
+          Copy-Item -LiteralPath $pinPath -Destination (Join-Path $everything 'manifest.json')
+          foreach ($name in @('Everything.exe', 'Everything.lng', 'License.txt')) {
+            $file = Get-Item -LiteralPath (Join-Path $everything $name)
+            $expected = $pin.files[$name]
+            if ($file.Length -ne $expected.bytes -or (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expected.sha256) { throw "Everything file identity mismatch: $name" }
+          }
+          $actualVersion = (Get-Item -LiteralPath (Join-Path $everything 'Everything.exe')).VersionInfo.ProductVersion
+          if ($actualVersion -ne $pin.version) { throw 'Everything executable version differs from its manifest' }
       - name: Package all Windows editions
-        if: github.event_name == 'push'
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         working-directory: zsdesk
         shell: pwsh
         run: |
@@ -89,21 +209,35 @@ jobs:
           $output = Join-Path $env:RUNNER_TEMP 'ZSDesk-release'
           & .\native\routing\build.ps1 -OutputDir $routing -BuildDir $routingBuild
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & .\scripts\package.ps1 -WorkDir $work -TargetDir $env:CARGO_TARGET_DIR -OutputDir $output -RoutingDir $routing -InnoCompiler $innoCompiler
+          & .\scripts\package.ps1 -WorkDir $work -TargetDir $env:CARGO_TARGET_DIR -OutputDir $output -RoutingDir $routing -EverythingDir (Join-Path $env:RUNNER_TEMP 'ZSDesk-everything') -InnoCompiler $innoCompiler
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Prepare release metadata
-        if: github.event_name == 'push'
-        id: release
+      - name: Commit release version
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        id: version_commit
         working-directory: zsdesk
         shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
         run: |
-          $version = [regex]::Match((Get-Content -LiteralPath Cargo.toml -Raw), '(?m)^version\s*=\s*"([^"]+)"').Groups[1].Value
-          if (-not $version) { throw 'Could not read the Cargo workspace version' }
-          $tag = "v$version-build.$($env:GITHUB_RUN_NUMBER).$($env:GITHUB_RUN_ATTEMPT)"
-          "version=$version" >> $env:GITHUB_OUTPUT
-          "tag=$tag" >> $env:GITHUB_OUTPUT
+          $ErrorActionPreference = 'Stop'
+          $version = $env:RELEASE_VERSION
+          git add -- Cargo.toml Cargo.lock crates/zsdesk-app/resources/zsdesk.rc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git diff --cached --quiet
+          $hasChanges = $LASTEXITCODE -ne 0
+          if ($hasChanges) {
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git commit -m "chore(release): prepare v$version [skip ci]"
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            git push origin HEAD:refs/heads/main
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          $commit = (git rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "commit=$commit" >> $env:GITHUB_OUTPUT
       - name: Prepare direct release notes
-        if: github.event_name == 'push'
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         id: release_notes
         uses: actions/github-script@v8
         with:
@@ -119,18 +253,19 @@ jobs:
             let commits;
             if (previous) {
               const comparison = await github.rest.repos.compareCommits({
-                owner, repo, base: previous.tag_name, head: context.sha
+                owner, repo, base: previous.tag_name, head: '${{ steps.version_commit.outputs.commit }}'
               });
               commits = comparison.data.commits;
             } else {
               const current = await github.rest.repos.getCommit({
-                owner, repo, ref: context.sha
+                owner, repo, ref: '${{ steps.version_commit.outputs.commit }}'
               });
               commits = [current.data];
             }
             const updates = commits
               .map(item => item.commit.message.split(/\r?\n/, 1)[0].trim())
               .filter(Boolean)
+              .filter(message => !/^chore\(release\): prepare v\d+\.\d+\.\d+ \[skip ci\]$/i.test(message))
               .map(message => `- ${message}`);
             const body = [
               '## 更新内容',
@@ -139,13 +274,13 @@ jobs:
             ].join('\n');
             core.setOutput('body', body);
       - name: Publish automatic release
-        if: github.event_name == 'push'
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v3
         with:
           token: ${{ github.token }}
           tag_name: ${{ steps.release.outputs.tag }}
-          name: ZSDesk ${{ steps.release.outputs.version }} build ${{ github.run_number }}.${{ github.run_attempt }}
-          target_commitish: ${{ github.sha }}
+          name: ZSDesk ${{ steps.release.outputs.version }}
+          target_commitish: ${{ steps.version_commit.outputs.commit }}
           prerelease: false
           generate_release_notes: false
           body: ${{ steps.release_notes.outputs.body }}
