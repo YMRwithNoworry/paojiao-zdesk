@@ -21,6 +21,9 @@ use windows::{
 
 const CLASSES: &str = r"Software\Classes";
 const VERB: &str = "ZSDesk";
+pub const FOLDER_DDE_SERVICE:&str="ZSDesk.Folders";
+pub const FOLDER_DDE_TOPIC:&str="Folders";
+pub const FOLDER_DDE_COMMAND:&str=r#"[Open("%V")]"#;
 /// Classes receiving the "使用 ZSDesk 打开" verb.
 const THIS_PC_CLASS:&str=r"CLSID\{20D04FE0-3AEA-1069-A2D8-08002B30309D}";
 const THIS_PC_ROOT:&str=r"Software\Classes\CLSID\{20D04FE0-3AEA-1069-A2D8-08002B30309D}";
@@ -162,6 +165,14 @@ pub fn owns_folder_integration(exe:&Path)->bool{
     })
 }
 
+/// The running default manager may accept a Shell conversation only while its
+/// private folder verbs still select this service and topic.
+pub fn folder_dde_owned(exe:&Path)->bool{
+    owns_folder_integration(exe)&&BUILTIN_CLASSES.into_iter().all(|class|{
+        dde_values(&format!(r"{CLASSES}\{class}\shell\{VERB}")).into_iter()
+            .all(|(key,expected)|read_string(&key,None).as_deref()==Some(expected))
+    })
+}
 /// A still-selected ZSDesk default whose canonical handlers were later changed.
 /// Report the conflict instead of repeatedly overwriting another program.
 pub fn folder_integration_needs_attention(exe:&Path)->bool{
@@ -224,7 +235,15 @@ pub fn upgrade_default(exe:&Path,backup_path:&Path)->io::Result<bool> {
     let mut backup:Backup=serde_json::from_slice(&bytes).map_err(io::Error::other)?;
     validate_backup(&backup,exe)?;
     let migrated=migrate_backup(&mut backup,exe);
-    let protected=changed_groups(&backup)?;
+    let mut protected=changed_groups(&backup)?;
+    // A previously unrecorded DDE conversation can belong to another handler.
+    // Automatic upgrades add absent entries, but do not claim an existing one.
+    for value in planned_values(Integration::Default,exe).into_iter().filter(|value|dde_key(&value.key)){
+        if !backup.values.iter().any(|saved|same_value_id(saved,&value))
+            &&read_checked(&value.key,value.name.as_deref())?.kind.is_some(){
+            protected.insert(value_group(&value));
+        }
+    }
     let (_,keys)=plan(Integration::Default,exe);
     let planned:Vec<_>=planned_values(Integration::Default,exe).into_iter()
         .filter(|value|!backup.values.iter().any(|saved|same_value_id(saved,value))&&!protected.contains(&value_group(value))
@@ -252,7 +271,15 @@ pub fn upgrade_default(exe:&Path,backup_path:&Path)->io::Result<bool> {
     notify();Ok(true)
 }
 
-/// Values to write for `level` (key, value name, data).
+/// Standard folder conversation registered alongside an owned command.
+fn dde_values(verb:&str)->[(String,&'static str);3]{
+    [(format!(r"{verb}\ddeexec"),FOLDER_DDE_COMMAND),
+        (format!(r"{verb}\ddeexec\application"),FOLDER_DDE_SERVICE),
+        (format!(r"{verb}\ddeexec\topic"),FOLDER_DDE_TOPIC)]
+}
+fn dde_key(key:&str)->bool{
+    key.ends_with(r"\ddeexec")||key.ends_with(r"\ddeexec\application")||key.ends_with(r"\ddeexec\topic")
+}
 fn plan(level: Integration, exe: &Path) -> (Vec<(String, Option<&'static str>, String)>, Vec<String>) {
     let exe = exe.display().to_string();
     let mut values = Vec::new();
@@ -266,6 +293,9 @@ fn plan(level: Integration, exe: &Path) -> (Vec<(String, Option<&'static str>, S
         values.push((format!(r"{verb}\command"), None, if class==THIS_PC_CLASS{format!("\"{exe}\" --this-pc")}else{format!("\"{exe}\" --shell-open \"%V\"" )}));
         values.push((format!(r"{verb}\command"),Some("DelegateExecute"),String::new()));
         verb_keys.push(verb.clone());verb_keys.push(format!(r"{verb}\command"));
+        if level==Integration::Default&&class!=THIS_PC_CLASS{
+            for (key,value) in dde_values(&verb){values.push((key.clone(),None,value.into()));verb_keys.push(key);}
+        }
     }
     if level == Integration::Default {
         for class in DEFAULT_CLASSES { values.push((format!(r"{CLASSES}\{class}\shell"), None, VERB.to_string())); }
@@ -276,7 +306,8 @@ fn plan(level: Integration, exe: &Path) -> (Vec<(String, Option<&'static str>, S
             let verb=format!(r"{CLASSES}\{class}\shell\{builtin}");let command=format!(r"{verb}\command");
             values.push((command.clone(),None,format!("\"{exe}\" --shell-open \"%V\"")));
             values.push((command.clone(),Some("DelegateExecute"),String::new()));
-            verb_keys.extend([verb,command]);
+            verb_keys.extend([verb.clone(),command]);
+            for (key,value) in dde_values(&verb){values.push((key.clone(),None,value.into()));verb_keys.push(key);}
         }}
     }
     (values, verb_keys)
@@ -301,6 +332,7 @@ fn builtin_key(key:&str)->bool{BUILTIN_CLASSES.into_iter().any(|class|BUILTIN_VE
     let root=format!(r"{CLASSES}\{class}\shell\{verb}");key==root||key.starts_with(&format!(r"{root}\"))
 }))}
 fn value_group(value:&SavedValue)->String{
+    if dde_key(&value.key){return value.key.rsplit_once(r"\ddeexec").unwrap().0.into();}
     if value.key==WIN_E_COMMAND{return WIN_E_COMMAND.trim_end_matches(r"\command").into();}
     for class in DEFAULT_CLASSES{let shell=format!(r"{CLASSES}\{class}\shell");
         if value.key==shell{return format!(r"{shell}\{VERB}");}}
@@ -457,6 +489,11 @@ fn replay_owned(backup:&Backup,exe:Option<&Path>)->io::Result<bool>{
         if let Some(handler)=backup.applied.iter().find(|value|value.key==group&&value.name.as_deref()==Some("ExplorerCommandHandler")){
             if read_checked(&handler.key,handler.name.as_deref())?!=*handler{continue;}
         }
+        let mut dde_unchanged=true;
+        for expected in backup.applied.iter().filter(|value|dde_key(&value.key)&&value_group(value)==group){
+            if read_checked(&expected.key,expected.name.as_deref())?!=*expected{dde_unchanged=false;break;}
+        }
+        if !dde_unchanged{continue;}
         owned.insert(group);
     }
     let mut changed=false;
@@ -541,8 +578,8 @@ mod tests {
             restore(&backup_file)?;
             delete_tree(WIN_E_ROOT);
             let (mut legacy_values,mut legacy_keys)=plan(Integration::Default,exe);
-            legacy_values.retain(|(key,_,_)|!key.starts_with(WIN_E_ROOT)&&!key.starts_with(THIS_PC_ROOT)&&!builtin_key(key));
-            legacy_keys.retain(|key|!key.starts_with(WIN_E_ROOT)&&!key.starts_with(THIS_PC_ROOT)&&!builtin_key(key));
+            legacy_values.retain(|(key,_,_)|!key.starts_with(WIN_E_ROOT)&&!key.starts_with(THIS_PC_ROOT)&&!builtin_key(key)&&!dde_key(key));
+            legacy_keys.retain(|key|!key.starts_with(WIN_E_ROOT)&&!key.starts_with(THIS_PC_ROOT)&&!builtin_key(key)&&!dde_key(key));
             let mut legacy=Backup{version:1,..Default::default()};
             for (key,name,_) in &legacy_values{legacy.values.push(read_checked(key,*name)?);}
             legacy.created_keys=legacy_keys.into_iter().filter(|key|!key_exists(key)).collect();
@@ -598,7 +635,15 @@ mod tests {
         assert!(values.iter().any(|(key,name,value)|key==&format!(r"{THIS_PC_ROOT}\shell\{VERB}\command")&&name.is_none()&&value==r#""C:\Apps\ZSDesk.exe" --this-pc"#));
         assert!(values.iter().any(|(key,name,value)|key==WIN_E_COMMAND && name.is_none() && value==r#""C:\Apps\ZSDesk.exe" --win-e"#));
         assert!(values.iter().any(|(key,name,value)|key==WIN_E_COMMAND && *name==Some("DelegateExecute") && value.is_empty()));
+        for class in BUILTIN_CLASSES{for verb in [VERB,"open","explore"]{
+            let root=format!(r"{CLASSES}\{class}\shell\{verb}");
+            for (key,value) in dde_values(&root){
+                assert!(values.iter().any(|(actual,name,text)|actual==&key&&name.is_none()&&text==value));
+                assert_eq!(value_group(&string_value(key,None,value)),root);
+            }
+        }}
         let (context, _) = plan(Integration::ContextMenu, Path::new("z.exe"));
+        assert!(!context.iter().any(|(key,_,_)|dde_key(key)),"context mode does not advertise a default-manager DDE server");
         assert!(!context.iter().any(|(key,_,_)|builtin_key(key)),"context-menu mode leaves canonical verbs unchanged");
         assert!(!context.iter().any(|(k, n, _)| k.ends_with(r"\shell") && n.is_none()), "context mode keeps Explorer as default");
         assert!(plan(Integration::Off, Path::new("z.exe")).0.is_empty());
@@ -659,6 +704,7 @@ mod tests {
             let original_private_hidden=read_checked(owned_root,Some("LegacyDisable"))?;
             apply(Integration::Default,exe,&backup_path)?;
             assert!(owns_folder_integration(exe));
+            assert!(folder_dde_owned(exe));
             assert!(!folder_integration_needs_attention(exe));
             assert!(read_checked(owned_root,Some("LegacyDisable"))?.kind.is_none());
             write_string(owned_root,Some("LegacyDisable"),"later-cleaner")?;
@@ -682,10 +728,10 @@ mod tests {
             // A v1 backup predates canonical verbs. Upgrade appends their exact
             // existing handlers and hidden values without replacing old records.
             let (legacy_values,legacy_keys)=plan(Integration::Default,exe);
-            let legacy_values:Vec<_>=legacy_values.into_iter().filter(|(key,_,_)|!builtin_key(key)).collect();
+            let legacy_values:Vec<_>=legacy_values.into_iter().filter(|(key,_,_)|!builtin_key(key)&&!dde_key(key)).collect();
             let mut legacy=Backup{version:1,..Default::default()};
             for (key,name,_) in &legacy_values{legacy.values.push(read_checked(key,*name)?);}
-            legacy.created_keys=legacy_keys.into_iter().filter(|key|!builtin_key(key)&&!key_exists(key)).collect();
+            legacy.created_keys=legacy_keys.into_iter().filter(|key|!builtin_key(key)&&!dde_key(key)&&!key_exists(key)).collect();
             save_backup(&backup_path,&legacy)?;
             for (key,name,text) in &legacy_values{write_string(key,*name,text)?;}
             assert!(upgrade_default(exe,&backup_path)?);
@@ -703,7 +749,7 @@ mod tests {
             let old_exe=output.join("old installed copy").join("ZSDesk.exe");
             std::fs::create_dir_all(old_exe.parent().unwrap())?;std::fs::write(&old_exe,b"owned fixture; never executed")?;
             let old_values:Vec<_>=plan(Integration::Default,&old_exe).0.into_iter().filter(|(key,name,_)|
-                !builtin_key(key)&&!key.starts_with(WIN_E_ROOT)&&!key.starts_with(THIS_PC_ROOT)
+                !builtin_key(key)&&!dde_key(key)&&!key.starts_with(WIN_E_ROOT)&&!key.starts_with(THIS_PC_ROOT)
                     &&*name!=Some("DelegateExecute")).collect();
             assert_eq!(old_values.len(),11);
             let mut old_backup=Backup{version:1,..Default::default()};
@@ -767,6 +813,68 @@ mod tests {
         let report=serde_json::json!({"state":if result.is_ok()&&cleaned{"passed"}else{"failed"},"process_local_registry_override":true,
             "registry_cleanup":cleaned,"shell_commands_invoked":false,"error":result.as_ref().err().map(|error|error.to_string())});
         std::fs::write(output.join("canonical-verbs.current.json"),serde_json::to_vec_pretty(&report)?)?;println!("{report}");
+        result?;assert!(cleaned);Ok(())
+    }
+    #[test]
+    #[ignore="Process-local registry override; no Shell launch or keyboard input"]
+    fn native_folder_dde_registration_preserves_originals_and_foreign_handlers()->Result<(),Box<dyn std::error::Error>>{
+        use windows::Win32::System::Registry::{RegCreateKeyExW,RegOverridePredefKey,KEY_ALL_ACCESS,REG_OPTION_NON_VOLATILE,REG_EXPAND_SZ};
+        let _serial=REGISTRY_TEST.lock().unwrap_or_else(|error|error.into_inner());
+        struct Sandbox{key:String,handle:HKEY,active:bool}
+        impl Drop for Sandbox{fn drop(&mut self){
+            if self.active{let _=unsafe{RegOverridePredefKey(HKEY_CURRENT_USER,None)};}
+            let _=unsafe{RegCloseKey(self.handle)};delete_tree(&self.key);
+        }}
+        let output=std::path::PathBuf::from(std::env::var_os("ZSDESK_NATIVE_TEST_OUTPUT").ok_or("missing isolated output")?);
+        assert!(output.is_absolute());std::fs::create_dir_all(&output)?;
+        let key=format!(r"Software\ZSDesk.FolderDde.Regression.{}",std::process::id());assert!(!key_exists(&key));
+        let raw=wide(&key);let mut handle=HKEY::default();
+        unsafe{RegCreateKeyExW(HKEY_CURRENT_USER,PCWSTR(raw.as_ptr()),None,PCWSTR::null(),REG_OPTION_NON_VOLATILE,KEY_ALL_ACCESS,None,&mut handle,None)}.ok()?;
+        let mut sandbox=Sandbox{key,handle,active:false};unsafe{RegOverridePredefKey(HKEY_CURRENT_USER,Some(handle))}.ok()?;sandbox.active=true;
+        let exe=Path::new(r"C:\Applications\ZSDesk\ZSDesk.exe");
+        let backup_path=output.join("folder-dde-backup.json");assert!(!backup_path.exists());
+        let verb=format!(r"{CLASSES}\Directory\shell\{VERB}");
+        let command=format!(r"{verb}\command");
+        let result=(||->Result<(),Box<dyn std::error::Error>>{
+            write_string(&format!(r"{CLASSES}\Directory\shell"),None,"prior-manager")?;
+            let mut original_dde=Vec::new();
+            for (key,value) in dde_values(&verb){
+                let text=format!("previous-{value}");let bytes:Vec<_>=wide(&text).iter().flat_map(|unit|unit.to_le_bytes()).collect();
+                write_raw(&key,None,REG_EXPAND_SZ.0,&bytes)?;original_dde.push(read_checked(&key,None)?);
+            }
+            apply(Integration::Default,exe,&backup_path)?;assert!(folder_dde_owned(exe));
+            restore(&backup_path)?;
+            for value in &original_dde{assert_eq!(read_checked(&value.key,None)?,*value);}
+            assert_eq!(read_string(&format!(r"{CLASSES}\Directory\shell"),None).as_deref(),Some("prior-manager"));
+
+            // Upgrade an owned v2 record predating DDE. Existing conversations
+            // are preserved, while absent groups receive complete new entries.
+            let applied:Vec<_>=planned_values(Integration::Default,exe).into_iter().filter(|value|!dde_key(&value.key)).collect();
+            let values=applied.iter().map(|value|read_checked(&value.key,value.name.as_deref())).collect::<io::Result<Vec<_>>>()?;
+            let created_keys=plan(Integration::Default,exe).1.into_iter().filter(|key|!dde_key(key)&&!key_exists(key)).collect();
+            let old=Backup{version:2,values,applied,created_keys};save_backup(&backup_path,&old)?;write_plan(&old.applied,&old.values)?;
+            assert!(upgrade_default(exe,&backup_path)?);assert!(owns_folder_integration(exe));assert!(!folder_dde_owned(exe));
+            for value in &original_dde{assert_eq!(read_checked(&value.key,None)?,*value,"automatic upgrade changed an existing DDE handler");}
+            assert!(!upgrade_default(exe,&backup_path)?);
+            restore(&backup_path)?;
+            for value in &original_dde{assert_eq!(read_checked(&value.key,None)?,*value);}
+
+            delete_tree(&format!(r"{verb}\ddeexec"));
+            apply(Integration::Default,exe,&backup_path)?;assert!(folder_dde_owned(exe));
+            let owned_command=read_checked(&command,None)?;let saved=std::fs::read(&backup_path)?;
+            let topic=format!(r"{verb}\ddeexec\topic");write_string(&topic,None,"later-topic")?;
+            assert!(!folder_dde_owned(exe));assert!(apply(Integration::Default,exe,&backup_path).is_err());
+            assert!(!upgrade_default(exe,&backup_path)?);assert_eq!(std::fs::read(&backup_path)?,saved);
+            restore(&backup_path)?;
+            assert_eq!(read_string(&topic,None).as_deref(),Some("later-topic"));
+            assert_eq!(read_checked(&command,None)?,owned_command,"a later DDE owner must retain its complete verb");
+            Ok(())
+        })();
+        unsafe{RegOverridePredefKey(HKEY_CURRENT_USER,None)}.ok()?;sandbox.active=false;
+        let key=sandbox.key.clone();drop(sandbox);let cleaned=!key_exists(&key);
+        let report=serde_json::json!({"state":if result.is_ok()&&cleaned{"passed"}else{"failed"},"registry_cleanup":cleaned,
+            "process_local_registry_override":true,"error":result.as_ref().err().map(|error|error.to_string())});
+        std::fs::write(output.join("folder-dde-registration.current.json"),serde_json::to_vec_pretty(&report)?)?;println!("{report}");
         result?;assert!(cleaned);Ok(())
     }
 }

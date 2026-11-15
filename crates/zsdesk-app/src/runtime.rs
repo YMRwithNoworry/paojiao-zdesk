@@ -178,6 +178,10 @@ pub fn run(profile:PathBuf,args:Vec<OsString>)->Result<()>{
     let window=HostWindow(unsafe{CreateWindowExW(WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE,CLASS,w!("ZSdesk"),WS_POPUP,0,0,0,0,None,None,Some(instance),Some((&mut*ingress as*mut Ingress).cast()))}?);
     let hwnd=window.0;unsafe{SetPropW(hwnd,PCWSTR(key.as_ptr()),Some(HANDLE(1usize as*mut _)))}?;
     LOCAL.set((profile.clone(),hwnd.0 as isize)).map_err(|_|anyhow::anyhow!("应用宿主已初始化"))?;
+    let folder_dde=match crate::folder_dde::Server::start(&profile){
+        Ok(server)=>server,
+        Err(error)=>{crate::window::diagnostics::record("folder-dde","startup-failed",None);trace(&format!("folder DDE startup: {error:#}"));None},
+    };
     ingress.tx.try_send(Request{args}).context("初始启动请求失败")?;
     let (finished_tx,finished_rx)=mpsc::channel::<Notice>();let mut workers:Vec<Worker>=Vec::new();let mut pool:Vec<WindowWorker>=Vec::new();
     let mut queued:VecDeque<WindowJob>=VecDeque::new();let mut last_error=None;let mut serial=0u64;let mut shutting_down=false;let mut previous_status=None;let mut accepted_request=None;
@@ -267,6 +271,7 @@ pub fn run(profile:PathBuf,args:Vec<OsString>)->Result<()>{
         if received<0{last_error=Some(format!("应用消息循环失败：{}",windows::core::Error::from_thread()));continue;}
         unsafe{let _=TranslateMessage(&message);DispatchMessageW(&message);}
     }
+    drop(folder_dde);
     crate::context_menu_process::shutdown_idle_worker();
     crate::window::diagnostics::flush_at_shutdown();
     drop(window);drop(ingress);

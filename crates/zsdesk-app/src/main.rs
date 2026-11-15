@@ -22,6 +22,7 @@ mod quick_search;
 mod win_e_bridge;
 mod explorer_forwarder;
 mod file_dialog_takeover;
+mod folder_dde;
 mod runtime;
 mod context_menu_process;
 mod utility_panel;
