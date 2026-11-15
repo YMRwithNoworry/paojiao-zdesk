@@ -310,9 +310,35 @@ fn receipts(backup:&Backup,exe:&Path)->Vec<SavedValue>{
     if backup.version==2{return backup.applied.clone();}
     planned_values(Integration::Default,exe).into_iter().filter(|value|backup.values.iter().any(|saved|same_value_id(saved,value))).collect()
 }
+fn legacy_registered_executable(backup:&Backup)->Option<std::path::PathBuf>{
+    if backup.version!=1{return None;}
+    let command=registered_command()?;
+    let (path,arguments)=command.strip_prefix('"')?.split_once('"')?;
+    let executable=std::path::PathBuf::from(path);
+    if !executable.is_absolute()||!executable.file_name()?.to_string_lossy().eq_ignore_ascii_case("ZSDesk.exe")
+        ||arguments.trim()!=r#"--shell-open "%V""#{return None;}
+    // v1 stored original values, but no executable identity. Recover it only
+    // from both complete, backed-up private verbs, including labels and icons.
+    // An arbitrary command, partial record or later manager is not ownership.
+    let expected=plan(Integration::ContextMenu,&executable).0.into_iter().filter(|(key,_,_)|
+        BUILTIN_CLASSES.into_iter().any(|class|{
+            let root=format!(r"{CLASSES}\{class}\shell\{VERB}");key==&root||key==&format!(r"{root}\command")
+        })).map(|(key,name,text)|string_value(key,name,&text)).collect::<Vec<_>>();
+    let private_handlers_unchanged=BUILTIN_CLASSES.into_iter().all(|class|{
+        let root=format!(r"{CLASSES}\{class}\shell\{VERB}");
+        VERB_OVERRIDES.into_iter().all(|name|read_checked(&root,Some(name)).is_ok_and(|value|value.kind.is_none()))
+            &&read_checked(&format!(r"{root}\command"),Some("DelegateExecute"))
+                .is_ok_and(|value|value.kind.is_none()||saved_string(&value).as_deref()==Some(""))
+    });
+    (private_handlers_unchanged&&expected.len()==8&&expected.iter().filter(|value|value.name.as_deref()!=Some("DelegateExecute")).all(|value|
+        backup.values.iter().any(|original|same_value_id(original,value))
+            &&read_checked(&value.key,value.name.as_deref()).is_ok_and(|current|current==*value)))
+        .then_some(executable)
+}
 fn migrate_backup(backup:&mut Backup,exe:&Path)->bool{
     if backup.version!=1{return false;}
-    backup.applied=receipts(backup,exe);backup.version=2;
+    let registered=legacy_registered_executable(backup);
+    backup.applied=receipts(backup,registered.as_deref().unwrap_or(exe));backup.version=2;
     // Older records listed a newly created verb root but omitted its command
     // child. Add only descendants of those proven-new roots; cleanup still
     // removes empty keys exclusively.
@@ -668,6 +694,49 @@ mod tests {
             assert!(original.iter().all(|value|upgraded.values.contains(value)));
             assert!(!upgrade_default(exe,&backup_path)?);
             restore(&backup_path)?;
+            for value in &original{assert_eq!(read_checked(&value.key,value.name.as_deref())?,*value);}
+
+            // The original v1 layout had three private verbs and two defaults,
+            // but no receipts or canonical verbs. An explicitly selected new
+            // installation must rebind it even while the old executable exists.
+            restore_value(&SavedValue{key:owned_root.into(),name:Some("LegacyDisable".into()),kind:None,data:None})?;
+            let old_exe=output.join("old installed copy").join("ZSDesk.exe");
+            std::fs::create_dir_all(old_exe.parent().unwrap())?;std::fs::write(&old_exe,b"owned fixture; never executed")?;
+            let old_values:Vec<_>=plan(Integration::Default,&old_exe).0.into_iter().filter(|(key,name,_)|
+                !builtin_key(key)&&!key.starts_with(WIN_E_ROOT)&&!key.starts_with(THIS_PC_ROOT)
+                    &&*name!=Some("DelegateExecute")).collect();
+            assert_eq!(old_values.len(),11);
+            let mut old_backup=Backup{version:1,..Default::default()};
+            for (key,name,_) in &old_values{old_backup.values.push(read_checked(key,*name)?);}
+            old_backup.created_keys=["Directory","Drive",r"Directory\Background"].into_iter()
+                .map(|class|format!(r"{CLASSES}\{class}\shell\{VERB}")).filter(|key|!key_exists(key)).collect();
+            save_backup(&backup_path,&old_backup)?;
+            for (key,name,text) in &old_values{write_string(key,*name,text)?;}
+            assert_eq!(legacy_registered_executable(&old_backup).as_deref(),Some(old_exe.as_path()));
+            assert!(!upgrade_default(exe,&backup_path)?,"startup must not take over another installed copy");
+            assert!(!restore_owned(exe,&backup_path)?,"uninstall must not remove another copy's registration");
+            let drive_command=format!(r"{CLASSES}\Drive\shell\{VERB}\command");
+            let old_drive=read_checked(&drive_command,None)?;
+            let prior_delegate=read_checked(&drive_command,Some("DelegateExecute"))?;
+            write_string(&drive_command,Some("DelegateExecute"),"{AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE}")?;
+            assert!(legacy_registered_executable(&old_backup).is_none(),"later COM handler must remain owned by its writer");
+            assert!(apply(Integration::Default,exe,&backup_path).is_err());
+            assert_eq!(read_string(&drive_command,Some("DelegateExecute")).as_deref(),Some("{AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE}"));
+            restore_value(&prior_delegate)?;
+            write_string(&drive_command,None,r#""C:\Other\Manager.exe" "%1""#)?;
+            let foreign=read_checked(&drive_command,None)?;let bytes=std::fs::read(&backup_path)?;
+            assert!(legacy_registered_executable(&old_backup).is_none());
+            assert!(apply(Integration::Default,exe,&backup_path).is_err());
+            assert_eq!(read_checked(&drive_command,None)?,foreign);assert_eq!(std::fs::read(&backup_path)?,bytes);
+            restore_value(&old_drive)?;
+            let mut incomplete=old_backup.clone();incomplete.values.retain(|value|value.name.as_deref()!=Some("Icon"));
+            assert!(legacy_registered_executable(&incomplete).is_none(),"partial records do not prove ownership");
+            apply(Integration::Default,exe,&backup_path)?;
+            assert!(old_exe.is_file());assert!(owns_folder_integration(exe));
+            let rebound:Backup=serde_json::from_slice(&std::fs::read(&backup_path)?)?;
+            for value in &old_backup.values{assert!(rebound.values.contains(value),"original restoration value replaced by stale application path");}
+            restore(&backup_path)?;
+            for value in &old_backup.values{assert_eq!(read_checked(&value.key,value.name.as_deref())?,*value);}
             for value in &original{assert_eq!(read_checked(&value.key,value.name.as_deref())?,*value);}
 
             apply(Integration::Default,exe,&backup_path)?;
