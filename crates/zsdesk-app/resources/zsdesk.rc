@@ -1,8 +1,8 @@
 #define RT_MANIFEST 24
 101 ICON "resources\\zsdesk.ico"
 1 VERSIONINFO
-FILEVERSION 0,3,11,0
-PRODUCTVERSION 0,3,11,0
+FILEVERSION 0,3,12,0
+PRODUCTVERSION 0,3,12,0
 FILEOS 0x40004
 FILETYPE 1
 BEGIN
@@ -12,8 +12,8 @@ BEGIN
     BEGIN
       VALUE "FileDescription", "ZSdesk\0"
       VALUE "ProductName", "ZSdesk\0"
-      VALUE "FileVersion", "0.3.11\0"
-      VALUE "ProductVersion", "0.3.11\0"
+      VALUE "FileVersion", "0.3.12\0"
+      VALUE "ProductVersion", "0.3.12\0"
       VALUE "OriginalFilename", "ZSDesk.exe\0"
     END
   END
