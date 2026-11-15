@@ -10,7 +10,7 @@ use windows::{core::BOOL,Win32::{Foundation::{HWND,LPARAM,LRESULT,WPARAM,COLORRE
 
 const SUBCLASS:usize=0x5a534247;
 #[derive(Clone,Copy)]
-pub(super) struct Colors{pub background:u32,pub high_contrast:bool}
+pub(super) struct Colors{pub background:u32,pub dark:bool,pub high_contrast:bool}
 #[derive(Clone,Copy,PartialEq,Eq)]
 enum PaintOwner{Container,Native,ListView}
 struct State{colors:Rc<Cell<Colors>>,brush:HBRUSH,last:Option<u32>,owner:PaintOwner}
@@ -35,7 +35,10 @@ fn prepare_list_view(hwnd:HWND,colors:Colors){
     }
 }
 fn install_one(hwnd:HWND,colors:Rc<Cell<Colors>>,owner:PaintOwner){
-    if owner==PaintOwner::ListView{prepare_list_view(hwnd,colors.get());}
+    let palette=colors.get();
+    crate::theme::theme_control(hwnd,palette.dark);
+    let _=unsafe{windows::Win32::Graphics::Gdi::InvalidateRect(Some(hwnd),None,true)};
+    if owner==PaintOwner::ListView{prepare_list_view(hwnd,palette);}
     let mut old=0usize;
     if unsafe{GetWindowSubclass(hwnd,Some(procedure),SUBCLASS,Some(&mut old))}.as_bool(){
         if old!=0 {unsafe{(*(old as*mut State)).colors=colors;}}return;
@@ -130,7 +133,7 @@ unsafe extern "system" fn procedure(hwnd:HWND,msg:u32,wp:WPARAM,lp:LPARAM,id:usi
         canvas.fill(sentinel);
         let expected=unsafe{SendMessageW(window.0,WM_ERASEBKGND,Some(WPARAM(canvas.dc.0 as usize)),None)};
         let expected_pixel=unsafe{GetPixel(canvas.dc,3,3)};
-        install_one(window.0,Rc::new(Cell::new(Colors{background:0x010203,high_contrast:false})),PaintOwner::Native);
+        install_one(window.0,Rc::new(Cell::new(Colors{background:0x010203,dark:false,high_contrast:false})),PaintOwner::Native);
         canvas.fill(sentinel);
         assert_eq!(unsafe{SendMessageW(window.0,WM_ERASEBKGND,Some(WPARAM(canvas.dc.0 as usize)),None)},expected);
         assert_eq!(unsafe{GetPixel(canvas.dc,3,3)},expected_pixel,"application filled a native renderer's scroll surface");
@@ -143,7 +146,7 @@ unsafe extern "system" fn procedure(hwnd:HWND,msg:u32,wp:WPARAM,lp:LPARAM,id:usi
         // showing a window or relying on the system's visible-window DC clip.
         let _child=Window(unsafe{CreateWindowExW(WINDOW_EX_STYLE::default(),windows::core::w!("STATIC"),None,
             WS_CHILD|WS_VISIBLE,2,2,4,4,Some(window.0),None,None,None)}.unwrap());
-        canvas.fill(sentinel);let colors=Rc::new(Cell::new(Colors{background:0x202020,high_contrast:false}));
+        canvas.fill(sentinel);let colors=Rc::new(Cell::new(Colors{background:0x202020,dark:true,high_contrast:false}));
         install_one(window.0,colors,PaintOwner::Container);
         assert_eq!(unsafe{SendMessageW(window.0,WM_ERASEBKGND,Some(WPARAM(canvas.dc.0 as usize)),None)}.0,1);
         assert_eq!(unsafe{GetPixel(canvas.dc,0,0)}.0,0x202020);
@@ -160,9 +163,9 @@ unsafe extern "system" fn procedure(hwnd:HWND,msg:u32,wp:WPARAM,lp:LPARAM,id:usi
         let window=Window(unsafe{CreateWindowExW(WINDOW_EX_STYLE::default(),windows::core::w!("SysListView32"),None,
             WS_POPUP|windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE(LVS_REPORT),0,0,8,8,None,None,None,None)}.unwrap());
         unsafe{SendMessageW(window.0,LVM_SETEXTENDEDLISTVIEWSTYLE,Some(WPARAM(LVS_EX_FULLROWSELECT as usize)),Some(LPARAM(LVS_EX_FULLROWSELECT as isize)));}
-        let colors=Rc::new(Cell::new(Colors{background:0x282828,high_contrast:false}));
-        for color in [0x282828,0xf0f0f0]{
-            colors.set(Colors{background:color,high_contrast:false});
+        let colors=Rc::new(Cell::new(Colors{background:0x282828,dark:true,high_contrast:false}));
+        for (color,dark) in [(0x282828,true),(0xf0f0f0,false)]{
+            colors.set(Colors{background:color,dark,high_contrast:false});
             install_one(window.0,colors.clone(),paint_owner(window.0).unwrap());
             let styles=unsafe{SendMessageW(window.0,LVM_GETEXTENDEDLISTVIEWSTYLE,None,None)}.0 as u32;
             assert_eq!(styles&(LVS_EX_DOUBLEBUFFER|LVS_EX_FULLROWSELECT),LVS_EX_DOUBLEBUFFER|LVS_EX_FULLROWSELECT);
@@ -172,12 +175,12 @@ unsafe extern "system" fn procedure(hwnd:HWND,msg:u32,wp:WPARAM,lp:LPARAM,id:usi
     #[test]
     fn native_view_erase_uses_current_palette_without_changing_theme(){
         let hwnd=unsafe{CreateWindowExW(WINDOW_EX_STYLE::default(),windows::core::w!("STATIC"),windows::core::w!("erase test"),WS_POPUP,0,0,8,8,None,None,None,None)}.unwrap();
-        let colors=Rc::new(Cell::new(Colors{background:0x202020,high_contrast:false}));install_one(hwnd,colors.clone(),PaintOwner::Container);
+        let colors=Rc::new(Cell::new(Colors{background:0x202020,dark:true,high_contrast:false}));install_one(hwnd,colors.clone(),PaintOwner::Container);
         let screen=unsafe{GetDC(None)};let dc=unsafe{CreateCompatibleDC(Some(screen))};let bitmap=unsafe{CreateCompatibleBitmap(screen,8,8)};
         unsafe{ReleaseDC(None,screen);}
         let previous=unsafe{SelectObject(dc,bitmap.into())};
         for value in [0x202020,0xeeeeee]{
-            colors.set(Colors{background:value,high_contrast:false});
+            colors.set(Colors{background:value,dark:value<0x808080,high_contrast:false});
             assert_eq!(unsafe{SendMessageW(hwnd,WM_ERASEBKGND,Some(WPARAM(dc.0 as usize)),Some(LPARAM(0)))}.0,1);
             assert_eq!(unsafe{GetPixel(dc,2,2)}.0,value);
         }

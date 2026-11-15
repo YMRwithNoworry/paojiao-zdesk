@@ -16,7 +16,7 @@ use windows::{core::PCWSTR,Win32::{Foundation::{HWND,LPARAM,WPARAM},Storage::Fil
 
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
 pub struct SearchOptions{pub backend:BackendPreference,pub include_development:bool,pub index_metadata:bool,pub pinyin_initials:bool,pub idle_seconds:u32}
-impl Default for SearchOptions{fn default()->Self{Self{backend:BackendPreference::NativeNtfs,include_development:false,index_metadata:false,pinyin_initials:false,idle_seconds:300}}}
+impl Default for SearchOptions{fn default()->Self{Self{backend:BackendPreference::Everything,include_development:false,index_metadata:false,pinyin_initials:false,idle_seconds:300}}}
 impl SearchOptions{
     pub fn from_ui(ui:&zsdesk_core::model::explorer::ExplorerUi)->Self{Self{backend:ui.search_backend,include_development:ui.search_include_development,index_metadata:ui.search_index_metadata,pinyin_initials:ui.search_pinyin_initials,idle_seconds:ui.search_idle_seconds.clamp(30,3600)}}
     fn effective(self,profile:&Path)->Result<Self>{crate::storage::load(profile).map(|session|Self::from_ui(&session.ui)).context("无法读取搜索后端设置，请重新保存搜索设置")}

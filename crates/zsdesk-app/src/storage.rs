@@ -5,7 +5,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use zsdesk_core::model::explorer::{Bookmark,ExplorerSession,SearchPreferences};
+use zsdesk_core::model::explorer::{Bookmark,ExplorerSession,SearchBackendPreference,SearchPreferences};
 
 // A process may host several window threads. Serialize their read/merge/write
 // transactions, not only the final rename, and never share a temporary file.
@@ -27,11 +27,17 @@ pub fn config_path() -> PathBuf {
 pub fn load(path: &Path) -> Result<ExplorerSession> {
     let text =
         fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))?;
-    serde_json::from_str(&text).context("invalid explorer session")
+    let mut session:ExplorerSession=serde_json::from_str(&text).context("invalid explorer session")?;
+    if !session.ui.search_backend_configured {
+        session.ui.search_backend=SearchBackendPreference::Everything;
+        session.ui.search_backend_configured=true;
+    }
+    Ok(session)
 }
 
 pub fn default_session() -> ExplorerSession {
     let mut session = ExplorerSession::default();
+    session.ui.search_backend_configured=true;
     if crate::edition::THEMED {
         session.ui.appearance.backdrop = zsdesk_core::model::explorer::BackdropStyle::Acrylic;
     }
@@ -189,15 +195,27 @@ mod tests {
         fs::remove_file(path).unwrap();fs::remove_dir(root).unwrap();
     }
     #[test]
-    fn stale_navigation_save_cannot_reenable_an_unselected_backend(){
+    fn legacy_search_backend_migrates_to_everything_and_later_native_choice_survives(){
+        use zsdesk_core::model::explorer::SearchBackendPreference;
+        let root=std::env::temp_dir().join(format!("zsdesk-search-backend-migration-{}-{}",std::process::id(),SAVE_SERIAL.fetch_add(1,Ordering::Relaxed)));
+        fs::create_dir(&root).unwrap();let path=root.join("explorer-session.json");
+        let mut legacy=default_session();legacy.ui.search_backend=SearchBackendPreference::NativeNtfs;legacy.ui.search_backend_configured=false;
+        fs::write(&path,serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let upgraded=load(&path).unwrap();assert_eq!(upgraded.ui.search_backend,SearchBackendPreference::Everything);assert!(upgraded.ui.search_backend_configured);
+        save(&path,&upgraded).unwrap();let mut chosen=upgraded;chosen.ui.search_backend=SearchBackendPreference::NativeNtfs;
+        save(&path,&chosen).unwrap();assert_eq!(load(&path).unwrap().ui.search_backend,SearchBackendPreference::NativeNtfs);
+        fs::remove_file(path).unwrap();fs::remove_dir(root).unwrap();
+    }
+    #[test]
+    fn stale_window_navigation_cannot_reenable_an_unselected_backend(){
         use zsdesk_core::model::explorer::SearchBackendPreference;
         let root=std::env::temp_dir().join(format!("zsdesk-search-preference-{}-{}",std::process::id(),SAVE_SERIAL.fetch_add(1,Ordering::Relaxed)));
-        fs::create_dir(&root).unwrap();let path=root.join("explorer-session.json");let mut original=default_session();original.ui.search_backend=SearchBackendPreference::Everything;
+        fs::create_dir(&root).unwrap();let path=root.join("explorer-session.json");let mut original=default_session();original.ui.search_backend=SearchBackendPreference::Everything;original.ui.search_backend_configured=true;
         save(&path,&original).unwrap();let baseline=original.ui.search_preferences();let mut chosen=original.clone();chosen.ui.search_backend=SearchBackendPreference::NativeNtfs;
         save_window_with_search(&path,&chosen,false,&baseline).unwrap();
         let restored=save_window_with_search(&path,&original,true,&baseline).unwrap();assert_eq!(restored.backend,SearchBackendPreference::NativeNtfs);
         assert_eq!(load(&path).unwrap().ui.search_backend,SearchBackendPreference::NativeNtfs);
-        let mut explicit=original;explicit.ui.search_backend=SearchBackendPreference::Everything;
+        let mut explicit=original;explicit.ui.search_backend=SearchBackendPreference::Everything;explicit.ui.search_backend_configured=true;
         save_window_with_search(&path,&explicit,true,&restored).unwrap();assert_eq!(load(&path).unwrap().ui.search_backend,SearchBackendPreference::Everything);
         fs::remove_file(path).unwrap();fs::remove_dir(root).unwrap();
     }

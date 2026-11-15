@@ -662,7 +662,7 @@ impl WindowState {
             Some("search-everything-program") => {
                 if self.session.ui.search_backend.is_builtin(){return;}
                 match crate::fast_search::everything::choose_executable(self.hwnd){
-                    Ok(Some(path))=>{self.session.ui.everything_executable=Some(path);self.session.ui.search_backend=zsdesk_core::model::explorer::SearchBackendPreference::Everything;if self.persist_search_preferences(){self.search_backend_changed();}},
+                    Ok(Some(path))=>{self.session.ui.everything_executable=Some(path);self.session.ui.search_backend=zsdesk_core::model::explorer::SearchBackendPreference::Everything;self.session.ui.search_backend_configured=true;if self.persist_search_preferences(){self.search_backend_changed();}},
                     Ok(None)=>{},Err(error)=>self.show_message(error.to_string()),
                 }
             },
@@ -761,6 +761,7 @@ impl WindowState {
     /// Applies an interface preference chosen in ≡ and refreshes what it affects.
     fn apply_interface_choice(&mut self, id: &str) {
         if !menus::apply_interface_setting(&mut self.session.ui,id) { return; }
+        if id.starts_with("search-backend-") { self.session.ui.search_backend_configured=true; }
         zsdesk_windows::shell::set_open_archives_externally(self.session.ui.archives_open_externally);
         if (id.starts_with("search-backend-")||id.starts_with("search-native-")||id=="everything-folder-sizes")&&!self.persist_search_preferences(){return;}
         if id=="everything-folder-sizes" {self.cancel_folder_sizes();}

@@ -281,7 +281,7 @@ impl Default for ContextMenuPreferences {
 /// Legacy variants remain readable so existing profiles migrate without data loss.
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum SearchBackendPreference { Auto, #[default] NativeNtfs, DirectoryScan, Everything }
+pub enum SearchBackendPreference { Auto, NativeNtfs, DirectoryScan, #[default] Everything }
 impl SearchBackendPreference {
     pub fn is_builtin(self)->bool {self!=Self::Everything}
 }
@@ -342,6 +342,8 @@ pub struct ExplorerUi {
     pub context_menu: ContextMenuPreferences,
     pub search_all_files: bool,
     pub search_backend: SearchBackendPreference,
+    /// False for profiles written before backend choice was surfaced in settings.
+    pub search_backend_configured: bool,
     pub search_include_development: bool,
     pub search_index_metadata: bool,
     pub search_pinyin_initials: bool,
@@ -364,14 +366,14 @@ pub struct ExplorerUi {
 
 #[derive(Clone,Debug,PartialEq,Eq)]
 pub struct SearchPreferences {
-    pub backend:SearchBackendPreference,pub include_development:bool,pub index_metadata:bool,pub pinyin_initials:bool,
+    pub backend:SearchBackendPreference,pub backend_configured:bool,pub include_development:bool,pub index_metadata:bool,pub pinyin_initials:bool,
     pub idle_seconds:u32,pub everything_executable:Option<PathBuf>,pub folder_sizes:bool,
 }
 impl ExplorerUi{
-    pub fn search_preferences(&self)->SearchPreferences{SearchPreferences{backend:self.search_backend,include_development:self.search_include_development,
+    pub fn search_preferences(&self)->SearchPreferences{SearchPreferences{backend:self.search_backend,backend_configured:self.search_backend_configured,include_development:self.search_include_development,
         index_metadata:self.search_index_metadata,pinyin_initials:self.search_pinyin_initials,idle_seconds:self.search_idle_seconds,
         everything_executable:self.everything_executable.clone(),folder_sizes:self.everything_folder_sizes}}
-    pub fn apply_search_preferences(&mut self,prefs:&SearchPreferences){self.search_backend=prefs.backend;self.search_include_development=prefs.include_development;
+    pub fn apply_search_preferences(&mut self,prefs:&SearchPreferences){self.search_backend=prefs.backend;self.search_backend_configured=prefs.backend_configured;self.search_include_development=prefs.include_development;
         self.search_index_metadata=prefs.index_metadata;self.search_pinyin_initials=prefs.pinyin_initials;self.search_idle_seconds=prefs.idle_seconds;
         self.everything_executable=prefs.everything_executable.clone();self.everything_folder_sizes=prefs.folder_sizes;}
 }
@@ -383,7 +385,7 @@ impl Default for ExplorerUi {
             close_window_on_last_tab:true,show_tab_count:true,
             show_tree: true, tree_width: 220, show_bookmarks: true, show_preview: false, show_details: false,
             command_bar: CommandBarPreferences::default(), context_menu: ContextMenuPreferences::default(),
-            search_all_files: true, search_backend: SearchBackendPreference::NativeNtfs, space_preview: true,
+            search_all_files: true, search_backend: SearchBackendPreference::Everything, search_backend_configured:false, space_preview: true,
             search_include_development:false,search_index_metadata:false,search_pinyin_initials:false,search_idle_seconds:300,
             everything_executable:None,
             hover_preview: false, archives_open_externally: false, preview_provider: PreviewProviderPreference::System,
@@ -691,7 +693,7 @@ mod tests {
         assert_eq!(ui.tree_width, 271);
         assert!(!ui.space_preview && !ui.hover_preview && ui.navigation_auto_expand.is_none());
         assert_eq!(ui.appearance, AppearancePreferences::default());
-        assert_eq!(ui.search_backend, SearchBackendPreference::NativeNtfs);
+        assert_eq!(ui.search_backend, SearchBackendPreference::Everything);
         assert!(!ui.dual_pane && !ui.everything_folder_sizes);
         assert!(ui.close_window_on_last_tab && ui.show_tab_count);
         assert!(ui.navigation_show_recycle_bin && ui.navigation_show_network);

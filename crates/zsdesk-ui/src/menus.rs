@@ -625,7 +625,7 @@ mod tests {
     }
     #[test]
     fn search_backends_are_explicit_and_never_map_native_to_everything(){
-        let mut ui=ExplorerUi::default();assert!(ui.search_backend.is_builtin());
+        let mut ui=ExplorerUi::default();assert!(!ui.search_backend.is_builtin());
         assert!(apply_interface_setting(&mut ui,"search-backend-everything"));assert_eq!(ui.search_backend,SearchBackendPreference::Everything);
         for id in ["search-backend-native","search-backend-auto","search-backend-directory"]{
             assert!(apply_interface_setting(&mut ui,id));assert_eq!(ui.search_backend,SearchBackendPreference::NativeNtfs);

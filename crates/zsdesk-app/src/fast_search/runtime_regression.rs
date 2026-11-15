@@ -17,6 +17,7 @@ impl Drop for Fixture{fn drop(&mut self){
     if self.root.is_absolute()&&fs::symlink_metadata(&self.root).is_ok_and(|m|m.file_attributes()&0x400==0)
         &&fs::read(self.root.join("owner")).is_ok_and(|bytes|bytes==self.marker.as_bytes()) {let _=fs::remove_dir_all(&self.root);}
 }}
+fn native_options()->SearchOptions{SearchOptions{backend:BackendPreference::NativeNtfs,..SearchOptions::default()}}
 fn shared()->Shared{Shared{control:Mutex::new(Control::default()),wake:Condvar::new(),stop:AtomicBool::new(false),engine_stop:AtomicBool::new(false),generation:AtomicU64::new(1),
     notified:AtomicBool::new(false),hwnd:0,message:0,notifier:None,maintenance_role:AtomicU64::new(0)}}
 fn direct(core:&native::Core,fixture:&Fixture,options:SearchOptions,text:&str,offset:u32,limit:u32,sort:everything::SearchSort)->Result<(Vec<PathBuf>,SearchEvent)>{
@@ -36,7 +37,7 @@ fn collect(service:&FastSearch,generation:u64)->Result<(Vec<PathBuf>,SearchEvent
 #[test]fn native_directory_pages_filters_metadata_and_pinyin()->Result<()>{
     let fixture=Fixture::new(&std::env::temp_dir())?;fixture.write("alpha.txt",b"a")?;let beta=fixture.write("beta.pdf",b"bbbb")?;
     fixture.write("中国人.txt",b"cc")?;let child=fixture.write("sub/child.pdf",b"123456789")?;fixture.write("node_modules/hidden.pdf",b"ignored")?;
-    let core=native::shared(&fixture.index);let options=SearchOptions::default();
+    let core=native::shared(&fixture.index);let options=native_options();
     let (paths,page)=direct(&core,&fixture,options,"ext:pdf",0,1,everything::SearchSort::NameAsc)?;assert_eq!(paths,vec![beta.clone()]);assert_eq!(page.indexed,2);assert!(page.truncated);
     let (paths,page)=direct(&core,&fixture,options,"ext:pdf",1,1,everything::SearchSort::NameAsc)?;assert_eq!(paths,vec![child.clone()]);assert!(!page.truncated);
     let (paths,_)=direct(&core,&fixture,options,"ext:pdf",0,200,everything::SearchSort::SizeDesc)?;assert_eq!(paths,vec![child.clone(),beta]);
@@ -64,7 +65,7 @@ fn collect(service:&FastSearch,generation:u64)->Result<(Vec<PathBuf>,SearchEvent
 
 #[test]fn native_incremental_survives_deleted_and_unreadable_directories()->Result<()>{
     let fixture=Fixture::new(&std::env::temp_dir())?;fixture.write("keep.txt",b"k")?;
-    let core=native::shared(&fixture.index);let options=SearchOptions::default();
+    let core=native::shared(&fixture.index);let options=native_options();
     let all=|core:&native::Core|direct(core,&fixture,options,"*",0,200,everything::SearchSort::NameAsc).map(|(paths,_)|paths);
     all(&core)?;
     // Without a readable journal every search rescans; there is no incremental pass to verify.
@@ -91,7 +92,7 @@ fn collect(service:&FastSearch,generation:u64)->Result<(Vec<PathBuf>,SearchEvent
     let fixture=Fixture::new(&std::env::temp_dir())?;let late=fixture.root.join("late");let core=native::shared(&fixture.index);
     let search=||{let shared=shared();let(sender,_receiver)=mpsc::sync_channel(128);
         let request=Request{generation:1,query:"*".into(),preferred:None,invalid:None,offset:0,limit:10,sort:everything::SearchSort::NameAsc};
-        native::execute(&core,&SearchOptions::default(),Some(std::slice::from_ref(&late)),&shared,&sender,&request)};
+        native::execute(&core,&native_options(),Some(std::slice::from_ref(&late)),&shared,&sender,&request)};
     assert!(search().is_err());fs::create_dir(&late)?;fs::write(late.join("a.txt"),b"a")?;
     assert!(search().is_err(),"a failed location was walked again by the next search");
     // An explicit refresh is the user's way to retry at once.
@@ -99,7 +100,8 @@ fn collect(service:&FastSearch,generation:u64)->Result<(Vec<PathBuf>,SearchEvent
 }
 
 #[test]fn builtin_preference_blocks_everything_entry_points()->Result<()>{
-    let fixture=Fixture::new(&std::env::temp_dir())?;let profile=fixture.root.join("explorer-session.json");let session=crate::storage::default_session();crate::storage::save(&profile,&session)?;
+    let fixture=Fixture::new(&std::env::temp_dir())?;let profile=fixture.root.join("explorer-session.json");let mut session=crate::storage::default_session();
+    session.ui.search_backend=BackendPreference::NativeNtfs;session.ui.search_backend_configured=true;crate::storage::save(&profile,&session)?;
     assert!(require_everything(&profile).is_err());assert!(everything::open_settings(&profile).is_err());assert!(everything::enable_service(&profile).is_err());
     assert!(everything::query_folder_sizes(&profile,&[],1,||false).is_err());assert!(everything::query_page(&profile,&everything::QueryOptions::default(),1,||false).is_err());
     assert!(!fixture.index.exists());Ok(())
@@ -168,7 +170,7 @@ fn native_builtin_unprivileged_usn_snapshot_resume()->Result<()>{
     let raw_denied=raw_error.downcast_ref::<windows::core::Error>().is_some_and(|error|
         error.code()==windows::core::HRESULT::from_win32(windows::Win32::Foundation::ERROR_ACCESS_DENIED.0));
     ensure!(raw_denied,"raw volume failed for a reason other than access denied: {raw_error:#}");
-    let core=native::shared(&fixture.index);let options=SearchOptions::default();
+    let core=native::shared(&fixture.index);let options=native_options();
     direct(&core,&fixture,options,"*",0,200,everything::SearchSort::NameAsc)?;ensure!(native::checkpoints(&core).iter().all(|c|c.2),"USN unavailable; directory refresh is not an incremental pass");
     let builds=native::inspect(&core).2;let before=native::checkpoints(&core);
     fs::rename(fixture.files.join("docs"),fixture.files.join("renamed"))?;fs::remove_file(fixture.files.join("removed.txt"))?;
@@ -233,7 +235,7 @@ fn native_backend_choice_does_not_cross_start()->Result<()>{
     let service=FastSearch::new_with_options(fixture.index.clone(),HWND::default(),0,SearchOptions::default())?;
     let first=service.start("regex:^ZSDeskBackendIsolation$",None);let error=failed(&service,first)?;
     ensure!(!error.contains("自带搜索支持"),"Everything failure fell back to the native parser");ensure!(!fixture.index.exists(),"Everything created a native snapshot");
-    session.ui.search_backend=BackendPreference::NativeNtfs;crate::storage::save(&profile,&session)?;
+    session.ui.search_backend=BackendPreference::NativeNtfs;session.ui.search_backend_configured=true;crate::storage::save(&profile,&session)?;
     let second=service.start("regex:^ZSDeskBackendIsolation$",None);let error=failed(&service,second)?;
     ensure!(error.contains("自带搜索支持"),"persisted native choice was overwritten by Everything");
     fs::remove_file(&profile)?;let third=service.start("ZSDeskBackendIsolation",None);let error=failed(&service,third)?;

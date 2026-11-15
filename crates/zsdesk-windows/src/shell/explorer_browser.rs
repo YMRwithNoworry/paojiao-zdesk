@@ -181,8 +181,10 @@ impl ExplorerBrowserHost {
         let results_active = Rc::new(Cell::new(false));
         let results_location = Rc::new(RefCell::new(None));
         let this_pc = Rc::new(Cell::new(false));
+        let high_contrast=crate::theme::high_contrast();
+        let dark=crate::theme::system_dark_mode()&&!high_contrast;
         let background=Rc::new(Cell::new(view_background::Colors{
-            background:if crate::theme::system_dark_mode(){0x202020}else{0xffffff},high_contrast:crate::theme::high_contrast()}));
+            background:if dark{0x202020}else{0xffffff},dark,high_contrast}));
         let site: IServiceProvider = BrowserSite {
             hwnd: parent.0 as isize,
             source,
@@ -626,8 +628,9 @@ impl ExplorerBrowserHost {
     pub fn panes(&self) -> Panes { self.panes.get() }
     /// Sets only the erasure surface; the native Shell remains responsible for
     /// item colors, selection backgrounds, accessibility and control painting.
-    pub fn set_content_background(&self,_dark:bool,colorref:u32){
-        self.background.set(view_background::Colors{background:colorref,high_contrast:crate::theme::high_contrast()});
+    pub fn set_content_background(&self,dark:bool,colorref:u32){
+        let high_contrast=crate::theme::high_contrast();
+        self.background.set(view_background::Colors{background:colorref,dark:dark&&!high_contrast,high_contrast});
         if let Ok(view)=unsafe{self.current_view()}{view_background::install(&view,self.background.clone());}
     }
     /// Changes presentation without rebuilding the file view or losing its
