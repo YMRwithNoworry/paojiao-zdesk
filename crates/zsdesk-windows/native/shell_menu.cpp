@@ -141,6 +141,25 @@ static std::atomic<ULONGLONG> gRequests{0},gPresenterCreations{0},gSelectionSnap
 static thread_local ULONGLONG gLastQueryMicros=0,gLastPrepareMicros=0,gLastPresenterCreateMicros=0;
 static thread_local ULONGLONG gCommandMessages=0;
 static thread_local bool gNativeCloseFault=false;
+// Test callers can supply a real COM extension without installing an AppX
+// package. The same verified native insertion and proxy path is exercised.
+static thread_local Microsoft::WRL::ComPtr<IExplorerCommand> gTestExtension;
+static thread_local UINT gTestExtensionId=0;
+static HRESULT InsertTestExtension(IUnknown* native,HMENU menu){
+    if(!gTestExtension)return S_OK;
+    auto command=std::move(gTestExtension);
+    auto storage=reinterpret_cast<BYTE*>(native)+0x130;
+    menu_command_agility::VectorRange range{};size_t beforeCount=0,afterCount=0;
+    if(!menu_command_agility::ReadRange(storage,range,beforeCount))return E_UNEXPECTED;
+    const std::wstring package;
+    menu_command_bridge::Insert(native,menu,command.Get(),GetMenuItemCount(menu),storage,&package);
+    if(!menu_command_agility::ReadRange(storage,range,afterCount)||afterCount!=beforeCount+1)return E_UNEXPECTED;
+    gTestExtensionId=*reinterpret_cast<UINT*>(range.begin+beforeCount*menu_command_agility::kVerbBytes);
+    std::fprintf(stderr,"test-native-extension id=%u\n",gTestExtensionId);
+    return gTestExtensionId?S_OK:E_UNEXPECTED;
+}
+extern "C" void zs_menu_test_extension(IExplorerCommand* command){gTestExtension=command;gTestExtensionId=0;menu_model_filter::testInsertion=&InsertTestExtension;}
+extern "C" UINT zs_menu_test_extension_id(){return gTestExtensionId;}
 static thread_local uint32_t gHiddenMenuFeatures=menu_model_filter::Wps;
 using OriginalMenuCallback=HRESULT(WINAPI*)(IShellView*,POINT);
 static std::atomic<OriginalMenuCallback> gOriginalMenuCallback{nullptr};
@@ -339,8 +358,14 @@ class Session final : public IServiceProvider, public IOleWindow, public NativeC
     uint32_t standaloneIntercept_=0;
     bool standaloneShift_=false,standaloneControl_=false;
     POINT standalonePoint_{};
+    POINT standaloneAnchor_{};
     HWND standaloneOwner_=nullptr;
     Microsoft::WRL::ComPtr<IContextMenu> standaloneContext_;
+    Microsoft::WRL::ComPtr<IContextMenu> pendingContext_;
+    Microsoft::WRL::ComPtr<IShellItemArray> pendingItems_;
+    HMENU pendingPopup_=nullptr;
+    UINT pendingCommand_=0;
+    POINT pendingPoint_{};
     std::shared_ptr<native_command_guard::Gate> commandGate_;
     Microsoft::WRL::ComPtr<IServiceProvider> nativeSite_;
 
@@ -402,7 +427,7 @@ public:
     HRESULT ConfigureStandalone(HWND owner,HMENU extra,POINT point,const UINT* applications,UINT applicationCount,
             uint32_t intercept,menu_dispatch::BeforeInvoke before,void* beforeContext,IContextMenu* context,UINT selectionCount,PCIDLIST_ABSOLUTE const* selection){
         if(commandGate_)commandGate_->Invalidate();nativeSite_.Reset();commandGate_.reset();
-        standalone_=true;standaloneCompletion_={};standaloneResult_={};standalonePoint_=point;standaloneOwner_=owner;
+        standalone_=true;standaloneCompletion_={};standaloneResult_={};standalonePoint_=point;standaloneAnchor_=point;standaloneOwner_=owner;
         standaloneContext_=context;
         standaloneApplications_.clear();if(applicationCount)standaloneApplications_.assign(applications,applications+applicationCount);
         standaloneIntercept_=intercept;
@@ -420,6 +445,16 @@ public:
     void ArmCommands(){if(commandGate_)commandGate_->Arm();}
     HRESULT CommandPreparationFailure()const{return commandGate_?commandGate_->State().failure:E_NOINTERFACE;}
     bool StandaloneDone()const{return standaloneCompletion_.done||retiring_;}
+    void DispatchPending(){
+        // Parent validation and Shell invocation pump messages. Run them only
+        // after the native click/dismiss callback has unwound; reentering the
+        // presenter's close animation can reset its IContextMenu mid-invoke.
+        if(pendingCommand_&&!retiring_&&!cancelRequested_){
+            auto menu=std::move(pendingContext_);auto items=std::move(pendingItems_);
+            const auto command=pendingCommand_;pendingCommand_=0;
+            DispatchCallback(menu.Get(),items.Get(),pendingPopup_,command,pendingPoint_);
+        }
+    }
     menu_dispatch::Completion::Wait StandaloneWait(bool ownerAlive,bool quitting,bool open,ULONGLONG now){
         if(commandGate_){const auto state=commandGate_->State();
             if(FAILED(state.failure)&&!standaloneCompletion_.requested&&!state.action()){
@@ -514,25 +549,21 @@ public:
         return presenter_->QueryInterface(iid,out);
     }
     void InvokeCommand(UINT command){
-        // Parent authorization pumps this STA. Keep both objects alive before
-        // that boundary, then reject a retired or replaced request afterwards.
+        // Deliver the native click before any parent round trip. Waiting here
+        // pumps XAML's closing animation, which can clear the presenter's menu
+        // before Invoke reads it. The deferred callback / guarded command owns
+        // selection validation and the one-shot authorization before execution.
         Microsoft::WRL::ComPtr<Presenter> native=!retiring_?presenter_:nullptr;
-        const auto gate=commandGate_;
-        const ULONGLONG generation=gate?gate->Generation():0;
         if(standalone_&&command){
             if(standaloneCompletion_.requested)return;
+            if(!commandGate_||!commandGate_->Select(command))return;
             standaloneCompletion_.Requested(command);standaloneShift_=GetKeyState(VK_SHIFT)<0;standaloneControl_=GetKeyState(VK_CONTROL)<0;
-            const auto grant=gate?gate->Authorize(generation,command,nullptr,false,false,true):native_command_guard::Decision{};
-            if(retiring_||presenter_!=native.Get()||commandGate_!=gate||gate&&!gate->Current(generation))return;
-            if(FAILED(grant.status)||grant.handled){
-                standaloneResult_=grant.handled?grant.outcome:menu_dispatch::Result{menu_dispatch::Invoked,command,grant.status,menu_dispatch::Presented};
-                standaloneCompletion_.Dismissed();if(native)native->DismissContextMenu(L"Command routed or cancelled");return;
-            }
         }
         if(native)native->Invoke(command);
     }
     void Retire(){
         if(retiring_)return;retiring_=true;
+        pendingCommand_=0;pendingContext_.Reset();pendingItems_.Reset();
         if(commandGate_)commandGate_->Invalidate();nativeSite_.Reset();commandGate_.reset();standaloneContext_.Reset();
         Presenter* previous=presenter_;presenter_=nullptr;
         RestoreSelectionBridge(previous);
@@ -609,6 +640,17 @@ public:
     }
     void STDMETHODCALLTYPE Invoke(IContextMenu* menu,IShellItemArray* items,HMENU popup,UINT command,POINT point)override{
         if(GetCurrentThreadId()!=thread_){++native_command_guard::unobserved;InterlockedExchange(&gLastFailure,RPC_E_WRONG_THREAD);return;}
+        if(!standalone_){ForwardCallback([&](NativeCallback* callback){callback->Invoke(menu,items,popup,command,point);});return;}
+        if(retiring_||!command||pendingCommand_||commandGate_&&commandGate_->State().action())return;
+        pendingContext_=menu;pendingItems_=items;pendingPopup_=popup;pendingCommand_=command;pendingPoint_=point;
+        standaloneCompletion_.Requested(command);
+    }
+    void DispatchCallback(IContextMenu* menu,IShellItemArray* items,HMENU popup,UINT command,POINT point){
+        if(GetEnvironmentVariableW(L"ZSDESK_MENU_TEST_PROBE",nullptr,0)){
+            wchar_t verb[128]{};HRESULT found=menu?menu->GetCommandString(command-1,GCS_VERBW,nullptr,reinterpret_cast<char*>(verb),128):E_POINTER;
+            std::fprintf(stderr,"native-callback command=%u verb=%ls hr=0x%08X\n",command,verb,static_cast<unsigned>(found));
+        }
+        if(GetCurrentThreadId()!=thread_){++native_command_guard::unobserved;InterlockedExchange(&gLastFailure,RPC_E_WRONG_THREAD);return;}
         if(standalone_){
             AddRef();Microsoft::WRL::ComPtr<IContextMenu> keep(menu);
             if(retiring_){Release();return;}
@@ -641,7 +683,7 @@ public:
         if(GetCurrentThreadId()!=thread_){++native_command_guard::unobserved;InterlockedExchange(&gLastFailure,RPC_E_WRONG_THREAD);return;}
         if(standalone_){
             const auto state=commandGate_?commandGate_->State():native_command_guard::Snapshot{};
-            if(standaloneResult_.kind==menu_dispatch::Dismissed&&standaloneCompletion_.requested&&!state.action()&&state.phase!=native_command_guard::Phase::Denied){
+            if(!pendingCommand_&&standaloneResult_.kind==menu_dispatch::Dismissed&&standaloneCompletion_.requested&&!state.action()&&state.phase!=native_command_guard::Phase::Denied){
                 ++native_command_guard::unobserved;
                 standaloneResult_={menu_dispatch::NativeHandled,standaloneCompletion_.requestedCommand,E_NOTIMPL,menu_dispatch::Executing};
             }
@@ -653,7 +695,12 @@ public:
     void STDMETHODCALLTYPE DoExpandedContextMenu(POINT point,int flags,GUID* context,POINT* origin,int kind)override{
         if(GetCurrentThreadId()!=thread_){++native_command_guard::unobserved;InterlockedExchange(&gLastFailure,RPC_E_WRONG_THREAD);return;}
         if(standalone_){
-            standaloneResult_={menu_dispatch::Expanded,0,S_OK,menu_dispatch::Presented};standalonePoint_=point;
+            if(pendingCommand_||(commandGate_&&commandGate_->State().action()))return;
+            // The callback point can describe the expanded-menu row rather
+            // than the original mouse/keyboard anchor. Both presentations
+            // belong to the same immutable screen-space menu request.
+            if(gProbeExpanded)std::fprintf(stderr,"expand anchor=%ld,%ld callback=%ld,%ld\n",standaloneAnchor_.x,standaloneAnchor_.y,point.x,point.y);
+            standaloneResult_={menu_dispatch::Expanded,0,S_OK,menu_dispatch::Presented};standalonePoint_=standaloneAnchor_;
             // Expansion is a handoff request, not completion of the XAML
             // dismissal. Starting TrackPopupMenu while its popup still owns
             // input causes the classic menu to disappear immediately.
@@ -911,6 +958,9 @@ HRESULT Run(uint32_t& passed){
         Before before;std::shared_ptr<Gate> gate;HRESULT hr=Make(owner,before,gate);if(FAILED(hr))return hr;
         ComPtr<Command> first,other;ComPtr<IExplorerCommand> firstProxy,otherProxy;
         hr=Wrap(before,gate,1,first,firstProxy);if(SUCCEEDED(hr))hr=Wrap(before,gate,2,other,otherProxy);if(FAILED(hr))return hr;
+        ComPtr<native_command_guard::ProxyIdentity> alias;
+        if(FAILED(firstProxy->QueryInterface(native_command_guard::kProxyIdentity,reinterpret_cast<void**>(alias.GetAddressOf())))||FAILED(alias->BindCommand(3))||!gate->Select(1)||gate->Select(2)
+                ||gate->State().phase!=Phase::Fresh||before.calls.load()!=0)return E_UNEXPECTED;
         ComPtr<IUnknown> unsupported;
         if(firstProxy->QueryInterface(__uuidof(OptionalMarker),reinterpret_cast<void**>(unsupported.GetAddressOf()))!=E_NOINTERFACE||unsupported||FAILED(gate->State().failure)||before.calls.load()!=0||first->calls.load()!=0)return E_UNEXPECTED;
         ComPtr<native_command_guard::PackageNameMetadata> package;

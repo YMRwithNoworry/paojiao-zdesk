@@ -364,6 +364,8 @@ pub struct ExplorerUi {
     /// browsing it as a folder in ZSDesk.
     pub archives_open_externally: bool,
     pub forward_unhandled_windows: bool,
+    #[serde(alias="file_dialog_tabs")]
+    pub file_dialog_takeover: bool,
     pub preview_provider: PreviewProviderPreference,
     pub navigation_auto_expand: Option<bool>,
     pub navigation_show_recycle_bin: bool,
@@ -400,6 +402,7 @@ impl Default for ExplorerUi {
             everything_executable:None,
             hover_preview: false, archives_open_externally: false, preview_provider: PreviewProviderPreference::System,
             forward_unhandled_windows: true,
+            file_dialog_takeover: true,
             navigation_auto_expand: None,navigation_show_recycle_bin:true,navigation_show_network:true,navigation_expand_this_pc:None,
             appearance: AppearancePreferences::default(),
             window: None }

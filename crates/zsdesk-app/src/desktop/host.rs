@@ -30,6 +30,22 @@ use super::fence::{FenceHit, FenceWin, Interaction, RenameTarget, SelectionChang
 /// Hovering a dragged file over another tab switches to it after this delay.
 const TAB_HOVER_SWITCH: Duration = Duration::from_millis(600);
 
+/// Focus can remain on an item just removed with Ctrl+click. Item commands
+/// must use a member of the current selection, not that stale focus alone.
+fn selected_focus_index(window:&FenceWin)->Option<usize>{
+    window.focus.filter(|index|window.entries.get(*index).is_some_and(|entry|window.selection.contains(&entry.key)))
+        .or_else(||window.entries.iter().position(|entry|window.selection.contains(&entry.key)))
+}
+fn keyboard_menu_anchor(window:&FenceWin,geometry:&super::fence::Geometry)->POINT{
+    use zsdesk_ui::chrome::Rect;
+    let viewport=if geometry.content.is_empty(){Rect::new(0,0,geometry.width.max(1),geometry.height.max(1))}else{geometry.content};
+    let cell=selected_focus_index(window).and_then(|index|geometry.cells.get(index)).map(|cell|cell.cell).unwrap_or(viewport);
+    // Wheel scrolling does not change selection/focus. Keep an offscreen
+    // selected item's keyboard menu inside the visible source content.
+    POINT{x:(cell.x+cell.width.clamp(0,32)/2).clamp(viewport.x,viewport.right().saturating_sub(1).max(viewport.x)),
+        y:(cell.y+cell.height.clamp(0,32)/2).clamp(viewport.y,viewport.bottom().saturating_sub(1).max(viewport.y))}
+}
+
 fn zoom_steps(remainder: &mut i32, delta: i32) -> i32 {
     *remainder = remainder.saturating_add(delta);
     let steps = (*remainder / 120).clamp(-16, 16);
@@ -233,7 +249,7 @@ pub struct DesktopHost {
     pub fences: Vec<FenceWin>,
     cut_paths: HashSet<String>,
     desktop_entries: Vec<ShellEntry>,
-    #[cfg(test)] desktop_test_entries:Option<Vec<ShellEntry>>,
+    #[cfg(test)] pub(super) desktop_test_entries:Option<Vec<ShellEntry>>,
     pub gfx: Gfx,
     icons: HashMap<IconKey, IconSlot>,
     icon_clock: u64,
@@ -1195,8 +1211,8 @@ impl DesktopHost {
     }
 
     fn refresh_desktop_entries(&mut self) {
-        #[cfg(test)]if let Some(entries)=&self.desktop_test_entries{self.desktop_entries=entries.clone();return;}
-        self.desktop_entries = desktop::enumerate_desktop();
+        #[cfg(test)]{self.desktop_entries=self.desktop_test_entries.clone().unwrap_or_else(desktop::enumerate_desktop);}
+        #[cfg(not(test))]{self.desktop_entries = desktop::enumerate_desktop();}
         let mut known: HashSet<String> = self.desktop_entries.iter().map(|e| e.key.to_lowercase()).collect();
         for key in self.config.fences.iter().chain(&self.config.released_items).filter(|f| f.is_desktop()).flat_map(|f| &f.members) {
             if known.contains(&key.to_lowercase()) { continue; }
@@ -1865,8 +1881,7 @@ impl DesktopHost {
         if !ctrl&&!alt&&(key==VK_APPS.0 || (key==VK_F10.0&&shift)) {
             self.menu_input_started=Some((id,input_started));
             let window=&self.fences[index];let geometry=window.geometry(&fence);
-            let cell=window.focus.and_then(|item|geometry.cells.get(item)).map(|cell|cell.cell).unwrap_or(geometry.content);
-            let mut point=POINT{x:cell.x+cell.width.min(32)/2,y:cell.y+cell.height.min(32)/2};
+            let mut point=keyboard_menu_anchor(window,&geometry);
             let _=unsafe{windows::Win32::Graphics::Gdi::ClientToScreen(window.hwnd,&mut point)};
             return if window.selection.is_empty(){After::FenceMenu{fence:id,point}}else{After::ItemMenu{fence:id,point}};
         }
@@ -1889,9 +1904,9 @@ impl DesktopHost {
         let count = win.entries.len();
         let k = VIRTUAL_KEY(key);
         match k {
-            VK_RETURN => if let Some(f) = win.focus.filter(|_| !win.selection.is_empty()) { return After::Open { fence: id, index: f, explorer: ctrl }; },
+            VK_RETURN => if let Some(f) = selected_focus_index(win) { return After::Open { fence: id, index: f, explorer: ctrl }; },
             VK_DELETE => return After::Verb { fence: id, verb: "delete", background: false },
-            VK_F2 => if let Some(f) = win.focus { let key = win.entries[f].key.clone(); self.begin_rename(id, RenameTarget::Item(key)); },
+            VK_F2 => if let Some(f) = selected_focus_index(win) { let key = win.entries[f].key.clone(); self.begin_rename(id, RenameTarget::Item(key)); },
             VK_F5 => if fence.is_desktop() { self.refresh_desktop(); } else { self.refresh_folder(id); },
             VK_ESCAPE => { win.selection.clear(); self.render(id); }
             VK_BACK => if fence.browse.is_some() { self.browse_up(id); },
@@ -2338,8 +2353,7 @@ impl DesktopHost {
 
     pub fn focused_entry(&self, id: u64) -> Option<&ShellEntry> {
         let win = &self.fences[self.win_index(id)?];
-        win.focus.and_then(|f| win.entries.get(f)).filter(|e| win.selection.contains(&e.key))
-            .or_else(|| win.selected_entries().into_iter().next())
+        win.entries.get(selected_focus_index(win)?)
     }
 
     /// Folder for "粘贴" / "新建" in this fence (the user desktop for desktop fences).
@@ -2774,6 +2788,41 @@ pub fn save_config(path: &Path, config: &DesktopConfig) -> std::io::Result<()> {
 mod shortcut_tests {
     use super::*;
     use windows::Win32::UI::Input::KeyboardAndMouse::{VK_C, VK_Y, VK_Z};
+    fn keyboard_selection()->FenceWin{
+        let mut window=FenceWin::new(1);
+        window.entries=["A","B"].into_iter().map(|name|ShellEntry{key:name.into(),name:name.into(),pidl:vec![0,0],
+            is_folder:false,is_file_system:true,is_link:false,is_stream:false,can_drop:false,ghosted:false,path:None,size:None,modified:None}).collect();
+        window
+    }
+    #[test]
+    fn ctrl_deselected_focus_is_not_an_open_rename_or_menu_target(){
+        let mut window=keyboard_selection();window.selection=HashSet::from(["A".into(),"B".into()]);window.focus=Some(1);
+        assert_eq!(selected_focus_index(&window),Some(1));
+        // Ctrl+click removes B but intentionally leaves keyboard focus there.
+        window.selection.remove("B");
+        assert_eq!(selected_focus_index(&window),Some(0));
+        let first=zsdesk_ui::chrome::Rect::new(12,40,70,50);let second=zsdesk_ui::chrome::Rect::new(100,40,70,50);
+        let geometry=super::super::fence::Geometry{width:200,height:150,content:zsdesk_ui::chrome::Rect::new(4,30,192,116),
+            cells:vec![super::super::fence::Cell{cell:first,icon:first,label:first},super::super::fence::Cell{cell:second,icon:second,label:second}],..Default::default()};
+        let point=keyboard_menu_anchor(&window,&geometry);assert!(first.contains(point.x,point.y));assert!(!second.contains(point.x,point.y));
+        window.selection.clear();assert_eq!(selected_focus_index(&window),None,"empty selection must not open or rename the old focused item");
+        window.selection.insert("A".into());window.focus=Some(usize::MAX);assert_eq!(selected_focus_index(&window),Some(0));
+    }
+    #[test]
+    fn keyboard_menu_anchor_stays_in_scrolled_content_at_all_scales(){
+        let mut window=keyboard_selection();window.selection.insert("A".into());window.focus=Some(0);
+        for dpi in [96,144,192]{
+            let mut fence=Fence::new(1,"keyboard",FenceSource::Desktop,Placement::default());fence.view=FenceView::List;
+            let initial=super::super::fence::Geometry::new(scale(240,dpi),scale(180,dpi),dpi,&fence,100,0,false);
+            for scroll in [0,initial.max_scroll]{
+                let geometry=super::super::fence::Geometry::new(scale(240,dpi),scale(180,dpi),dpi,&fence,100,scroll,false);
+                let point=keyboard_menu_anchor(&window,&geometry);
+                assert!(geometry.content.contains(point.x,point.y),"keyboard anchor escaped its viewport: dpi={dpi} scroll={scroll}");
+            }
+            fence.collapsed=true;let geometry=super::super::fence::Geometry::new(scale(240,dpi),scale(TITLE_H,dpi),dpi,&fence,100,0,false);
+            let point=keyboard_menu_anchor(&window,&geometry);assert!(point.x>=0&&point.y>=0&&point.x<geometry.width&&point.y<geometry.height);
+        }
+    }
     #[test]
     fn fence_control_wheel_accumulates_and_clamps_icon_zoom() {
         let mut remainder=0;

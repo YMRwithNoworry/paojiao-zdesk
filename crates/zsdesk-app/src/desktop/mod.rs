@@ -12,6 +12,7 @@ mod host;
 mod menu_worker;
 mod return_to_desktop;
 mod drag_placement;
+mod external_drop;
 mod clipboard;
 mod outside_selection;
 mod protocol;
@@ -327,6 +328,7 @@ fn run_host(config_path: PathBuf, explorer_config: PathBuf, command: DesktopComm
         unsafe { let _ = TranslateMessage(&msg); DispatchMessageW(&msg); }
     }
     update_hook(false,false);
+    external_drop::shutdown();
     if !foreground.is_invalid() { let _ = unsafe { windows::Win32::UI::Accessibility::UnhookWinEvent(foreground) }; }
     for hook in layer_hooks{if !hook.is_invalid(){let _=unsafe{windows::Win32::UI::Accessibility::UnhookWinEvent(hook)};}}
     LAYER_SETTLE_UNTIL.with(|until|until.set(None));
@@ -415,6 +417,8 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
     match msg {
         outside_selection::MESSAGE=>{outside_selection::dispatch();return LRESULT(0);}
         WM_TIMER if wp.0==outside_selection::TIMER=>{outside_selection::tick();return LRESULT(0);}
+        external_drop::MESSAGE=>{external_drop::start();return LRESULT(0);}
+        WM_TIMER if wp.0==external_drop::TIMER=>{external_drop::tick();return LRESULT(0);}
         WM_CANCELMODE=>{outside_selection::cancel();return unsafe{DefWindowProcW(hwnd,msg,wp,lp)};}
         WM_CLOSE => { execute(DesktopCommand::Quit); return LRESULT(0); }
         menu_worker::READY => { finish_menu_work(); return LRESULT(0); }
@@ -766,13 +770,28 @@ fn queue_menu(mut request:menu_worker::Request){
 }
 
 fn menu_target_current(request:&menu_worker::Request)->bool{
-    with_host(|host|host.win_index(request.fence).is_some_and(|index|{
-        if host.fences[index].hwnd.0 as isize!=request.owner||!unsafe{IsWindowVisible(host.fences[index].hwnd)}.as_bool(){return false;}
-        match &request.target{
-            menu_worker::Target::Items{pidls,..}=>host.selected_pidls(request.fence)==*pidls,
-            menu_worker::Target::Background{folder}=>host.target_folder(request.fence)==*folder,
-        }
-    })).unwrap_or(false)
+    let snapshot=||with_host(|host|{
+        let index=host.win_index(request.fence)?;
+        if host.fences[index].hwnd.0 as isize!=request.owner||!unsafe{IsWindowVisible(host.fences[index].hwnd)}.as_bool(){return None;}
+        Some(match &request.target{
+            menu_worker::Target::Items{..}=>menu_worker::Target::Items{pidls:host.selected_pidls(request.fence),key:None},
+            menu_worker::Target::Background{..}=>menu_worker::Target::Background{folder:host.target_folder(request.fence)},
+        })
+    }).flatten();
+    let Some(before)=snapshot()else{return false;};
+    // Canonical Shell comparisons may pump messages. Keep the host unborrowed
+    // and reject a request replaced or changed while those calls were running.
+    let matches=match (&request.target,&before){
+        (menu_worker::Target::Items{pidls,..},menu_worker::Target::Items{pidls:current,..})=>zsdesk_windows::shell::menu::same_item_identities(pidls,current),
+        (menu_worker::Target::Background{folder},menu_worker::Target::Background{folder:current})=>folder==current,
+        _=>false,
+    };
+    if !matches||!menu_request_current(request.generation){return false;}
+    match (before,snapshot()){
+        (menu_worker::Target::Items{mut pidls,..},Some(menu_worker::Target::Items{pidls:mut current,..}))=>{pidls.sort();current.sort();pidls==current},
+        (menu_worker::Target::Background{folder},Some(menu_worker::Target::Background{folder:current}))=>folder==current,
+        _=>false,
+    }
 }
 
 fn menu_diagnostics()->serde_json::Value{MENU_WORKER.with(|worker|worker.borrow().as_ref().map_or(serde_json::Value::Null,menu_worker::Worker::diagnostics))}
@@ -1219,7 +1238,7 @@ unsafe extern "system" fn mouse_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESU
     } else if code >= 0 && matches!(wp.0 as u32, WM_RBUTTONDOWN | WM_RBUTTONUP | WM_MBUTTONDOWN | WM_XBUTTONDOWN | WM_MOUSEWHEEL | WM_MOUSEHWHEEL) {
         LAST_CLICK.with(|click| click.set(None));
     }
-    if code>=0&&lp.0!=0{let info=unsafe{&*(lp.0 as*const MSLLHOOKSTRUCT)};outside_selection::observe(wp.0 as u32,info.pt,double);}
+    if code>=0&&lp.0!=0{let info=unsafe{&*(lp.0 as*const MSLLHOOKSTRUCT)};outside_selection::observe(wp.0 as u32,info.pt,double);external_drop::observe(wp.0 as u32,info.pt);}
     unsafe { CallNextHookEx(None, code, wp, lp) }
 }
 

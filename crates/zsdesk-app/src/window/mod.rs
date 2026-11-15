@@ -22,6 +22,7 @@ mod wps_preview;
 mod preview_handlers;
 mod hover_preview;
 mod paint;
+pub(crate) mod picker;
 mod global_search;
 mod search_panel;
 mod integrated_search;
@@ -167,6 +168,9 @@ pub fn run(session: ExplorerSession, config_path: PathBuf, selection: Option<std
 }
 
 unsafe fn run_inner(session: ExplorerSession, config_path: PathBuf, selection: Option<std::ffi::OsString>, modern: bool, secondary_window: bool,focus_search:Option<bool>) -> Result<()> {
+    unsafe{run_window(session,config_path,selection,modern,secondary_window,focus_search,None)}
+}
+unsafe fn run_window(session: ExplorerSession, config_path: PathBuf, selection: Option<std::ffi::OsString>, modern: bool, secondary_window: bool,focus_search:Option<bool>,picker:Option<picker::State>) -> Result<()> {
     unsafe { InitCommonControlsEx(&INITCOMMONCONTROLSEX { dwSize: size_of::<INITCOMMONCONTROLSEX>() as u32, dwICC: ICC_BAR_CLASSES | ICC_STANDARD_CLASSES }) }.ok()?;
     let instance = HINSTANCE(unsafe { GetModuleHandleW(None)? }.0);
     let class = wide("ZSDesk.Native.Explorer");
@@ -182,6 +186,7 @@ unsafe fn run_inner(session: ExplorerSession, config_path: PathBuf, selection: O
     let relaunch = relaunch_command(&config_path);
     // The slot outlives the window and every callback that can reach it.
     let mut state = WindowState::new(session, config_path, selection, modern);
+    state.picker=picker;
     state.secondary_window = secondary_window;
     let slot = Box::new(RefCell::new(Some(state)));
     let (x, y, w, h) = initial_rect(placement);
@@ -204,6 +209,9 @@ unsafe fn run_inner(session: ExplorerSession, config_path: PathBuf, selection: O
     }
     let accelerators = unsafe { CreateAcceleratorTableW(&accelerator_table())? };
     let _ = unsafe { ShowWindow(hwnd, if placement.is_some_and(|p| p.maximized) { SW_SHOWMAXIMIZED } else { SW_SHOW }) };
+    if let Some(picker)=slot.borrow().as_ref().and_then(|state|state.picker.as_ref()){
+        let _=picker.options.events.send(picker::Event::Ready{token:picker.options.token,window:hwnd.0 as isize});
+    }
     if let Some(settings)=focus_search{post(hwnd,WM_ACTION,if settings{ACTION_SEARCH_SETTINGS}else{Command::FocusSearch.id()as usize},0);}
     let mut msg = MSG::default();
     let mut quick_preview:Option<preview_process::PreviewProcess>=None;
@@ -221,6 +229,7 @@ unsafe fn run_inner(session: ExplorerSession, config_path: PathBuf, selection: O
             zsdesk_windows::shell::file_transfer::note_user_input(msg.hwnd);
         }
         if diagnostics::dispatch(&msg){continue;}
+        if picker::pre_translate(&slot,&msg){continue;}
         if address_input::pre_translate(&msg){continue;}
         dual_pane::activate_for_message(&slot,&msg);
         if pane_input::blank_double_click(&slot,&msg){continue;}
@@ -372,6 +381,7 @@ pub(super) struct BookmarkDrag { pub id:u64,pub start:POINT,pub point:POINT,pub 
 pub(super) struct DropZones { pub bookmarks: LayoutRect, pub strip: LayoutRect, pub tabs:LayoutRect, pub identity:Option<pane_input::Identity> }
 
 struct WindowState {
+    picker:Option<picker::State>,
     search_panel:search_panel::SearchPanel,
     hwnd: HWND,
     dpi: u32,
@@ -469,6 +479,7 @@ impl WindowState {
         let modern=crate::context_preferences::modern(&session.ui.context_menu);
         crate::context_preferences::register(&config_path,&session.ui.context_menu);
         Self {
+            picker:None,
             search_panel:search_panel::SearchPanel::default(),
             hwnd: HWND::default(), dpi: 96, search_saved_preferences:session.ui.search_preferences(),bookmarks_saved:session.bookmarks.clone(),session_ending:false,session, config_path, modern, browser: None, tree: None,
             browser_source:0,destroyed:false,folder_sizes:Default::default(),view_hwnd:HWND::default(),navigation_epoch:0,
@@ -503,9 +514,9 @@ impl WindowState {
         context_menu::install();
         zsdesk_windows::shell::set_folder_open_capture(Some(pane_input::capture_folder_open));
         let key = crate::instance::property(&self.config_path);
-        unsafe { SetPropW(hwnd, PCWSTR(key.as_ptr()), Some(windows::Win32::Foundation::HANDLE(1usize as *mut _)))?; }
+        if self.picker.is_none(){unsafe { SetPropW(hwnd, PCWSTR(key.as_ptr()), Some(windows::Win32::Foundation::HANDLE(1usize as *mut _)))?; }}
         let route_key = crate::routing_control::profile_property(&self.config_path);
-        unsafe { SetPropW(hwnd, PCWSTR(route_key.as_ptr()), Some(windows::Win32::Foundation::HANDLE(1usize as *mut _)))?; }
+        if self.picker.is_none(){unsafe { SetPropW(hwnd, PCWSTR(route_key.as_ptr()), Some(windows::Win32::Foundation::HANDLE(1usize as *mut _)))?; }}
         unsafe { SetPropW(hwnd, windows::core::w!("ZSDesk.Activate.v1"), Some(windows::Win32::Foundation::HANDLE(1usize as *mut _)))?; }
         let preferred_show=if self.session.ui.window.is_some_and(|p|p.maximized){SW_SHOWMAXIMIZED.0}else{SW_SHOWNORMAL.0};
         unsafe{SetPropW(hwnd,windows::core::w!("ZSDesk.PreferredShow"),Some(windows::Win32::Foundation::HANDLE(preferred_show as usize as *mut _)))?;}
@@ -515,6 +526,7 @@ impl WindowState {
         zsdesk_windows::flyout::prepare();
         self.address_edit = unsafe { child(hwnd, "EDIT", "", ID_ADDRESS, ES_AUTOHSCROLL as u32, false)? };
         self.search_edit = unsafe { child(hwnd, "EDIT", "", ID_SEARCH, ES_AUTOHSCROLL as u32, true)? };
+        self.initialize_picker()?;
         for (edit, id) in [(self.address_edit, ID_ADDRESS), (self.search_edit, ID_SEARCH)] {
             unsafe { SetWindowSubclass(edit, Some(edit_proc), id, hwnd.0 as usize) }.ok()?;
         }
@@ -535,7 +547,7 @@ impl WindowState {
         unsafe { self.navigate_current(); }
         if self.session.ui.dual_pane { self.ensure_dual_pane(); }
         #[cfg(not(test))]
-        {
+        if self.picker.is_none(){
             self.check_integration();
             if let Err(error) = crate::routing_control::refresh_owned_target(&self.config_path, hwnd) {
                 self.show_message(format!("文件位置绑定检查失败：{error}"));
@@ -600,6 +612,7 @@ impl WindowState {
 
     fn relayout(&mut self) {
         let (width, height) = self.client_size();
+        let height=(height-self.picker_height()).max(0);
         let input = ChromeInput {
             search_panel_open:self.search_panel.open,
             tab_placement:self.session.ui.tab_placement,
@@ -631,6 +644,7 @@ impl WindowState {
     }
 
     fn position_children(&mut self) {
+        self.position_picker();
         if let Some(browser) = &self.browser { unsafe { browser.resize(win_rect(self.layout.browser)); } }
         self.position_other_pane();
         if let Some(tree) = &self.tree {
@@ -688,6 +702,7 @@ impl WindowState {
             if !hwnd.0.is_null() { unsafe { SendMessageW(hwnd, WM_SETFONT, Some(WPARAM(self.font.0 as usize)), Some(LPARAM(1))); } }
         }
         if !old.0.is_null() { let _ = unsafe { DeleteObject(old.into()) }; }
+        self.picker_fonts();
     }
 
     /// Follows the system app mode for the chrome, DWM frame and Shell controls.
@@ -779,6 +794,8 @@ impl WindowState {
     }
 
     fn save(&mut self) {
+        if self.picker.is_some(){return;}
+        if let Ok(saved)=storage::load(&self.config_path){self.session.ui.file_dialog_takeover=saved.ui.file_dialog_takeover;}
         if let Some(options)=crate::context_preferences::current(&self.config_path){self.session.ui.context_menu=options;}
         match storage::save_window_with_shared_preferences(&self.config_path,&self.canonical_session(),self.secondary_window,&self.search_saved_preferences,&self.bookmarks_saved){
             Ok((preferences,bookmarks))=>{
@@ -793,6 +810,11 @@ impl WindowState {
             },
             Err(e)=>self.show_message(format!("保存会话失败：{e}")),
         }
+    }
+
+    fn toggle_file_dialog_takeover(&mut self){
+        let value=!storage::load(&self.config_path).map_or(self.session.ui.file_dialog_takeover,|saved|saved.ui.file_dialog_takeover);
+        match storage::save_file_dialog_takeover(&self.config_path,value){Ok(())=>{self.session.ui.file_dialog_takeover=value;let _=crate::quick_search::start_if_enabled(&self.config_path);},Err(error)=>self.show_message(format!("无法保存文件选择设置：{error}"))}
     }
 
     fn remember_placement(&mut self) {
@@ -1232,7 +1254,7 @@ impl WindowState {
         match msg {
             WM_QUERYENDSESSION=>return Some(LRESULT(1)),
             WM_ENDSESSION=>{self.session_ending=wp.0!=0;if self.session_ending{self.save();}return None;},
-            WM_CLOSE if !self.session_ending&&self.session.has_locked_tabs()=>{
+            WM_CLOSE if self.picker.is_none()&&!self.session_ending&&self.session.has_locked_tabs()=>{
                 self.show_message(if !self.session.ui.dual_pane&&self.session.secondary_pane.tabs.iter().any(|t|t.locked){"隐藏窗格中有已锁定的标签页，请开启双栏并解锁后再关闭窗口"}else{"有已锁定的标签页，请先在标签右键菜单中解锁后再关闭窗口"}.into());return Some(LRESULT(0));
             },
             // Release Shell hosts while the owner is still a live window.
@@ -1330,6 +1352,7 @@ impl WindowState {
             WM_COMMAND => {
                 let id = wp.0 & 0xFFFF;
                 let code = (wp.0 >> 16) as u32;
+                if self.picker_command(id,code){return Some(LRESULT(0));}
                 if lp.0 != 0 {
                     // Notifications from native EDIT children.
                     if (id == ID_ADDRESS || id == ID_SEARCH) && (code == EN_SETFOCUS || code == EN_KILLFOCUS) {
@@ -1354,7 +1377,8 @@ impl WindowState {
             WM_SHELL_NAVIGATED => if lp.0 != 0 { unsafe { self.navigation_completed(*Box::from_raw(lp.0 as *mut ShellLocation)); } },
             WM_SHELL_FOLDER_INVOKED => if lp.0 != 0 { unsafe { self.navigate_to(*Box::from_raw(lp.0 as *mut ShellLocation)); } },
             WM_SHELL_NAVIGATION_FAILED => unsafe { self.navigation_failed() },
-            WM_SHELL_SELECTION_CHANGED => { unsafe { acknowledge_selection_changed(lp.0); } self.refresh_status(); }
+            WM_SHELL_SELECTION_CHANGED => { unsafe { acknowledge_selection_changed(lp.0); } self.refresh_status();self.picker_selection_changed(); }
+            zsdesk_windows::shell::WM_SHELL_PICKER_ACCEPT=>self.picker_accept_view(),
             WM_TREE_NAVIGATE => if lp.0 != 0 {
                 let location = unsafe { *Box::from_raw(lp.0 as *mut ShellLocation) };
                 if wp.0 != 0 { unsafe { self.new_tab(location); } } else { unsafe { self.navigate_from_tree(location); } }

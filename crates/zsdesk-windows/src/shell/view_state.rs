@@ -35,7 +35,10 @@ pub fn capture_view_layout(shell:&IShellView)->Option<ShellViewState> {
 pub fn restore_view_layout(shell:&IShellView,state:&ShellViewState) {
     let Ok(view)=shell.cast::<IFolderView2>()else{return;};
     if (1..=8).contains(&state.mode)&&(8..=512).contains(&state.icon_size) {
-        let _=unsafe{view.SetViewModeAndIconSize(FOLDERVIEWMODE(state.mode),state.icon_size)};
+        let mut mode=FOLDERVIEWMODE(0);let mut icon=0;
+        let unchanged=unsafe{view.GetViewModeAndIconSize(&mut mode,&mut icon)}.is_ok()
+            &&(mode.0,icon)==(state.mode,state.icon_size);
+        if !unchanged{let _=unsafe{view.SetViewModeAndIconSize(FOLDERVIEWMODE(state.mode),state.icon_size)};}
     }
     restore_layout(shell,&view,state);
     let _=sync_column_header(&view);

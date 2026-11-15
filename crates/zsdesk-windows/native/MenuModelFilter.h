@@ -29,6 +29,7 @@ inline ExtensionFunction originalExtension=nullptr;
 inline UpdateFunction originalUpdate=nullptr;
 inline PolicyProbe policyProbe=nullptr;
 inline ModelAugmenter modelAugmenter=nullptr;
+inline HRESULT(*testInsertion)(IUnknown*,HMENU)=nullptr;
 inline thread_local unsigned createDepth=0;
 inline SRWLOCK setupLock=SRWLOCK_INIT;
 inline HMODULE retainedModule=nullptr;
@@ -108,6 +109,7 @@ inline bool Policy(IUnknown* native,uint32_t& policy) noexcept {
 inline IUnknown** __fastcall CreateModels(IUnknown* native,IUnknown** output,HMENU menu) {
     ++createDepth;
     struct DepthScope { ~DepthScope(){--createDepth;} } depthScope;
+    if(createDepth==1&&testInsertion&&FAILED(testInsertion(native,menu)))++failures;
     auto result=originalCreate(native,output,menu);
     if(createDepth==1&&output&&*output&&modelAugmenter&&FAILED(modelAugmenter(native,output)))++failures;
     uint32_t policy=0;

@@ -1,7 +1,7 @@
 //! Immediate common commands with explicit, isolated extension menus.
 use super::*;
 use std::collections::HashMap;
-use windows::{core::{Interface,Error,HRESULT},Win32::{System::{Com::CoTaskMemFree,SystemServices::SFGAO_FOLDER},UI::Shell::{IFolderView2,IPersistFolder2,IShellItem,IShellItemArray,IShellView,SVGIO_SELECTION,SIGDN_DESKTOPABSOLUTEPARSING,SICHINT_CANONICAL}}};
+use windows::{core::{Interface,Error,HRESULT},Win32::{System::{Com::CoTaskMemFree,SystemServices::SFGAO_FOLDER},UI::Shell::{Common::ITEMIDLIST,IFolderView2,IEnumIDList,IPersistFolder2,IShellFolder,IShellItem,IShellItemArray,IShellView,ILGetSize,SHCreateItemWithParent,SVGIO_SELECTION,SVSI_SELECT,SVSI_NOTAKEFOCUS,SVSI_FOCUSED,SVSI_SELECTIONMARK}}};
 use zsdesk_windows::shell::{file_transfer,menu::{self,MenuInterceptions,MenuOutcome}};
 use crate::context_menu_process::{AsyncClient as Client,Mode as WorkerMode};
 
@@ -13,7 +13,7 @@ impl WindowState{
         Ok((results,crate::context_preferences::native(&self.session.ui.context_menu)))
     }
 }
-struct Session{generation:u64,identity:super::pane_input::Identity,view_window:HWND,foreground:HWND,view:IShellView,pidls:Vec<Vec<u8>>,folder:Option<PathBuf>,background:Option<Vec<u8>>,client:Client,catalog:bool,input:Option<super::global_search::InputWatch>}
+struct Session{generation:u64,identity:super::pane_input::Identity,view_window:HWND,foreground:HWND,view:IShellView,pidls:Vec<Vec<u8>>,folder:Option<PathBuf>,background:Option<Vec<u8>>,client:Client,catalog:bool,input:Option<super::global_search::InputWatch>,visual:Option<VisualSelection>,invocation_authorized:bool}
 thread_local!{static ACTIVE:RefCell<HashMap<isize,Session>>=RefCell::new(HashMap::new());}
 thread_local!{static GENERATIONS:RefCell<HashMap<isize,u64>>=RefCell::new(HashMap::new());static NEXT:Cell<u64>=const{Cell::new(1)};}
 fn generation(owner:HWND)->Option<u64>{GENERATIONS.with(|generations|generations.borrow().get(&(owner.0 as isize)).copied())}
@@ -38,37 +38,72 @@ fn snapshot(view:&IShellView)->windows::core::Result<Vec<Vec<u8>>>{
     Ok(pidls)
 }
 fn same_identities(expected:&[Vec<u8>],current:&[Vec<u8>])->bool{
-    if expected.len()!=current.len(){return false;}
-    let mut a=expected.iter().collect::<Vec<_>>();let mut b=current.iter().collect::<Vec<_>>();a.sort();b.sort();
-    if a==b{return true;}
-    // Filesystem PIDLs also carry cached dates/attributes. A view can refresh
-    // those bytes without changing the selected Shell items. Confirm identity
-    // through Shell's canonical comparison, retaining an O(n log n) bound.
-    fn canonical(pidls:&[Vec<u8>])->windows::core::Result<Vec<(String,IShellItem)>>{
-        let mut result=Vec::with_capacity(pidls.len());let mut bytes=0usize;
-        for pidl in pidls{
-            let item=zsdesk_windows::shell::pidl::item_from_pidl(pidl)?;
-            let raw=unsafe{item.GetDisplayName(SIGDN_DESKTOPABSOLUTEPARSING)}?;
-            let name=unsafe{raw.to_string()};unsafe{CoTaskMemFree(Some(raw.0.cast()));}
-            let name=name?;bytes=bytes.saturating_add(name.len());
-            if bytes>4*1024*1024{return Err(failure("选择标识过大"));}
-            result.push((name,item));
-        }
-        result.sort_by(|a,b|a.0.cmp(&b.0));Ok(result)
-    }
-    let (Ok(a),Ok(b))=(canonical(expected),canonical(current))else{return false;};
-    // Ambiguous provider names must not cause an unrelated item to be matched.
-    if a.windows(2).any(|p|p[0].0==p[1].0)||b.windows(2).any(|p|p[0].0==p[1].0){return false;}
-    a.iter().zip(&b).all(|((name,a),(other,b))|name==other&&unsafe{a.Compare(b,SICHINT_CANONICAL.0 as u32)}.is_ok_and(|order|order==0))
+    menu::same_item_identities(expected,current)
 }
-fn selection_matches(expected:&[Vec<u8>],current:&[Vec<u8>],allow_empty:bool)->bool{
-    (!expected.is_empty()&&current.is_empty()&&allow_empty)||same_identities(expected,current)
+struct ChildPidl(*mut ITEMIDLIST);
+impl Drop for ChildPidl{fn drop(&mut self){if !self.0.is_null(){unsafe{CoTaskMemFree(Some(self.0.cast()));}}}}
+impl ChildPidl{
+    fn bytes(&self)->windows::core::Result<Vec<u8>>{
+        if self.0.is_null(){return Err(failure("菜单选区返回空标识"));}
+        let size=unsafe{ILGetSize(Some(self.0))}as usize;
+        if !(2..=65536).contains(&size){return Err(failure("菜单选区标识大小无效"));}
+        let bytes=unsafe{std::slice::from_raw_parts(self.0.cast::<u8>(),size)};
+        if !zsdesk_windows::shell::pidl::valid(bytes){return Err(failure("菜单选区标识无效"));}Ok(bytes.to_vec())
+    }
+}
+struct VisualSelection{folder:Vec<u8>,children:Vec<Vec<u8>>,focused:Option<Vec<u8>>}
+impl VisualSelection{
+    fn capture(view:&IShellView,expected:&[Vec<u8>])->windows::core::Result<Self>{
+        let folder_view:IFolderView2=view.cast()?;let folder:IShellFolder=unsafe{folder_view.GetFolder()?};
+        let root=background_pidl(view)?;let selected:IEnumIDList=unsafe{folder_view.Items(SVGIO_SELECTION)?};
+        let mut children=Vec::with_capacity(expected.len());let mut absolute=Vec::with_capacity(expected.len());let mut bytes=0usize;
+        loop{
+            let mut raw=[std::ptr::null_mut()];let mut fetched=0;
+            let status=unsafe{selected.Next(&mut raw,Some(&mut fetched))};let child=ChildPidl(raw[0]);status.ok()?;
+            if fetched==0{break;}
+            if children.len()>=8192{return Err(failure("菜单选区数量过多"));}
+            let id=child.bytes()?;bytes=bytes.saturating_add(id.len());if bytes>3*1024*1024{return Err(failure("菜单选区标识过大"));}
+            let item:IShellItem=unsafe{SHCreateItemWithParent(None,&folder,child.0)}?;
+            absolute.push(zsdesk_windows::shell::pidl::item_pidl(&item).ok_or_else(||failure("无法确认菜单选区标识"))?);
+            children.push(id);
+        }
+        if !same_identities(expected,&absolute){return Err(failure("菜单选区在读取期间已改变"));}
+        let focused=unsafe{folder_view.GetFocusedItem()}.ok().filter(|index|*index>=0)
+            .and_then(|index|unsafe{folder_view.Item(index)}.ok()).and_then(|item|ChildPidl(item).bytes().ok())
+            .filter(|item|children.contains(item));
+        Ok(Self{folder:root,children,focused})
+    }
+    fn restore_if_cleared(&self,view:&IShellView,expected:&[Vec<u8>],permit:&dyn Fn()->bool)->bool{
+        let restore=(||->windows::core::Result<bool>{
+            if !permit(){return Ok(false);}
+            let folder:IFolderView2=view.cast()?;
+            // This count is cheap while a menu is open. Enumerate identities
+            // only after a clear or at an invocation validation barrier.
+            if unsafe{folder.ItemCount(SVGIO_SELECTION)?}!=0{return Ok(true);}
+            if !same_identities(std::slice::from_ref(&self.folder),&[background_pidl(view)?])||!permit(){return Ok(false);}
+            let parent:IShellFolder=unsafe{folder.GetFolder()?};let mut live=Vec::with_capacity(self.children.len());
+            for child in &self.children{
+                if !permit(){return Ok(false);}
+                let item:IShellItem=unsafe{SHCreateItemWithParent(None,&parent,child.as_ptr().cast())}?;
+                live.push(zsdesk_windows::shell::pidl::item_pidl(&item).ok_or_else(||failure("菜单选区标识已失效"))?);
+            }
+            if !same_identities(expected,&live)||!permit(){return Ok(false);}
+            for (index,child) in self.children.iter().enumerate(){
+                if !permit()||unsafe{folder.ItemCount(SVGIO_SELECTION)?}!=index as i32{return Ok(false);}
+                let mut flags=SVSI_SELECT.0|SVSI_NOTAKEFOCUS.0;
+                if self.focused.as_ref()==Some(child){flags|=SVSI_FOCUSED.0|SVSI_SELECTIONMARK.0;}
+                unsafe{view.SelectItem(child.as_ptr().cast(),flags as u32)}?;
+            }
+            Ok(same_identities(expected,&snapshot(view)?)&&permit())
+        })();
+        restore.unwrap_or(false)
+    }
 }
 fn same_selection(view:&IShellView,pidls:&[Vec<u8>],folder:&Option<PathBuf>,background:&Option<Vec<u8>>,input:Option<&super::global_search::InputWatch>)->bool{
     // Background verbs target this folder, not its current selection. DefView
     // can select its first drive asynchronously even after a blank-area click.
     let selected=pidls.is_empty()||snapshot(view).is_ok_and(|current|{
-        let same=selection_matches(pidls,&current,input.is_some_and(|watch|!watch.changed()));
+        let same=same_identities(pidls,&current);
         #[cfg(test)]if !same{eprintln!("context selection changed: expected_count={} actual_count={}",pidls.len(),current.len());}
         same
     });
@@ -86,6 +121,7 @@ pub(super) fn install(){
 }
 #[cfg(test)]pub(super) fn active_pid(owner:HWND)->Option<u32>{ACTIVE.with(|active|active.borrow().get(&(owner.0 as isize)).and_then(|session|session.client.pid()))}
 #[cfg(test)]pub(super) fn request_active(owner:HWND)->bool{ACTIVE.with(|active|active.borrow().contains_key(&(owner.0 as isize)))}
+#[cfg(test)]pub(super) fn selected_identities(view:&IShellView)->windows::core::Result<Vec<Vec<u8>>>{snapshot(view)}
 fn background_pidl(view:&IShellView)->windows::core::Result<Vec<u8>>{
     let folder:IFolderView2=view.cast()?;let persistent:IPersistFolder2=unsafe{folder.GetFolder()?};
     let value=unsafe{persistent.GetCurFolder()?};let bytes=zsdesk_windows::shell::pidl::pidl_bytes(value);unsafe{CoTaskMemFree(Some(value.cast()));}Ok(bytes)
@@ -111,10 +147,12 @@ pub(super) fn show_catalog(owner:HWND,view:&IShellView,identity:super::pane_inpu
 fn start(owner:HWND,window:HWND,view:&IShellView,identity:super::pane_input::Identity,point:POINT,new:bool,catalog:bool,keyboard:bool,background_click:bool,captured:Option<SourcePreferences>)->windows::core::Result<()>{
     close(owner);let foreground=unsafe{GetForegroundWindow()};let generation=generation(owner).unwrap();
     // A newly materialized DefView can asynchronously clear its highlight.
-    // Only an observed absence of source-thread input permits keeping the
-    // frozen selection in that case. Failure to install the watch stays strict.
+    // Restore its visual selection only while the same source has had no input
+    // and before any command is authorized. Frozen targets alone are not proof
+    // that the visible selection still agrees with the command.
     let input=super::global_search::InputWatch::new();
     let pidls=if new||background_click{Vec::new()}else{snapshot(view)?};let folder=file_transfer::folder_path(view).ok();
+    let visual=if !pidls.is_empty()&&input.is_some(){VisualSelection::capture(view,&pidls).ok()}else{None};
     let background=if pidls.is_empty(){Some(background_pidl(view)?)}else{None};
     let options=if let Some((_,options))=&captured{options.clone()}else{
         let pointer=unsafe{GetWindowLongPtrW(owner,GWLP_USERDATA)}as*const Slot;
@@ -133,7 +171,7 @@ fn start(owner:HWND,window:HWND,view:&IShellView,identity:super::pane_input::Ide
     let client=Client::spawn_with_context(owner,point,targets,folder.clone(),options,MenuInterceptions{rename:true,open:true,file_actions},mode,unsafe{GetKeyState(VK_SHIFT.0 as i32)}<0,layout,Some(view_context))
         .map_err(|error|failure(&format!("无法启动系统菜单：{error:#}")))?;
     if !current(owner,generation){return Ok(());}
-    ACTIVE.with(|active|{active.borrow_mut().insert(owner.0 as isize,Session{generation,identity,view_window:window,foreground,view:view.clone(),pidls,folder,background,client,catalog,input});});
+    ACTIVE.with(|active|{active.borrow_mut().insert(owner.0 as isize,Session{generation,identity,view_window:window,foreground,view:view.clone(),pidls,folder,background,client,catalog,input,visual,invocation_authorized:false});});
     unsafe{SetTimer(Some(owner),TIMER,50,None)};Ok(())
 }
 
@@ -168,14 +206,21 @@ pub(super) fn poll(owner:HWND){
     let generation=session.generation;let identity=session.identity;let window=session.view_window;let foreground=session.foreground;
     if !current(owner,generation)||!live_source(owner,window,identity){return;}
     let view=session.view.clone();let pidls=&session.pidls;let folder=&session.folder;let background=&session.background;let input=&session.input;
+    let visual=&session.visual;let invocation_authorized=&mut session.invocation_authorized;
+    let preserve=||visual.as_ref().is_none_or(|saved|saved.restore_if_cleared(&view,pidls,&||{
+        current(owner,generation)&&live_source(owner,window,identity)&&input.as_ref().is_some_and(|watch|!watch.changed())
+    }));
+    if !*invocation_authorized&&!preserve(){return;}
     let result=session.client.poll(&mut|before_invoke|{
         let source_valid=current(owner,generation)&&live_source(owner,window,identity);
         let focus_valid=before_invoke||unsafe{GetForegroundWindow()}==foreground;
-        let selection_valid=same_selection(&view,pidls,folder,background,input.as_ref());
+        let selection_valid=source_valid&&focus_valid&&(*invocation_authorized||preserve())
+            &&same_selection(&view,pidls,folder,background,input.as_ref());
         #[cfg(test)]if !(source_valid&&focus_valid&&selection_valid){
             eprintln!("context validation rejected: before_invoke={before_invoke} source={source_valid} focus={focus_valid} selection={selection_valid} source_id={} tab={} epoch={}",identity.source,identity.tab,identity.epoch);
         }
-        source_valid&&focus_valid&&selection_valid&&current(owner,generation)&&live_source(owner,window,identity)
+        let permit=source_valid&&focus_valid&&selection_valid&&current(owner,generation)&&live_source(owner,window,identity);
+        if permit&&before_invoke{*invocation_authorized=true;}permit
     });
     if !current(owner,generation)||!live_source(owner,window,identity){return;}
     // Full PIDL enumeration belongs to validation barriers, not every 50 ms
@@ -278,12 +323,13 @@ pub(super) fn poll(owner:HWND){
         std::fs::write(&path,b"changed cached size and attributes")?;
         let second=zsdesk_windows::shell::pidl::location_pidl(&ShellLocation::Path(path)).context("changed identity")?;
         assert_ne!(first,second,"fixture must exercise metadata-bearing PIDL differences");
-        assert!(same_identities(&[first.clone()],&[second]));
+        assert!(same_identities(&[first.clone()],&[second.clone()]));
         let other=root.join("其它文件.txt");std::fs::write(&other,b"a")?;
         let different=zsdesk_windows::shell::pidl::location_pidl(&ShellLocation::Path(other)).context("different identity")?;
-        assert!(!selection_matches(&[first.clone()],&[different],true),"a real replacement selection cannot use the frozen snapshot");
-        assert!(!selection_matches(&[first.clone()],&[],false),"unknown/user-cleared selection must be rejected");
-        assert!(selection_matches(&[first],&[],true),"an observed no-input asynchronous clear keeps the frozen targets");
+        assert!(same_identities(&[first.clone(),different.clone()],&[different.clone(),second]),"ordering and cached metadata do not change the selected set");
+        assert!(!same_identities(&[first.clone(),different.clone()],&[different.clone()]),"a removed target changes the selected set");
+        assert!(!same_identities(&[first.clone()],&[different]),"a real replacement selection cannot use the frozen snapshot");
+        assert!(!same_identities(&[first],&[]),"a cleared selection must be restored before granting a command");
         Ok(())
     }
     #[test]fn menu_input_watch_observes_source_thread_input()->Result<()>{

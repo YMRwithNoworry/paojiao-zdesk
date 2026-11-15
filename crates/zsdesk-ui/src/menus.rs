@@ -268,7 +268,9 @@ fn search_settings(ui: &ExplorerUi) -> MenuItemSpec {
         item("重建文件名索引", "search-rebuild-index"),
         entry("Everything 索引设置…", "search-index-settings",!builtin,false),
         entry("启用 Everything 索引服务…", "search-everything-service",!builtin,false),
-        entry("选择已安装的 Everything…", "search-everything-program",!builtin,false),
+        entry("选择已安装的 Everything…", "search-everything-program",!builtin,ui.everything_executable.is_some()),
+        entry("自动选择已安装或内置 Everything", "search-everything-auto",!builtin,ui.everything_executable.is_none()),
+        item("搜索引擎状态…", "search-engine-status"),
     ])
 }
 
@@ -277,7 +279,7 @@ pub fn interface_requires_dialog(choice:&str)->bool{matches!(choice,"search-ever
 
 /// Settings entries that run an action instead of toggling a preference.
 pub fn interface_action(choice:&str)->bool{
-    matches!(choice,"search-rebuild-index"|"search-index-settings"|"search-everything-service"|"dual-pane"|"startup-restore"|"startup-this-pc"|"new-tab-this-pc"|"new-tab-current")||interface_requires_dialog(choice)
+    matches!(choice,"search-rebuild-index"|"search-index-settings"|"search-everything-service"|"search-engine-status"|"dual-pane"|"startup-restore"|"startup-this-pc"|"new-tab-this-pc"|"new-tab-current")||interface_requires_dialog(choice)
 }
 
 pub fn apply_interface_setting(ui: &mut ExplorerUi, choice: &str) -> bool {
@@ -317,6 +319,7 @@ pub fn apply_interface_setting(ui: &mut ExplorerUi, choice: &str) -> bool {
         "preview-provider-wps" => ui.preview_provider = PreviewProviderPreference::Wps,
         "search-backend-auto"|"search-backend-native"|"search-backend-directory" => ui.search_backend = SearchBackendPreference::NativeNtfs,
         "search-backend-everything"=>ui.search_backend=SearchBackendPreference::Everything,
+        "search-everything-auto"=>ui.everything_executable=None,
         "search-native-development"=>ui.search_include_development=!ui.search_include_development,
         "search-native-metadata"=>ui.search_index_metadata=!ui.search_index_metadata,
         "search-native-pinyin"=>ui.search_pinyin_initials=!ui.search_pinyin_initials,
@@ -427,6 +430,7 @@ pub fn app_menu_with_capabilities(state: AppMenuState, ui: &ExplorerUi, themed: 
         entry("右键菜单“使用 ZSDesk 打开”", "integration-context", true, state.integration == 1),
         entry("默认打开文件夹、磁盘和此电脑", "integration-default", true, state.integration == 2),
         entry("同时接管新出现的系统浏览窗口", "integration-forward-unhandled", state.integration == 2, state.forward_unhandled_windows),
+        entry("接管文件选择窗口（多标签）", "integration-file-dialog-takeover", true, ui.file_dialog_takeover),
         MenuItemSpec::Separator,
         item("开机启动与全局快捷键…", "quick-search-settings"),
         item("快速搜索…", "quick-search-open"),
@@ -632,6 +636,21 @@ mod tests {
         }
         assert!(!ui.search_include_development&&!ui.search_index_metadata&&!ui.search_pinyin_initials);
         assert!(apply_interface_setting(&mut ui,"search-native-metadata"));assert!(ui.search_index_metadata);assert!(ui.search_backend.is_builtin());
+    }
+    #[test]
+    fn everything_program_choice_is_visible_and_can_return_to_auto(){
+        fn checked(ui:&ExplorerUi,id:&str)->bool{
+            let MenuItemSpec::Submenu{menu,..}=search_settings(ui)else{panic!("search group")};
+            menu.items.iter().any(|item|matches!(item,MenuItemSpec::Command{command:UiCommand::Custom{id:key,..},checked:true,..} if key==id))
+        }
+        let mut ui=ExplorerUi::default();ui.search_backend=SearchBackendPreference::Everything;
+        ui.everything_executable=Some(r"E:\Apps\Everything.exe".into());
+        let preferences=ui.search_preferences();let mut reopened=ExplorerUi::default();reopened.apply_search_preferences(&preferences);
+        assert!(checked(&reopened,"search-everything-program")&&!checked(&reopened,"search-everything-auto"));
+        assert!(apply_interface_setting(&mut reopened,"search-everything-auto"));
+        assert!(reopened.everything_executable.is_none()&&checked(&reopened,"search-everything-auto")&&!checked(&reopened,"search-everything-program"));
+        assert_eq!(reopened.search_backend,SearchBackendPreference::Everything);
+        assert!(interface_action("search-engine-status"));
     }
 
     #[test]

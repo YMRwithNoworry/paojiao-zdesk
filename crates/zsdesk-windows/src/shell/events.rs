@@ -10,6 +10,7 @@ pub const WM_SHELL_NAVIGATION_FAILED: u32 = WM_APP + 0x214;
 /// Selection changed in the Shell view. `LPARAM` is an `Rc<Cell<bool>>` pending
 /// flag that the receiver must reclaim with [`acknowledge_selection_changed`].
 pub const WM_SHELL_SELECTION_CHANGED: u32 = WM_APP + 0x215;
+pub const WM_SHELL_PICKER_ACCEPT: u32 = WM_APP + 0x216;
 
 /// Clears the coalescing flag carried by `WM_SHELL_SELECTION_CHANGED`.
 ///

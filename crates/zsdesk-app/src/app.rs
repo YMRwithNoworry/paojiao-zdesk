@@ -293,7 +293,10 @@ pub(crate) fn run_arguments(args:Vec<OsString>,in_host:bool)->Result<()> {
         Mode::Desktop(_) | Mode::Guard(..) | Mode::ImportTencent if !crate::edition::DESKTOP => {
             bail!("ZSDesk {} 不包含桌面格子，请使用桌面版或全量版", crate::edition::name())
         }
-        Mode::Desktop(command) => return desktop::run(desktop_config, config, command),
+        Mode::Desktop(command) => {
+            if !matches!(command,DesktopCommand::Quit|DesktopCommand::Diagnostics(_)){let _=crate::quick_search::start_if_enabled(&config);}
+            return desktop::run(desktop_config, config, command);
+        },
         Mode::Guard(pid,thread) => return desktop::guard(desktop_config, pid,thread),
         Mode::ImportTencent => return desktop::migration::run(
             opts.import_source.as_deref().context("缺少腾讯布局路径")?, &desktop_config,

@@ -39,8 +39,10 @@ impl BackgroundView {
         REUSED.with(|reused|reused.set(false));
         let cached=CACHE.with(|cache|cache.borrow().clone());
         if let Some((previous,host))=cached{
-            if unsafe{IsWindow(Some(host.window))}.as_bool()&&view_matches(&host.view,item)&&unsafe{previous.Compare(item,SICHINT_CANONICAL.0 as u32)}.is_ok_and(|order|order==0){
-                unsafe{host.view.Refresh()?;}
+            if current_view(&host)&&view_matches(&host.view,item)&&unsafe{previous.Compare(item,SICHINT_CANONICAL.0 as u32)}.is_ok_and(|order|order==0){
+                // Reuse the browser's actual current view. Its Shell change
+                // notifications and each new menu query update folder/command
+                // state without re-enumerating the folder on every right click.
                 REUSED.with(|reused|reused.set(true));return Ok(host);
             }
         }

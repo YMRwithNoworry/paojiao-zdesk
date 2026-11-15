@@ -287,7 +287,8 @@ impl WindowState {
             self.end_address_edit();
             let _=unsafe {SetWindowTextW(self.address_edit,PCWSTR(wide(&target.address()).as_ptr()))};
         }
-        let _=unsafe {SetWindowTextW(self.hwnd,PCWSTR(wide(&format!("{} - ZSDesk",target.title())).as_ptr()))};
+        let title=if let Some(picker)=&self.picker{format!("{} — {} - ZSDesk",picker.options.title,target.title())}else{format!("{} - ZSDesk",target.title())};
+        let _=unsafe {SetWindowTextW(self.hwnd,PCWSTR(wide(&title).as_ptr()))};
         self.invalidate();
     }
     pub(super) unsafe fn focus_address(&mut self) {

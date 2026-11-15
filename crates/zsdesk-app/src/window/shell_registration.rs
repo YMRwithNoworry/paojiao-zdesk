@@ -34,7 +34,7 @@ pub(super) fn same_location(left:&ShellLocation,right:&ShellLocation)->bool {
 
 impl WindowState {
     pub(super) fn update_shell_registry(&mut self) {
-        if cfg!(test){return;}
+        if cfg!(test)||self.picker.is_some(){return;}
         let default_profile=std::path::absolute(&self.config_path).ok().zip(std::path::absolute(storage::config_path()).ok())
             .is_some_and(|(actual,default)|crate::explorer_forwarder::same_path(&actual,&default));
         let executable=std::env::current_exe().ok();

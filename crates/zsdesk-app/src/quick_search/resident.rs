@@ -45,7 +45,7 @@ fn configure(hwnd:HWND,state:&mut State)->Result<bool>{
         }
     }else{state.hotkey=prefs.hotkey.clone();}
     control::write_status(&state.profile,state.error.as_deref(),false,&state.hotkey,state.registered);
-    Ok(prefs.enabled||crate::explorer_forwarder::owns_integration(&state.profile))
+    Ok(prefs.enabled||crate::explorer_forwarder::owns_integration(&state.profile)||super::dialog_enabled(&state.profile))
 }
 unsafe extern "system" fn proc(hwnd:HWND,message:u32,wp:WPARAM,lp:LPARAM)->LRESULT{
     if message==WM_NCCREATE{
@@ -98,7 +98,7 @@ pub(super) fn run(profile:PathBuf,action:Action,instance:&control::Instance)->Re
     if action!=Action::Resident{focus_main(&profile,action==Action::Settings)?;}
     // An explicitly opened modeless popup still needs its STA message pump
     // when the user deliberately keeps the global shortcut disabled.
-    if action!=Action::Open&&!configuration.preferences.enabled&&!crate::explorer_forwarder::owns_integration(&profile){return Ok(());}
+    if action!=Action::Open&&!configuration.preferences.enabled&&!crate::explorer_forwarder::owns_integration(&profile)&&!super::dialog_enabled(&profile){return Ok(());}
     let module=HINSTANCE(unsafe{GetModuleHandleW(None)}?.0);let class=w!("ZSDesk.SearchHotkey");
     unsafe{RegisterClassW(&WNDCLASSW{hInstance:module,lpfnWndProc:Some(proc),lpszClassName:class,..Default::default()});}
     let mut state=Box::new(State{profile,registered:false,hotkey:String::new(),error:None,persistent:false,visible:false});

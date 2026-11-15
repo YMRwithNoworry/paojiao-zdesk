@@ -15,6 +15,7 @@ use windows::{core::{BOOL,PWSTR},Win32::{Foundation::{CloseHandle,COLORREF,FILET
         Input::KeyboardAndMouse::{GetAsyncKeyState,IsWindowEnabled,VK_SHIFT},WindowsAndMessaging::*}}};
 
 pub(super) const LEASE_MS:u64=800;
+pub(super) const PREPARE_MS:u64=8000;
 const MAX_LEASES:usize=16;
 const PROPERTY:windows::core::PCWSTR=windows::core::w!("ZSDesk.ExplorerVisibilityLease.v1");
 const CHANGED_STYLE:u32=WS_EX_LAYERED.0|WS_EX_TOOLWINDOW.0|WS_EX_APPWINDOW.0;
@@ -131,7 +132,7 @@ impl Connection {
         let mut child=Command::new(std::env::current_exe()?).args(["--explorer-visibility-guard",&parent.to_string(),&created.to_string()])
             .creation_flags(0x08000000).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn()?;
         let input=Arc::new(Mutex::new(child.stdin.take()));let stdout=child.stdout.take().context("guard output")?;
-        let leases=Arc::new(Mutex::new(HashMap::<u64,Lease>::new()));let recovery=leases.clone();let writer=input.clone();
+        let leases=Arc::new(Mutex::new(HashMap::<u64,Lease>::new()));let recovery=leases.clone();
         let(tx,events)=mpsc::channel();
         let reader=thread::Builder::new().name("zsdesk-explorer-lease-recovery".into()).stack_size(256*1024).spawn(move||{
             for line in BufReader::new(stdout).lines(){
@@ -140,10 +141,8 @@ impl Connection {
                 match &event {
                     Event::Prepared(lease)=>{
                         if let Ok(mut known)=recovery.lock(){known.insert(lease.id,lease.clone());}
-                        // Recovery has the original style before the child is
-                        // allowed to make any window invisible.
-                        if send(&writer,&Control::Hide(lease.id)).is_err(){break;}
-                        continue;
+                        // Keep Explorer visible while its Shell view starts.
+                        // The coordinator requests hiding after a readable view.
                     },
                     Event::Hidden(lease)=>{if let Ok(mut known)=recovery.lock(){known.insert(lease.id,lease.clone());}},
                     Event::Restored{lease,..}|Event::Closed{lease}=>{if let Ok(mut known)=recovery.lock(){known.remove(lease);}},
@@ -159,7 +158,11 @@ impl Connection {
     pub fn pid(&self)->u32{self.child.id()}
     pub fn enable(&self,enabled:bool)->Result<()>{send(&self.input,&Control::Enable(enabled))}
     pub fn heartbeat(&self)->Result<()>{send(&self.input,&Control::Heartbeat)}
+    pub fn hide_ready(&self,lease:&Lease)->Result<()>{send(&self.input,&Control::Hide(lease.id))}
     pub fn events(&self)->Vec<Event>{self.events.try_iter().collect()}
+    pub fn preparing(&self,lease:&Lease)->bool{
+        preparation_live(lease,now())&&self.leases.lock().is_ok_and(|known|known.get(&lease.id).is_some_and(|current|current.identity==lease.identity&&current.started==lease.started))
+    }
     pub fn active(&self,lease:&Lease)->bool{
         lease.live_at(now())&&self.leases.lock().is_ok_and(|known|known.get(&lease.id).is_some_and(|current|
             current.identity==lease.identity&&current.started==lease.started&&current.deadline==lease.deadline))
@@ -185,7 +188,18 @@ impl Drop for Connection {
     }
 }
 
-struct Entry{lease:Lease,hidden:bool,closing:bool}
+static INPUT_EPOCH:std::sync::atomic::AtomicU64=std::sync::atomic::AtomicU64::new(0);
+fn last_input()->u64{INPUT_EPOCH.load(Ordering::Acquire)}
+unsafe extern "system" fn mouse_input(code:i32,wp:WPARAM,lp:LPARAM)->windows::Win32::Foundation::LRESULT{
+    if code>=0&&matches!(wp.0 as u32,WM_LBUTTONDOWN|WM_RBUTTONDOWN|WM_MBUTTONDOWN|WM_XBUTTONDOWN|WM_MOUSEWHEEL|WM_MOUSEHWHEEL){INPUT_EPOCH.fetch_add(1,Ordering::AcqRel);}
+    unsafe{CallNextHookEx(None,code,wp,lp)}
+}
+unsafe extern "system" fn keyboard_input(code:i32,wp:WPARAM,lp:LPARAM)->windows::Win32::Foundation::LRESULT{
+    if code>=0&&matches!(wp.0 as u32,WM_KEYDOWN|WM_SYSKEYDOWN){INPUT_EPOCH.fetch_add(1,Ordering::AcqRel);}
+    unsafe{CallNextHookEx(None,code,wp,lp)}
+}
+fn preparation_live(lease:&Lease,stamp:u64)->bool{stamp>=lease.started&&stamp-lease.started<PREPARE_MS}
+struct Entry{lease:Lease,hidden:bool,closing:bool,input:u64}
 struct Watcher{enabled:bool,heartbeat:u64,known:HashSet<(isize,u32,u32)>,entries:HashMap<u64,Entry>,serial:u64,output:SyncSender<Event>}
 thread_local!{static WATCHER:RefCell<Option<Watcher>>=const{RefCell::new(None)};}
 impl Watcher {
@@ -211,7 +225,7 @@ impl Watcher {
         if !self.enabled||!root_browser(window){return;}
         if let Some((id,lease,hidden))=self.entries.iter().find_map(|(id,entry)|(entry.lease.identity.window==key)
             .then_some((*id,entry.lease.clone(),entry.hidden))){
-            if !lease.live_at(now())||shift_down()||modal(window)||native_tab_count(window)>1{self.remove(id,"source-changed");}
+            if !(if hidden{lease.live_at(now())}else{preparation_live(&lease,now())})||shift_down()||modal(window)||native_tab_count(window)>1{self.remove(id,"source-changed");}
             else if hidden&&event==EVENT_OBJECT_SHOW&&marked(&lease){
                 let current=unsafe{GetWindowLongPtrW(window,GWL_EXSTYLE)}as u32;
                 unsafe{SetWindowLongPtrW(window,GWL_EXSTYLE,hidden_style(current)as isize);}
@@ -229,7 +243,7 @@ impl Watcher {
         if original_style&WS_EX_LAYERED.0!=0{return;}
         self.serial=self.serial.wrapping_add(1).max(1);
         let stamp=now();let lease=Lease{id:self.serial,identity,original_style,started:stamp,deadline:stamp.saturating_add(LEASE_MS),foreground:unsafe{GetForegroundWindow()}==window};
-        if self.emit(Event::Prepared(lease.clone())){self.entries.insert(lease.id,Entry{lease,hidden:false,closing:false});}
+        if self.emit(Event::Prepared(lease.clone())){self.entries.insert(lease.id,Entry{lease,hidden:false,closing:false,input:last_input()});}
     }
     fn command(&mut self,command:Control)->bool{
         match command {
@@ -237,7 +251,8 @@ impl Watcher {
             Control::Heartbeat=>self.heartbeat=now(),
             Control::Hide(id)=>{
                 let Some(entry)=self.entries.get_mut(&id)else{return true;};
-                if entry.hidden||!entry.lease.live_at(now())||!self.enabled{return true;}
+                if entry.hidden||!self.enabled{return true;}
+                if !preparation_live(&entry.lease,now())||entry.input!=last_input(){self.remove(id,"preparation-expired-or-input");return true;}
                 // The one and only clock start for an actual hidden window.
                 entry.lease.started=now();entry.lease.deadline=entry.lease.started.saturating_add(LEASE_MS);
                 if hide(&entry.lease){entry.hidden=true;let event=Event::Hidden(entry.lease.clone());
@@ -268,7 +283,7 @@ impl Watcher {
     fn restore_all(&mut self,reason:&str){let ids:Vec<_>=self.entries.keys().copied().collect();for id in ids{self.remove(id,reason);}}
     fn expire(&mut self){
         let stamp=now();let ids:Vec<_>=self.entries.iter().filter_map(|(id,entry)|
-            (!entry.lease.live_at(stamp)||!basic_identity_matches(&entry.lease.identity)||shift_down()
+            (!(if entry.hidden{entry.lease.live_at(stamp)}else{preparation_live(&entry.lease,stamp)&&entry.input==last_input()})||!basic_identity_matches(&entry.lease.identity)||shift_down()
                 ||modal(entry.lease.identity.hwnd())||native_tab_count(entry.lease.identity.hwnd())>1).then_some(*id)).collect();
         for id in ids{self.remove(id,"lease-expired-or-interrupted");}
         self.known.retain(|(handle,pid,tid)|{
@@ -307,6 +322,9 @@ fn run_guard()->Result<()>{
     struct Hooks(Vec<HWINEVENTHOOK>);impl Drop for Hooks{fn drop(&mut self){for hook in self.0.drain(..){unsafe{UnhookWinEvent(hook);}}}}
     struct Recovery;impl Drop for Recovery{fn drop(&mut self){WATCHER.with(|slot|{if let Some(mut watcher)=slot.borrow_mut().take(){watcher.restore_all("guard-exit");}});}}
     let _recovery=Recovery;let mut hooks=Hooks(Vec::new());
+    struct InputHooks(Vec<HHOOK>);impl Drop for InputHooks{fn drop(&mut self){for hook in self.0.drain(..){let _=unsafe{UnhookWindowsHookEx(hook)};}}}
+    let module=windows::Win32::Foundation::HINSTANCE(unsafe{windows::Win32::System::LibraryLoader::GetModuleHandleW(None)}?.0);
+    let _input_hooks=InputHooks(vec![unsafe{SetWindowsHookExW(WH_MOUSE_LL,Some(mouse_input),Some(module),0)}?,unsafe{SetWindowsHookExW(WH_KEYBOARD_LL,Some(keyboard_input),Some(module),0)}?]);
     for event in [EVENT_SYSTEM_FOREGROUND,EVENT_OBJECT_SHOW,EVENT_OBJECT_DESTROY]{
         let hook=unsafe{SetWinEventHook(event,event,None,Some(event_hook),0,0,WINEVENT_OUTOFCONTEXT|WINEVENT_SKIPOWNPROCESS)};
         ensure!(!hook.0.is_null(),"Explorer event hook unavailable");hooks.0.push(hook);
@@ -317,7 +335,7 @@ fn run_guard()->Result<()>{
         if !running{break;}
         let mut message=MSG::default();while unsafe{PeekMessageW(&mut message,None,0,0,PM_REMOVE)}.as_bool(){unsafe{let _=TranslateMessage(&message);DispatchMessageW(&message);}}
         let healthy=WATCHER.with(|slot|{if let Some(watcher)=slot.borrow_mut().as_mut(){watcher.expire();
-            !watcher.enabled||now().saturating_sub(watcher.heartbeat)<2000}else{false}});
+            !watcher.enabled||now().saturating_sub(watcher.heartbeat)<PREPARE_MS+1000}else{false}});
         // A live host can still have a stuck coordinator. Stop intercepting
         // new windows until that coordinator returns and establishes a new
         // guarded connection; already-hidden windows still expire at 800 ms.
@@ -367,7 +385,7 @@ fn run_guard()->Result<()>{
             SetWindowLongPtrW(window,GWL_EXSTYLE,hidden_style(original)as isize);
             SetLayeredWindowAttributes(window,COLORREF(0),0,LWA_ALPHA)?;}
         let(tx,rx)=mpsc::sync_channel(8);let mut watcher=Watcher{enabled:true,heartbeat:now(),known:HashSet::new(),
-            entries:HashMap::from([(lease.id,Entry{lease:lease.clone(),hidden:true,closing:false})]),serial:42,output:tx};
+            entries:HashMap::from([(lease.id,Entry{lease:lease.clone(),hidden:true,closing:false,input:last_input()})]),serial:42,output:tx};
         watcher.expire();assert!(watcher.entries.is_empty());assert!(matches!(rx.try_recv(),Ok(Event::Restored{lease:42,..})));
         assert_eq!(unsafe{GetWindowLongPtrW(window,GWL_EXSTYLE)}as u32&CHANGED_STYLE,original&CHANGED_STYLE);
         assert!(!marked(&lease));assert!(watcher.command(Control::Commit(42)));

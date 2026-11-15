@@ -641,6 +641,7 @@ impl WindowState {
         };
         // The menu shows the effective navigation expansion (system default included).
         let mut menu_ui=self.session.ui.clone();
+        if let Ok(saved)=storage::load(&self.config_path){menu_ui.file_dialog_takeover=saved.ui.file_dialog_takeover;}
         menu_ui.navigation_auto_expand=Some(self.navigation_auto_expand());
         menus::app_menu_with_capabilities(state, &menu_ui, crate::edition::THEMED)
     }
@@ -660,6 +661,9 @@ impl WindowState {
             return true;
         }
         if id.starts_with("appearance-") { if crate::edition::THEMED { self.apply_appearance_choice(id); } return true; }
+        if id=="integration-file-dialog-takeover" {
+            self.toggle_file_dialog_takeover();return true;
+        }
         if id=="integration-forward-unhandled" {
             self.session.ui.forward_unhandled_windows=!self.session.ui.forward_unhandled_windows;self.save();
             let _=crate::quick_search::start_if_enabled(&self.config_path);return true;
@@ -711,7 +715,7 @@ impl WindowState {
             Some("search-everything-program") => {
                 if self.session.ui.search_backend.is_builtin(){return;}
                 match crate::fast_search::everything::choose_executable(self.hwnd){
-                    Ok(Some(path))=>{self.session.ui.everything_executable=Some(path);self.session.ui.search_backend=zsdesk_core::model::explorer::SearchBackendPreference::Everything;if self.persist_search_preferences(){self.search_backend_changed();}},
+                    Ok(Some(path))=>{self.session.ui.everything_executable=Some(path);self.session.ui.search_backend=zsdesk_core::model::explorer::SearchBackendPreference::Everything;if self.persist_search_preferences(){self.search_backend_changed();if let Err(error)=super::diagnostics::show_search(self.hwnd,&self.config_path){self.show_message(format!("无法显示搜索引擎状态：{error:#}"));}}},
                     Ok(None)=>{},Err(error)=>self.show_message(error.to_string()),
                 }
             },
@@ -737,6 +741,7 @@ impl WindowState {
             Some("desktop-tray") => self.launch_desktop(&["--tray".into()]),
             Some(id @ ("integration-off" | "integration-context" | "integration-default" | "integration-restore")) => self.set_integration(id),
             Some("integration-forward-unhandled") => {self.session.ui.forward_unhandled_windows=!self.session.ui.forward_unhandled_windows;self.save();let _=crate::quick_search::start_if_enabled(&self.config_path);},
+            Some("integration-file-dialog-takeover") => self.toggle_file_dialog_takeover(),
             Some("bookmark") => self.add_current_bookmark(),
             Some("folder-options") => open_folder_options(),
             Some(id) if menus::apply_interface_setting(&mut self.session.ui.clone(), id) => self.apply_interface_choice(id),
@@ -768,7 +773,7 @@ impl WindowState {
         if !menus::apply_interface_setting(&mut self.session.ui,id) { return; }
         if id.starts_with("tab-placement-"){self.side_tab_first=None;self.side_tab_wheel=0;}
         zsdesk_windows::shell::set_open_archives_externally(self.session.ui.archives_open_externally);
-        if (id.starts_with("search-backend-")||id.starts_with("search-native-")||id=="everything-folder-sizes")&&!self.persist_search_preferences(){return;}
+        if (id.starts_with("search-backend-")||id.starts_with("search-native-")||id=="everything-folder-sizes"||id=="search-everything-auto")&&!self.persist_search_preferences(){return;}
         if id=="everything-folder-sizes" {self.cancel_folder_sizes();}
         if id=="navigation-recycle-bin" || id=="navigation-network" || id.starts_with("navigation-this-pc-") {self.rebuild_navigation_tree();}
         self.crumbs_for=None;
@@ -781,7 +786,7 @@ impl WindowState {
         }
         self.save();self.measure_bookmarks();self.relayout();self.position_children();
         if id=="everything-folder-sizes" {self.poll_folder_sizes();}
-        if id.starts_with("search-backend-")||id.starts_with("search-native-"){self.search_backend_changed();}
+        if id.starts_with("search-backend-")||id.starts_with("search-native-")||id=="search-everything-auto"{self.search_backend_changed();}
         if (id=="navigation-auto-expand" || id=="navigation-expand-system" || id=="interface-navigation") && self.pending.is_none() && self.session.ui.show_tree {
             if let Some(tree)=&self.tree {
                 let location=self.current_location();
@@ -794,6 +799,7 @@ impl WindowState {
     /// Index administration is reached only through explicit menu actions.
     fn search_engine_menu_action(&mut self, id: &str) -> bool {
         match id {
+            "search-engine-status"=>{self.sync_search_preferences();if let Err(error)=super::diagnostics::show_search(self.hwnd,&self.config_path){self.show_message(format!("无法显示搜索引擎状态：{error:#}"));}},
             "search-index-settings" => self.launch_search_settings(false),
             "search-everything-service" => self.launch_search_settings(true),
             _ => return false,

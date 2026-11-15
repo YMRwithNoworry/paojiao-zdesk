@@ -124,6 +124,7 @@ impl WindowState {
         }?;
         if !cfg!(test) { browser.set_view_state_name(&view_memory::property_bag_name(&self.config_path))?; }
         browser.set_context_menu_options(crate::context_preferences::native(&self.session.ui.context_menu));
+        if let Some(picker)=&self.picker{browser.set_picker(picker.pattern(),picker.options.multiple,picker.options.kind.folders());}
         browser.set_content_background(self.dark,colorref(self.palette.content));
         self.native_theme_dark=Some(self.dark);
         Ok(browser)

@@ -100,10 +100,12 @@ impl WindowState {
             menus::item("关闭搜索\tEsc","search-close"),
             menus::MenuItemSpec::Separator,
             if self.session.ui.search_backend.is_builtin(){menus::item("重建自带索引","search-native-rebuild")}else{menus::item("Everything 索引设置…","search-settings")},
+            menus::item("搜索引擎状态…","search-engine-status"),
         ])
     }
 
     pub(super) unsafe fn apply_search_option(&mut self,id:&str)->bool {
+        if id=="search-engine-status"{self.sync_search_preferences();if let Err(error)=super::diagnostics::show_search(self.hwnd,&self.config_path){self.show_message(format!("无法显示搜索引擎状态：{error:#}"));}return true;}
         if id=="search-native-rebuild"{self.rebuild_search_index();return true;}
         let hit=match id {
             "search-scope"=>SearchPanelHit::Scope,"search-order"=>SearchPanelHit::Sort,

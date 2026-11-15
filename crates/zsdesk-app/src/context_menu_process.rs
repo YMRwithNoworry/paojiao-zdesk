@@ -299,12 +299,21 @@ fn read_small<T:serde::de::DeserializeOwned>(path:&Path,limit:u64)->Result<T>{
     let mut bytes=Vec::new();fs::File::open(path)?.take(limit+1).read_to_end(&mut bytes)?;ensure!(bytes.len()as u64<=limit,"菜单协议文件过大");Ok(serde_json::from_slice(&bytes)?)
 }
 fn worker_stderr(workspace:&Path)->String{
+    use std::io::{Seek,SeekFrom};
     let path=workspace.join("worker.stderr.log");
     let Ok(metadata)=fs::symlink_metadata(&path)else{return String::new();};
     if !metadata.is_file()||metadata.file_attributes()&0x400!=0{return String::new();}
-    let mut bytes=Vec::new();
-    if fs::File::open(path).and_then(|file|file.take(4096).read_to_end(&mut bytes)).is_err(){return String::new();}
-    String::from_utf8_lossy(&bytes).trim().to_owned()
+    let mut bytes=Vec::new();let mut skipped=false;
+    let read=(||->std::io::Result<()>{
+        let mut file=fs::File::open(path)?;let start=file.metadata()?.len().saturating_sub(4096);skipped=start!=0;
+        file.seek(SeekFrom::Start(start))?;file.take(4096).read_to_end(&mut bytes)?;Ok(())
+    })();
+    if read.is_err(){return String::new();}
+    // A reused worker keeps appending. Preserve its latest complete lines, and
+    // discard a cut leading line so a truncated path cannot evade redaction.
+    let bytes=if skipped{let Some(end)=bytes.iter().position(|b|*b==b'\n')else{return String::new();};&bytes[end+1..]}else{&bytes[..]};
+    let text=String::from_utf8_lossy(bytes);let mut lines=text.lines().rev().take(24).collect::<Vec<_>>();lines.reverse();
+    lines.join("\n").trim().to_owned()
 }
 fn valid_pidl(bytes:&[u8])->bool{
     if bytes.len()<2||bytes.len()>65536{return false;}
@@ -724,10 +733,14 @@ unsafe extern "system" fn procedure(hwnd:HWND,msg:u32,wp:WPARAM,lp:LPARAM)->LRES
             state.observe_open(hwnd);
             #[cfg(test)]if matches!(state.request.probe.as_deref(),Some("modern-expand"|"modern-expand-copy"))&&state.menu_open.get()&&!state.expanded_requested.replace(true){
                 unsafe{SetTimer(Some(hwnd),2,2000,None);}
-                let result=unsafe{zs_menu_test_request_expanded(hwnd,POINT{x:state.request.point[0],y:state.request.point[1]})};
+                let result=unsafe{zs_menu_test_request_expanded(hwnd,POINT{x:state.request.point[0].saturating_add(43),y:state.request.point[1].saturating_add(89)})};
                 if result.is_err(){eprintln!("expanded probe failed: {result:?}");}
             }
-            #[cfg(test)]if matches!(state.request.probe.as_deref(),Some("modern-owner-copy"|"modern-expand-copy"|"modern-owner-new-folder"|"modern-owner-static-probe"))&&state.menu_open.get(){
+            #[cfg(test)]if state.request.probe.as_deref()==Some("modern-owner-extension")&&state.menu_open.get()&&!state.expanded_requested.replace(true){
+                unsafe extern "C"{fn zs_menu_test_extension_id()->u32;}
+                let command=unsafe{zs_menu_test_extension_id()};if command!=0{state.command.set(Some(command));}
+            }
+            #[cfg(test)]if matches!(state.request.probe.as_deref(),Some("modern-owner-copy"|"modern-expand-copy"|"modern-owner-new-folder"|"modern-owner-static-probe"|"modern-owner-properties"|"modern-owner-extension"))&&state.menu_open.get(){
                 if let Some(command)=state.command.take(){
                     if state.classic_loop.get()&&unsafe{zs_menu_is_open(hwnd)}==0&&matches!(state.request.probe.as_deref(),Some("modern-owner-copy"|"modern-expand-copy")){
                         let mut label=[0u16;1024];let count=unsafe{GetMenuStringW(state.menu.get(),command,Some(&mut label),MF_BYCOMMAND)}.max(0)as usize;
@@ -834,6 +847,15 @@ fn run_request(path:&Path,request:Request,events:&EventSet,com_us:u64,fault_repo
             state.allow(false)?;state.status.catalog=menu.catalog();return Ok(MenuOutcome::Dismissed);
         }
         state.allow(false)?;
+        #[cfg(test)]if request.probe.as_deref()==Some("modern-owner-extension"){
+            use windows::{core::{GUID,Interface},Win32::{System::Com::{CoCreateInstance,CLSCTX_INPROC_SERVER},UI::Shell::IExplorerCommand}};
+            unsafe extern "C"{fn zs_menu_test_extension(command:*mut core::ffi::c_void);}
+            let command:IExplorerCommand=unsafe{CoCreateInstance(&GUID::from_u128(0xb3489bd3_6c40_4aaa_9610_d72754252627),None,CLSCTX_INPROC_SERVER)}?;
+            unsafe{zs_menu_test_extension(command.as_raw());}
+        }
+        #[cfg(test)]if request.probe.as_deref()==Some("properties-direct"){
+            state.allow(true)?;menu.invoke_verb(window,"properties",false)?;return Ok(MenuOutcome::ShellInvoked);
+        }
         #[cfg(test)]if request.probe.as_deref()==Some("modern-owner-copy"){
             ensure!(request.options.modern,"modern owner probe requires the native Windows 11 presenter");
             let count=unsafe{GetMenuItemCount(Some(menu.hmenu()))};
@@ -844,6 +866,13 @@ fn run_request(path:&Path,request:Request,events:&EventSet,com_us:u64,fault_repo
         #[cfg(test)]if request.probe.as_deref()==Some("modern-owner-new-folder"){
             ensure!(request.options.modern,"modern creation probe requires the native presenter");
             watch.command.set(Some(isolation_tests::new_item_command(&menu,false)?));
+        }
+        #[cfg(test)]if request.probe.as_deref()==Some("modern-owner-properties"){
+            let command=(0..unsafe{GetMenuItemCount(Some(menu.hmenu()))})
+                .map(|index|unsafe{GetMenuItemID(menu.hmenu(),index)})
+                .find(|id|menu.verb(*id).is_some_and(|verb|verb.eq_ignore_ascii_case("properties")))
+                .context("native properties command missing")?;
+            watch.command.set(Some(command));
         }
         #[cfg(test)]if request.probe.as_deref()==Some("modern-owner-static-probe"){
             watch.command.set(Some(isolation_tests::static_background_command(&menu)?));
@@ -1076,6 +1105,17 @@ pub fn run_worker_if_requested()->Option<Result<()>>{
         let value=redacted_error("0xC0000005 failed C:\\Users\\Example\\private file.txt\nmodule WPS.dll\nnetwork \\\\server\\private");
         assert!(value.contains("0xC0000005")&&value.contains("WPS.dll"));
         assert!(!value.contains("Example")&&!value.contains("server")&&!value.contains("private"));
+    }
+    #[test]fn reused_worker_diagnostics_keep_the_latest_failure_without_partial_paths()->Result<()>{
+        let root=std::env::temp_dir().join(format!("zsdesk-stderr-{}-{}",std::process::id(),SERIAL.fetch_add(1,Ordering::Relaxed)));
+        fs::create_dir(&root)?;
+        struct Fixture(PathBuf);impl Drop for Fixture{fn drop(&mut self){let _=fs::remove_file(self.0.join("worker.stderr.log"));let _=fs::remove_dir(&self.0);}}let _fixture=Fixture(root.clone());
+        let mut text="obsolete request\n".repeat(500);text.push_str(&format!("C:\\Users\\Private\\{}\n","hidden".repeat(800)));
+        text.push_str("latest failure 0x80004001\nsource C:\\Users\\Example\\secret.txt\n");
+        fs::write(root.join("worker.stderr.log"),text)?;
+        let raw=worker_stderr(&root);let visible=redacted_error(&raw);
+        assert!(visible.contains("latest failure 0x80004001"));assert!(!visible.contains("obsolete")&&!visible.contains("hidden")&&!visible.contains("secret")&&!visible.contains("Example"));
+        fs::write(root.join("worker.stderr.log"),"unfinished".repeat(900))?;assert!(worker_stderr(&root).is_empty());Ok(())
     }
     #[test]fn menu_failure_keeps_native_hresult_and_distinguishes_invocation(){
         let failed=MenuFailure{phase:"invoking".into(),code:Some(0x80070005u32 as i32),detail:"权限不足 (0x80070005)".into(),invoked:true};

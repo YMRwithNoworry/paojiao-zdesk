@@ -45,12 +45,16 @@ fn read_snapshot(browser:&IWebBrowser2,window:HWND,pid:u32)->windows::core::Resu
     Ok(Snapshot{window,pid,folder,selected,browser:browser.clone(),this_pc})
 }
 fn snapshots(shell:&IShellWindows)->Result<Snapshots>{
+    snapshots_for(shell,None)
+}
+fn snapshots_for(shell:&IShellWindows,requested:Option<&HashSet<isize>>)->Result<Snapshots>{
     let mut result=Vec::new();let mut counts=HashMap::new();
     for index in 0..unsafe{shell.Count()?}.clamp(0,128){
         let Ok(dispatch)=(unsafe{shell.Item(&VARIANT::from(index))})else{continue;};
         let Ok(browser)=dispatch.cast::<IWebBrowser2>()else{continue;};
         let Ok(handle)=(unsafe{browser.HWND()})else{continue;};let window=HWND(handle.0 as*mut _);
         *counts.entry(window.0 as isize).or_insert(0usize)+=1;
+        if requested.is_some_and(|windows|!windows.contains(&(window.0 as isize))){continue;}
         let mut class=[0u16;80];let n=unsafe{GetClassNameW(window,&mut class)}.max(0)as usize;
         if !matches!(String::from_utf16_lossy(&class[..n]).as_str(),"CabinetWClass"|"ExploreWClass"){continue;}
         let expected=PathBuf::from(std::env::var_os("SystemRoot").unwrap_or_else(||r"C:\Windows".into())).join("explorer.exe");
@@ -106,9 +110,9 @@ const EMPTY_OBSERVATION_MS:u64=600;
 const SELECTED_OBSERVATION_MS:u64=450;
 const SELECTION_STABLE_MS:u64=150;
 const CLOSE_RESERVE_MS:u64=120;
-struct Candidate{lease:Lease,ready_at:Option<u64>,first:Option<Snapshot>,observed:Option<(Snapshot,u64)>,sent:Option<Snapshot>,launched:bool,committed:bool}
+struct Candidate{lease:Lease,hidden:bool,hide_requested:bool,activation_launched:bool,ready_at:Option<u64>,first:Option<Snapshot>,observed:Option<(Snapshot,u64)>,sent:Option<Snapshot>,launched:bool,committed:bool}
 impl Candidate{
-    fn new(lease:Lease)->Self{Self{lease,ready_at:None,first:None,observed:None,sent:None,launched:false,committed:false}}
+    fn new(lease:Lease)->Self{Self{lease,hidden:false,hide_requested:false,activation_launched:false,ready_at:None,first:None,observed:None,sent:None,launched:false,committed:false}}
 }
 fn packet(snapshot:&Snapshot)->Result<Vec<u8>>{
     if snapshot.this_pc{Ok(serde_json::to_vec(&(Some(zsdesk_core::model::explorer::ShellLocation::ThisPc),None::<String>))?)}
@@ -128,11 +132,52 @@ fn close_due(deadline:u64,now:u64,ready:u64,stable:u64,has_selection:bool)->bool
     now>=ready&&now>=stable&&now.saturating_sub(ready)>=observation
         &&now.saturating_sub(stable)>=SELECTION_STABLE_MS&&now.saturating_add(CLOSE_RESERVE_MS)<=deadline
 }
-fn launch_selected_target(launched:&mut bool,has_selection:bool,launch:impl FnOnce()->Result<()>)->Result<()>{
-    if !*launched&&has_selection{launch()?;*launched=true;}
+fn launch_target_once(launched:&mut bool,launch:impl FnOnce()->Result<()>)->Result<()>{
+    if !*launched{launch()?;*launched=true;}
     Ok(())
 }
+fn activate_from_source(profile:&Path,snapshot:&Snapshot,target:HWND,launched:&mut bool)->Result<bool>{
+    if unsafe{GetForegroundWindow()}==target{return Ok(true);}
+    if unsafe{GetForegroundWindow()}!=snapshot.window||!unsafe{IsWindowEnabled(target)}.as_bool(){return Ok(false);}
+    crate::instance::request_activation(target);
+    if unsafe{GetForegroundWindow()}==target{return Ok(true);}
+    if !*launched{
+        // Ask the foreground Shell to launch the normal activation-only entry.
+        // Keep input queues independent and retain the source until activation.
+        use windows::{core::BSTR,Win32::UI::Shell::IShellDispatch2};
+        let view=unsafe{snapshot.browser.Document()}?.cast::<IShellFolderViewDual>()?;
+        let shell=unsafe{view.Application()}?.cast::<IShellDispatch2>()?;
+        let executable=std::env::current_exe()?;
+        let arguments=format!("--profile-dir {}",crate::quick_search::control::quote_argument(&profile.parent().context("配置目录缺失")?.to_string_lossy()));
+        unsafe{shell.ShellExecute(&BSTR::from(executable.to_string_lossy().as_ref()),&VARIANT::from(BSTR::from(arguments.as_str())),
+            &VARIANT::default(),&VARIANT::from(BSTR::from("open")),&VARIANT::from(1i32))}?;*launched=true;
+    }Ok(false)
+}
 fn update_candidate(profile:&Path,guard:&Connection,candidate:&mut Candidate,snapshot:&Snapshot)->Result<()>{
+    if !candidate.hidden{
+        ensure!(guard.preparing(&candidate.lease),"来源窗口准备阶段已结束");
+        ensure!(snapshot.pid==candidate.lease.identity.pid&&snapshot.window.0 as isize==candidate.lease.identity.window,"来源窗口身份已改变");
+        let stamp=visibility_guard::now();
+        if candidate.first.as_ref().is_none_or(|first|!first.same_location(snapshot)){
+            candidate.first=Some(snapshot.clone());candidate.ready_at=Some(stamp);candidate.observed=None;
+        }
+        if candidate.observed.as_ref().is_none_or(|(last,_)|!last.equivalent(snapshot)){candidate.observed=Some((snapshot.clone(),stamp));}
+        if !can_deliver(candidate.ready_at.unwrap_or(stamp),stamp,false){return Ok(());}
+        let Some(target)=find_target(profile)else{launch_target_once(&mut candidate.launched,||start_target(profile,snapshot))?;return Ok(());};
+        let bytes=packet(snapshot)?;
+        if candidate.sent.as_ref().is_none_or(|sent|!sent.equivalent(snapshot)){
+            if !send_with_budget(target,if snapshot.this_pc{crate::instance::OPEN_MAGIC}else{crate::reveal::COPYDATA_TAG},&bytes,25){return Ok(());}
+            candidate.sent=Some(snapshot.clone());
+        }
+        let ready=candidate.ready_at.unwrap_or(stamp);let stable=candidate.observed.as_ref().map_or(stamp,|(_,at)|*at);
+        if !close_due(candidate.lease.started.saturating_add(visibility_guard::PREPARE_MS),stamp,ready,stable,!snapshot.selected.is_empty()){return Ok(());}
+        if !send_with_budget(target,if snapshot.this_pc{crate::reveal::VERIFY_THIS_PC}else{crate::reveal::VERIFY_TAG},if snapshot.this_pc{&[]}else{&bytes},25){return Ok(());}
+        if !candidate.hide_requested{
+            if unsafe{GetForegroundWindow()}==snapshot.window&&!activate_from_source(profile,snapshot,target,&mut candidate.activation_launched)?{return Ok(());}
+            guard.hide_ready(&candidate.lease)?;candidate.hide_requested=true;
+        }
+        return Ok(());
+    }
     ensure!(guard.active(&candidate.lease),"来源窗口隐藏租约已结束");
     ensure!(snapshot.pid==candidate.lease.identity.pid&&snapshot.window.0 as isize==candidate.lease.identity.window
         &&visibility_guard::matches_identity(&candidate.lease.identity),"来源窗口身份已改变");
@@ -146,10 +191,7 @@ fn update_candidate(profile:&Path,guard:&Connection,candidate:&mut Candidate,sna
     }
     if !can_deliver(ready,stamp,!snapshot.selected.is_empty())||candidate.committed{return Ok(());}
     let Some(target)=find_target(profile)else{
-        // Without an explicit selection, a cold start cannot establish whether
-        // this is a plain folder open or an as-yet incomplete /select request.
-        // Keep the original Explorer usable instead of creating a duplicate.
-        launch_selected_target(&mut candidate.launched,!snapshot.selected.is_empty(),||start_target(profile,snapshot))?;
+        launch_target_once(&mut candidate.launched,||start_target(profile,snapshot))?;
         return Ok(());
     };
     let bytes=packet(snapshot)?;
@@ -206,21 +248,22 @@ impl Bridge{
                     if let Some(guard)=&guard{
                         if heartbeat.elapsed()>=Duration::from_millis(250){let _=guard.heartbeat();heartbeat=Instant::now();}
                         for event in guard.events(){match event{
-                            Event::Hidden(lease)=>{candidates.insert(lease.id,Candidate::new(lease));},
+                            Event::Prepared(lease)=>{candidates.insert(lease.id,Candidate::new(lease));},
+                            Event::Hidden(lease)=>{if let Some(candidate)=candidates.get_mut(&lease.id){candidate.lease=lease;candidate.hidden=true;}},
                             Event::Closed{lease}=>{candidates.remove(&lease);forwarded+=1;write_status(&profile,true,forwarded,None,Some(guard.pid()));},
                             Event::Restored{lease,reason}=>{candidates.remove(&lease);write_status(&profile,true,forwarded,Some(&format!("系统窗口已恢复：{reason}")),Some(guard.pid()));},
-                            Event::Prepared(_)=>{},
                         }}
-                        candidates.retain(|_,candidate|guard.active(&candidate.lease));
+                        candidates.retain(|_,candidate|if candidate.hidden{guard.active(&candidate.lease)}else{visibility_guard::now().saturating_sub(candidate.lease.started)<visibility_guard::PREPARE_MS});
                         // There is no idle Shell-window enumeration. WinEvent
                         // notifications create bounded work only for new HWNDs.
                         if !candidates.is_empty(){
                             if shell.is_none(){shell=unsafe{CoCreateInstance::<_,IShellWindows>(&ShellWindows,None,CLSCTX_LOCAL_SERVER)}.ok();}
-                            if let Some(value)=&shell{match snapshots(value){
+                            let requested=candidates.values().map(|candidate|candidate.lease.identity.window).collect();
+                            if let Some(value)=&shell{match snapshots_for(value,Some(&requested)){
                                 Ok(batch)=>{
                                     let mut cancel=Vec::new();
                                     for(id,candidate)in &mut candidates{
-                                        if !guard.active(&candidate.lease){continue;}
+                                        if candidate.hidden&&!guard.active(&candidate.lease){continue;}
                                         if batch.multiple.contains(&candidate.lease.identity.window){cancel.push((*id,"多标签系统窗口保持独立".to_owned()));continue;}
                                         if let Some(snapshot)=batch.views.iter().find(|view|view.window.0 as isize==candidate.lease.identity.window){
                                             if let Err(error)=update_candidate(&profile,guard,candidate,snapshot){cancel.push((*id,format!("{error:#}")));}
@@ -270,17 +313,16 @@ fn write_status(profile:&Path,active:bool,forwarded:u64,error:Option<&str>,guard
         }
         assert!(!close_due(900,900,100,550,true));assert!(!close_due(900,1000,100,550,true));
     }
-    #[test]fn cold_target_waits_for_selection_and_is_started_at_most_once()->Result<()>{
+    #[test]fn cold_target_for_plain_folder_or_selection_is_started_at_most_once()->Result<()>{
         let mut launched=false;let mut starts=0;
         for selected in [false,false,true,true,false]{
-            launch_selected_target(&mut launched,selected,||{starts+=1;Ok(())})?;
-            if !selected&&!launched{assert_eq!(starts,0,"empty selection cold-started another window");}
+            let _=selected;launch_target_once(&mut launched,||{starts+=1;Ok(())})?;
         }
         assert!(launched);assert_eq!(starts,1);
         let mut failed=false;
-        assert!(launch_selected_target(&mut failed,true,||anyhow::bail!("fixture launch failure")).is_err());
+        assert!(launch_target_once(&mut failed,||anyhow::bail!("fixture launch failure")).is_err());
         assert!(!failed,"failed launch must remain retryable");
-        launch_selected_target(&mut failed,true,||Ok(()))?;assert!(failed);Ok(())
+        launch_target_once(&mut failed,||Ok(()))?;assert!(failed);Ok(())
     }
     #[test]fn path_comparison_preserves_unicode_and_normalizes_windows_spelling(){assert!(same_path(Path::new(r"E:\资料\Äbc"),Path::new("e:/资料/äBC/")));assert!(!same_path(Path::new(r"E:\a"),Path::new(r"E:\ab")));}
     #[test]

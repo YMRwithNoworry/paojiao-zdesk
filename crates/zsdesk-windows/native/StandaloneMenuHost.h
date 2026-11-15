@@ -270,6 +270,14 @@ public:
             }
             MsgWaitForMultipleObjectsEx(0,nullptr,20,QS_ALLINPUT,MWMO_INPUTAVAILABLE);
         }
+        // The presenter site is only for native preparation. Shell property
+        // sheets and legacy extensions require their original view services
+        // during InvokeCommand, including any asynchronous UI they create.
+        if(restoreSite_&&site_){
+            result=site_->SetSite(previousSite_.Get());
+            if(FAILED(result))return result;restoreSite_=false;
+        }
+        if(!aborted)session_->DispatchPending();
         *outcome=aborted?menu_dispatch::Result{}:session_->StandaloneResult();
         if(gProbeExpanded)std::fprintf(stderr,"expand track: aborted=%d quit=%d cancelled=%d kind=%u status=0x%08X\n",aborted,quit_.quit,session_->Cancelled(),outcome->kind,static_cast<unsigned>(outcome->status));
         outcome->phase=(std::max)(outcome->phase,static_cast<uint32_t>(menu_dispatch::Presented));

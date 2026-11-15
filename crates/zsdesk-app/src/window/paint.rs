@@ -57,6 +57,7 @@ impl WindowState {
             self.paint_content(cv);
             self.paint_bookmarks(cv, &bookmark_icons);
             self.paint_status(cv);
+            self.paint_picker(cv);
         });
         if result.is_err() { self.icons.values_mut().for_each(|e| e.bitmap = None); }
     }

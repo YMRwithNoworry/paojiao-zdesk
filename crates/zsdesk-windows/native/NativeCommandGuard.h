@@ -61,6 +61,7 @@ class Gate final:public std::enable_shared_from_this<Gate>{
     HWND owner_=nullptr,dispatcher_=nullptr;DWORD ownerThread_=0;
     const ULONGLONG token_=nextToken.fetch_add(1);
     ULONGLONG generation_=0,nextRequest_=1;
+    UINT selectedCommand_=0;
     bool alive_=true,armed_=false,requiresCommandIdentity_=false;
     menu_dispatch::BeforeInvoke before_=nullptr;void* beforeContext_=nullptr;
     ResolveAction resolve_=nullptr;void* resolveContext_=nullptr;
@@ -105,6 +106,7 @@ class Gate final:public std::enable_shared_from_this<Gate>{
         {
             std::lock_guard<std::mutex> lock(mutex_);
             if(!alive_||!armed_||request->generation!=generation_||request->cancelled.load()||!WindowMatches()){++denied;return decision;}
+            if(selectedCommand_&&command!=selectedCommand_){++denied;return decision;}
             if(result_.phase==Phase::Fresh&&!command&&requiresCommandIdentity_){result_.failure=E_NOTIMPL;decision.status=E_NOTIMPL;++unsupported;return decision;}
             if(result_.phase==Phase::Granted){
                 if(command&&result_.command&&command!=result_.command){++denied;return decision;}
@@ -187,9 +189,18 @@ public:
     bool Current(ULONGLONG generation)const{std::lock_guard<std::mutex> lock(mutex_);return alive_&&generation==generation_;}
     bool Available()const{std::lock_guard<std::mutex> lock(mutex_);return alive_&&WindowMatches();}
     ULONGLONG Generation()const{std::lock_guard<std::mutex> lock(mutex_);return generation_;}
+    // A native click may alias a shared command object. Remember its identity
+    // without COM calls or message pumping; authorization still happens later.
+    bool Select(UINT command){
+        std::lock_guard<std::mutex> lock(mutex_);
+        if(!command||!alive_||!armed_||GetCurrentThreadId()!=ownerThread_||!WindowMatches()||result_.phase!=Phase::Fresh)return false;
+        if(selectedCommand_&&selectedCommand_!=command)return false;
+        selectedCommand_=command;return true;
+    }
+    UINT Selected()const{std::lock_guard<std::mutex> lock(mutex_);return selectedCommand_;}
     void Generation(ULONGLONG value){
         std::vector<std::shared_ptr<Pending>> pending;
-        {std::lock_guard<std::mutex> lock(mutex_);generation_=value;armed_=false;result_={};for(auto& item:pending_)pending.push_back(item.second);pending_.clear();}
+        {std::lock_guard<std::mutex> lock(mutex_);generation_=value;armed_=false;selectedCommand_=0;result_={};for(auto& item:pending_)pending.push_back(item.second);pending_.clear();}
         for(auto& item:pending){item->cancelled.store(true);SetEvent(item->event);}
     }
     void Arm(){std::lock_guard<std::mutex> lock(mutex_);if(alive_)armed_=true;}
@@ -393,6 +404,9 @@ public:
                 if(state.phase==Phase::Granted){
                     if(!state.command||std::find(commandIds_.begin(),commandIds_.end(),state.command)==commandIds_.end())return kCancelled;
                     command=state.command;
+                }else if(const auto selected=gate->Selected()){
+                    if(std::find(commandIds_.begin(),commandIds_.end(),selected)==commandIds_.end())return kCancelled;
+                    command=selected;
                 }else if(commandIds_.size()==1)command=commandIds_[0];
                 else if(commandIds_.size()>1){gate->Failure(E_NOTIMPL,"ambiguous-command-id",nullptr,generation_);return E_NOTIMPL;}
             }

@@ -51,6 +51,10 @@ pub fn save_new_tab_location(path:&Path,location:&zsdesk_core::model::explorer::
     let _write=SAVE_LOCK.lock().map_err(|_|anyhow::anyhow!("会话保存锁异常"))?;
     let mut session=if path.try_exists()?{load(path)?}else{default_session()};session.ui.new_tab_location=location.clone();save_unlocked(path,&session)
 }
+pub fn save_file_dialog_takeover(path:&Path,enabled:bool)->Result<()>{
+    let _write=SAVE_LOCK.lock().map_err(|_|anyhow::anyhow!("会话保存锁异常"))?;
+    let mut session=if path.try_exists()?{load(path)?}else{default_session()};session.ui.file_dialog_takeover=enabled;save_unlocked(path,&session)
+}
 pub fn save_context_menu(path:&Path,options:&zsdesk_core::model::explorer::ContextMenuPreferences)->Result<()> {
     let _write=SAVE_LOCK.lock().map_err(|_|anyhow::anyhow!("会话保存锁异常"))?;
     let mut session=load(path)?;session.ui.context_menu=options.clone();save_unlocked(path,&session)?;

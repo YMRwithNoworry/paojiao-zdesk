@@ -39,6 +39,32 @@ pub const SHELL_LAST: u32 = 0x6FFF;
 /// Application items appended to a Shell menu should use ids from here.
 pub const APP_FIRST: u32 = 0x7000;
 
+/// Compares immutable Shell selections as sets, including PIDLs whose cached
+/// filesystem metadata changed. A missing/replaced item never matches a saved
+/// selection. Call outside host/model borrows because Shell can pump messages.
+pub fn same_item_identities(expected:&[Vec<u8>],current:&[Vec<u8>])->bool{
+    use windows::Win32::UI::Shell::{SIGDN_DESKTOPABSOLUTEPARSING,SICHINT_CANONICAL};
+    if expected.len()!=current.len()||expected.len()>8192
+        ||!expected.iter().chain(current).all(|pidl|super::pidl::valid(pidl)){return false;}
+    let mut a=expected.iter().collect::<Vec<_>>();let mut b=current.iter().collect::<Vec<_>>();a.sort();b.sort();
+    if a==b{return true;}
+    fn canonical(pidls:&[Vec<u8>])->Result<Vec<(String,IShellItem)>>{
+        let mut result=Vec::with_capacity(pidls.len());let mut bytes=0usize;
+        for pidl in pidls{
+            let item=super::pidl::item_from_pidl(pidl)?;
+            let raw=unsafe{item.GetDisplayName(SIGDN_DESKTOPABSOLUTEPARSING)}?;
+            let name=unsafe{raw.to_string()};unsafe{CoTaskMemFree(Some(raw.0.cast()));}
+            let name=name?;bytes=bytes.saturating_add(name.len());
+            if bytes>4*1024*1024{return Err(windows::core::Error::from_hresult(windows::core::HRESULT(0x8007000eu32 as i32)));}
+            result.push((name,item));
+        }
+        result.sort_by(|a,b|a.0.cmp(&b.0));Ok(result)
+    }
+    let (Ok(a),Ok(b))=(canonical(expected),canonical(current))else{return false;};
+    if a.windows(2).any(|p|p[0].0==p[1].0)||b.windows(2).any(|p|p[0].0==p[1].0){return false;}
+    a.iter().zip(&b).all(|((name,a),(other,b))|name==other&&unsafe{a.Compare(b,SICHINT_CANONICAL.0 as u32)}.is_ok_and(|order|order==0))
+}
+
 #[path="quick_menu.rs"]
 mod quick_menu;
 pub use quick_menu::{QuickAction,QuickMenu};
@@ -172,7 +198,9 @@ fn decode_native_result(result: NativeMenuResult, applications: &[u32]) -> Resul
         0 => Some(MenuOutcome::Dismissed),
         1 if applications.contains(&result.command) => Some(MenuOutcome::Application(result.command)),
         2 => Some(MenuOutcome::Rename), 3 => Some(MenuOutcome::Open), 4 => Some(MenuOutcome::Explore),
-        5 => Some(MenuOutcome::ShellInvoked), 6 => None, 7 => Some(MenuOutcome::NativeHandled),
+        5 => Some(MenuOutcome::ShellInvoked),
+        6 if result.phase == 1 && result.command == 0 => None,
+        7 => Some(MenuOutcome::NativeHandled),
         8 => Some(MenuOutcome::Copy),9=>Some(MenuOutcome::Cut),10=>Some(MenuOutcome::Paste),
         11=>Some(MenuOutcome::Delete{permanent:false}),12=>Some(MenuOutcome::Delete{permanent:true}),
         _ => return Err(windows::core::Error::from_hresult(windows::core::HRESULT(0x8000ffffu32 as i32))),
@@ -267,25 +295,25 @@ impl Default for ContextMenuOptions {
 const SUPPORTED_PRESENTER_SHA256: &str = "4ce847cbbe84bedab2799bc7de9aa1d85684e66b95e2c59daf4ecee759aef0b1";
 /// `kPresenterClass` registration; its in-process server is the module above.
 const PRESENTER_SERVER_KEY: &str = "CLSID\\{86CA1AA0-34AA-4E8B-A509-50C905BAE2A2}\\InprocServer32";
+#[path="feature_compatibility.rs"]
+mod feature_compatibility;
 
 /// Whether the Windows 11 presenter can host this application's menus.
 ///
-/// `Some(false)` means it certainly cannot: Windows 10 has no such presenter,
-/// and any other build of the module fails the native digest check after the
-/// worker has already created a hidden Shell view, loaded the XAML runtime and
-/// hashed the module, on every cold menu process. Callers use the classic
-/// presentation directly in that case. `None` (registration unreadable) keeps
-/// the native verification as the authority.
+/// The verified image must also use the verified feature layout. Runtime
+/// feature state is read for each request; missing or unknown evidence selects
+/// the classic presentation before private presenter activation. The native
+/// image/vtable verification remains the final guard.
 pub fn modern_presenter_supported() -> Option<bool> {
-    static SUPPORTED: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
-    *SUPPORTED.get_or_init(|| {
-        if !cfg!(all(target_arch = "x86_64", target_env = "msvc")) { return Some(false); }
+    static IMAGE_SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let image_matches = *IMAGE_SUPPORTED.get_or_init(|| {
+        if !cfg!(all(target_arch = "x86_64", target_env = "msvc")) { return false; }
         let build = crate::theme::os_build();
-        if build != 0 && build < 22000 { return Some(false); }
-        let path = presenter_server_path()?;
-        let digest = file_sha256(&path)?;
-        Some(digest.eq_ignore_ascii_case(SUPPORTED_PRESENTER_SHA256))
-    })
+        if build != 0 && build < 22000 { return false; }
+        presenter_server_path().and_then(|path| file_sha256(&path))
+            .is_some_and(|digest| digest.eq_ignore_ascii_case(SUPPORTED_PRESENTER_SHA256))
+    });
+    Some(feature_compatibility::supports_old_layout(image_matches))
 }
 
 fn presenter_server_path() -> Option<std::path::PathBuf> {
@@ -617,7 +645,7 @@ impl ShellMenu {
         self.track_standalone(owner,point,&[],Some(folder),true,Some(browser),0,intercept,before)
     }
 
-    fn track_standalone(&self, owner: HWND, mut point: POINT, pidls: &[Vec<u8>], folder: Option<&IShellItem>, background: bool, browser:Option<&IExplorerBrowser>,
+    fn track_standalone(&self, owner: HWND, point: POINT, pidls: &[Vec<u8>], folder: Option<&IShellItem>, background: bool, browser:Option<&IExplorerBrowser>,
             application_count: usize, intercept: MenuInterceptions, before: &mut dyn FnMut() -> Result<()>) -> Result<MenuOutcome> {
         let applications = application_ids(application_count)?;
         let options=context_menu_options();
@@ -627,12 +655,15 @@ impl ShellMenu {
             self.filter(self.hmenu,&options);
             let identifiers:Vec<*const ITEMIDLIST>=pidls.iter().map(|pidl|pidl.as_ptr().cast()).collect();
             let mut outcome=NativeMenuResult::default();let mut observer=BeforeShell{callback:&mut *before};
+            // A native expansion callback must not move the next popup to its
+            // own row/cursor position. Keep the caller's screen-space anchor.
+            let mut native_point=point;
             let directory=self.directory.borrow();unsafe{zs_menu_set_working_directory(directory.as_ref().map_or(PCWSTR::null(),|value|PCWSTR(value.as_ptr())));}
             struct DirectoryScope;impl Drop for DirectoryScope{fn drop(&mut self){unsafe{zs_menu_set_working_directory(PCWSTR::null());}}}let _directory=DirectoryScope;
             let active=ActiveMenuScope::enter(&self.menu,true,self.hmenu);
             let result=unsafe{zs_menu_track_standalone(owner,self.menu.as_raw(),self.hmenu,count,identifiers.as_ptr(),
                 folder.map_or(std::ptr::null_mut(),Interface::as_raw),i32::from(background),browser.map_or(std::ptr::null_mut(),Interface::as_raw),self.input_flags.get(),
-                &mut point,applications.as_ptr(),applications.len()as u32,intercept.bits(),Some(before_shell),(&mut observer as*mut BeforeShell<'_>).cast(),&mut outcome)};
+                &mut native_point,applications.as_ptr(),applications.len()as u32,intercept.bits(),Some(before_shell),(&mut observer as*mut BeforeShell<'_>).cast(),&mut outcome)};
             drop(active);
             // The native presenter can consume and destroy the supplied HMENU
             // when it closes. Release our ownership before another menu can
@@ -655,6 +686,7 @@ impl ShellMenu {
         self.dispatch_shell_command(owner,command,Some(point),intercept,shift,control,before)
     }
     fn track_recreated_classic(&self,owner:HWND,point:POINT,applications:&[u32],intercept:MenuInterceptions,before:&mut dyn FnMut()->Result<()>)->Result<MenuOutcome>{
+        if std::env::var_os("ZSDESK_MENU_TEST_PROBE").is_some(){eprintln!("classic-popup rebuilt=true anchor={},{}",point.x,point.y);}
         let mut menu=Self::new(self.menu.clone())?;menu.background=self.background;menu.recycle_bin=self.recycle_bin;
         menu.input_flags.set(self.input_flags.get());*menu.directory.borrow_mut()=self.directory.borrow().clone();
         // Keep the same context/site and immutable selection, but rebuild its
@@ -699,10 +731,13 @@ impl ShellMenu {
         }
         let flags = TRACK_POPUP_MENU_FLAGS(TPM_RETURNCMD.0 | TPM_RIGHTBUTTON.0 | TPM_LEFTALIGN.0 | TPM_TOPALIGN.0);
         let trace=std::env::var_os("ZSDESK_MENU_TEST_PROBE").is_some();
-        if trace{unsafe{windows::Win32::Foundation::SetLastError(windows::Win32::Foundation::ERROR_SUCCESS);}}
+        if trace{
+            eprintln!("classic-popup tracking owner={} anchor={},{}",owner.0 as usize,point.x,point.y);
+            unsafe{windows::Win32::Foundation::SetLastError(windows::Win32::Foundation::ERROR_SUCCESS);}
+        }
         let chosen = unsafe { TrackPopupMenuEx(menu, flags.0, point.x, point.y, owner, None) }.0 as u32;
         if trace{let error=unsafe{windows::Win32::Foundation::GetLastError()}.0;
-            eprintln!("classic-popup result={chosen} error={error} items={} owner={}",unsafe{GetMenuItemCount(Some(menu))},owner.0 as usize);}
+            eprintln!("classic-popup result={chosen} error={error} items={} owner={} anchor={},{}",unsafe{GetMenuItemCount(Some(menu))},owner.0 as usize,point.x,point.y);}
         // Complete the foreground popup handoff before its owner is reused or
         // destroyed. Without this documented benign message, a subsequent
         // popup can immediately dismiss after switching between menu owners.
@@ -1095,6 +1130,9 @@ mod policy_tests {
         assert!(!can_fall_back_before_presentation(failed, NativeMenuResult { phase: 1, ..Default::default() }));
         assert!(!can_fall_back_before_presentation(failed, NativeMenuResult { phase: 2, ..Default::default() }));
         assert!(decode_native_result(NativeMenuResult { kind: 5, command: 19, status: failed.0, phase: 2 }, &applications).is_err());
+        assert_eq!(decode_native_result(NativeMenuResult { kind: 6, command: 0, status: 0, phase: 1 }, &applications).unwrap(), None);
+        assert!(decode_native_result(NativeMenuResult { kind: 6, command: 19, status: 0, phase: 1 }, &applications).is_err());
+        assert!(decode_native_result(NativeMenuResult { kind: 6, command: 0, status: 0, phase: 2 }, &applications).is_err());
     }
     #[test]
     fn only_requested_open_and_rename_interceptions_defer_shell_execution() {

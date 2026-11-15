@@ -513,6 +513,117 @@ fn native_background_static_verb_preserves_folder_and_working_directory()->Resul
 }
 
 #[test]
+#[ignore="Native file/folder property sheets on a private desktop; requires ZSDESK_NATIVE_TEST_OUTPUT"]
+fn native_modern_fence_properties_execute_once()->Result<()>{
+    exercise_fence_properties(true,false)
+}
+#[test]
+#[ignore="Classic property sheet control on a private desktop; requires ZSDESK_NATIVE_TEST_OUTPUT"]
+fn native_classic_fence_properties_control()->Result<()>{exercise_fence_properties(false,false)}
+#[test]
+#[ignore="Registered test IExplorerCommand DLL on a private desktop; requires ZSDESK_MENU_EXTENSION_PROBE and output"]
+fn native_modern_fence_extension_executes_exact_selection()->Result<()>{
+    use windows::Win32::System::Registry::*;
+    let dll=PathBuf::from(std::env::var_os("ZSDESK_MENU_EXTENSION_PROBE").context("extension fixture DLL")?);
+    ensure!(dll.is_absolute()&&dll.is_file(),"extension fixture DLL missing");
+    struct Registration(Vec<String>);impl Drop for Registration{fn drop(&mut self){for name in self.0.iter().rev(){let _=unsafe{RegDeleteTreeW(HKEY_CURRENT_USER,PCWSTR(wide(name).as_ptr()))};}}}
+    let mut registration=Registration(Vec::new());
+    let clsid="{B3489BD3-6C40-4AAA-9610-D72754252627}";
+    for (path,values) in [
+        (format!(r"Software\Classes\CLSID\{clsid}\InprocServer32"),vec![("",dll.to_string_lossy().into_owned()),("ThreadingModel","Apartment".into())]),
+    ]{
+        let mut key=HKEY::default();let mut disposition=REG_CREATE_KEY_DISPOSITION::default();
+        unsafe{RegCreateKeyExW(HKEY_CURRENT_USER,PCWSTR(wide(&path).as_ptr()),None,PCWSTR::null(),REG_OPTION_NON_VOLATILE,KEY_WRITE,None,&mut key,Some(&mut disposition))}.ok()?;
+        if disposition!=REG_CREATED_NEW_KEY{let _=unsafe{RegCloseKey(key)};anyhow::bail!("extension fixture key already exists: {path}");}
+        registration.0.push(path);
+        let result=(||->Result<()>{for (name,value) in values{let text=wide(&value);let bytes=unsafe{std::slice::from_raw_parts(text.as_ptr().cast::<u8>(),text.len()*2)};
+            unsafe{RegSetValueExW(key,PCWSTR(wide(name).as_ptr()),None,REG_SZ,Some(bytes))}.ok()?;}Ok(())})();
+        let _=unsafe{RegCloseKey(key)};result?;
+    }
+    exercise_fence_properties(true,true)
+}
+fn exercise_fence_properties(modern:bool,extension:bool)->Result<()>{
+    let root=PathBuf::from(std::env::var_os("ZSDESK_NATIVE_TEST_OUTPUT").context("output")?).join(if extension{"issue27-extension"}else{"issue27-properties"});
+    ensure!(root.is_absolute(),"absolute output required");fs::create_dir_all(&root)?;
+    let name=format!("ZSDesk.Issue27.{}",std::process::id());
+    let interactive=std::env::var_os("ZSDESK_MENU_TEST_INPUT_DESKTOP").is_some();
+    let desktop=if interactive{std::ptr::null_mut()}else{unsafe{CreateDesktopW(wide(&name).as_ptr(),std::ptr::null(),std::ptr::null(),0,0x000f00ff,std::ptr::null())}};
+    ensure!(interactive||!desktop.is_null(),"private desktop creation failed");
+    let raw=desktop as usize;let target=root.clone();
+    let result=thread::spawn(move||->Result<()>{
+        if !interactive{ensure!(unsafe{SetThreadDesktop(raw as*mut c_void)}!=0,"SetThreadDesktop failed");}unsafe{OleInitialize(None)}?;
+        struct Apartment;impl Drop for Apartment{fn drop(&mut self){unsafe{OleUninitialize();}}}let _apartment=Apartment;let _pool=PoolCleanup;
+        let _desktop=(!interactive).then(||Environment::set("ZSDESK_MENU_TEST_DESKTOP",&name));
+        let _root=Environment::set("ZSDESK_MENU_ROOT",target.join("workers"));
+        let _probe=Environment::set("ZSDESK_MENU_TEST_PROBE",if extension{"modern-owner-extension"}else if modern{"modern-ui-properties"}else{"properties-direct"});
+        let module=HINSTANCE(unsafe{GetModuleHandleW(None)?}.0);let class=w!("ZSDesk.Issue27.Parent");
+        unsafe{RegisterClassW(&WNDCLASSW{hInstance:module,lpfnWndProc:Some(owner_proc),lpszClassName:class,..Default::default()});}
+        let owner=Owner(unsafe{CreateWindowExW(WS_EX_NOACTIVATE,class,w!("Issue 27 regression"),WS_OVERLAPPEDWINDOW,20,20,640,480,None,None,Some(module),None)}?);
+        unsafe{let _=ShowWindow(owner.0,SW_SHOWNOACTIVATE);}
+        let mut reports=Vec::new();
+        for folder in [false,true]{
+            let path=target.join(if folder{"issue27 中文 文件夹"}else{"issue27 中文 文件.txt"});
+            if folder{fs::create_dir_all(&path)?;}else{fs::write(&path,b"issue27 property fixture")?;}
+            let marker=target.join(if folder{"folder.marker"}else{"file.marker"});
+            if marker.exists(){fs::remove_file(&marker)?;}
+            let _marker=Environment::set("ZSDESK_TEST_COMMAND_MARKER",&marker);
+            let pidl=zsdesk_windows::shell::pidl::location_pidl(&zsdesk_core::model::explorer::ShellLocation::Path(path.clone())).context("fixture PIDL")?;
+            let mut client=Client::spawn(owner.0,POINT{x:70,y:100},vec![pidl],None,ContextMenuOptions{modern,..Default::default()},
+                MenuInterceptions{rename:true,open:true,file_actions:true},Mode::More)?;
+            struct Dialogs{pid:u32,seen:std::collections::HashSet<usize>,popups:Vec<HWND>,windows:Vec<String>}
+            unsafe extern "system" fn close_properties(window:HWND,data:LPARAM)->windows::core::BOOL{
+                let state=unsafe{&mut*(data.0 as*mut Dialogs)};let mut pid=0;unsafe{GetWindowThreadProcessId(window,Some(&mut pid));}
+                if pid==state.pid&&unsafe{IsWindowVisible(window)}.as_bool(){
+                    let mut title=[0u16;512];let size=unsafe{GetWindowTextW(window,&mut title)}.max(0)as usize;
+                    let mut class=[0u16;64];let length=unsafe{GetClassNameW(window,&mut class)}.max(0)as usize;
+                    let description=format!("{}: {}",String::from_utf16_lossy(&class[..length]),String::from_utf16_lossy(&title[..size]));
+                    if !state.windows.contains(&description){state.windows.push(description);}
+                    if String::from_utf16_lossy(&class[..length]).contains("Popup")&&!state.popups.contains(&window){state.popups.push(window);}
+                    if String::from_utf16_lossy(&class[..length])=="#32770"&&String::from_utf16_lossy(&title[..size]).contains("issue27"){
+                        if state.seen.insert(window.0 as usize){let _=unsafe{PostMessageW(Some(window),WM_CLOSE,WPARAM(0),LPARAM(0))};}
+                    }
+                }true.into()
+            }
+            let mut dialogs=Dialogs{pid:client.pid().context("worker pid")?,seen:Default::default(),popups:Vec::new(),windows:Vec::new()};let mut barriers=0;
+            use windows::Win32::{System::Com::{CoCreateInstance,CLSCTX_INPROC_SERVER},UI::Accessibility::*};
+            let automation:IUIAutomation=unsafe{CoCreateInstance(&CUIAutomation,None,CLSCTX_INPROC_SERVER)}?;
+            let condition=unsafe{automation.CreateTrueCondition()}?;let mut clicked=!modern||extension;
+            let deadline=Instant::now()+Duration::from_secs(25);let mut outcome=None;
+            while Instant::now()<deadline{
+                let _=unsafe{EnumWindows(Some(close_properties),LPARAM((&mut dialogs as*mut Dialogs)as isize))};
+                if !clicked{for &popup in &dialogs.popups{
+                    let Ok(element)=(unsafe{automation.ElementFromHandle(popup)})else{continue;};
+                    let Ok(elements)=(unsafe{element.FindAll(TreeScope_Subtree,&condition)})else{continue;};
+                    for index in 0..unsafe{elements.Length()}?{
+                        let element=unsafe{elements.GetElement(index)}?;let name=unsafe{element.CurrentName()}.unwrap_or_default().to_string();
+                        if if extension{name=="ZSDesk issue27 extension"}else{name=="属性"||name=="Properties"}{
+                            if let Ok(invoke)=unsafe{element.GetCurrentPatternAs::<IUIAutomationInvokePattern>(UIA_InvokePatternId)}{
+                                unsafe{invoke.Invoke()}?;clicked=true;break;
+                            }
+                        }
+                    }if clicked{break;}
+                }}
+                if outcome.is_none(){outcome=client.poll(&mut|before|{if before{barriers+=1;}true});}
+                if outcome.as_ref().is_some_and(|value|value.is_err())||outcome.is_some()&&(if extension{marker.exists()}else{!dialogs.seen.is_empty()}){break;}
+                pump(10);client.wait_for_progress(20);
+            }
+            reports.push(serde_json::json!({"folder":folder,"outcome":outcome.as_ref().map(|value|value.as_ref().map_err(|error|format!("{error:#}"))),
+                "property_sheets":dialogs.seen.len(),"extension_marker":marker.exists(),"command_trigger":if extension{"native-owner-message"}else if modern{"native-uia-item"}else{"classic-verb"},"interactive":interactive,"windows":dialogs.windows,"invocation_barriers":barriers,"status":client.last_status,"diagnostic":read_recent_diagnostics(),"stderr":worker_stderr(&client.workspace)}));
+            fs::write(target.join("verification.current.json"),serde_json::to_vec_pretty(&reports)?)?;
+            client.cancel();drop(client);shutdown_idle_worker();let until=Instant::now()+Duration::from_secs(5);while pending_workers()>0&&Instant::now()<until{pump(10);}
+            let executed=if extension{marker.exists()}else{dialogs.seen.len()==1};
+            ensure!(outcome.is_some_and(|value|matches!(value,Ok(MenuOutcome::ShellInvoked|MenuOutcome::NativeHandled)))&&executed&&barriers==1&&clicked,
+                "properties did not execute once: {}",reports.last().unwrap());
+            if extension{let bytes=fs::read(&marker)?;ensure!(bytes.len()%2==0,"invalid extension result");let text=String::from_utf16(&bytes.chunks_exact(2).map(|pair|u16::from_le_bytes([pair[0],pair[1]])).collect::<Vec<_>>())?;
+                ensure!(text.trim_end()==path.to_string_lossy(),"extension invoked a different selection: {text}");fs::remove_file(&marker)?;}
+            ensure!(pending_workers()==0,"properties worker retained");
+            if folder{fs::remove_dir(&path)?;}else{fs::remove_file(&path)?;}
+        }Ok(())
+    }).join().map_err(|_|anyhow::anyhow!("property regression panicked")).and_then(|value|value);
+    let closed=interactive||unsafe{CloseDesktop(desktop)}!=0;result?;ensure!(closed,"private desktop retained");Ok(())
+}
+
+#[test]
 #[ignore="Native Win11 to classic handoff on an unswitched WinSta0 desktop; no clipboard command"]
 fn native_show_more_options_opens_classic_menu()->Result<()>{
     let root=PathBuf::from(std::env::var_os("ZSDESK_NATIVE_TEST_OUTPUT").context("output")?).join("more-options");fs::create_dir_all(&root)?;

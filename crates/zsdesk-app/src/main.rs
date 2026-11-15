@@ -21,6 +21,7 @@ mod folder_size_data;
 mod quick_search;
 mod win_e_bridge;
 mod explorer_forwarder;
+mod file_dialog_takeover;
 mod runtime;
 mod context_menu_process;
 mod utility_panel;
@@ -42,6 +43,7 @@ impl Drop for ApplicationLifetime {
 }
 
 fn main() {
+    if let Some(result)=file_dialog_takeover::guard::run_if_requested(){if let Err(error)=result{eprintln!("{error:#}");std::process::exit(1);}return;}
     if let Some(result)=zsdesk_windows::shell::maybe_handle_packaged_state_worker(&std::env::args_os().skip(1).collect::<Vec<_>>()){
         if let Err(error)=result{eprintln!("{error}");std::process::exit(1);}return;
     }

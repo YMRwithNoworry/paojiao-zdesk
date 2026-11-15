@@ -11,8 +11,14 @@ use windows::{core::{implement, Error, HRESULT, Interface, PCWSTR, Ref, Result},
 }};
 use zsdesk_windows::{desktop::{self, ShellEntry}, ole::{DropHandler, DropRegistration}};
 use super::{host, with_host};
+#[cfg(test)]#[path="external_drop_regression.rs"]mod external_drop_regression;
 
 static ACTIVE: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]thread_local!{static TEST_DESKTOP:RefCell<Option<PathBuf>>=const{RefCell::new(None)};}
+fn destination()->Option<PathBuf>{
+    #[cfg(test)]if let Some(path)=TEST_DESKTOP.with(|slot|slot.borrow().clone()){return Some(path);}
+    desktop::user_desktop()
+}
 pub(super) fn pending() -> usize { usize::from(ACTIVE.load(Ordering::Acquire)) }
 fn error(message: &str) -> Error { Error::new(HRESULT(0x80004005u32 as i32), message) }
 fn wide(path: &Path) -> Vec<u16> { use std::os::windows::ffi::OsStrExt; path.as_os_str().encode_wide().chain(Some(0)).collect() }
@@ -104,7 +110,7 @@ pub(super) fn return_entries(owner:HWND,entries:&[ShellEntry],point:POINT,moving
     if entries.is_empty() || entries.len()>10_000 || ACTIVE.swap(true,Ordering::AcqRel) { return false; }
     struct Active; impl Drop for Active { fn drop(&mut self) { ACTIVE.store(false,Ordering::Release); } }
     let _active=Active;
-    let Some(target)=desktop::user_desktop() else { return false; };
+    let Some(target)=destination() else { return false; };
     let public=desktop::public_desktop();
     let mut keys=Vec::new(); let mut paths=Vec::new();let mut unique=std::collections::HashSet::new();
     for entry in entries {
@@ -167,6 +173,50 @@ impl DropHandler for ReturnDrop {
         effect
     }
 }
+struct ExternalDrop{owner:HWND,delegate:RefCell<Option<(IDataObject,windows::Win32::System::Ole::IDropTarget)>>,on_desktop:std::cell::Cell<bool>}
+impl ExternalDrop{
+    fn effect(&self,keys:u32,point:POINT,allowed:DROPEFFECT)->DROPEFFECT{
+        if self.on_desktop.get()&&keys&(8|32)==0&&allowed.0&DROPEFFECT_MOVE.0!=0{return DROPEFFECT_MOVE;}
+        let mut effect=allowed;
+        if let Some((_,target))=self.delegate.borrow().as_ref(){
+            if unsafe{target.DragOver(windows::Win32::System::SystemServices::MODIFIERKEYS_FLAGS(keys),windows::Win32::Foundation::POINTL{x:point.x,y:point.y},&mut effect)}.is_ok()
+                {return effect;}
+        }DROPEFFECT_NONE
+    }
+}
+impl DropHandler for ExternalDrop{
+    fn enter(&self,data:&IDataObject,keys:u32,point:POINT,allowed:DROPEFFECT)->DROPEFFECT{
+        self.leave();let paths=zsdesk_windows::ole::hdrop_paths(data);
+        let Some(folder)=destination()else{return DROPEFFECT_NONE;};
+        self.on_desktop.set(!paths.is_empty()&&paths.iter().all(|path|path.parent().is_some_and(|parent|same_path(parent,&folder))));
+        let Ok(target)=desktop::folder_drop_target(self.owner,&folder)else{return DROPEFFECT_NONE;};
+        let mut effect=allowed;
+        if unsafe{target.DragEnter(data,windows::Win32::System::SystemServices::MODIFIERKEYS_FLAGS(keys),windows::Win32::Foundation::POINTL{x:point.x,y:point.y},&mut effect)}.is_err(){return DROPEFFECT_NONE;}
+        *self.delegate.borrow_mut()=Some((data.clone(),target));self.effect(keys,point,allowed)
+    }
+    fn over(&self,keys:u32,point:POINT,allowed:DROPEFFECT)->DROPEFFECT{self.effect(keys,point,allowed)}
+    fn leave(&self){self.on_desktop.set(false);if let Some((_,target))=self.delegate.borrow_mut().take(){let _=unsafe{target.DragLeave()};}}
+    fn dropped(&self,data:&IDataObject,keys:u32,point:POINT,allowed:DROPEFFECT)->DROPEFFECT{
+        if self.delegate.borrow().as_ref().is_none_or(|(expected,_)|expected!=data){self.leave();return DROPEFFECT_NONE;}
+        let effect=self.effect(keys,point,allowed);
+        if effect==DROPEFFECT_NONE{self.leave();return effect;}
+        let paths=zsdesk_windows::ole::hdrop_paths(data);
+        if paths.is_empty()||!matches!(effect,DROPEFFECT_COPY|DROPEFFECT_MOVE){
+            self.on_desktop.set(false);let delegate=self.delegate.borrow_mut().take();
+            let Some((_,target))=delegate else{return DROPEFFECT_NONE;};let mut result=effect;
+            return if unsafe{target.Drop(data,windows::Win32::System::SystemServices::MODIFIERKEYS_FLAGS(keys),windows::Win32::Foundation::POINTL{x:point.x,y:point.y},&mut result)}.is_ok(){result}else{DROPEFFECT_NONE};
+        }
+        self.leave();
+        let entries:Option<Vec<_>>=paths.iter().map(|path|desktop::entry_from_parsing_name(&path.to_string_lossy())).collect();
+        let Some(entries)=entries else{return DROPEFFECT_NONE;};
+        let complete=return_entries(self.owner,&entries,point,effect==DROPEFFECT_MOVE);
+        let (returned,performed,logical)=super::drop_effects(effect==DROPEFFECT_MOVE,complete);
+        let _=super::publish_drop_effect(data,windows::Win32::UI::Shell::CFSTR_PERFORMEDDROPEFFECT,performed);
+        let _=super::publish_drop_effect(data,windows::Win32::UI::Shell::CFSTR_LOGICALPERFORMEDDROPEFFECT,logical);
+        returned
+    }
+}
+impl Drop for ExternalDrop{fn drop(&mut self){self.leave();}}
 unsafe extern "system" fn surface_proc(hwnd:HWND,msg:u32,wp:WPARAM,lp:LPARAM)->LRESULT {
     if msg==WM_MOUSEACTIVATE { return LRESULT(MA_NOACTIVATE as isize); }
     unsafe { DefWindowProcW(hwnd,msg,wp,lp) }
@@ -174,6 +224,13 @@ unsafe extern "system" fn surface_proc(hwnd:HWND,msg:u32,wp:WPARAM,lp:LPARAM)->L
 impl DesktopDropSurfaces {
     pub(super) fn new(owner:HWND,source:u64,data:&IDataObject,entries:Vec<ShellEntry>)->Self {
         let completed=Rc::new(RefCell::new(false));
+        let handler=Rc::new(ReturnDrop { owner,source,expected:data.clone(),entries,completed:completed.clone(),active:CellState::new(false) });
+        Self::with_handler(completed,handler)
+    }
+    pub(super) fn external(owner:HWND)->Self{
+        Self::with_handler(Rc::new(RefCell::new(false)),Rc::new(ExternalDrop{owner,delegate:RefCell::new(None),on_desktop:std::cell::Cell::new(false)}))
+    }
+    fn with_handler(completed:Rc<RefCell<bool>>,handler:Rc<dyn DropHandler>)->Self{
         let mut surfaces=Self { windows:Vec::new(),completed:completed.clone() };
         let enabled=with_host(|host|host.config.settings.organize).unwrap_or(false);
         if !enabled { return surfaces; }
@@ -185,8 +242,7 @@ impl DesktopDropSurfaces {
             let rect=monitor.work;
             let Ok(window)=(unsafe { CreateWindowExW(WS_EX_LAYERED|WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE,class,PCWSTR::null(),WS_POPUP,
                 rect.left,rect.top,rect.right-rect.left,rect.bottom-rect.top,Some(desktop),None,instance,None) }) else { continue; };
-            let handler=Rc::new(ReturnDrop { owner,source,expected:data.clone(),entries:entries.clone(),completed:completed.clone(),active:CellState::new(false) });
-            let registration=unsafe { DropRegistration::register(window,handler) }.ok();
+            let registration=unsafe { DropRegistration::register(window,handler.clone()) }.ok();
             if registration.is_none() { let _=unsafe { DestroyWindow(window) }; continue; }
             let _=unsafe { SetLayeredWindowAttributes(window,Default::default(),1,LWA_ALPHA) };
             let above=unsafe { GetWindow(desktop,GW_HWNDPREV) }.unwrap_or(HWND_TOP);
@@ -196,6 +252,7 @@ impl DesktopDropSurfaces {
         surfaces
     }
     pub(super) fn completed(&self)->bool { *self.completed.borrow() }
+    pub(super) fn pass_through(&self){for(window,_)in &self.windows{unsafe{let style=GetWindowLongPtrW(*window,GWL_EXSTYLE);SetWindowLongPtrW(*window,GWL_EXSTYLE,style|WS_EX_TRANSPARENT.0 as isize);}}}
 }
 
 #[cfg(test)] mod tests {

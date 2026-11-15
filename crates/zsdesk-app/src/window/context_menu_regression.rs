@@ -197,6 +197,140 @@ fn native_main_window_background_and_selection_menu_isolation()->Result<()>{
 }
 
 #[test]
+#[ignore="Native/classic handoff with source selection and screen-anchor verification on a private desktop"]
+fn native_more_options_preserves_source_selection_and_anchor()->Result<()>{
+    use windows::core::Interface;
+    use windows::Win32::UI::Shell::IFolderView2;
+    use zsdesk_windows::shell::{file_transfer,menu::{self,ViewMenuTarget}};
+    fn keys(pidls:&[Vec<u8>])->Result<Vec<Vec<u16>>>{
+        if pidls.is_empty(){return Ok(Vec::new());}
+        let mut values=file_transfer::paths_from_pidls(pidls)?.iter().map(|path|ExplorerBrowserHost::search_path_key(path)).collect::<Vec<_>>();
+        values.sort();Ok(values)
+    }
+    fn request(root:&Path,owner:HWND,point:POINT,targets:&[Vec<u8>])->Result<Option<(PathBuf,serde_json::Value)>>{
+        let wanted=keys(targets)?;
+        for entry in fs::read_dir(root)?.flatten(){
+            let path=entry.path().join("request.json");let Ok(bytes)=fs::read(path)else{continue;};
+            let Ok(value)=serde_json::from_slice::<serde_json::Value>(&bytes)else{continue;};
+            if value["owner"].as_i64()!=Some(owner.0 as isize as i64)||value["point"]!=serde_json::json!([point.x,point.y]){continue;}
+            let Ok(pidls)=serde_json::from_value::<Vec<Vec<u8>>>(value["pidls"].clone())else{continue;};
+            if keys(&pidls)?==wanted{return Ok(Some((entry.path(),value)));}
+        }Ok(None)
+    }
+    fn status(workspace:&Path,token:&str)->Option<serde_json::Value>{
+        let bytes=fs::read(workspace.join("status.json")).ok()?;
+        let value:serde_json::Value=serde_json::from_slice(&bytes).ok()?;
+        (value["token"].as_str()==Some(token)).then_some(value)
+    }
+    #[derive(Default)]struct Popup{pid:u32,rectangle:Option<RECT>}
+    unsafe extern "system" fn find_classic(window:HWND,data:LPARAM)->windows::core::BOOL{
+        let found=unsafe{&mut*(data.0 as*mut Popup)};let mut pid=0;unsafe{GetWindowThreadProcessId(window,Some(&mut pid));}
+        if pid==found.pid&&unsafe{IsWindowVisible(window)}.as_bool(){
+            let mut class=[0u16;64];let length=unsafe{GetClassNameW(window,&mut class)}.max(0)as usize;
+            if String::from_utf16_lossy(&class[..length])=="#32768"{let mut rect=RECT::default();if unsafe{GetWindowRect(window,&mut rect)}.is_ok(){found.rectangle=Some(rect);}}
+        }true.into()
+    }
+    let root=PathBuf::from(std::env::var_os("ZSDESK_NATIVE_TEST_OUTPUT").context("output")?).join("more-options-source");fs::create_dir_all(&root)?;
+    let name=format!("ZSDesk.MoreOptionsSource.{}",std::process::id());
+    let desktop=unsafe{CreateDesktopW(wide(&name).as_ptr(),std::ptr::null(),std::ptr::null(),0,0x000f00ff,std::ptr::null())};ensure!(!desktop.is_null(),"private desktop");
+    let raw=desktop as usize;let target=root.clone();let foreground=unsafe{GetForegroundWindow()};
+    let result=thread::spawn(move||->Result<serde_json::Value>{
+        ensure!(unsafe{SetThreadDesktop(raw as*mut c_void)}!=0,"private desktop attach");unsafe{OleInitialize(None)}?;let _apartment=Apartment;
+        struct Workers;impl Drop for Workers{fn drop(&mut self){crate::context_menu_process::shutdown_idle_worker();let until=Instant::now()+Duration::from_secs(5);while crate::context_menu_process::pending_workers()>0&&Instant::now()<until{pump(10);}}}let _workers=Workers;
+        let _desktop=Environment::set("ZSDESK_MENU_TEST_DESKTOP",&name);
+        let workers=target.join("workers");fs::create_dir_all(&workers)?;let _root=Environment::set("ZSDESK_MENU_ROOT",&workers);
+        let _probe=Environment::set("ZSDESK_MENU_TEST_PROBE","modern-expand");
+        let files=target.join("files");fs::create_dir_all(&files)?;
+        for name in ["one.txt","two.txt","three.txt"]{fs::write(files.join(name),b"menu handoff fixture")?;}
+        let runner=create(&target,&files,true)?;let mut checks=Vec::new();
+        for count in [0usize,1,2]{for keyboard in [false,true]{
+            let (view,window)={let slot=runner.slot.borrow();let browser=slot.as_ref().unwrap().browser.as_ref().unwrap();
+                browser.select_all(false);if count>0{browser.select_children(&["one.txt","two.txt"][..count].iter().map(|name|std::ffi::OsString::from(*name)).collect::<Vec<_>>())?;}
+                (unsafe{browser.current_view()}?,browser.view_window().context("source view")?)};
+            pump(35);
+            let expected=super::context_menu::selected_identities(&view)?;ensure!(expected.len()==count,"fixture selection count");
+            let folder:IFolderView2=view.cast()?;let focused=unsafe{folder.GetFocusedItem()}.ok();
+            let mut bounds=RECT::default();unsafe{GetWindowRect(window,&mut bounds)}?;
+            let mouse=POINT{x:bounds.left+150,y:bounds.top+70};
+            let position=if keyboard{LPARAM(-1)}else{LPARAM(((mouse.x as u32&0xffff)|((mouse.y as u32&0xffff)<<16))as isize)};
+            let anchor=menu::context_menu_point(&view,position)?;
+            let target_kind=if count==0{ViewMenuTarget::Background}else{ViewMenuTarget::Selection};
+            let targets=if count==0{vec![zsdesk_windows::shell::pidl::location_pidl(&ShellLocation::Path(files.clone())).context("background PIDL")?]}else{expected.clone()};
+            super::context_menu::show(window,&view,window,position,target_kind)?;
+            ensure!(super::context_menu::request_active(runner.hwnd),"menu request not active");
+            let mut frozen=None;let mut popup=None;let mut restored=false;let mut cleared=false;let mut worker_owner=None;let mut worker_pid=None;
+            let until=Instant::now()+Duration::from_secs(20);
+            while super::context_menu::request_active(runner.hwnd){
+                if frozen.is_none(){frozen=request(&workers,runner.hwnd,anchor,&targets)?;}
+                if let Some((workspace,request))=&frozen{
+                    if let Some(value)=request["token"].as_str().and_then(|token|status(workspace,token)){
+                        if let Some(owner)=value["window"].as_u64().filter(|owner|*owner!=0){worker_owner=Some(owner);}
+                    }
+                }
+                if let Some(pid)=super::context_menu::active_pid(runner.hwnd){
+                    worker_pid=Some(pid);
+                    let mut found=Popup{pid,..Default::default()};let _=unsafe{EnumWindows(Some(find_classic),LPARAM((&mut found as*mut Popup)as isize))};
+                    if let Some(rect)=found.rectangle{popup=Some(rect);
+                        if count>0&&!cleared{
+                            // Model DefView's asynchronous highlight clear at
+                            // the native/classic transition, without user input.
+                            unsafe{view.SelectItem(std::ptr::null(),windows::Win32::UI::Shell::SVSI_DESELECTOTHERS.0 as u32)}?;
+                            ensure!(super::context_menu::selected_identities(&view)?.is_empty(),"clear fixture did not clear");
+                            cleared=true;super::context_menu::poll(runner.hwnd);
+                            restored=keys(&super::context_menu::selected_identities(&view)?)?==keys(&expected)?;
+                        }
+                    }
+                }
+                pump(5);ensure!(Instant::now()<until,"menu handoff timed out");
+            }
+            let (workspace,frozen)=frozen.context("immutable worker request not observed")?;
+            ensure!(frozen["view_context"]["keyboard"]==keyboard,"keyboard origin changed");
+            let token=frozen["token"].as_str().context("request token")?;
+            let until=Instant::now()+Duration::from_secs(5);
+            let finished=loop{
+                if let Some(value)=status(&workspace,token){if matches!(value["phase"].as_str(),Some("idle"|"done")){break value;}}
+                ensure!(Instant::now()<until,"request {token} has no matching terminal status");pump(5);
+            };
+            ensure!(finished["pid"].as_u64()==worker_pid.map(u64::from)&&finished["error"].is_null()&&finished["before_invoke"]==false&&finished["outcome"]=="Dismissed","expansion executed or failed: {finished}");
+            // The retained diagnostic intentionally contains only the first
+            // 24 stderr lines. A reused worker's later menus require its own
+            // token-matched terminal status and the full bounded fixture log.
+            let log=workspace.join("worker.stderr.log");ensure!(fs::metadata(&log)?.len()<=1024*1024,"fixture log exceeds bound");
+            let all_stderr=fs::read_to_string(log)?;
+            let stderr=&all_stderr[all_stderr.rfind("expand anchor=").context("current expansion trace missing")?..];
+            let classic=stderr.lines().filter(|line|line.starts_with("classic-popup tracking ")).last().unwrap_or_default();
+            let expanded=stderr.lines().filter(|line|line.starts_with("expand anchor=")).last().unwrap_or_default();
+            ensure!(classic==format!("classic-popup tracking owner={} anchor={},{}",worker_owner.context("worker owner window not observed")?,anchor.x,anchor.y),"classic menu lost original owner/anchor: {stderr}");
+            ensure!(expanded.contains(&format!("anchor={},{}",anchor.x,anchor.y))&&expanded.ends_with(&format!("callback={},{}",anchor.x.saturating_add(43),anchor.y.saturating_add(89))),"offset expansion callback not exercised: {stderr}");
+            ensure!(popup.is_some(),"classic popup was not observed");
+            ensure!(count==0||cleared&&restored,"source highlight was not restored");
+            ensure!(keys(&super::context_menu::selected_identities(&view)?)?==keys(&expected)?,"source selection changed across expansion");
+            if count>0{ensure!(unsafe{folder.GetFocusedItem()}.ok()==focused,"focused source row changed");}
+            let rect=popup.unwrap();checks.push(serde_json::json!({"selected":count,"keyboard":keyboard,"request_token":token,"worker_pid":worker_pid,"terminal_phase":finished["phase"],"anchor":[anchor.x,anchor.y],"classic_rect":[rect.left,rect.top,rect.right,rect.bottom],"visual_selection_restored":restored,"target_pidls_verified":true,"command_executed":false,"rebuilt_menu":stderr.contains("rebuilt=true")}));
+        }}
+        // A real new selection must not be overwritten by the saved selection.
+        let _probe=Environment::set("ZSDESK_MENU_TEST_PROBE","dismiss");
+        let (view,window)={let slot=runner.slot.borrow();let browser=slot.as_ref().unwrap().browser.as_ref().unwrap();browser.select_children(&["one.txt".into()])?;(unsafe{browser.current_view()}?,browser.view_window().unwrap())};
+        super::context_menu::show(window,&view,window,LPARAM(-1),ViewMenuTarget::Selection)?;
+        {let slot=runner.slot.borrow();slot.as_ref().unwrap().browser.as_ref().unwrap().select_children(&["three.txt".into()])?;}
+        let replacement=super::context_menu::selected_identities(&view)?;super::context_menu::poll(runner.hwnd);
+        ensure!(keys(&super::context_menu::selected_identities(&view)?)?==keys(&replacement)?,"replacement selection was overwritten");
+        super::context_menu::close(runner.hwnd);
+        // An observed source input cancels restoration of a now-empty selection.
+        {let slot=runner.slot.borrow();slot.as_ref().unwrap().browser.as_ref().unwrap().select_children(&["one.txt".into()])?;}
+        super::context_menu::show(window,&view,window,LPARAM(-1),ViewMenuTarget::Selection)?;
+        unsafe{PostMessageW(Some(runner.hwnd),WM_LBUTTONDOWN,WPARAM(0),LPARAM(0))}?;let mut message=MSG::default();
+        ensure!(unsafe{PeekMessageW(&mut message,Some(runner.hwnd),WM_LBUTTONDOWN,WM_LBUTTONDOWN,PM_REMOVE)}.as_bool(),"source input not observed");
+        unsafe{view.SelectItem(std::ptr::null(),windows::Win32::UI::Shell::SVSI_DESELECTOTHERS.0 as u32)}?;super::context_menu::poll(runner.hwnd);
+        ensure!(super::context_menu::selected_identities(&view)?.is_empty()&&!super::context_menu::request_active(runner.hwnd),"user-cleared selection was restored");
+        drop(runner);pump(20);Ok(serde_json::json!({"cases":checks,"replacement_selection_preserved":true,"user_clear_not_restored":true,"clipboard_untouched":true}))
+    }).join().map_err(|_|anyhow::anyhow!("source menu regression panicked")).and_then(|value|value);
+    let closed=unsafe{CloseDesktop(desktop)}!=0;
+    let report=serde_json::json!({"state":if result.is_ok()&&closed{"passed"}else{"failed"},"checks":result.as_ref().map_err(|error|format!("{error:#}")),"desktop_closed":closed,"foreground_unchanged":foreground==unsafe{GetForegroundWindow()}});
+    fs::write(root.join("verification.current.json"),serde_json::to_vec_pretty(&report)?)?;println!("{report}");result?;ensure!(closed,"private desktop retained");Ok(())
+}
+
+#[test]
 #[ignore="Blank double-click navigation and folder-search scope in a private desktop"]
 fn native_blank_double_click_and_folder_search_scope()->Result<()>{
     let root=PathBuf::from(std::env::var_os("ZSDESK_NATIVE_TEST_OUTPUT").context("output")?).join("blank-doubleclick");fs::create_dir_all(&root)?;

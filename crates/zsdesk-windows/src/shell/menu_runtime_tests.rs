@@ -78,6 +78,60 @@ fn native_mixed_fence_menu_routes_application_and_shell_commands()->Result<()>{
     std::fs::write(output.join("verification.current.json"),serde_json::to_vec_pretty(&report)?)?;println!("{report}");result?;ensure!(closed&&unchanged,"desktop cleanup/focus failed");Ok(())
 }
 
+#[test]
+#[ignore="Rebuilds a consumed HMENU and executes a counted fixture command on a private desktop; no file or clipboard operation"]
+fn native_recreated_classic_menu_preserves_target_anchor_and_single_dispatch()->Result<()>{
+    use windows::{core::{implement,HRESULT,PSTR},Win32::UI::Shell::IContextMenu_Impl};
+    type Calls=Rc<RefCell<Vec<(Vec<Vec<u8>>,[i32;2])>>>;
+    #[implement(IContextMenu)]
+    struct BoundContext{targets:Vec<Vec<u8>>,calls:Calls,queries:Rc<Cell<usize>>}
+    #[allow(non_snake_case)]impl IContextMenu_Impl for BoundContext_Impl{
+        fn QueryContextMenu(&self,menu:HMENU,_:u32,first:u32,_:u32,_:u32)->HRESULT{
+            self.queries.set(self.queries.get()+1);
+            match unsafe{AppendMenuW(menu,MF_STRING,first as usize,w!("Execute fixture (&Z)"))}{Ok(())=>HRESULT(1),Err(error)=>error.code()}
+        }
+        fn GetCommandString(&self,id:usize,_:u32,_:*const u32,output:PSTR,count:u32)->windows::core::Result<()>{
+            let verb:Vec<u16>="zsdesk.fixture".encode_utf16().chain(Some(0)).collect();
+            if id!=0||count<verb.len()as u32{return Err(windows::core::Error::from_hresult(HRESULT(0x80070057u32 as i32)));}
+            unsafe{std::ptr::copy_nonoverlapping(verb.as_ptr(),output.0.cast(),verb.len());}Ok(())
+        }
+        fn InvokeCommand(&self,info:*const CMINVOKECOMMANDINFO)->windows::core::Result<()>{
+            if info.is_null()||unsafe{(*info).cbSize}<std::mem::size_of::<CMINVOKECOMMANDINFOEX>()as u32{return Err(windows::core::Error::from_hresult(HRESULT(0x80070057u32 as i32)));}
+            let info=unsafe{&*info.cast::<CMINVOKECOMMANDINFOEX>()};
+            if !info.lpVerb.0.is_null()||!info.lpVerbW.0.is_null(){return Err(windows::core::Error::from_hresult(HRESULT(0x80070057u32 as i32)));}
+            self.calls.borrow_mut().push((self.targets.clone(),[info.ptInvoke.x,info.ptInvoke.y]));Ok(())
+        }
+    }
+    let output=PathBuf::from(std::env::var_os("ZSDESK_NATIVE_TEST_OUTPUT").context("output")?).join("recreated-classic");std::fs::create_dir_all(&output)?;
+    let name:Vec<u16>=format!("ZSDesk.RecreatedMenu.{}",std::process::id()).encode_utf16().chain(Some(0)).collect();
+    let desktop=unsafe{CreateDesktopW(name.as_ptr(),ptr::null(),ptr::null(),0,0x000f00ff,ptr::null())};ensure!(!desktop.is_null(),"private desktop");let raw=desktop as usize;
+    let result=thread::spawn(move||->Result<serde_json::Value>{
+        ensure!(unsafe{SetThreadDesktop(raw as*mut c_void)}!=0,"private desktop attach");unsafe{OleInitialize(None)}?;let _apartment=Apartment;
+        let module=HINSTANCE(unsafe{GetModuleHandleW(None)?}.0);let class=w!("ZSDesk.RecreatedMenu.Owner");
+        unsafe{RegisterClassW(&WNDCLASSW{hInstance:module,lpfnWndProc:Some(procedure),lpszClassName:class,..Default::default()});}
+        let owner=Owner(unsafe{CreateWindowExW(WINDOW_EX_STYLE::default(),class,w!("Recreated menu"),WS_OVERLAPPEDWINDOW,20,20,600,400,None,None,Some(module),None)}?);
+        unsafe{let _=ShowWindow(owner.0,SW_SHOW);let _=SetForegroundWindow(owner.0);}
+        CHOOSE_LAST.with(|last|last.set(false));let mut checks=Vec::new();
+        for (background,targets) in [(false,vec![vec![3,0,11,0,0]]),(false,vec![vec![3,0,11,0,0],vec![3,0,12,0,0]]),(true,Vec::new())]{
+            for input_flags in [0u32,1,3]{
+                let calls:Calls=Default::default();let queries=Rc::new(Cell::new(0));
+                let context:IContextMenu=BoundContext{targets:targets.clone(),calls:calls.clone(),queries:queries.clone()}.into();
+                let mut menu=ShellMenu::new(context)?;menu.background=background;menu.input_flags.set(input_flags);menu.populate(false,false)?;
+                unsafe{DestroyMenu(menu.hmenu)}?;menu.owns_menu.set(false);
+                let anchor=POINT{x:70+(input_flags as i32)*13,y:100+(input_flags as i32)*17};let mut authorizations=0;
+                let outcome=menu.track_recreated_classic(owner.0,anchor,&[],MenuInterceptions::default(),&mut||{authorizations+=1;Ok(())})?;
+                let _=unsafe{KillTimer(Some(owner.0),1)};let _=unsafe{KillTimer(Some(owner.0),2)};
+                ensure!(outcome==MenuOutcome::ShellInvoked&&authorizations==1,"rebuilt command was not authorized and executed exactly once");
+                ensure!(*calls.borrow()==vec![(targets.clone(),[anchor.x,anchor.y])]&&queries.get()==2,"rebuilt popup changed target/anchor or replayed invocation");
+                checks.push(serde_json::json!({"background":background,"count":targets.len(),"input_flags":input_flags,"anchor":[anchor.x,anchor.y],"queries":queries.get(),"invocations":calls.borrow().len(),"authorizations":authorizations}));
+            }
+        }Ok(serde_json::json!({"cases":checks,"clipboard_untouched":true}))
+    }).join().map_err(|_|anyhow::anyhow!("recreated menu regression panicked")).and_then(|value|value);
+    let closed=unsafe{CloseDesktop(desktop)}!=0;
+    let report=serde_json::json!({"state":if result.is_ok()&&closed{"passed"}else{"failed"},"checks":result.as_ref().map_err(|error|format!("{error:#}")),"desktop_closed":closed});
+    std::fs::write(output.join("verification.current.json"),serde_json::to_vec_pretty(&report)?)?;println!("{report}");result?;ensure!(closed,"private desktop retained");Ok(())
+}
+
 // Exercise the file manager's actual IShellView subclass, rather than the
 // fence's independent PIDL context menu. Timing excludes synthetic user dwell.
 mod view_menu {
