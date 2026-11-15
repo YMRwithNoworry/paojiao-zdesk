@@ -523,24 +523,258 @@ fn native_classic_fence_properties_control()->Result<()>{exercise_fence_properti
 #[test]
 #[ignore="Registered test IExplorerCommand DLL on a private desktop; requires ZSDESK_MENU_EXTENSION_PROBE and output"]
 fn native_modern_fence_extension_executes_exact_selection()->Result<()>{
-    use windows::Win32::System::Registry::*;
     let dll=PathBuf::from(std::env::var_os("ZSDESK_MENU_EXTENSION_PROBE").context("extension fixture DLL")?);
-    ensure!(dll.is_absolute()&&dll.is_file(),"extension fixture DLL missing");
-    struct Registration(Vec<String>);impl Drop for Registration{fn drop(&mut self){for name in self.0.iter().rev(){let _=unsafe{RegDeleteTreeW(HKEY_CURRENT_USER,PCWSTR(wide(name).as_ptr()))};}}}
-    let mut registration=Registration(Vec::new());
-    let clsid="{B3489BD3-6C40-4AAA-9610-D72754252627}";
-    for (path,values) in [
-        (format!(r"Software\Classes\CLSID\{clsid}\InprocServer32"),vec![("",dll.to_string_lossy().into_owned()),("ThreadingModel","Apartment".into())]),
-    ]{
-        let mut key=HKEY::default();let mut disposition=REG_CREATE_KEY_DISPOSITION::default();
-        unsafe{RegCreateKeyExW(HKEY_CURRENT_USER,PCWSTR(wide(&path).as_ptr()),None,PCWSTR::null(),REG_OPTION_NON_VOLATILE,KEY_WRITE,None,&mut key,Some(&mut disposition))}.ok()?;
-        if disposition!=REG_CREATED_NEW_KEY{let _=unsafe{RegCloseKey(key)};anyhow::bail!("extension fixture key already exists: {path}");}
-        registration.0.push(path);
-        let result=(||->Result<()>{for (name,value) in values{let text=wide(&value);let bytes=unsafe{std::slice::from_raw_parts(text.as_ptr().cast::<u8>(),text.len()*2)};
-            unsafe{RegSetValueExW(key,PCWSTR(wide(name).as_ptr()),None,REG_SZ,Some(bytes))}.ok()?;}Ok(())})();
-        let _=unsafe{RegCloseKey(key)};result?;
+    with_extension_registration(&dll,||{
+        let _nested=Environment::set("ZSDESK_TEST_COMMAND_NESTED","");
+        exercise_fence_properties(true,true)
+    })
+}
+
+fn with_extension_registration(dll:&Path,action:impl FnOnce()->Result<()>)->Result<()>{
+    use windows::Win32::{Foundation::{ERROR_FILE_NOT_FOUND,ERROR_PATH_NOT_FOUND,WAIT_OBJECT_0,WAIT_ABANDONED},
+        System::{Registry::*,Threading::{CreateMutexW,WaitForSingleObject,ReleaseMutex}}};
+    ensure!(dll.is_absolute()&&dll.is_file()&&fs::symlink_metadata(dll)?.file_attributes()&0x400==0,"extension fixture DLL must be an absolute regular file");
+    struct Lock{handle:HANDLE,owned:bool}impl Drop for Lock{fn drop(&mut self){unsafe{if self.owned{let _=ReleaseMutex(self.handle);}let _=CloseHandle(self.handle);}}}
+    let mut lock=Lock{handle:unsafe{CreateMutexW(None,false,w!("Local\\ZSDesk.MenuExtensionFixture.B3489BD3"))}?,owned:false};
+    let waited=unsafe{WaitForSingleObject(lock.handle,15000)};ensure!(waited==WAIT_OBJECT_0||waited==WAIT_ABANDONED,"extension fixture registration is in use");lock.owned=true;
+    struct Key(HKEY);impl Drop for Key{fn drop(&mut self){let _=unsafe{RegCloseKey(self.0)};}}
+    fn open(path:&str)->Result<Option<Key>>{
+        let mut key=HKEY::default();let status=unsafe{RegOpenKeyExW(HKEY_CURRENT_USER,PCWSTR(wide(path).as_ptr()),None,KEY_READ,&mut key)};
+        if status==ERROR_FILE_NOT_FOUND||status==ERROR_PATH_NOT_FOUND{return Ok(None);}status.ok()?;Ok(Some(Key(key)))
     }
-    exercise_fence_properties(true,true)
+    fn counts(key:HKEY)->Result<(u32,u32)>{let(mut children,mut values)=(0,0);unsafe{RegQueryInfoKeyW(key,None,None,None,Some(&mut children),None,None,Some(&mut values),None,None,None,None)}.ok()?;Ok((children,values))}
+    fn string(key:HKEY,name:&str)->Result<String>{
+        let mut kind=REG_VALUE_TYPE::default();let mut length=0;unsafe{RegQueryValueExW(key,PCWSTR(wide(name).as_ptr()),None,Some(&mut kind),None,Some(&mut length))}.ok()?;
+        ensure!(kind==REG_SZ&&length<=65536&&length%2==0,"fixture registry value changed type or size");let mut bytes=vec![0u8;length as usize];
+        unsafe{RegQueryValueExW(key,PCWSTR(wide(name).as_ptr()),None,Some(&mut kind),Some(bytes.as_mut_ptr()),Some(&mut length))}.ok()?;
+        let text=String::from_utf16(&bytes[..length as usize].chunks_exact(2).map(|pair|u16::from_le_bytes([pair[0],pair[1]])).collect::<Vec<_>>())?;
+        Ok(text.trim_end_matches('\0').to_owned())
+    }
+    struct Registration{root:String,child:String,created_root:bool,child_created:bool,values:Vec<(String,String)>,cleaned:bool}
+    impl Registration{
+        fn cleanup(&mut self)->Result<()>{
+            if self.cleaned{return Ok(());}
+            if self.child_created{
+                if let Some(key)=open(&self.child)?{
+                    ensure!(counts(key.0)?==(0,self.values.len()as u32),"fixture registry contents changed; registration retained");
+                    for(name,value)in &self.values{ensure!(string(key.0,name)?==*value,"fixture registry value changed; registration retained");}
+                    drop(key);unsafe{RegDeleteTreeW(HKEY_CURRENT_USER,PCWSTR(wide(&self.child).as_ptr()))}.ok()?;
+                }
+            }
+            ensure!(open(&self.child)?.is_none(),"fixture registration remains");
+            if let Some(key)=open(&self.root)?{
+                ensure!(counts(key.0)?==(0,0),"fixture CLSID root changed; retained");drop(key);
+                if self.created_root{unsafe{RegDeleteTreeW(HKEY_CURRENT_USER,PCWSTR(wide(&self.root).as_ptr()))}.ok()?;}
+            }
+            let after=open(&self.root)?;
+            ensure!(if self.created_root{after.is_none()}else{after.as_ref().is_some_and(|key|counts(key.0).ok()==Some((0,0)))},"fixture root was not restored");
+            self.cleaned=true;Ok(())
+        }
+    }
+    impl Drop for Registration{fn drop(&mut self){let _=self.cleanup();}}
+    let root=r"Software\Classes\CLSID\{B3489BD3-6C40-4AAA-9610-D72754252627}".to_owned();
+    if let Some(key)=open(&root)?{ensure!(counts(key.0)?==(0,0),"extension fixture CLSID contains existing data; not overwritten");}
+    let mut key=HKEY::default();let mut disposition=REG_CREATE_KEY_DISPOSITION::default();
+    unsafe{RegCreateKeyExW(HKEY_CURRENT_USER,PCWSTR(wide(&root).as_ptr()),None,PCWSTR::null(),REG_OPTION_NON_VOLATILE,KEY_ALL_ACCESS,None,&mut key,Some(&mut disposition))}.ok()?;drop(Key(key));
+    let mut registration=Registration{child:format!(r"{root}\InprocServer32"),root,created_root:disposition==REG_CREATED_NEW_KEY,child_created:false,values:Vec::new(),cleaned:false};
+    let setup=(||->Result<()>{
+        let mut key=HKEY::default();unsafe{RegCreateKeyExW(HKEY_CURRENT_USER,PCWSTR(wide(&registration.child).as_ptr()),None,PCWSTR::null(),REG_OPTION_NON_VOLATILE,KEY_ALL_ACCESS,None,&mut key,Some(&mut disposition))}.ok()?;let key=Key(key);
+        ensure!(disposition==REG_CREATED_NEW_KEY,"fixture registration appeared concurrently");registration.child_created=true;
+        for(name,value)in [("",dll.to_string_lossy().into_owned()),("ThreadingModel","Apartment".to_owned())]{
+            let text=wide(&value);let bytes=unsafe{std::slice::from_raw_parts(text.as_ptr().cast::<u8>(),text.len()*2)};
+            unsafe{RegSetValueExW(key.0,PCWSTR(wide(name).as_ptr()),None,REG_SZ,Some(bytes))}.ok()?;registration.values.push((name.to_owned(),value));
+        }Ok(())
+    })();
+    let result=setup.and_then(|_|action());let cleaned=registration.cleanup();
+    if let Some(output)=std::env::var_os("ZSDESK_NATIVE_TEST_OUTPUT"){
+        let output=PathBuf::from(output);if output.is_absolute(){fs::create_dir_all(&output)?;fs::write(output.join("extension-registration.current.json"),serde_json::to_vec_pretty(&serde_json::json!({
+            "clsid":"{B3489BD3-6C40-4AAA-9610-D72754252627}","created_root":registration.created_root,"registration_removed":registration.cleaned,
+            "preexisting_empty_root_preserved":!registration.created_root&&registration.cleaned,"cleanup_error":cleaned.as_ref().err().map(|error|format!("{error:#}")),"test_error":result.as_ref().err().map(|error|format!("{error:#}"))}))?)?;}
+    }
+    cleaned?;result
+}
+
+fn read_extension_text(path:&Path)->Result<String>{
+    let bytes=fs::read(path)?;ensure!(bytes.len()<=1024*1024&&bytes.len()%2==0,"invalid extension fixture output");
+    Ok(String::from_utf16(&bytes.chunks_exact(2).map(|pair|u16::from_le_bytes([pair[0],pair[1]])).collect::<Vec<_>>())?)
+}
+
+fn drive_nested_extension_ui(pid:u32,desktop:usize,deep:bool,stop:std::sync::Arc<std::sync::atomic::AtomicBool>)->Result<serde_json::Value>{
+    use windows::{core::{BSTR,Interface},Win32::{System::{Com::{CoCreateInstance,CoInitializeEx,CoUninitialize,CLSCTX_INPROC_SERVER,COINIT_MULTITHREADED},Variant::VARIANT},UI::Accessibility::*}};
+    ensure!(unsafe{SetThreadDesktop(desktop as*mut c_void)}!=0,"UIA thread private desktop");
+    unsafe{CoInitializeEx(None,COINIT_MULTITHREADED)}.ok()?;
+    struct Apartment;impl Drop for Apartment{fn drop(&mut self){unsafe{CoUninitialize();}}}let _apartment=Apartment;
+    let automation:IUIAutomation=unsafe{CoCreateInstance(&CUIAutomation8,None,CLSCTX_INPROC_SERVER)}?;
+    let bounded=automation.cast::<IUIAutomation2>()?;unsafe{bounded.SetConnectionTimeout(1000)?;bounded.SetTransactionTimeout(1000)?;}
+    let names=if deep{vec!["ZSDesk issue27 extension","ZSDesk nested tools","ZSDesk deep execute"]}else{vec!["ZSDesk issue27 extension","ZSDesk child execute"]};
+    let conditions=names.iter().map(|name|unsafe{automation.CreatePropertyCondition(UIA_NamePropertyId,&VARIANT::from(BSTR::from(*name)))}).collect::<windows::core::Result<Vec<_>>>()?;
+    struct Visible{pid:u32,windows:Vec<HWND>}
+    unsafe extern "system" fn collect(window:HWND,data:LPARAM)->windows::core::BOOL{
+        let target=unsafe{&mut*(data.0 as*mut Visible)};let mut pid=0;unsafe{GetWindowThreadProcessId(window,Some(&mut pid));}
+        if pid==target.pid&&unsafe{IsWindowVisible(window)}.as_bool(){target.windows.push(window);}true.into()
+    }
+    fn snapshot(automation:&IUIAutomation,pid:u32)->serde_json::Value{
+        let result=(||->Result<serde_json::Value>{
+            let request=unsafe{automation.CreateCacheRequest()}?;unsafe{request.SetTreeScope(TreeScope_Element)}?;
+            for property in [UIA_NamePropertyId,UIA_ControlTypePropertyId,UIA_ClassNamePropertyId,UIA_BoundingRectanglePropertyId,
+                UIA_IsOffscreenPropertyId,UIA_IsEnabledPropertyId,UIA_ProcessIdPropertyId,UIA_NativeWindowHandlePropertyId,
+                UIA_IsExpandCollapsePatternAvailablePropertyId,UIA_IsInvokePatternAvailablePropertyId,UIA_ExpandCollapseExpandCollapseStatePropertyId]{unsafe{request.AddProperty(property)}?;}
+            let condition=unsafe{automation.CreateTrueCondition()}?;let mut visible=Visible{pid,windows:Vec::new()};
+            let _=unsafe{EnumWindows(Some(collect),LPARAM((&mut visible as*mut Visible)as isize))};
+            let until=Instant::now()+Duration::from_secs(2);let mut windows=Vec::new();let mut total=0;
+            for window in visible.windows.into_iter().take(8){
+                if Instant::now()>=until||total>=256{break;}
+                let Ok(root)=(unsafe{automation.ElementFromHandle(window)})else{continue;};
+                let values=unsafe{root.FindAllBuildCache(TreeScope_Subtree,&condition,&request)};
+                let elements=match values{Ok(value)=>value,Err(error)=>{windows.push(serde_json::json!({"window":window.0 as usize,"error":format!("{error}")}));continue;}};
+                let count=unsafe{elements.Length()}?;let mut rows=Vec::new();
+                for index in 0..count.min(128){
+                    if total>=256||Instant::now()>=until{break;}total+=1;
+                    let element=unsafe{elements.GetElement(index)}?;
+                    let boolean=|property|unsafe{element.GetCachedPropertyValue(property)}.ok().and_then(|value|bool::try_from(&value).ok());
+                    let integer=|property|unsafe{element.GetCachedPropertyValue(property)}.ok().and_then(|value|i32::try_from(&value).ok());
+                    rows.push(serde_json::json!({"index":index,"name":unsafe{element.CachedName()}.ok().map(|value|value.to_string()),
+                        "control_type":unsafe{element.CachedControlType()}.ok().map(|value|value.0),"class":unsafe{element.CachedClassName()}.ok().map(|value|value.to_string()),
+                        "bounds":unsafe{element.CachedBoundingRectangle()}.ok().map(|rect|[rect.left,rect.top,rect.right,rect.bottom]),
+                        "offscreen":unsafe{element.CachedIsOffscreen()}.ok().map(|value|value.as_bool()),"enabled":unsafe{element.CachedIsEnabled()}.ok().map(|value|value.as_bool()),
+                        "pid":unsafe{element.CachedProcessId()}.ok(),"native_window":integer(UIA_NativeWindowHandlePropertyId),
+                        "expand_available":boolean(UIA_IsExpandCollapsePatternAvailablePropertyId),"invoke_available":boolean(UIA_IsInvokePatternAvailablePropertyId),
+                        "expand_state":integer(UIA_ExpandCollapseExpandCollapseStatePropertyId)}));
+                }
+                windows.push(serde_json::json!({"window":window.0 as usize,"available_elements":count,"elements":rows}));
+            }
+            Ok(serde_json::json!({"windows":windows,"sampled_elements":total,"bounded":true}))
+        })();
+        result.unwrap_or_else(|error|serde_json::json!({"error":format!("{error:#}")}))
+    }
+    let started=Instant::now();let deadline=started+Duration::from_secs(25);let mut stage=0usize;let mut evidence=Vec::new();let mut observed=std::collections::BTreeSet::new();
+    let mut rejected=std::collections::BTreeMap::new();let mut snapshots=Vec::new();let mut stage_started=Instant::now();let mut waited_snapshot=false;
+    while Instant::now()<deadline&&!stop.load(Ordering::Acquire){
+        let mut visible=Visible{pid,windows:Vec::new()};let _=unsafe{EnumWindows(Some(collect),LPARAM((&mut visible as*mut Visible)as isize))};
+        for window in visible.windows{
+            let Ok(root)=(unsafe{automation.ElementFromHandle(window)})else{continue;};
+            let Ok(element)=(unsafe{root.FindFirst(TreeScope_Subtree,&conditions[stage])})else{continue;};
+            let offscreen=unsafe{element.CurrentIsOffscreen()}.ok().map(|value|value.as_bool());
+            let enabled=unsafe{element.CurrentIsEnabled()}.ok().map(|value|value.as_bool());let process=unsafe{element.CurrentProcessId()}.ok();
+            let bounds=unsafe{element.CurrentBoundingRectangle()}.ok();let control_type=unsafe{element.CurrentControlType()}.ok().map(|value|value.0);
+            let mut reasons=Vec::new();if offscreen!=Some(false){reasons.push("offscreen-or-unreadable");}if enabled!=Some(true){reasons.push("disabled-or-unreadable");}
+            if process!=Some(pid as i32){reasons.push("different-or-unreadable-process");}
+            if !bounds.as_ref().is_some_and(|rect|rect.right>rect.left&&rect.bottom>rect.top){reasons.push("empty-or-unreadable-bounds");}
+            let key=format!("{stage}:{}",window.0 as usize);
+            if !reasons.is_empty(){rejected.insert(key,serde_json::json!({"name":names[stage],"reasons":reasons,"control_type":control_type,"offscreen":offscreen,"enabled":enabled,"pid":process,
+                "bounds":bounds.map(|rect|[rect.left,rect.top,rect.right,rect.bottom])}));continue;}
+            let bounds=bounds.unwrap();
+            observed.insert(names[stage].to_owned());
+            if stage+1<names.len(){
+                let expand=match unsafe{element.GetCurrentPatternAs::<IUIAutomationExpandCollapsePattern>(UIA_ExpandCollapsePatternId)}{
+                    Ok(value)=>value,Err(error)=>{rejected.insert(key,serde_json::json!({"name":names[stage],"reason":"expand-pattern-unavailable","control_type":control_type,"error":format!("{error}")}));continue;}};
+                let before=match unsafe{expand.CurrentExpandCollapseState()}{Ok(value)=>value,Err(error)=>{
+                    rejected.insert(key,serde_json::json!({"name":names[stage],"reason":"expand-state-unreadable","error":format!("{error}")}));continue;}};
+                let focus=unsafe{element.SetFocus()};let after_focus=unsafe{expand.CurrentExpandCollapseState()}.unwrap_or(before);
+                let expansion=if after_focus!=ExpandCollapseState_Expanded&&after_focus!=ExpandCollapseState_PartiallyExpanded{unsafe{expand.Expand()}}else{Ok(())};
+                evidence.push(serde_json::json!({"name":names[stage],"action":"native-uia-focus-expand","window":window.0 as usize,"bounds":[bounds.left,bounds.top,bounds.right,bounds.bottom],"before":before.0,
+                    "focus_error":focus.as_ref().err().map(|error|format!("{error}")),"after_focus":after_focus.0,"expand_error":expansion.as_ref().err().map(|error|format!("{error}")),"after_expand":unsafe{expand.CurrentExpandCollapseState()}.ok().map(|value|value.0)}));
+                snapshots.push(serde_json::json!({"reason":"after-expand","stage":stage,"at_ms":started.elapsed().as_millis(),"tree":snapshot(&automation,pid)}));
+                if expansion.is_err(){anyhow::bail!("native UIA expansion failed: {}",serde_json::json!({"stage":stage,"actions":evidence,"snapshots":snapshots,"rejected_matches":rejected}));}
+                stage+=1;stage_started=Instant::now();waited_snapshot=false;break;
+            }else{
+                let invoke=match unsafe{element.GetCurrentPatternAs::<IUIAutomationInvokePattern>(UIA_InvokePatternId)}{
+                    Ok(value)=>value,Err(error)=>{rejected.insert(key,serde_json::json!({"name":names[stage],"reason":"invoke-pattern-unavailable","control_type":control_type,"error":format!("{error}")}));continue;}};
+                // Attempt exactly once. Even an automation error can accompany
+                // native completion; the parent verifies its real outcome/trace.
+                ensure!(!stop.load(Ordering::Acquire),"native UIA invocation cancelled before dispatch");let result=unsafe{invoke.Invoke()};
+                evidence.push(serde_json::json!({"name":names[stage],"action":"native-uia-invoke","window":window.0 as usize,"bounds":[bounds.left,bounds.top,bounds.right,bounds.bottom],"hresult":result.as_ref().err().map(|error|format!("0x{:08X}",error.code().0 as u32))}));
+                return Ok(serde_json::json!({"state":"invocation-attempted","deep":deep,"observed":observed,"actions":evidence,"private_desktop":true,"rejected_matches":rejected,"snapshots":snapshots}));
+            }
+        }
+        if !waited_snapshot&&stage_started.elapsed()>=Duration::from_millis(700){snapshots.push(serde_json::json!({"reason":"waiting-for-next-item","stage":stage,"at_ms":started.elapsed().as_millis(),"tree":snapshot(&automation,pid)}));waited_snapshot=true;}
+        thread::sleep(Duration::from_millis(20));
+    }
+    snapshots.push(serde_json::json!({"reason":"stop","stage":stage,"at_ms":started.elapsed().as_millis(),"tree":snapshot(&automation,pid)}));
+    anyhow::bail!("native submenu element did not become actionable: {}",serde_json::json!({"stage":stage,"wanted":names[stage],"observed":observed,"actions":evidence,"rejected_matches":rejected,"snapshots":snapshots,"cancelled":stop.load(Ordering::Acquire)}))
+}
+
+#[test]
+#[ignore="Registered nested IExplorerCommand through real native UIA menu expansion on a private desktop; requires ZSDESK_MENU_EXTENSION_PROBE"]
+fn native_modern_nested_extension_menu_executes_exact_selection_once()->Result<()>{
+    use sha2::{Digest,Sha256};
+    ensure!(std::env::var_os("ZSDESK_MENU_TEST_INPUT_DESKTOP").is_none(),"nested extension fixture never runs on the input desktop");
+    let dll=PathBuf::from(std::env::var_os("ZSDESK_MENU_EXTENSION_PROBE").context("nested extension fixture DLL")?);
+    let dll_hash=format!("{:x}",Sha256::digest(fs::read(&dll)?));
+    with_extension_registration(&dll,||{
+        let output=PathBuf::from(std::env::var_os("ZSDESK_NATIVE_TEST_OUTPUT").context("output")?).join("nested-extension");
+        ensure!(output.is_absolute(),"absolute output required");fs::create_dir_all(&output)?;
+        let name=format!("ZSDesk.NestedExtension.{}",std::process::id());
+        let desktop=unsafe{CreateDesktopW(wide(&name).as_ptr(),std::ptr::null(),std::ptr::null(),0,0x000f00ff,std::ptr::null())};ensure!(!desktop.is_null(),"private desktop creation");
+        let raw=desktop as usize;let root=output.clone();let desktop_name=name.clone();
+        let result=thread::spawn(move||->Result<serde_json::Value>{
+            ensure!(unsafe{SetThreadDesktop(raw as*mut c_void)}!=0,"test thread private desktop");unsafe{OleInitialize(None)}?;
+            struct Apartment;impl Drop for Apartment{fn drop(&mut self){unsafe{OleUninitialize();}}}let _apartment=Apartment;let _pool=PoolCleanup;
+            let _desktop=Environment::set("ZSDESK_MENU_TEST_DESKTOP",&desktop_name);
+            let _root=Environment::set("ZSDESK_MENU_ROOT",root.join("workers"));
+            let _probe=Environment::set("ZSDESK_MENU_TEST_PROBE","modern-ui-nested-extension");
+            let _nested=Environment::set("ZSDESK_TEST_COMMAND_NESTED","1");
+            let _delay=Environment::set("ZSDESK_TEST_COMMAND_DELAY_MS","350");
+            let module=HINSTANCE(unsafe{GetModuleHandleW(None)?}.0);let class=w!("ZSDesk.NestedExtension.Parent");
+            unsafe{RegisterClassW(&WNDCLASSW{hInstance:module,lpfnWndProc:Some(owner_proc),lpszClassName:class,..Default::default()});}
+            let owner=Owner(unsafe{CreateWindowExW(WS_EX_NOACTIVATE,class,w!("Nested extension regression"),WS_OVERLAPPEDWINDOW,20,20,640,480,None,None,Some(module),None)}?);
+            unsafe{let _=ShowWindow(owner.0,SW_SHOWNOACTIVATE);}let mut reports=Vec::new();
+            for deep in [false,true]{
+                let paths=if deep{let path=root.join("nested 中文 文件夹");fs::create_dir_all(&path)?;vec![path]}else{
+                    let paths=vec![root.join("first selected.txt"),root.join("第二个 选中文件.txt")];for path in &paths{fs::write(path,b"owned nested-command fixture")?;}paths};
+                let marker=root.join(if deep{"deep.marker"}else{"children.marker"});let trace=PathBuf::from(format!("{}.trace",marker.display()));
+                ensure!(!marker.exists()&&!trace.exists(),"previous nested command evidence retained; inspect before retrying");
+                let _marker=Environment::set("ZSDESK_TEST_COMMAND_MARKER",&marker);
+                let pidls=paths.iter().map(|path|zsdesk_windows::shell::pidl::location_pidl(&zsdesk_core::model::explorer::ShellLocation::Path(path.clone())).context("selected fixture PIDL")).collect::<Result<Vec<_>>>()?;
+                let mut client=Client::spawn(owner.0,POINT{x:70,y:100},pidls,None,ContextMenuOptions{modern:true,..Default::default()},
+                    MenuInterceptions{rename:true,open:true,file_actions:true},Mode::More)?;
+                let pid=client.pid().context("nested worker PID")?;let stop=std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));let signal=stop.clone();
+                let(tx,rx)=std::sync::mpsc::channel();
+                let ui=thread::spawn(move||{let result=drive_nested_extension_ui(pid,raw,deep,signal).map_err(|error|format!("{error:#}"));let _=tx.send(result);});
+                let started=Instant::now();let deadline=started+Duration::from_secs(35);let(mut outcome,mut ui_result,mut terminal_at)=(None,None,None);let mut barriers=0;
+                while Instant::now()<deadline{
+                    if ui_result.is_none(){if let Ok(result)=rx.try_recv(){ui_result=Some(result);}}
+                    if outcome.is_none(){outcome=client.poll(&mut|before|{if before{barriers+=1;}true});if outcome.is_some(){terminal_at=Some(Instant::now());}}
+                    if let Some(terminal)=terminal_at{
+                        if ui_result.is_some()&&marker.exists()&&terminal.elapsed()>=Duration::from_millis(450){break;}
+                        if outcome.as_ref().is_some_and(|value|value.is_err())&&terminal.elapsed()>=Duration::from_secs(2){break;}
+                    }
+                    if ui_result.as_ref().is_some_and(|value|value.is_err()){break;}
+                    pump(10);client.wait_for_progress(20);
+                }
+                let observed_status=serde_json::to_value(&client.last_status)?;stop.store(true,Ordering::Release);client.cancel();
+                let joined_until=Instant::now()+Duration::from_secs(5);let mut after_cancel=None;
+                while (!ui.is_finished()||outcome.is_none()&&after_cancel.is_none())&&Instant::now()<joined_until{
+                    if outcome.is_none()&&after_cancel.is_none(){after_cancel=client.poll(&mut|_|false);}pump(10);
+                }
+                let ui_joined=ui.is_finished();if ui_joined{let _=ui.join();}if ui_result.is_none(){ui_result=rx.try_recv().ok();}
+                let trace_text=if trace.exists(){Some(read_extension_text(&trace)?)}else{None};
+                let marker_text=if marker.exists(){Some(read_extension_text(&marker)?)}else{None};
+                let invoked=trace_text.as_ref().map_or(0,|text|text.lines().filter(|line|line.starts_with("invoke-start:")).count());
+                let returned=trace_text.as_ref().map_or(0,|text|text.lines().filter(|line|line.starts_with("invoke-done:")).count());
+                let level=if deep{3}else{1};
+                let report=serde_json::json!({"deep":deep,"worker_pid":pid,"ui":ui_result,"ui_thread_joined":ui_joined,"outcome":outcome.as_ref().map(|value|value.as_ref().map_err(|error|format!("{error:#}"))),
+                    "status":observed_status,"after_cancel_status":client.last_status,"after_cancel_outcome":after_cancel.as_ref().map(|value|value.as_ref().map_err(|error|format!("{error:#}"))),
+                    "diagnostic":read_recent_diagnostics(),"stderr":worker_stderr(&client.workspace),"invocation_barriers":barriers,"invoke_attempts":invoked,"invoke_completed":returned,"trace":trace_text,
+                    "selected_paths":paths,"actual_selection":marker_text,"elapsed_ms":started.elapsed().as_millis(),"configured_invoke_delay_ms":350,"no_input_injection":true});
+                reports.push(report);fs::write(root.join("verification.current.json"),serde_json::to_vec_pretty(&reports)?)?;
+                let native_open=client.last_status.as_ref().is_some_and(|status|status.probe_menu_open&&!status.probe_classic_loop&&status.error.is_none());
+                drop(client);shutdown_idle_worker();let until=Instant::now()+Duration::from_secs(5);while pending_workers()>0&&Instant::now()<until{pump(10);}
+                let mut actual=marker_text.as_ref().map(|text|text.lines().map(str::to_owned).collect::<Vec<_>>()).unwrap_or_default();actual.sort();
+                let mut expected=paths.iter().map(|path|path.to_string_lossy().into_owned()).collect::<Vec<_>>();expected.sort();
+                ensure!(ui_joined&&ui_result.as_ref().is_some_and(|value|value.is_ok())&&outcome.is_some_and(|value|matches!(value,Ok(MenuOutcome::ShellInvoked|MenuOutcome::NativeHandled)))
+                    &&native_open&&barriers==1&&invoked==1&&returned==1&&actual==expected&&trace_text.as_ref().is_some_and(|text|
+                        text.lines().any(|line|line==format!("invoke-start:{level}"))&&text.lines().any(|line|line=="enum:0")&&(!deep||text.lines().any(|line|line=="enum:2"))
+                            &&text.lines().filter_map(|line|line.strip_prefix("invoke-delay-observed:")).filter_map(|value|value.parse::<u64>().ok()).any(|elapsed|elapsed>=300))&&pending_workers()==0,
+                    "native nested extension contract failed: {}",reports.last().unwrap());
+                fs::remove_file(&marker)?;fs::remove_file(&trace)?;for path in paths{if path.is_dir(){fs::remove_dir(path)?;}else{fs::remove_file(path)?;}}
+            }
+            Ok(serde_json::json!({"cases":reports,"private_desktop":desktop_name,"dll_sha256":dll_hash,"no_input_injection":true}))
+        }).join().map_err(|_|anyhow::anyhow!("nested extension controller panicked")).and_then(|value|value);
+        let closed=unsafe{CloseDesktop(desktop)}!=0;
+        fs::write(output.join("result.current.json"),serde_json::to_vec_pretty(&serde_json::json!({"checks":result.as_ref().map_err(|error|format!("{error:#}")),"desktop_closed":closed,"desktop_name":name,"state":if result.is_ok()&&closed{"passed"}else{"failed"}}))?)?;
+        result?;ensure!(closed,"nested extension private desktop retained");Ok(())
+    })
 }
 fn exercise_fence_properties(modern:bool,extension:bool)->Result<()>{
     let root=PathBuf::from(std::env::var_os("ZSDESK_NATIVE_TEST_OUTPUT").context("output")?).join(if extension{"issue27-extension"}else{"issue27-properties"});

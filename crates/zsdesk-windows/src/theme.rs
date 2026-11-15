@@ -42,7 +42,7 @@ pub fn system_dark_mode() -> bool {
 }
 
 type SetPreferredAppMode = unsafe extern "system" fn(i32) -> i32;
-type AllowDarkModeForWindow = unsafe extern "system" fn(HWND, i32) -> i32;
+type AllowDarkModeForWindow = unsafe extern "system" fn(HWND, bool) -> bool;
 type FlushMenuThemes = unsafe extern "system" fn();
 
 fn uxtheme_ordinal(ordinal: usize) -> Option<unsafe extern "system" fn() -> isize> {
@@ -137,14 +137,22 @@ pub fn set_backdrop(hwnd: HWND, style: zsdesk_core::model::explorer::BackdropSty
     unsafe { DwmSetWindowAttribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, (&value as *const i32).cast(), 4) }.is_ok() && value != 1
 }
 
+/// Sets a window's dark-mode capability without replacing its theme class.
+/// Shell ItemsView owns its own class and must not be renamed to Explorer.
+pub fn allow_dark_for_window(hwnd:HWND,dark:bool){
+    if hwnd.0.is_null() { return; }
+    let dark=dark&&!high_contrast();
+    if let Some(proc) = uxtheme_ordinal(133) {
+        let allow: AllowDarkModeForWindow = unsafe { std::mem::transmute(proc) };
+        unsafe { allow(hwnd, dark); }
+    }
+}
+
 /// Applies dark/light control theme to a hosted window (tree, list).
 pub fn theme_control(hwnd: HWND, dark: bool) {
     if hwnd.0.is_null() { return; }
     let contrast=high_contrast();let dark=dark&&!contrast;
-    if let Some(proc) = uxtheme_ordinal(133) {
-        let allow: AllowDarkModeForWindow = unsafe { std::mem::transmute(proc) };
-        unsafe { allow(hwnd, dark as i32); }
-    }
+    allow_dark_for_window(hwnd,dark);
     let name = if contrast{PCWSTR::null()}else if dark { w!("DarkMode_Explorer") } else { w!("Explorer") };
     let _ = unsafe { SetWindowTheme(hwnd, name, PCWSTR::null()) };
 }

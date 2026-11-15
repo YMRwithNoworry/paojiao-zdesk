@@ -248,10 +248,18 @@ public:
         if(session_->Cancelled())return E_ABORT;
         if(!background){result=SelectionMatches(folderView_.Get(),count,pidls);if(FAILED(result))return result;++gSelectionSnapshots;}
         result=session_->CommandPreparationFailure();if(FAILED(result))return result;
+        // The native projection snapshots HMENU children. Initialize empty
+        // legacy submenus here, where failure can abort before presentation.
+        const auto commandGeneration=session_->CommandGeneration();
+        result=session_->InitializeSubmenus(menu);if(FAILED(result))return result;
+        if(session_->Cancelled()||!IsWindow(owner)||!IsMenu(menu))return E_ABORT;
+        if(!background){result=SelectionMatches(folderView_.Get(),count,pidls);if(FAILED(result))return result;}
+        if(!session_->CommandsCurrent(commandGeneration))return E_ABORT;
         const auto failures=menu_model_filter::failures.load();
         if(session_->Cancelled())return E_ABORT;
         session_->ArmCommands();
         outcome->phase=menu_dispatch::Presented;
+        menu_model_filter::ProjectionProbe projection(menu,GetEnvironmentVariableW(L"ZSDESK_MENU_TEST_PROBE",nullptr,0)!=0);
         presenter_->DoContextMenu(menu,(inputFlags&1u)?1:9,GUID{});
         if(menu_model_filter::failures.load()!=failures)return E_UNEXPECTED;
         // Keep Shell callbacks and XAML command objects alive until the native
@@ -259,6 +267,12 @@ public:
         // is still queued behind the closing animation.
         bool aborted=false;
         for(;;){
+            if(!quit_.quit&&IsWindow(owner)&&session_->CallbackReady()){
+                // This executes after the native dismiss callback has unwound,
+                // but before waiting for its deferred legacy command result.
+                if(restoreSite_&&site_){result=site_->SetSite(previousSite_.Get());if(FAILED(result))return result;restoreSite_=false;}
+                session_->DispatchPending();
+            }
             const auto wait=session_->StandaloneWait(IsWindow(owner)!=FALSE,quit_.quit,presenter_->IsContextMenuOpen()!=FALSE,GetTickCount64());
             if(wait==menu_dispatch::Completion::Complete)break;
             if(wait==menu_dispatch::Completion::Aborted){aborted=true;break;}
@@ -279,6 +293,7 @@ public:
         }
         if(!aborted)session_->DispatchPending();
         *outcome=aborted?menu_dispatch::Result{}:session_->StandaloneResult();
+        if(GetEnvironmentVariableW(L"ZSDESK_MENU_TEST_PROBE",nullptr,0))std::fprintf(stderr,"native-menu-projection input_tree_observed=%d lazy_initialized=%zu\n",projection.Observed(),session_->InitializedMenuCount());
         if(gProbeExpanded)std::fprintf(stderr,"expand track: aborted=%d quit=%d cancelled=%d kind=%u status=0x%08X\n",aborted,quit_.quit,session_->Cancelled(),outcome->kind,static_cast<unsigned>(outcome->status));
         outcome->phase=(std::max)(outcome->phase,static_cast<uint32_t>(menu_dispatch::Presented));
         if(outcome->kind==menu_dispatch::Expanded)*point=session_->StandalonePoint();

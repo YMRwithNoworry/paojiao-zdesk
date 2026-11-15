@@ -25,6 +25,9 @@
 #include "MenuCommandDispatch.h"
 #include "MixedItemMenu.h"
 #include "MenuModelFilter.h"
+#include "LazySubmenuInitialization.h"
+#include "LazySubmenuTests.h"
+#include "CommandEnumerationTests.h"
 
 // Installed only by an isolated menu worker. Record a last-chance fault without
 // attempting to continue in a process whose native extension state is corrupt.
@@ -145,18 +148,36 @@ static thread_local bool gNativeCloseFault=false;
 // package. The same verified native insertion and proxy path is exercised.
 static thread_local Microsoft::WRL::ComPtr<IExplorerCommand> gTestExtension;
 static thread_local UINT gTestExtensionId=0;
+static void TraceTestSubmenu(HMENU menu,UINT depth,bool includeAll=false){
+    if(!IsMenu(menu)||depth>8)return;
+    const int count=(std::min)(GetMenuItemCount(menu),128);
+    for(int index=0;index<count;++index){
+        wchar_t text[256]{};MENUITEMINFOW item{};item.cbSize=sizeof(item);item.fMask=MIIM_STRING|MIIM_ID|MIIM_STATE|MIIM_FTYPE|MIIM_SUBMENU;item.dwTypeData=text;item.cch=255;
+        if(!GetMenuItemInfoW(menu,index,TRUE,&item))continue;
+        if(includeAll||wcsstr(text,L"ZSDesk")){
+            std::fprintf(stderr,"test-native-tree depth=%u id=%u type=0x%X state=0x%X children=%d text=%ls\n",depth,item.wID,item.fType,item.fState,item.hSubMenu?GetMenuItemCount(item.hSubMenu):-1,text);
+            if(item.hSubMenu)TraceTestSubmenu(item.hSubMenu,depth+1,true);
+        }
+    }
+}
 static HRESULT InsertTestExtension(IUnknown* native,HMENU menu){
     if(!gTestExtension)return S_OK;
     auto command=std::move(gTestExtension);
     auto storage=reinterpret_cast<BYTE*>(native)+0x130;
     menu_command_agility::VectorRange range{};size_t beforeCount=0,afterCount=0;
     if(!menu_command_agility::ReadRange(storage,range,beforeCount))return E_UNEXPECTED;
+    EXPCMDFLAGS flags=ECF_DEFAULT;const HRESULT flagStatus=command->GetFlags(&flags);if(FAILED(flagStatus))return flagStatus;
+    const bool nested=(flags&ECF_HASSUBCOMMANDS)!=0;
     const std::wstring package;
     menu_command_bridge::Insert(native,menu,command.Get(),GetMenuItemCount(menu),storage,&package);
-    if(!menu_command_agility::ReadRange(storage,range,afterCount)||afterCount!=beforeCount+1)return E_UNEXPECTED;
-    gTestExtensionId=*reinterpret_cast<UINT*>(range.begin+beforeCount*menu_command_agility::kVerbBytes);
-    std::fprintf(stderr,"test-native-extension id=%u\n",gTestExtensionId);
-    return gTestExtensionId?S_OK:E_UNEXPECTED;
+    if(!menu_command_agility::ReadRange(storage,range,afterCount)||afterCount<=beforeCount||afterCount-beforeCount>64
+        ||(!nested&&afterCount!=beforeCount+1))return E_UNEXPECTED;
+    // Hierarchical insertion can add child records before the parent. Nested
+    // tests use the actual visible UIA entries, never a guessed vector ID.
+    gTestExtensionId=nested?0:*reinterpret_cast<UINT*>(range.begin+beforeCount*menu_command_agility::kVerbBytes);
+    std::fprintf(stderr,"test-native-extension id=%u slots=%zu nested=%d\n",gTestExtensionId,afterCount-beforeCount,nested);
+    if(nested)TraceTestSubmenu(menu,0);
+    return nested||gTestExtensionId?S_OK:E_UNEXPECTED;
 }
 extern "C" void zs_menu_test_extension(IExplorerCommand* command){gTestExtension=command;gTestExtensionId=0;menu_model_filter::testInsertion=&InsertTestExtension;}
 extern "C" UINT zs_menu_test_extension_id(){return gTestExtensionId;}
@@ -336,6 +357,8 @@ thread_local NewItemCallback gNewItemCallback=nullptr;
 extern "C" void zs_menu_set_new_item_callback(NewItemCallback callback) noexcept {gNewItemCallback=callback;}
 extern "C" void zs_menu_set_working_directory(PCWSTR path) {menu_dispatch::workingDirectory=path?path:L"";}
 class Session final : public IServiceProvider, public IOleWindow, public NativeCallback, public IOleCommandTarget, public INewMenuClient {
+    std::unordered_set<HMENU> initializedSubmenus_;
+    bool initializingSubmenus_=false;
     LONG refs_=1;
     IShellView* shell_=nullptr;
     NativeCallback* callback_=nullptr;
@@ -395,6 +418,26 @@ class Session final : public IServiceProvider, public IOleWindow, public NativeC
     }
 
 public:
+    struct PendingProbe{};
+    Session(PendingProbe,HWND owner):window_(owner),thread_(GetCurrentThreadId()),standalone_(true),standaloneOwner_(owner){}
+    static HRESULT PendingContract(HWND owner,IContextMenu* menu,menu_dispatch::BeforeInvoke before,void* state,bool late,menu_dispatch::Result* result){
+        if(!owner||!menu||!before||!result)return E_INVALIDARG;
+        Microsoft::WRL::ComPtr<Session> session;session.Attach(new(std::nothrow)Session(PendingProbe{},owner));if(!session)return E_OUTOFMEMORY;
+        HRESULT status=native_command_guard::Gate::Create(owner,before,state,nullptr,nullptr,0,nullptr,false,session->commandGate_);
+        if(FAILED(status))return status;session->commandGate_->Generation(1);session->commandGate_->Arm();session->standaloneContext_=menu;
+        if(!session->commandGate_->Select(1))return E_UNEXPECTED;
+        if(late){
+            session->standaloneCompletion_.Requested(1);session->OnContextMenuDismiss();
+            if(session->CallbackReady()||session->StandaloneWait(true,false,false,99)!=menu_dispatch::Completion::Continue)return E_UNEXPECTED;
+            session->Invoke(menu,nullptr,nullptr,1,POINT{});
+        }else{
+            session->Invoke(menu,nullptr,nullptr,1,POINT{});if(session->CallbackReady())return E_UNEXPECTED;
+            session->OnContextMenuDismiss();
+        }
+        if(!session->CallbackReady()||session->StandaloneWait(true,false,false,100)!=menu_dispatch::Completion::Continue)return E_UNEXPECTED;
+        session->DispatchPending();if(session->CallbackReady()||session->StandaloneWait(true,false,false,101)!=menu_dispatch::Completion::Complete)return E_UNEXPECTED;
+        session->Invoke(menu,nullptr,nullptr,1,POINT{});session->DispatchPending();*result=session->StandaloneResult();return S_OK;
+    }
     Session(IExplorerBrowser* browser,IShellView* shell,HWND window,HWND menuOwner=nullptr):shell_(shell),browser_(browser),window_(window),thread_(GetCurrentThreadId()),standalone_(menuOwner!=nullptr),standaloneOwner_(menuOwner){
         shell_->AddRef();browser_->AddRef();
         shell_->QueryInterface(IID_PPV_ARGS(&nativeServices_));
@@ -444,7 +487,10 @@ public:
     IServiceProvider* MenuSite()const{return nativeSite_.Get();}
     void ArmCommands(){if(commandGate_)commandGate_->Arm();}
     HRESULT CommandPreparationFailure()const{return commandGate_?commandGate_->State().failure:E_NOINTERFACE;}
+    ULONGLONG CommandGeneration()const{return commandGate_?commandGate_->Generation():0;}
+    bool CommandsCurrent(ULONGLONG generation)const{return !retiring_&&!cancelRequested_&&commandGate_&&commandGate_->Current(generation)&&commandGate_->Available();}
     bool StandaloneDone()const{return standaloneCompletion_.done||retiring_;}
+    bool CallbackReady()const{return pendingCommand_&&standaloneCompletion_.dismissed&&!retiring_&&!cancelRequested_;}
     void DispatchPending(){
         // Parent validation and Shell invocation pump messages. Run them only
         // after the native click/dismiss callback has unwound; reentering the
@@ -463,7 +509,10 @@ public:
                 if(presenter_&&open)presenter_->DismissContextMenu(L"Native command interface unavailable");
             }
             if(state.waiting()&&ownerAlive&&!quitting&&!retiring_&&!cancelRequested_)return menu_dispatch::Completion::Continue;
+            if(state.phase==native_command_guard::Phase::Completed||state.phase==native_command_guard::Phase::Denied)
+                standaloneCompletion_.Resolved();
         }
+        if(standaloneResult_.kind!=menu_dispatch::Dismissed)standaloneCompletion_.Resolved();
         return standaloneCompletion_.Poll(ownerAlive&&!retiring_,quitting||cancelRequested_,open,now);
     }
     menu_dispatch::Result StandaloneResult()const{
@@ -494,6 +543,7 @@ public:
         originalPresenterTable_=original;return true;
     }
     void BeginSelectionGeneration(){
+        initializedSubmenus_.clear();
         AcquireSRWLockExclusive(&gPresenterLock);auto found=gPresenters.find(presenter_);
         ULONGLONG generation=0;
         if(found!=gPresenters.end()){generation=++found->second.generation;found->second.hidden=gHiddenMenuFeatures;}
@@ -507,6 +557,18 @@ public:
             originalPresenterTable_=nullptr;
         }
     }
+    HRESULT InitializeSubmenus(HMENU menu){
+        if(!standalone_||!standaloneContext_||initializingSubmenus_)return S_FALSE;
+        if(retiring_||GetCurrentThreadId()!=thread_||!commandGate_)return HRESULT_FROM_WIN32(ERROR_CANCELLED);
+        struct Busy{bool& value;Busy(bool& flag):value(flag){value=true;}~Busy(){value=false;}} busy(initializingSubmenus_);
+        struct Scope{Session* session;std::shared_ptr<native_command_guard::Gate> gate;ULONGLONG generation;};
+        Scope scope{this,commandGate_,commandGate_->Generation()};
+        auto current=[](void* pointer)->bool{auto value=static_cast<Scope*>(pointer);
+            return !value->session->retiring_&&value->session->commandGate_==value->gate&&value->gate->Current(value->generation)&&value->gate->Available();};
+        Microsoft::WRL::ComPtr<IContextMenu> context=standaloneContext_;
+        return menu_lazy::InitializeEmpty(context.Get(),menu,initializedSubmenus_,current,&scope);
+    }
+    size_t InitializedMenuCount()const{return initializedSubmenus_.size();}
     bool Matches(IShellView* shell,HWND menuOwner)const{return shell==shell_ && standaloneOwner_==menuOwner && !retiring_;}
     HRESULT CreatePresenter(){
         struct Timing{ULONGLONG start=Micros();~Timing(){gLastPresenterCreateMicros=Micros()-start;}} timing;
@@ -659,7 +721,12 @@ public:
             if(!command&&standaloneResult_.kind!=menu_dispatch::Dismissed){Release();return;}
             if(commandGate_&&commandGate_->State().action()){Release();return;}
             if(command>0x6fff&&std::find(standaloneApplications_.begin(),standaloneApplications_.end(),command)==standaloneApplications_.end()){
-                standaloneResult_={menu_dispatch::NativeHandled,command,E_NOTIMPL,menu_dispatch::Presented};Release();return;
+                // Modern command IDs are not offsets into the legacy context.
+                // Its click notification can precede the guarded agile Invoke.
+                // Wait for that exact command's result; never invoke or replay
+                // an unknown numeric ID through the legacy interface.
+                if(commandGate_&&commandGate_->Select(command))standaloneCompletion_.Requested(command);
+                Release();return;
             }
             if(!standaloneCompletion_.requested){standaloneShift_=GetKeyState(VK_SHIFT)<0;standaloneControl_=GetKeyState(VK_CONTROL)<0;}
             standaloneCompletion_.Requested(command);standalonePoint_=point;
@@ -683,10 +750,8 @@ public:
         if(GetCurrentThreadId()!=thread_){++native_command_guard::unobserved;InterlockedExchange(&gLastFailure,RPC_E_WRONG_THREAD);return;}
         if(standalone_){
             const auto state=commandGate_?commandGate_->State():native_command_guard::Snapshot{};
-            if(!pendingCommand_&&standaloneResult_.kind==menu_dispatch::Dismissed&&standaloneCompletion_.requested&&!state.action()&&state.phase!=native_command_guard::Phase::Denied){
-                ++native_command_guard::unobserved;
-                standaloneResult_={menu_dispatch::NativeHandled,standaloneCompletion_.requestedCommand,E_NOTIMPL,menu_dispatch::Executing};
-            }
+            // Agile Invoke may arrive after the XAML dismiss callback. Keep
+            // its gate alive until the actual result or the bounded timeout.
             if(commandGate_&&!standaloneCompletion_.requested&&state.phase==native_command_guard::Phase::Fresh)commandGate_->Invalidate();
             standaloneCompletion_.Dismissed();return;
         }
@@ -887,6 +952,44 @@ extern "C" HRESULT zs_menu_test_dispatch(IContextMenu* context,uint32_t intercep
 }
 
 namespace native_guard_probe {
+HRESULT SubmenuOwnershipContract() noexcept {
+    using namespace menu_submenu_lifetime;
+    HMENU root=CreatePopupMenu(),child=CreatePopupMenu(),deep=CreatePopupMenu(),other=CreatePopupMenu();
+    if(!root||!child||!deep||!other){for(HMENU menu:{root,child,deep,other})if(menu)DestroyMenu(menu);return E_OUTOFMEMORY;}
+    bool childAttached=false,deepAttached=false;
+    HRESULT result=E_UNEXPECTED;
+    if(AppendMenuW(root,MF_POPUP,reinterpret_cast<UINT_PTR>(child),L"group"))childAttached=true;
+    if(childAttached&&AppendMenuW(child,MF_POPUP,reinterpret_cast<UINT_PTR>(deep),L"nested"))deepAttached=true;
+    if(deepAttached&&AppendMenuW(deep,MF_STRING,1,L"leaf")){
+        const auto before=Insertion::current;
+        {Insertion outer(root,0);
+            bool valid=Insertion::current==&outer&&Attached(root,0,child)&&!Attached(root,1,child)
+                &&!Attached(root,0,deep)&&!Attached(root,0,other)&&!Attached(root,0,root);
+            {Insertion inner(child,0);valid=valid&&Insertion::current==&inner&&Attached(child,0,deep);}
+            if(valid&&Insertion::current==&outer)result=S_OK;
+        }
+        if(Insertion::current!=before)result=E_UNEXPECTED;
+    }
+    DestroyMenu(root);
+    if(childAttached&&IsMenu(child)||deepAttached&&IsMenu(deep))result=E_UNEXPECTED;
+    if(!childAttached)DestroyMenu(child);
+    if(!deepAttached)DestroyMenu(deep);
+    DestroyMenu(other);return result;
+}
+HRESULT CompletionContract() noexcept {
+    using C=menu_dispatch::Completion;
+    C cancelled;cancelled.Dismissed();if(cancelled.Poll(true,false,false,100)!=C::Complete)return E_UNEXPECTED;
+    C late;late.Requested(0x7c12);late.Dismissed();
+    if(late.Poll(true,false,false,100)!=C::Continue||late.Poll(true,false,false,450)!=C::Continue)return E_UNEXPECTED;
+    late.Resolved();if(late.Poll(true,false,false,451)!=C::Complete)return E_UNEXPECTED;
+    C early;early.Requested(6);early.Resolved();if(early.Poll(true,false,true,100)!=C::Continue)return E_UNEXPECTED;
+    early.Dismissed();if(early.Poll(true,false,false,101)!=C::Complete)return E_UNEXPECTED;
+    C missing;missing.Requested(8);missing.Dismissed();
+    if(missing.Poll(true,false,false,100)!=C::Continue||missing.Poll(true,false,false,5100)!=C::TimedOut)return E_UNEXPECTED;
+    C aborted;aborted.Requested(9);aborted.Dismissed();
+    if(aborted.Poll(false,false,false,100)!=C::Aborted||aborted.Poll(true,true,false,100)!=C::Aborted)return E_UNEXPECTED;
+    return S_OK;
+}
 using Microsoft::WRL::ComPtr;
 struct __declspec(uuid("C9811F72-25D8-4A68-9DB7-A03222A8A1F0")) OptionalMarker:IUnknown{};
 struct Before {
@@ -1162,6 +1265,18 @@ extern "C" HRESULT zs_menu_test_command_guard(uint32_t* passed) noexcept {
     if(!passed)return E_POINTER;*passed=0;HRESULT initialized=OleInitialize(nullptr);if(FAILED(initialized))return initialized;
     HRESULT result=E_UNEXPECTED;try{result=native_guard_probe::Run(*passed);}catch(const std::bad_alloc&){result=E_OUTOFMEMORY;}catch(...){result=E_UNEXPECTED;}
     OleUninitialize();return result;
+}
+extern "C" HRESULT zs_menu_test_completion() noexcept {return native_guard_probe::CompletionContract();}
+extern "C" HRESULT zs_menu_test_submenu_ownership() noexcept {return native_guard_probe::SubmenuOwnershipContract();}
+extern "C" HRESULT zs_menu_test_pending_callback(IContextMenu* menu,menu_dispatch::BeforeInvoke before,void* state,int late,menu_dispatch::Result* result) noexcept {
+    const HRESULT initialized=OleInitialize(nullptr);if(FAILED(initialized))return initialized;
+    HWND window=CreateWindowExW(WS_EX_TOOLWINDOW,L"STATIC",L"ZSDesk pending callback fixture",WS_POPUP,0,0,1,1,nullptr,nullptr,GetModuleHandleW(nullptr),nullptr);
+    HRESULT status=window?S_OK:HRESULT_FROM_WIN32(GetLastError());
+    if(window){try{status=Session::PendingContract(window,menu,before,state,late!=0,result);}catch(const std::bad_alloc&){status=E_OUTOFMEMORY;}catch(...){status=E_UNEXPECTED;}DestroyWindow(window);}
+    OleUninitialize();return status;
+}
+extern "C" HRESULT zs_menu_test_lazy_submenus() noexcept {
+    try{return menu_lazy_test::Run();}catch(const std::bad_alloc&){return E_OUTOFMEMORY;}catch(...){return E_UNEXPECTED;}
 }
 // Bitmask 0x1f: MTA invoke, STA site, child enumeration/generation, cycle
 // rejection, parent-owned action. All commands and services are local mocks.

@@ -158,11 +158,12 @@ const MAX_COLD_ICON_BYTES: u64 = 8 * 1024 * 1024;
 type IconKey = (String, i32);
 struct IconSlot {
     wic: Option<IWICBitmapSource>, bitmap: Option<(u64, ID2D1Bitmap)>, request: Option<u64>,
+    complete:bool,
     signature: (Option<u64>, Option<u64>), last_used: u64, source_bytes: u64, retry_after: Option<Instant>,
 }
 impl IconSlot {
     fn new(signature: (Option<u64>, Option<u64>), tick: u64) -> Self {
-        Self { wic: None, bitmap: None, request: None, signature, last_used: tick, source_bytes: 0, retry_after: None }
+        Self { wic: None, bitmap: None, request: None, complete:false, signature, last_used: tick, source_bytes: 0, retry_after: None }
     }
     fn pixel_bytes(&self) -> u64 { self.source_bytes.saturating_mul(if self.bitmap.is_some() { 2 } else { 1 }) }
 }
@@ -298,6 +299,9 @@ pub struct DesktopHost {
 
 impl DesktopHost {
     pub fn new(hwnd: HWND, config_path: PathBuf, explorer_config: PathBuf, config: DesktopConfig, gfx: Gfx) -> Self {
+        #[cfg(test)]
+        let _icon_entry=zsdesk_windows::shell::icons::icon_worker_test_entry(&[
+            "icon_worker_tests::native_icon_worker_entry".into(),"--exact".into(),"--ignored".into(),"--nocapture".into()]).ok();
         let loader = IconLoader::spawn(hwnd, WM_ICON_READY);
         let taskbar_created = unsafe { RegisterWindowMessageW(windows::core::w!("TaskbarCreated")) };
         let mut host = Self { hwnd, config_path, explorer_config, config, fences: Vec::new(), desktop_entries: Vec::new(), #[cfg(test)]desktop_test_entries:None,gfx,
@@ -1084,7 +1088,7 @@ impl DesktopHost {
             let slot = icons.entry(key).or_insert_with(|| IconSlot::new(signature, tick));
             if slot.signature != signature { *slot = IconSlot::new(signature, tick); }
             slot.last_used = tick;
-            if slot.wic.is_none() && slot.request.is_none() && slot.retry_after.is_none_or(|t| Instant::now() >= t) {
+            if (slot.wic.is_none()||!slot.complete) && slot.request.is_none() && slot.retry_after.is_none_or(|t| Instant::now() >= t) {
                 let thumbnail = !entry.is_folder && !entry.is_link && matches!(entry_category(entry), Category::Images | Category::Media | Category::Documents);
                 let token = *next_request;
                 *next_request = next_request.wrapping_add(1).max(1);
@@ -1106,11 +1110,14 @@ impl DesktopHost {
         for result in ready {
             let Some(slot) = self.icons.get_mut(&(result.key.clone(), result.size as i32)) else { continue };
             if slot.request != Some(result.token) { continue; }
-            slot.request = None;
-            slot.wic = (!result.bitmap.is_invalid()).then(|| self.gfx.wic_from_hbitmap(result.bitmap, result.alpha)).flatten();
-            slot.bitmap = None;
-            slot.source_bytes = slot.wic.as_ref().map(|wic| { let (w,h) = Gfx::wic_size(wic); (u64::from(w) * u64::from(h) * 4).max(result.pixel_bytes) }).unwrap_or(0);
-            slot.retry_after = slot.wic.is_none().then(|| Instant::now() + Duration::from_secs(30));
+            slot.complete=result.final_result;
+            if result.final_result{slot.request = None;}
+            if let Some(wic)=(!result.bitmap.is_invalid()).then(|| self.gfx.wic_from_hbitmap(result.bitmap, result.alpha)).flatten(){
+                let (w,h)=Gfx::wic_size(&wic);slot.source_bytes=(u64::from(w)*u64::from(h)*4).max(result.pixel_bytes);
+                slot.wic=Some(wic);slot.bitmap=None;
+            }
+            // A slow/failed thumbnail must not erase the already-visible icon.
+            slot.retry_after = (result.final_result&&slot.wic.is_none()).then(|| Instant::now() + Duration::from_secs(30));
             accepted = true;
         }
         // One repaint per batch also retries visible requests rejected by a full queue.
@@ -1197,7 +1204,7 @@ impl DesktopHost {
             "icon_entries":self.icons.len(),"icon_pixel_bytes":self.icons.values().map(IconSlot::pixel_bytes).sum::<u64>(),
             "visible_icon_keys":visible.len(),"cold_icon_entries":cold.len(),"cold_icon_pixel_bytes":cold.iter().map(|s|s.pixel_bytes()).sum::<u64>(),
             "cold_entry_limit":MAX_COLD_ICONS,"cold_pixel_limit":MAX_COLD_ICON_BYTES,"pending_icon_requests":queue.pending,"queued_icon_requests":queue.queued,
-            "ready_icon_results":queue.ready,"ready_icon_pixel_bytes":queue.ready_pixel_bytes,"text_formats":formats,"render_target_live":target,"imaging_factory_live":self.gfx.imaging_factory_live(),"context_menu":super::menu_diagnostics()})
+            "ready_icon_results":queue.ready,"ready_icon_pixel_bytes":queue.ready_pixel_bytes,"decoder_workers":zsdesk_windows::shell::icons::icon_worker_diagnostics(),"text_formats":formats,"render_target_live":target,"imaging_factory_live":self.gfx.imaging_factory_live(),"context_menu":super::menu_diagnostics()})
     }
 
     pub fn write_diagnostics(&self, path: &Path) -> anyhow::Result<()> {

@@ -2,8 +2,9 @@
 //!
 //! Tab, bookmark and address icons come from the system image list (same
 //! icons Explorer shows). Desktop fences request icons/thumbnails from a
-//! background STA thread through `IShellItemImageFactory`; completed bitmaps
-//! remain in its queue and a generation-tagged message wakes the owner.
+//! bounded helper processes through `IShellItemImageFactory`; a fast icon is
+//! delivered before thumbnail extraction and generation-tagged messages wake
+//! the owner. A stalled provider cannot block the independent icon lane.
 
 use std::{collections::{HashSet, VecDeque}, sync::{Arc, Condvar, Mutex, atomic::{AtomicUsize, Ordering}}, thread};
 
@@ -30,6 +31,9 @@ use windows::{
 };
 
 use crate::gfx::BitmapAlpha;
+#[path="icons_worker.rs"]mod worker;
+pub use worker::{maybe_handle as maybe_handle_icon_worker,test_entry as icon_worker_test_entry,run_test_entry as run_icon_test_worker,
+    pending_workers as pending_icon_workers,diagnostics as icon_worker_diagnostics};
 
 /// System image list index for a PIDL.
 pub fn icon_index(pidl: &[u8]) -> Option<i32> {
@@ -91,6 +95,8 @@ pub struct IconResult {
     pub bitmap: HBITMAP,
     pub alpha: BitmapAlpha,
     pub pixel_bytes: u64,
+    /// Provisional icon results keep the token alive until thumbnail completion.
+    pub final_result: bool,
 }
 
 impl IconResult {
@@ -105,7 +111,7 @@ impl Drop for IconResult {
 // materializes its WIC copy or drops this result before anyone else uses it.
 unsafe impl Send for IconResult {}
 
-pub struct IconRequest { pub key: String, pub pidl: Vec<u8>, pub size: u32, pub thumbnail: bool, pub token: u64 }
+#[derive(Clone)]pub struct IconRequest { pub key: String, pub pidl: Vec<u8>, pub size: u32, pub thumbnail: bool, pub token: u64 }
 
 const MAX_PENDING: usize = 128;
 const MAX_READY: usize = 16;
@@ -114,6 +120,7 @@ const MAX_READY_BYTES: u64 = 8 * 1024 * 1024;
 #[derive(Default)]
 struct LoaderState {
     requests: VecDeque<IconRequest>,
+    thumbnails: VecDeque<IconRequest>,
     pending: HashSet<u64>,
     ready: VecDeque<IconResult>,
     ready_bytes: u64,
@@ -121,19 +128,21 @@ struct LoaderState {
 }
 impl LoaderState {
     fn enqueue(&mut self, request: IconRequest) -> bool {
-        if self.stopping || self.pending.len() >= MAX_PENDING || !self.pending.insert(request.token) { return false; }
+        if self.stopping || request.token==0 || !(1..=1024).contains(&request.size) || !super::pidl::valid(&request.pidl)
+            || self.pending.len() >= MAX_PENDING || !self.pending.insert(request.token) { return false; }
         self.requests.push_back(request);
         true
     }
     fn retain(&mut self, tokens: &HashSet<u64>) {
         self.pending.retain(|t| tokens.contains(t));
         self.requests.retain(|r| tokens.contains(&r.token));
+        self.thumbnails.retain(|r|tokens.contains(&r.token));
         self.ready.retain(|r| tokens.contains(&r.token));
         self.ready_bytes = self.ready.iter().map(|r| r.pixel_bytes).sum();
     }
     fn stop(&mut self) {
         self.stopping = true;
-        self.requests.clear(); self.pending.clear(); self.ready.clear(); self.ready_bytes = 0;
+        self.requests.clear();self.thumbnails.clear(); self.pending.clear(); self.ready.clear(); self.ready_bytes = 0;
     }
     fn complete(&mut self, result: IconResult) -> bool {
         if self.stopping || !self.pending.contains(&result.token) { return false; }
@@ -184,14 +193,13 @@ unsafe extern "system" fn notification_proc(hwnd: HWND, message: u32, wp: WPARAM
 }
 
 struct WorkerExit {
-    shared: Arc<(Mutex<LoaderState>, Condvar)>, notification: Arc<Notification>, initialized: bool,
+    shared: Arc<(Mutex<LoaderState>, Condvar)>, notification: Arc<Notification>,
 }
 impl Drop for WorkerExit {
     fn drop(&mut self) {
         self.notification.revoke();
         self.shared.0.lock().unwrap_or_else(|p| p.into_inner()).stop();
         self.shared.1.notify_all();
-        if self.initialized { unsafe { CoUninitialize() }; }
     }
 }
 
@@ -200,12 +208,15 @@ pub struct IconLoaderStats { pub pending: usize, pub queued: usize, pub ready: u
 
 /// A bounded, cancellable queue. Window messages only wake the owner; this
 /// object owns every completed bitmap, including results not consumed at exit.
-pub struct IconLoader { shared: Arc<(Mutex<LoaderState>, Condvar)>, notification: Arc<Notification>, thread: Option<thread::JoinHandle<()>> }
+pub struct IconLoader { shared: Arc<(Mutex<LoaderState>, Condvar)>, notification: Arc<Notification>, threads: Vec<thread::JoinHandle<()>> }
 
 impl IconLoader {
     /// WPARAM carries this loader's token; there is no bitmap/pointer payload.
     /// Validate it with `accepts_notification` before draining the result queue.
     pub fn spawn(hwnd: HWND, message: u32) -> Self {
+        Self::spawn_with_config(hwnd,message,worker::Config::current().ok())
+    }
+    fn spawn_with_config(hwnd:HWND,message:u32,config:Option<worker::Config>)->Self{
         let shared = Arc::new((Mutex::new(LoaderState::default()), Condvar::new()));
         static NEXT_TOKEN: AtomicUsize = AtomicUsize::new(1);
         let token = loop { let value = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed); if value != 0 { break value; } };
@@ -216,25 +227,31 @@ impl IconLoader {
             unsafe { drop(Arc::from_raw(subclass)); }
             notification.revoke();
             shared.0.lock().unwrap_or_else(|p| p.into_inner()).stop();
-            return Self { shared, notification, thread: None };
+            return Self { shared, notification, threads: Vec::new() };
         }
-        let worker = shared.clone();
-        let notify = notification.clone();
-        let thread = thread::Builder::new().name("zsdesk-icons".into()).spawn(move || {
-            let initialized = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) }.is_ok();
-            let _exit = WorkerExit { shared: worker.clone(), notification: notify.clone(), initialized };
+        let mut threads=Vec::new();
+        for thumbnail in [false,true]{
+            let worker=shared.clone();let notify=notification.clone();let config=config.clone();
+            let thread=thread::Builder::new().name(if thumbnail{"zsdesk-thumbnails"}else{"zsdesk-icons"}.into()).spawn(move||{
+            let _exit = WorkerExit { shared: worker.clone(), notification: notify.clone() };
             let (lock, wake) = &*worker;
+            let mut process=None;
             loop {
                 let request = {
                     let mut state = lock.lock().unwrap_or_else(|p| p.into_inner());
-                    while !state.stopping && state.requests.is_empty() { state = wake.wait(state).unwrap_or_else(|p| p.into_inner()); }
+                    while !state.stopping && if thumbnail{state.thumbnails.is_empty()}else{state.requests.is_empty()} {
+                        let(next,timeout)=wake.wait_timeout(state,worker::IDLE).unwrap_or_else(|p|p.into_inner());state=next;
+                        if timeout.timed_out(){drop(state);process.take();state=lock.lock().unwrap_or_else(|p|p.into_inner());}
+                    }
                     if state.stopping { break; }
-                    state.requests.pop_front().unwrap()
+                    if thumbnail{state.thumbnails.pop_front().unwrap()}else{state.requests.pop_front().unwrap()}
                 };
-                let loaded = initialized.then(|| load(&request)).flatten();
+                let cancelled=||{let state=lock.lock().unwrap_or_else(|p|p.into_inner());state.stopping||!state.pending.contains(&request.token)};
+                let loaded=config.as_ref().and_then(|config|worker::Worker::extract(&mut process,config,&request,thumbnail,&cancelled));
                 let (bitmap, alpha) = loaded.unwrap_or((HBITMAP::default(), BitmapAlpha::Ignore));
-                let result = IconResult { key: request.key, size: request.size, token: request.token,
-                    bitmap, alpha, pixel_bytes: bitmap_bytes(bitmap) };
+                let final_result=thumbnail||!request.thumbnail;
+                let result = IconResult { key: request.key.clone(), size: request.size, token: request.token,
+                    bitmap, alpha, pixel_bytes: bitmap_bytes(bitmap), final_result };
                 let should_post = {
                     let mut state = lock.lock().unwrap_or_else(|p| p.into_inner());
                     while !state.stopping && state.pending.contains(&result.token)
@@ -243,7 +260,9 @@ impl IconLoader {
                     }
                     if state.stopping { break; }
                     if !state.pending.contains(&result.token) { continue; }
-                    state.complete(result)
+                    let post=state.complete(result);
+                    if !final_result{state.thumbnails.push_back(request);wake.notify_all();}
+                    post
                 };
                 if should_post && !notify.post() {
                     lock.lock().unwrap_or_else(|p| p.into_inner()).stop();
@@ -251,9 +270,10 @@ impl IconLoader {
                     break;
                 }
             }
-        }).ok();
-        if thread.is_none() { notification.detach();shared.0.lock().unwrap_or_else(|p| p.into_inner()).stop(); }
-        Self { shared, notification, thread }
+        });
+            match thread{Ok(thread)=>threads.push(thread),Err(_)=>{notification.detach();shared.0.lock().unwrap_or_else(|p|p.into_inner()).stop();shared.1.notify_all();break;}}
+        }
+        Self { shared, notification, threads }
     }
 
     pub fn accepts_notification(&self, token: usize) -> bool {
@@ -263,14 +283,14 @@ impl IconLoader {
     /// False means the bounded queue is full; retry on the next repaint.
     pub fn request(&self, request: IconRequest) -> bool {
         let accepted = self.shared.0.lock().unwrap_or_else(|p| p.into_inner()).enqueue(request);
-        if accepted { self.shared.1.notify_one(); }
+        if accepted { self.shared.1.notify_all(); }
         accepted
     }
 
     pub fn take_ready(&self) -> Vec<IconResult> {
         let mut state = self.shared.0.lock().unwrap_or_else(|p| p.into_inner());
         let ready: Vec<_> = state.ready.drain(..).collect();
-        for result in &ready { state.pending.remove(&result.token); }
+        for result in &ready { if result.final_result{state.pending.remove(&result.token);} }
         state.ready_bytes = 0;
         self.shared.1.notify_all();
         ready
@@ -284,16 +304,16 @@ impl IconLoader {
 
     pub fn stats(&self) -> IconLoaderStats {
         let state = self.shared.0.lock().unwrap_or_else(|p| p.into_inner());
-        IconLoaderStats { pending: state.pending.len(), queued: state.requests.len(), ready: state.ready.len(), ready_pixel_bytes: state.ready_bytes }
+        IconLoaderStats { pending: state.pending.len(), queued: state.requests.len()+state.thumbnails.len(), ready: state.ready.len(), ready_pixel_bytes: state.ready_bytes }
     }
 
     pub fn shutdown(&mut self) {
         self.notification.detach();
         self.shared.0.lock().unwrap_or_else(|p| p.into_inner()).stop();
         self.shared.1.notify_all();
-        // An in-flight third-party extractor may never return. Detach it after
-        // revoking notifications; it owns only its stopped queue and COM scope.
-        if let Some(thread) = self.thread.take() { if thread.is_finished() { let _ = thread.join(); } }
+        // Cancellation retires only the concrete owned helper process. Parent
+        // threads never enter a decoder call, so there is no detached extractor.
+        for thread in self.threads.drain(..){let _=thread.join();}
     }
 }
 
@@ -429,7 +449,7 @@ mod tests {
         notify.revoke();state.stop();
         assert!(notify.with_target(|_| panic!("late HWND notification")).is_none());
         assert!(!state.complete(IconResult { key: in_flight.key, size: 48, token: 1, bitmap: HBITMAP::default(),
-            alpha: BitmapAlpha::Ignore, pixel_bytes: 0 }));
+            alpha: BitmapAlpha::Ignore, pixel_bytes: 0,final_result:true }));
         assert!(state.ready.is_empty() && state.pending.is_empty());
     }
     #[test]
@@ -438,7 +458,7 @@ mod tests {
         let notify = notification();
         shared.0.lock().unwrap().enqueue(request(1));
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _exit = WorkerExit { shared: shared.clone(), notification: notify.clone(), initialized: false };
+            let _exit = WorkerExit { shared: shared.clone(), notification: notify.clone() };
             panic!("simulated extractor failure");
         }));
         assert!(result.is_err());
@@ -447,21 +467,35 @@ mod tests {
         assert!(notify.with_target(|_| ()).is_none());
     }
     #[test]
-    fn shutdown_does_not_wait_for_an_in_flight_extractor() {
+    fn shutdown_wakes_and_joins_parent_workers() {
         use std::{sync::mpsc, time::Duration};
-        let (release, waiting) = mpsc::channel();
         let (started, ready) = mpsc::channel();
         let (finished, exited) = mpsc::channel();
-        let worker = thread::spawn(move || { started.send(()).unwrap(); let _ = waiting.recv(); let _ = finished.send(()); });
+        let shared=Arc::new((Mutex::new(LoaderState::default()),Condvar::new()));let worker_state=shared.clone();
+        let worker = thread::spawn(move || {started.send(()).unwrap();let mut state=worker_state.0.lock().unwrap();
+            while !state.stopping{state=worker_state.1.wait(state).unwrap();}let _=finished.send(());});
         ready.recv_timeout(Duration::from_secs(2)).unwrap();
-        let mut loader = IconLoader { shared: Arc::new((Mutex::new(LoaderState::default()), Condvar::new())),
-            notification: notification(), thread: Some(worker) };
+        let mut loader = IconLoader { shared, notification: notification(), threads: vec![worker] };
         let (stopped, received) = mpsc::channel();
         let shutdown = thread::spawn(move || { loader.shutdown(); stopped.send(()).unwrap(); });
         let completed_without_release = received.recv_timeout(Duration::from_secs(2)).is_ok();
-        let _ = release.send(());
         shutdown.join().unwrap();
         exited.recv_timeout(Duration::from_secs(2)).unwrap();
         assert!(completed_without_release);
+    }
+    #[test]
+    fn provisional_results_keep_tokens_until_terminal_delivery_and_cancel_both_lanes(){
+        let shared=Arc::new((Mutex::new(LoaderState::default()),Condvar::new()));
+        let loader=IconLoader{shared:shared.clone(),notification:notification(),threads:Vec::new()};
+        {let mut state=shared.0.lock().unwrap();assert!(state.enqueue(request(1)));
+            let queued=state.requests.pop_front().unwrap();state.thumbnails.push_back(queued);
+            assert!(state.complete(IconResult{key:"same-file".into(),size:48,token:1,bitmap:HBITMAP::default(),alpha:BitmapAlpha::Ignore,pixel_bytes:0,final_result:false}));}
+        let provisional=loader.take_ready();assert_eq!(provisional.len(),1);assert!(!provisional[0].final_result);
+        assert_eq!(loader.stats().pending,1);assert_eq!(loader.stats().queued,1);
+        loader.retain_requests(&HashSet::new());assert_eq!(loader.stats().pending,0);assert_eq!(loader.stats().queued,0);
+        {let mut state=shared.0.lock().unwrap();assert!(!state.complete(IconResult{key:"same-file".into(),size:48,token:1,bitmap:HBITMAP::default(),alpha:BitmapAlpha::Ignore,pixel_bytes:0,final_result:true}));
+            assert!(state.enqueue(request(2)));state.requests.pop_front();
+            assert!(state.complete(IconResult{key:"same-file".into(),size:48,token:2,bitmap:HBITMAP::default(),alpha:BitmapAlpha::Ignore,pixel_bytes:0,final_result:true}));}
+        assert!(loader.take_ready()[0].final_result);assert_eq!(loader.stats().pending,0);
     }
 }

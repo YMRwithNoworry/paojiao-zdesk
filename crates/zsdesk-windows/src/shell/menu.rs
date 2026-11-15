@@ -127,7 +127,7 @@ pub fn context_menu_point(view:&IShellView,position:LPARAM)->Result<POINT>{
     unsafe{ClientToScreen(window,&mut point)}.ok()?;Ok(point)
 }
 
-fn control_owns_context_menu(view:HWND,mut source:HWND)->bool{
+pub fn control_owns_context_menu(view:HWND,mut source:HWND)->bool{
     use windows::Win32::UI::WindowsAndMessaging::{GetClassNameW,GetParent,IsChild};
     if source.0.is_null()||source==view||!unsafe{IsChild(view,source)}.as_bool(){return false;}
     for _ in 0..8{
@@ -910,6 +910,18 @@ pub(crate) unsafe fn attach_view_menu(view: &IShellView, modern: Rc<Cell<bool>>)
     }
 }
 
+/// Resolve an owned pointer request outside the application's model borrow.
+/// Keep only the cloned COM view across accessibility calls, which may pump.
+pub fn prepare_pointer_menu(window:HWND,position:LPARAM)->Result<(IShellView,ViewMenuTarget)>{
+    let mut data=0usize;
+    if !unsafe{GetWindowSubclass(window,Some(view_menu_proc),VIEW_MENU_SUBCLASS,Some(&mut data))}.as_bool()||data==0{
+        return Err(windows::core::Error::from_hresult(windows::core::HRESULT(0x800704c7u32 as i32)));
+    }
+    let view=unsafe{(*(data as*const ViewMenuState)).view.clone()};
+    let target=menu_target::prepare(window,window,position)?;
+    Ok((view,target))
+}
+
 unsafe extern "system" fn view_menu_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM, _: usize, data: usize) -> LRESULT {
     if msg == WM_NCDESTROY {
         unsafe { let _ = RemoveWindowSubclass(hwnd, Some(view_menu_proc), VIEW_MENU_SUBCLASS); }
@@ -1000,6 +1012,26 @@ mod presenter_tests {
 #[cfg(test)]
 mod policy_tests {
     use super::*;
+    #[cfg(all(target_arch="x86_64",target_env="msvc"))]
+    #[test]fn native_dismissal_waits_for_the_actual_command_result(){
+        unsafe extern "C"{fn zs_menu_test_completion()->windows::core::HRESULT;}
+        unsafe{zs_menu_test_completion()}.ok().unwrap();
+    }
+    #[cfg(all(target_arch="x86_64",target_env="msvc"))]
+    #[test]fn native_lazy_submenus_initialize_nested_commands_without_invoking(){
+        unsafe extern "C"{fn zs_menu_test_lazy_submenus()->windows::core::HRESULT;}
+        unsafe{zs_menu_test_lazy_submenus()}.ok().unwrap();
+    }
+    #[cfg(all(target_arch="x86_64",target_env="msvc"))]
+    #[test]fn native_nested_submenus_remain_owned_by_the_exact_parent_position(){
+        unsafe extern "C"{fn zs_menu_test_submenu_ownership()->windows::core::HRESULT;}
+        unsafe{zs_menu_test_submenu_ownership()}.ok().unwrap();
+    }
+    #[cfg(all(target_arch="x86_64",target_env="msvc"))]
+    #[test]fn native_declared_submenu_failures_preserve_enumeration_and_generation_contracts()->Result<()>{
+        unsafe extern "C"{fn zs_menu_test_enumeration_contract(passed:*mut u32)->windows::core::HRESULT;}
+        let mut passed=0;unsafe{zs_menu_test_enumeration_contract(&mut passed)}.ok()?;assert_eq!(passed,0xff);Ok(())
+    }
     use windows::{core::{implement,Error},Win32::UI::Shell::IContextMenu_Impl};
     #[cfg(all(target_arch="x86_64",target_env="msvc"))]
     #[test]fn native_commands_keep_authorization_bound_to_command_and_generation()->Result<()>{
@@ -1022,6 +1054,21 @@ mod policy_tests {
     #[cfg(all(target_arch="x86_64",target_env="msvc"))]
     extern "C"{fn zs_menu_test_dispatch(context:*mut core::ffi::c_void,intercept:u32,shift:i32,
         before:Option<unsafe extern "system" fn(*mut core::ffi::c_void)->windows::core::HRESULT>,state:*mut core::ffi::c_void,out:*mut NativeMenuResult)->windows::core::HRESULT;}
+
+    #[cfg(all(target_arch="x86_64",target_env="msvc"))]
+    #[test]fn deferred_native_callback_dispatches_once_after_dismissal()->Result<()>{
+        unsafe extern "C"{fn zs_menu_test_pending_callback(context:*mut core::ffi::c_void,
+            before:Option<unsafe extern "system" fn(*mut core::ffi::c_void)->windows::core::HRESULT>,state:*mut core::ffi::c_void,late:i32,out:*mut NativeMenuResult)->windows::core::HRESULT;}
+        unsafe extern "system" fn allow(raw:*mut core::ffi::c_void)->windows::core::HRESULT{
+            let calls=unsafe{&*raw.cast::<Cell<usize>>()};calls.set(calls.get()+1);windows::core::HRESULT(0)
+        }
+        let invoked=Rc::new(Cell::new(0));let context:IContextMenu=FileActionProbe{verb:"third-party-tool",invoked:invoked.clone()}.into();
+        let permitted=Cell::new(0usize);let mut outcome=NativeMenuResult::default();
+        for late in [0,1]{
+            unsafe{zs_menu_test_pending_callback(context.as_raw(),Some(allow),(&permitted as*const Cell<usize>).cast_mut().cast(),late,&mut outcome)}.ok()?;
+            assert_eq!(permitted.get(),late as usize+1);assert_eq!(invoked.get(),late as usize+1);assert_eq!(outcome.kind,5);assert_eq!(outcome.command,1);assert_eq!(outcome.status,0);
+        }Ok(())
+    }
 
     #[test]fn file_action_interceptions_return_before_any_shell_invoke()->Result<()>{
         for (verb,shift,expected) in [

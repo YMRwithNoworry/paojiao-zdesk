@@ -28,6 +28,13 @@ mod context_menu_process;
 mod utility_panel;
 mod update_check;
 
+#[cfg(test)]
+mod icon_worker_tests{
+    #[test]
+    #[ignore="Owned hidden icon-worker endpoint for desktop fixtures"]
+    fn native_icon_worker_entry(){zsdesk_windows::shell::icons::run_icon_test_worker().unwrap();}
+}
+
 /// Lets the installer wait for all application windows and desktop guards to
 /// finish before replacing or uninstalling their files.
 struct ApplicationLifetime(Option<windows::Win32::Foundation::HANDLE>);
@@ -44,6 +51,9 @@ impl Drop for ApplicationLifetime {
 }
 
 fn main() {
+    if let Some(result)=zsdesk_windows::shell::icons::maybe_handle_icon_worker(&std::env::args_os().skip(1).collect::<Vec<_>>()){
+        if let Err(error)=result{eprintln!("{error}");std::process::exit(1);}return;
+    }
     if let Some(result)=file_dialog_takeover::guard::run_if_requested(){if let Err(error)=result{eprintln!("{error:#}");std::process::exit(1);}return;}
     if let Some(result)=zsdesk_windows::shell::maybe_handle_packaged_state_worker(&std::env::args_os().skip(1).collect::<Vec<_>>()){
         if let Err(error)=result{eprintln!("{error}");std::process::exit(1);}return;

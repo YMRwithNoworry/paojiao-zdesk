@@ -847,7 +847,7 @@ fn run_request(path:&Path,request:Request,events:&EventSet,com_us:u64,fault_repo
             state.allow(false)?;state.status.catalog=menu.catalog();return Ok(MenuOutcome::Dismissed);
         }
         state.allow(false)?;
-        #[cfg(test)]if request.probe.as_deref()==Some("modern-owner-extension"){
+        #[cfg(test)]if matches!(request.probe.as_deref(),Some("modern-owner-extension"|"modern-ui-nested-extension")){
             use windows::{core::{GUID,Interface},Win32::{System::Com::{CoCreateInstance,CLSCTX_INPROC_SERVER},UI::Shell::IExplorerCommand}};
             unsafe extern "C"{fn zs_menu_test_extension(command:*mut core::ffi::c_void);}
             let command:IExplorerCommand=unsafe{CoCreateInstance(&GUID::from_u128(0xb3489bd3_6c40_4aaa_9610_d72754252627),None,CLSCTX_INPROC_SERVER)}?;

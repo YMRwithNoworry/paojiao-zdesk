@@ -68,19 +68,22 @@ inline Result Dispatch(IContextMenu* menu,HWND owner,UINT command,UINT first,POI
 }
 
 // IsContextMenuOpen becomes false at the beginning of the closing animation.
-// The command is delivered afterwards, before the native dismiss callback.
-// Only that completion callback (or owner/loop shutdown) ends tracking.
+// Command delivery may follow even the native dismiss callback. Keep the
+// request until both dismissal and the real outcome, or a bounded abort.
 struct Completion {
     enum Wait { Continue, Complete, Aborted, TimedOut };
     bool done=false;
+    bool dismissed=false;
+    bool resolved=false;
     bool requested=false;
     UINT requestedCommand=0;
     bool closing=false;
     ULONGLONG closingSince=0;
     void Requested(UINT command) noexcept {requested=command!=0;requestedCommand=command;}
-    void Dismissed() noexcept {done=true;}
+    void Dismissed() noexcept {dismissed=true;done=!requested||resolved;}
+    void Resolved() noexcept {resolved=true;done=dismissed;}
     bool ClosingExpired(bool open,ULONGLONG now) noexcept {
-        if(done||open){closing=false;return false;}
+        if(done||(open&&!dismissed)){closing=false;return false;}
         if(!closing){closing=true;closingSince=now;}
         return now-closingSince>=5000;
     }

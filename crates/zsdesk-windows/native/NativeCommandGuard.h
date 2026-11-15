@@ -317,6 +317,17 @@ class Command final:public IExplorerCommand,public IObjectWithSite,public IObjec
     std::weak_ptr<Gate> gate_;ULONGLONG token_=0,generation_=0;Ancestors ancestors_;
     bool site_=false,selection_=false,initialize_=false,bind_=false,state_=false,packageName_=false;
     mutable std::mutex idsMutex_;std::vector<UINT> commandIds_;
+    // Cache successful flag observations for the enumeration contract. The
+    // public GetFlags call still reaches the provider and refreshes this value.
+    static constexpr ULONGLONG kFlagsKnown=1ull<<63;
+    std::atomic<ULONGLONG> observedFlags_{0};
+    void RememberFlags(EXPCMDFLAGS flags)noexcept{observedFlags_.store(kFlagsKnown|static_cast<ULONG>(flags),std::memory_order_release);}
+    bool DeclaresSubcommands(IExplorerCommand* original){
+        auto flags=observedFlags_.load(std::memory_order_acquire);
+        if(!(flags&kFlagsKnown)&&original){EXPCMDFLAGS value=ECF_DEFAULT;
+            if(SUCCEEDED(original->GetFlags(&value))){RememberFlags(value);flags=observedFlags_.load(std::memory_order_acquire);}}
+        return (flags&kFlagsKnown)&&(static_cast<ULONG>(flags)&ECF_HASSUBCOMMANDS)!=0;
+    }
     template<class T> HRESULT Get(ComPtr<T>& output)const{auto gate=gate_.lock();if(!gate||!gate->Current(generation_))return kCancelled;ComPtr<IExplorerCommand> command;HRESULT hr=original_->Resolve(IID_PPV_ARGS(&command));return FAILED(hr)?hr:command.As(&output);}
     ~Command()=default;
 public:
@@ -379,14 +390,19 @@ public:
         if(!command)return E_INVALIDARG;std::lock_guard<std::mutex> lock(idsMutex_);
         if(std::find(commandIds_.begin(),commandIds_.end(),command)!=commandIds_.end())return S_OK;
         if(commandIds_.size()>=256){if(auto gate=gate_.lock())gate->Failure(E_OUTOFMEMORY,"command-id-limit",nullptr,generation_);return E_OUTOFMEMORY;}
-        commandIds_.push_back(command);return S_OK;
+        commandIds_.push_back(command);
+        if(GetEnvironmentVariableW(L"ZSDESK_MENU_TEST_PROBE",nullptr,0))std::fprintf(stderr,"native-command-bound proxy=%p id=%u count=%zu generation=%llu\n",this,command,commandIds_.size(),generation_);
+        return S_OK;
     }
     HRESULT STDMETHODCALLTYPE GetTitle(IShellItemArray* items,LPWSTR* value)override{ComPtr<IExplorerCommand> original;HRESULT hr=Get(original);return FAILED(hr)?hr:original->GetTitle(items,value);}
     HRESULT STDMETHODCALLTYPE GetIcon(IShellItemArray* items,LPWSTR* value)override{ComPtr<IExplorerCommand> original;HRESULT hr=Get(original);return FAILED(hr)?hr:original->GetIcon(items,value);}
     HRESULT STDMETHODCALLTYPE GetToolTip(IShellItemArray* items,LPWSTR* value)override{ComPtr<IExplorerCommand> original;HRESULT hr=Get(original);return FAILED(hr)?hr:original->GetToolTip(items,value);}
     HRESULT STDMETHODCALLTYPE GetCanonicalName(GUID* value)override{ComPtr<IExplorerCommand> original;HRESULT hr=Get(original);return FAILED(hr)?hr:original->GetCanonicalName(value);}
     HRESULT STDMETHODCALLTYPE GetState(IShellItemArray* items,BOOL slow,EXPCMDSTATE* value)override{ComPtr<IExplorerCommand> original;HRESULT hr=Get(original);return FAILED(hr)?hr:original->GetState(items,slow,value);}
-    HRESULT STDMETHODCALLTYPE GetFlags(EXPCMDFLAGS* value)override{ComPtr<IExplorerCommand> original;HRESULT hr=Get(original);return FAILED(hr)?hr:original->GetFlags(value);}
+    HRESULT STDMETHODCALLTYPE GetFlags(EXPCMDFLAGS* value)override{
+        ComPtr<IExplorerCommand> original;HRESULT hr=Get(original);if(SUCCEEDED(hr))hr=original->GetFlags(value);
+        if(SUCCEEDED(hr)&&value)RememberFlags(*value);return hr;
+    }
     HRESULT STDMETHODCALLTYPE GetPackageFullName(IShellItemArray* items,PWSTR* value)override{
         if(!value)return E_POINTER;*value=nullptr;
         ComPtr<PackageNameMetadata> original;HRESULT hr=Get(original);
@@ -405,11 +421,15 @@ public:
                     if(!state.command||std::find(commandIds_.begin(),commandIds_.end(),state.command)==commandIds_.end())return kCancelled;
                     command=state.command;
                 }else if(const auto selected=gate->Selected()){
-                    if(std::find(commandIds_.begin(),commandIds_.end(),selected)==commandIds_.end())return kCancelled;
+                    if(std::find(commandIds_.begin(),commandIds_.end(),selected)==commandIds_.end()){
+                        if(GetEnvironmentVariableW(L"ZSDESK_MENU_TEST_PROBE",nullptr,0))std::fprintf(stderr,"native-command-unbound proxy=%p selected=%u count=%zu generation=%llu\n",this,selected,commandIds_.size(),generation_);
+                        return kCancelled;
+                    }
                     command=selected;
                 }else if(commandIds_.size()==1)command=commandIds_[0];
                 else if(commandIds_.size()>1){gate->Failure(E_NOTIMPL,"ambiguous-command-id",nullptr,generation_);return E_NOTIMPL;}
             }
+            if(!command&&GetEnvironmentVariableW(L"ZSDESK_MENU_TEST_PROBE",nullptr,0))std::fprintf(stderr,"native-command-no-id proxy=%p generation=%llu\n",this,generation_);
             const Decision decision=gate->Authorize(generation_,command,items,true,true,true);
             if(FAILED(decision.status)||!decision.execute)return decision.status;
             executing=true;hr=original->Invoke(items,context);
@@ -418,13 +438,29 @@ public:
     }
     HRESULT STDMETHODCALLTYPE EnumSubCommands(IEnumExplorerCommand** output)override{
         if(!output)return E_POINTER;*output=nullptr;auto gate=gate_.lock();if(!gate||!gate->Current(generation_))return kCancelled;
-        ComPtr<IExplorerCommand> original;ComPtr<IEnumExplorerCommand> enumerator;HRESULT hr=Get(original);if(SUCCEEDED(hr))hr=original->EnumSubCommands(&enumerator);
-        // E_NOTIMPL/E_NOINTERFACE are normal for leaf commands. Preserve the
-        // provider result; only our inability to guard returned children fails
-        // the host's preparation contract.
-        if(FAILED(hr)||!enumerator)return hr;
+        ComPtr<IExplorerCommand> original;ComPtr<IEnumExplorerCommand> enumerator;HRESULT hr=Get(original);
+        if(!gate->Current(generation_))return kCancelled;
+        if(FAILED(hr)){
+            if(DeclaresSubcommands(nullptr))gate->Failure(hr,"resolve-subcommand-parent",&IID_IExplorerCommand,generation_);
+            return hr;
+        }
+        const bool declared=DeclaresSubcommands(original.Get());
+        if(!gate->Current(generation_))return kCancelled;
+        hr=original->EnumSubCommands(&enumerator);
+        if(!gate->Current(generation_))return kCancelled;
+        // A leaf may normally return E_NOTIMPL/E_NOINTERFACE. A parent that
+        // advertised children must instead expose an enumerator, including a
+        // valid empty enumerator. Record a broken contract for pre-action
+        // fallback rather than silently presenting an empty native submenu.
+        if(FAILED(hr)||!enumerator){
+            if(declared){if(SUCCEEDED(hr))hr=E_UNEXPECTED;gate->Failure(hr,"enumerate-declared-subcommands",&IID_IEnumExplorerCommand,generation_);}
+            return hr;
+        }
+        const HRESULT providerResult=hr;
         hr=WrapEnumeration(enumerator.Get(),gate,generation_,ancestors_,output);
-        if(FAILED(hr))gate->Failure(hr,"wrap-subcommands",&IID_IEnumExplorerCommand,generation_);return hr;
+        if(!gate->Current(generation_)){if(*output){(*output)->Release();*output=nullptr;}return kCancelled;}
+        if(FAILED(hr)){gate->Failure(hr,"wrap-subcommands",&IID_IEnumExplorerCommand,generation_);return hr;}
+        return providerResult;
     }
     HRESULT STDMETHODCALLTYPE SetSite(IUnknown* site)override{ComPtr<IObjectWithSite> original;HRESULT hr=Get(original);return FAILED(hr)?hr:original->SetSite(site);}
     HRESULT STDMETHODCALLTYPE GetSite(REFIID iid,void** output)override{ComPtr<IObjectWithSite> original;HRESULT hr=Get(original);return FAILED(hr)?hr:original->GetSite(iid,output);}
@@ -454,18 +490,33 @@ public:
     HRESULT STDMETHODCALLTYPE Next(ULONG count,IExplorerCommand** values,ULONG* fetched)override{
         if(fetched)*fetched=0;if(!values||(!fetched&&count!=1)||count>8192)return E_INVALIDARG;for(ULONG i=0;i<count;++i)values[i]=nullptr;
         auto gate=gate_.lock();if(!gate||!gate->Current(generation_))return kCancelled;
-        ComPtr<IEnumExplorerCommand> original;HRESULT hr=Get(original);if(FAILED(hr))return hr;
+        ComPtr<IEnumExplorerCommand> original;HRESULT hr=Get(original);
+        if(!gate->Current(generation_))return kCancelled;
+        if(FAILED(hr)){gate->Failure(hr,"resolve-subcommand-enumerator",&IID_IEnumExplorerCommand,generation_);return hr;}
         std::vector<IExplorerCommand*> raw(count,nullptr);ULONG received=0;hr=original->Next(count,raw.data(),&received);const HRESULT originalResult=hr;
+        if(!gate->Current(generation_))hr=kCancelled;
         if(SUCCEEDED(hr)&&received<=count){for(ULONG i=0;i<received;++i){hr=WrapCommand(raw[i],gate,generation_,ancestors_,&values[i]);if(FAILED(hr))break;}}
         else if(SUCCEEDED(hr))hr=E_UNEXPECTED;
         for(auto item:raw)if(item)item->Release();
+        if(!gate->Current(generation_)){for(ULONG i=0;i<count;++i){if(values[i])values[i]->Release();values[i]=nullptr;}return kCancelled;}
         if(FAILED(hr)){for(ULONG i=0;i<count;++i){if(values[i])values[i]->Release();values[i]=nullptr;}gate->Failure(hr,"wrap-enumerated-command",&IID_IExplorerCommand,generation_);return hr;}
         if(fetched)*fetched=received;return originalResult;
     }
     HRESULT STDMETHODCALLTYPE Skip(ULONG count)override{auto gate=gate_.lock();if(!gate||!gate->Current(generation_))return kCancelled;ComPtr<IEnumExplorerCommand> original;HRESULT hr=Get(original);return FAILED(hr)?hr:original->Skip(count);}
     HRESULT STDMETHODCALLTYPE Reset()override{auto gate=gate_.lock();if(!gate||!gate->Current(generation_))return kCancelled;ComPtr<IEnumExplorerCommand> original;HRESULT hr=Get(original);return FAILED(hr)?hr:original->Reset();}
-    HRESULT STDMETHODCALLTYPE Clone(IEnumExplorerCommand** output)override{if(!output)return E_POINTER;*output=nullptr;auto gate=gate_.lock();if(!gate||!gate->Current(generation_))return kCancelled;
-        ComPtr<IEnumExplorerCommand> original,copy;HRESULT hr=Get(original);if(SUCCEEDED(hr))hr=original->Clone(&copy);return FAILED(hr)?hr:WrapEnumeration(copy.Get(),gate,generation_,ancestors_,output);}
+    HRESULT STDMETHODCALLTYPE Clone(IEnumExplorerCommand** output)override{
+        if(!output)return E_POINTER;*output=nullptr;auto gate=gate_.lock();if(!gate||!gate->Current(generation_))return kCancelled;
+        ComPtr<IEnumExplorerCommand> original,copy;HRESULT hr=Get(original);
+        if(!gate->Current(generation_))return kCancelled;
+        if(FAILED(hr)){gate->Failure(hr,"resolve-subcommand-clone",&IID_IEnumExplorerCommand,generation_);return hr;}
+        hr=original->Clone(&copy);
+        if(!gate->Current(generation_))return kCancelled;
+        if(FAILED(hr)||!copy){if(SUCCEEDED(hr))hr=E_UNEXPECTED;gate->Failure(hr,"clone-subcommands",&IID_IEnumExplorerCommand,generation_);return hr;}
+        const HRESULT providerResult=hr;hr=WrapEnumeration(copy.Get(),gate,generation_,ancestors_,output);
+        if(!gate->Current(generation_)){if(*output){(*output)->Release();*output=nullptr;}return kCancelled;}
+        if(FAILED(hr)){gate->Failure(hr,"wrap-subcommand-clone",&IID_IEnumExplorerCommand,generation_);return hr;}
+        return providerResult;
+    }
 };
 
 inline HRESULT WrapCommand(IExplorerCommand* original,const std::shared_ptr<Gate>& gate,ULONGLONG generation,const Ancestors& ancestors,IExplorerCommand** output){

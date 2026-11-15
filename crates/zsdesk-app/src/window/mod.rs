@@ -221,6 +221,7 @@ unsafe fn run_window(session: ExplorerSession, config_path: PathBuf, selection: 
     let mut hover_preview=hover_preview::HoverPreview::new(hwnd);
     let mut middle_click=hover_preview::MiddleClick::new(hwnd);
     let mut gestures=mouse_gestures::MouseGestures::default();
+    let mut blank_clicks=pane_input::BlankClicks::default();
     let mut last_space_preview=slot.borrow().as_ref().is_none_or(|state|state.session.ui.space_preview);
     loop {
         let result = unsafe { GetMessageW(&mut msg, None, 0, 0) }.0;
@@ -233,7 +234,7 @@ unsafe fn run_window(session: ExplorerSession, config_path: PathBuf, selection: 
         if picker::pre_translate(&slot,&msg){continue;}
         if address_input::pre_translate(&msg){continue;}
         dual_pane::activate_for_message(&slot,&msg);
-        if pane_input::blank_double_click(&slot,&msg){continue;}
+        if pane_input::blank_double_click(&slot,&msg,&mut blank_clicks){continue;}
         if gestures.process(hwnd,&msg,&slot) { hover_preview.dismiss(&mut quick_preview);continue; }
         if mouse_navigation::pre_translate(hwnd,&msg){continue;}
         if msg.hwnd==hwnd && msg.message==WM_TIMER && msg.wParam.0==preview_process::TIMER {
@@ -716,6 +717,7 @@ impl WindowState {
         zsdesk_windows::flyout::refresh_system();
         self.palette = Palette::for_mode(if self.dark { Mode::Dark } else { Mode::Light });
         if let Some(accent) = theme::system_accent(self.dark) { self.palette = self.palette.with_accent(accent); }
+        theme::allow_dark_for_window(self.hwnd,self.dark);
         theme::set_dark_frame(self.hwnd, self.dark);
         theme::round_corners(self.hwnd, false);
         theme::round_corners(self.tooltip, true);
@@ -921,6 +923,7 @@ fn native_caption(hwnd:HWND)->bool{
 }
 
 unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    if (msg==WM_ACTIVATE&&(wp.0&0xffff)==0)||(msg==WM_ACTIVATEAPP&&wp.0==0){pane_input::invalidate_blank_clicks(hwnd);}
     if msg==WM_NCDESTROY{release_window_properties(hwnd);}
     let native_caption = native_caption(hwnd);
     let caption_message = matches!(msg, WM_NCHITTEST | WM_NCMOUSEMOVE | WM_NCMOUSELEAVE | WM_NCLBUTTONDOWN | WM_NCLBUTTONUP | WM_NCLBUTTONDBLCLK);
@@ -1111,6 +1114,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
     if msg==WM_SYSCOMMAND&&window_actions::fullscreen(hwnd)&&matches!((wp.0 as u32)&0xfff0,SC_RESTORE|SC_MAXIMIZE){
         post(hwnd,WM_ACTION,Command::ToggleFullscreen.id()as usize,0);return LRESULT(0);
     }
+    if msg==pane_input::MESSAGE&&pane_input::dispatch_context_menu(hwnd,wp.0){return LRESULT(0);}
     // Calls into Shell and native controls may synchronously re-enter this procedure.
     let Ok(mut slot) = (unsafe { &*pointer }).try_borrow_mut() else {
         return unsafe { reentrant(hwnd, msg, wp, lp) };
