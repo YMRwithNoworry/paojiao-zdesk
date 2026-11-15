@@ -25,7 +25,7 @@ unsafe extern "system" fn offscreen(code:i32,wp:WPARAM,lp:LPARAM)->windows::Win3
     fn OnTypeChange(&self,dialog:Ref<IFileDialog>)->windows::core::Result<()>{if let Some(dialog)=dialog.as_ref(){eprintln!("native type changed: {:?}",unsafe{dialog.GetFileTypeIndex()});}Ok(())}
     fn OnOverwrite(&self,_:Ref<IFileDialog>,_:Ref<IShellItem>)->windows::core::Result<FDE_OVERWRITE_RESPONSE>{Ok(FDEOR_DEFAULT)}
 }
-fn original(directory:PathBuf,ready:mpsc::Sender<isize>,kind:SelectionKind,upload_folder:bool)->Result<(Vec<PathBuf>,u32,bool)>{
+fn original(directory:PathBuf,ready:mpsc::Sender<isize>,kind:SelectionKind,accept_label:Option<&str>)->Result<(Vec<PathBuf>,u32,bool)>{
     let hook=unsafe{SetWindowsHookExW(WH_CBT,Some(offscreen),None,GetCurrentThreadId())}?;struct Hook(HHOOK);impl Drop for Hook{fn drop(&mut self){let _=unsafe{UnhookWindowsHookEx(self.0)};}}let _hook=Hook(hook);
     unsafe{OleInitialize(None)}?;struct Apartment;impl Drop for Apartment{fn drop(&mut self){unsafe{OleUninitialize();}}}let _apartment=Apartment;
     let dialog:IFileOpenDialog=unsafe{CoCreateInstance(&FileOpenDialog,None,CLSCTX_INPROC_SERVER)}?;
@@ -34,7 +34,7 @@ fn original(directory:PathBuf,ready:mpsc::Sender<isize>,kind:SelectionKind,uploa
     let cookie=unsafe{dialog.Advise(&sink)}?;
     unsafe{dialog.SetOptions(if kind.folders(){FOS_PICKFOLDERS|FOS_PATHMUSTEXIST|FOS_FORCEFILESYSTEM}else{FOS_ALLOWMULTISELECT|FOS_FILEMUSTEXIST|FOS_FORCEFILESYSTEM})?;dialog.SetFolder(&folder)?;
         dialog.SetTitle(w!("ZSDesk Original Picker Test"))?;
-        if upload_folder{dialog.SetTitle(w!("选择要上传的文件夹"))?;dialog.SetOkButtonLabel(w!("上传"))?;}
+        if let Some(label)=accept_label{dialog.SetOkButtonLabel(PCWSTR(wide(label).as_ptr()))?;}
         if !kind.folders(){dialog.SetFileTypes(&[Common::COMDLG_FILTERSPEC{pszName:w!("文本文件"),pszSpec:w!("*.txt")},Common::COMDLG_FILTERSPEC{pszName:w!("所有文件"),pszSpec:w!("*.*")}])?;}}
     let shown=unsafe{dialog.Show(None)};unsafe{dialog.Unadvise(cookie)}?;
     if let Err(error)=shown{ensure!(error.code().0 as u32==0x800704c7,"native dialog failed: {error}");return Ok((Vec::new(),0,true));}
@@ -47,9 +47,9 @@ fn exercise(root:&Path)->Result<serde_json::Value>{
     let automation:IUIAutomation=unsafe{CoCreateInstance(&CUIAutomation,None,CLSCTX_INPROC_SERVER)}?;
     let first=root.join("native source");let second=root.join("selected 中文");fs::create_dir_all(&first)?;fs::create_dir_all(&second)?;
     let expected=vec![second.join("first file.txt"),second.join("第二个.txt")];for path in &expected{fs::write(path,b"native return fixture")?;}
-    for cancelled in [false,true]{
+    for (cancelled,label) in [(false,None),(true,None),(false,Some("上传(&U)")),(true,Some("Upload (&U)"))]{
         let(tx,rx)=mpsc::channel();let folder=first.clone();let(done_tx,done_rx)=mpsc::channel();
-        let worker=thread::spawn(move||{let _=done_tx.send(original(folder,tx,SelectionKind::Files,false));});
+        let worker=thread::spawn(move||{let _=done_tx.send(original(folder,tx,SelectionKind::Files,label));});
         let window=HWND(rx.recv_timeout(Duration::from_secs(10)).context("native dialog ready")?as*mut _);
         struct Cancel(HWND);impl Drop for Cancel{fn drop(&mut self){if unsafe{IsWindow(Some(self.0))}.as_bool(){let _=unsafe{PostMessageW(Some(self.0),WM_COMMAND,WPARAM(2),LPARAM(0))};}}}let _cancel=Cancel(window);
         let deadline=Instant::now()+Duration::from_secs(8);let part=loop{let part=parts(window);if part.shell&&!part.name.0.is_null()&&!part.address.0.is_null(){break part;}ensure!(Instant::now()<deadline,"native controls unavailable");thread::sleep(Duration::from_millis(20));};
@@ -63,6 +63,7 @@ fn exercise(root:&Path)->Result<serde_json::Value>{
         let location=text(part.address).and_then(|value|initial_location(&value));ensure!(location.as_ref().and_then(|location|location.as_path()).is_some_and(|path|crate::explorer_forwarder::same_path(path,&first)),"native initial folder mismatch: {location:?}");
         let (filters,index)=types(part.types);ensure!(filters.len()==2&&index==0&&filters[0].pattern=="*.txt","native file filters mismatch");
         let accept=unsafe{GetDlgItem(Some(window),1)}.ok().and_then(text).context("original accept label")?;
+        ensure!(dialog_kind(window,&part,Some(&automation))==Some(SelectionKind::Files),"file upload was not recognized as files: {accept}");
         let mut session=Session{source:guard::Identity::capture(window).context("source identity")?,name:part.name,types:part.types,kind:SelectionKind::Files,multiple:true,accept,token:1,picker:None,guard:None,worker:None,fallback:false};
         if !cancelled{if let Some(executable)=std::env::var_os("ZSDESK_GUARD_TEST_EXE"){
             let picker=unsafe{CreateWindowExW(WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE,w!("STATIC"),None,WS_POPUP,-30000,-30000,50,50,None,None,None,None)}?;
@@ -82,9 +83,12 @@ fn exercise(root:&Path)->Result<serde_json::Value>{
         ensure!(!unsafe{IsWindow(Some(window))}.as_bool(),"native caller window remained alive");
         if cancelled{ensure!(result.2&&result.0.is_empty(),"Cancel did not propagate");}else{ensure!(!result.2&&result.0==expected&&result.1==2,"native caller received wrong files or filter: {result:?}");}
     }
-    for (cancelled,upload_folder) in [(false,false),(true,false),(false,true),(true,true)]{
+    for (cancelled,label) in [
+        (false,None),(true,None),(false,Some("上传")),(true,Some("上传")),
+        (false,Some("上传(&U)")),(true,Some("Upload (&U)")),
+        (false,Some("Open")),(true,Some("OK")),(false,Some("添加到项目"))]{
         let(tx,rx)=mpsc::channel();let folder=first.clone();let(done_tx,done_rx)=mpsc::channel();
-        let worker=thread::spawn(move||{let _=done_tx.send(original(folder,tx,SelectionKind::Folders,upload_folder));});
+        let worker=thread::spawn(move||{let _=done_tx.send(original(folder,tx,SelectionKind::Folders,label));});
         let window=HWND(rx.recv_timeout(Duration::from_secs(10)).context("native folder dialog ready")?as*mut _);
         struct Cancel(HWND);impl Drop for Cancel{fn drop(&mut self){if unsafe{IsWindow(Some(self.0))}.as_bool(){let _=unsafe{PostMessageW(Some(self.0),WM_COMMAND,WPARAM(2),LPARAM(0))};}}}let _cancel=Cancel(window);
         let deadline=Instant::now()+Duration::from_secs(8);let part=loop{
@@ -110,7 +114,7 @@ fn exercise(root:&Path)->Result<serde_json::Value>{
         if cancelled{ensure!(result.2&&result.0.is_empty(),"folder Cancel did not propagate");}else{ensure!(!result.2&&result.0==vec![second.clone()],"native caller received wrong folder: {result:?}");}
     }
     let mut foreground=0;unsafe{GetWindowThreadProcessId(GetForegroundWindow(),Some(&mut foreground));}ensure!(foreground!=std::process::id(),"test became the foreground application");
-    Ok(serde_json::json!({"original_dialog_received_files":true,"original_folder_dialog_received_directory":true,"browser_style_upload_folder_contract":true,"wrong_kind_rejected":true,"unicode_multiple_paths":true,"type_filter_preserved":true,"cancel_propagated":true,"off_retains_native_dialog":true,"offscreen_no_input":true,"owned_windows_destroyed":true}))
+    Ok(serde_json::json!({"original_dialog_received_files":true,"original_folder_dialog_received_directory":true,"browser_style_upload_folder_contract":true,"accelerator_and_custom_accept_labels":true,"file_and_folder_modes_distinct":true,"wrong_kind_rejected":true,"unicode_multiple_paths":true,"type_filter_preserved":true,"cancel_propagated":true,"off_retains_native_dialog":true,"offscreen_no_input":true,"owned_windows_destroyed":true}))
 }
 #[test]
 #[ignore="Owned offscreen IFileOpenDialog result contract without input injection"]

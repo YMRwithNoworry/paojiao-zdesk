@@ -24,6 +24,7 @@ fn footer_dpi_checks(fixture:&Fixture)->Result<()>{
         pump(30);
         let slot=fixture.slot.borrow();let state=slot.as_ref().context("picker state")?;let picker=state.picker.as_ref().context("picker footer")?;
         let (width,height)=state.client_size();let top=height-state.picker_height();
+        ensure!(control_text(picker.accept)==picker.options.kind.title(),"picker action label does not match file/folder mode");
         for button in [picker.accept,picker.cancel]{
             ensure!(unsafe{IsWindowVisible(button)}.as_bool()&&unsafe{IsWindowEnabled(button)}.as_bool(),"picker action is hidden/disabled at {dpi} DPI");
             let mut rect=RECT::default();unsafe{GetWindowRect(button,&mut rect)}?;

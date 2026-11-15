@@ -12,7 +12,18 @@ fn class(window:HWND)->String{let mut value=[0u16;128];let n=unsafe{GetClassName
 fn send(window:HWND,message:u32,wp:usize,lp:isize)->Option<usize>{let mut result=0;(unsafe{SendMessageTimeoutW(window,message,WPARAM(wp),LPARAM(lp),SMTO_ABORTIFHUNG|SMTO_BLOCK,250,Some(&mut result))}.0!=0).then_some(result)}
 fn text(window:HWND)->Option<String>{let mut value=vec![0u16;32768];let n=send(window,WM_GETTEXT,value.len(),value.as_mut_ptr()as isize)?;Some(String::from_utf16_lossy(&value[..n.min(value.len()-1)]))}
 #[derive(Default)]struct Parts{name:HWND,types:HWND,address:HWND,shell:bool,folder_label:bool}
-fn directory_label(value:&str)->bool{matches!(value.replace('&',"").trim().trim_end_matches([':', '：']).trim().to_lowercase().as_str(),"文件夹"|"目录"|"folder"|"directory")}
+fn control_label(value:&str)->String{
+    let value=value.replace('&',"");let mut value=value.trim().trim_end_matches([':', '：']).trim();
+    // Native dialogs can append a localized accelerator, e.g. 上传(&U).
+    // It is presentation, not part of the caller's selection contract.
+    if let Some((prefix,suffix))=value.rsplit_once('('){
+        if let Some(key)=suffix.strip_suffix(')'){
+            if key.len()==1&&key.as_bytes()[0].is_ascii_alphanumeric(){value=prefix.trim_end();}
+        }
+    }
+    value.to_lowercase()
+}
+fn directory_label(value:&str)->bool{matches!(control_label(value).as_str(),"文件夹"|"目录"|"folder"|"directory")}
 fn parts(dialog:HWND)->Parts{
     unsafe extern "system" fn visit(window:HWND,p:LPARAM)->BOOL{let value=unsafe{&mut*(p.0 as*mut Parts)};let kind=class(window);let id=unsafe{GetDlgCtrlID(window)};
         // Common dialogs use either cmb13 (1148) or edt1 (1152). Folder
@@ -21,19 +32,24 @@ fn parts(dialog:HWND)->Parts{
             if value.name.0.is_null()||class(value.name)!="Edit"||unsafe{IsWindowVisible(window)}.as_bool(){value.name=window;}
         }else if id==1148&&value.name.0.is_null()&&kind=="ComboBox"{value.name=window;}
         if id==1136&&kind=="ComboBox"{value.types=window;}if id==1001&&kind=="ToolbarWindow32"{value.address=window;}
-        if kind=="Static"&&text(window).is_some_and(|value|directory_label(&value)){value.folder_label=true;}
+        if kind=="Static"&&unsafe{IsWindowVisible(window)}.as_bool()&&text(window).is_some_and(|value|directory_label(&value)){value.folder_label=true;}
         if kind=="SHELLDLL_DefView"{value.shell=true;}true.into()}
     let mut value=Parts::default();let _=unsafe{EnumChildWindows(Some(dialog),Some(visit),LPARAM(&mut value as*mut _ as isize))};value
 }
-fn open_label(value:&str)->bool{let value=value.replace('&',"").to_lowercase();
+fn open_label(value:&str)->bool{let value=control_label(value);
     if value.contains("文件夹")||value.contains("folder"){return false;}
     value.starts_with("打开")||value.starts_with("open")||value.starts_with("选择文件")||value.starts_with("select file")}
 fn selection_kind(accept:&str,visible_types:bool,folder_field:bool)->Option<SelectionKind>{
-    let accept=accept.replace('&',"").to_lowercase();
+    let accept=control_label(accept);
+    if accept.is_empty()||accept.starts_with("保存")||accept.starts_with("另存")||accept.starts_with("save")
+        ||matches!(accept.as_str(),"取消"|"cancel"|"替换"|"replace"){return None;}
     let folder=accept.starts_with("选择文件夹")||accept.starts_with("选择此文件夹")||accept.starts_with("选择目录")
         ||accept.starts_with("select folder")||accept.starts_with("choose folder")||accept.starts_with("select directory")||accept.starts_with("choose directory");
     let upload=accept=="上传"||accept=="upload";
-    if !visible_types&&(folder||(upload&&folder_field)){return Some(SelectionKind::Folders);}
+    // The associated folder field is the explicit directory contract. The
+    // caller may independently name its acceptance button Upload, Open or OK.
+    // Conflicting directory/file evidence must leave the native dialog intact.
+    if folder||folder_field{return (!visible_types).then_some(SelectionKind::Folders);}
     if visible_types&&(open_label(&accept)||upload){return Some(SelectionKind::Files);}
     None
 }
@@ -98,6 +114,8 @@ impl Session{
                 crate::window::picker::validate_paths(&paths,self.multiple,self.kind).map_err(anyhow::Error::msg)?;
                 let actual=parts(self.source.hwnd());let accept=unsafe{GetDlgItem(Some(self.source.hwnd()),1)}.ok().and_then(text);
                 ensure!(actual.name==self.name&&accept.as_deref()==Some(self.accept.as_str()),"文件选择窗口已改变");
+                let automation:IUIAutomation=unsafe{CoCreateInstance(&CUIAutomation,None,CLSCTX_INPROC_SERVER)}.context("无法确认原窗口的选择模式")?;
+                ensure!(dialog_kind(self.source.hwnd(),&actual,Some(&automation))==Some(self.kind),"原窗口的文件或文件夹选择模式已改变");
                 if !self.types.0.is_null()&&self.types==actual.types{
                     send(self.types,CB_SETCURSEL,filter,0).context("文件类型切换失败")?;
                     let owner=unsafe{GetParent(self.types)}.context("文件类型控件父窗口不可用")?;
@@ -193,13 +211,16 @@ fn run(profile:&Path,stop:&AtomicBool)->Result<()>{
         for label in ["选择文件夹","选择此文件夹","Select Folder","Choose directory"]{
             assert_eq!(selection_kind(label,false,false),Some(SelectionKind::Folders));assert_eq!(selection_kind(label,true,false),None);
         }
-        assert_eq!(selection_kind("Upload",false,true),Some(SelectionKind::Folders));
-        assert_eq!(selection_kind("上传",false,true),Some(SelectionKind::Folders));
+        for label in ["Upload","上传","上传(&U)","Upload (&U)","打开(&O)","Open","确定","OK","添加到项目"]{
+            assert_eq!(selection_kind(label,false,true),Some(SelectionKind::Folders),"{label}");
+            assert_eq!(selection_kind(label,true,true),None,"conflicting folder and file controls: {label}");
+        }
         assert_eq!(selection_kind("Upload",true,false),Some(SelectionKind::Files));
+        assert_eq!(selection_kind("上传(&U)",true,false),Some(SelectionKind::Files));
         assert_eq!(selection_kind("打开(&O)",true,false),Some(SelectionKind::Files));
-        for label in ["保存(&S)","Save","Save As","确定","OK","替换","Cancel"]{for types in [false,true]{assert_eq!(selection_kind(label,types,true),None);}}
-        assert_eq!(selection_kind("Upload",false,false),None);assert_eq!(selection_kind("Open",false,true),None);
-        for label in ["文件夹：","目录:","Folder:","&Folder:"]{assert!(directory_label(label));}
+        for label in ["保存(&S)","Save","Save As","替换","Cancel",""]{for types in [false,true]{assert_eq!(selection_kind(label,types,true),None);}}
+        for label in ["Upload","Open","确定","OK"]{assert_eq!(selection_kind(label,false,false),None);}
+        for label in ["文件夹：","目录:","Folder:","&Folder:","文件夹(&F)："]{assert!(directory_label(label));}
         for label in ["文件名：","File name:","选择文件夹上传"]{assert!(!directory_label(label));}
     }
     #[test]fn filter_labels_preserve_masks_and_default_to_all(){assert_eq!(pattern("文本文件 (*.txt;*.log)"),"*.txt;*.log");assert_eq!(pattern("文档（*.docx）"),"*.docx");assert_eq!(pattern("Files"),"*");}
