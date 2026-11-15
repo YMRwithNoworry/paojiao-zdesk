@@ -115,7 +115,12 @@ fn exercise(root:&Path)->Result<serde_json::Value>{
 #[test]
 #[ignore="Owned offscreen IFileOpenDialog result contract without input injection"]
 fn native_file_dialog_return_and_cancel_preserve_caller_contract()->Result<()>{
-    let root=PathBuf::from(std::env::var_os("ZSDESK_NATIVE_TEST_OUTPUT").context("output")?).join("native-picker-return");ensure!(root.is_absolute()&&root.starts_with(r"E:\codex操作目录"),"isolated fixtures required");fs::create_dir_all(&root)?;
+    use std::os::windows::fs::MetadataExt;
+    let output=PathBuf::from(std::env::var_os("ZSDESK_NATIVE_TEST_OUTPUT").context("output")?);
+    ensure!(output.is_absolute()&&output.parent().is_some_and(|parent|parent.parent().is_some()),"dedicated absolute output directory required");
+    let root=output.join("native-picker-return");
+    for path in root.ancestors(){if path.exists(){ensure!(fs::symlink_metadata(path)?.file_attributes()&0x400==0,"fixture output must use real directories");}}
+    fs::create_dir_all(&root)?;
     let output=root.clone();let result=thread::spawn(move||exercise(&output)).join().map_err(|_|anyhow::anyhow!("caller contract test panicked")).and_then(|result|result);
     let report=serde_json::json!({"checks":result.as_ref().map_err(|error|format!("{error:#}")),"created_desktop":false});fs::write(root.join("verification.current.json"),serde_json::to_vec_pretty(&report)?)?;result?;Ok(())
 }
