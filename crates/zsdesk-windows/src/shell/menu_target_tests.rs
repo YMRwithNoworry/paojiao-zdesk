@@ -1,6 +1,7 @@
 use super::*;
 use anyhow::ensure;
 use windows::{core::{w,PWSTR},Win32::{Foundation::{WPARAM,LRESULT},Graphics::Gdi::ClientToScreen,System::Ole::{OleInitialize,OleUninitialize}}};
+#[path="native_theme_test_context.rs"]mod native_context;
 
 struct Apartment;impl Drop for Apartment{fn drop(&mut self){unsafe{OleUninitialize();}}}
 struct Fixture{owner:HWND,list:HWND,_apartment:Apartment}
@@ -65,6 +66,7 @@ unsafe extern "system" fn unsupported_ids(window:HWND,message:u32,wp:WPARAM,lp:L
 }
 #[test]
 fn unsupported_stable_ids_and_owner_data_keep_the_exact_msaa_row()->anyhow::Result<()>{
+    native_context::private_desktop("menu-compat",||{
     for owner_data in [false,true]{
         let fixture=fixture_kind(owner_data)?;
         ensure!(unsafe{windows::Win32::UI::Shell::SetWindowSubclass(fixture.list,Some(unsupported_ids),1,0)}.as_bool(),"ID compatibility fixture hook");
@@ -76,10 +78,12 @@ fn unsupported_stable_ids_and_owner_data_keep_the_exact_msaa_row()->anyhow::Resu
         ensure!(selected(fixture.list)==[0,2],"fallback lost existing multi-selection");
     }
     Ok(())
+    })
 }
 
 #[test]
 fn classic_list_view_context_hit_selects_exact_row_and_preserves_selected_group()->anyhow::Result<()>{
+    native_context::private_desktop("menu-selection",||{
     let fixture=fixture()?;select(fixture.list,0);select(fixture.list,1);
     ensure!(prepare(fixture.owner,fixture.owner,row_point(fixture.list,0,35)?)?==ViewMenuTarget::Selection,"name hit was not an item");
     ensure!(selected(fixture.list)==[0,1],"right click on a selected row lost multiple selection");
@@ -90,10 +94,12 @@ fn classic_list_view_context_hit_selects_exact_row_and_preserves_selected_group(
     ensure!(prepare(fixture.owner,fixture.list,LPARAM(-1))?==ViewMenuTarget::CurrentSelection,"keyboard menu did not preserve its selection contract");
     ensure!(selected(fixture.list)==[0],"keyboard menu changed the row");
     Ok(())
+    })
 }
 
 #[test]
 fn classic_list_view_background_header_and_edit_controls_are_distinct()->anyhow::Result<()>{
+    native_context::private_desktop("menu-hit",||{
     let fixture=fixture()?;select(fixture.list,1);
     let background=packed(fixture.list,POINT{x:400,y:220})?;
     ensure!(prepare(fixture.owner,fixture.owner,background)?==ViewMenuTarget::Background,"empty client area was not background");
@@ -108,4 +114,46 @@ fn classic_list_view_background_header_and_edit_controls_are_distinct()->anyhow:
     let mut pid=0;unsafe{GetWindowThreadProcessId(GetForegroundWindow(),Some(&mut pid));}
     ensure!(pid!=std::process::id(),"owned offscreen controls took foreground focus");
     Ok(())
+    })
+}
+
+#[test]
+fn msaa_list_selection_is_independent_of_foreground_focus()->anyhow::Result<()>{
+    native_context::private_desktop("menu-no-focus",||{
+        use windows::Win32::UI::Input::KeyboardAndMouse::GetFocus;
+        let fixture=fixture()?;
+        ensure!(unsafe{windows::Win32::UI::Shell::SetWindowSubclass(fixture.list,Some(unsupported_ids),1,0)}.as_bool(),"ID compatibility fixture hook");
+        select(fixture.list,0);select(fixture.list,1);
+        let focus=unsafe{GetFocus()};
+        ensure!(focus!=fixture.list,"fixture already owns keyboard focus");
+        select_list_accessible(fixture.list,2)?;
+        ensure!(selected(fixture.list)==[2],"MSAA selection requires unavailable foreground focus");
+        ensure!(unsafe{GetFocus()}==focus,"selection unexpectedly changed keyboard focus");
+        select_list_accessible(fixture.list,0)?;
+        ensure!(selected(fixture.list)==[0],"MSAA selection used stale focus/row identity");
+        select(fixture.list,2);select_list_accessible(fixture.list,2)?;
+        ensure!(selected(fixture.list)==[0,2],"selected row lost existing group");
+        Ok(())
+    })
+}
+
+#[test]
+fn v6_stable_list_identity_selects_the_clicked_row()->anyhow::Result<()>{
+    native_context::private_desktop("menu-v6",||{
+        let output=std::env::temp_dir().join(format!("zsdesk-menu-target-v6-{}",std::process::id()));
+        std::fs::create_dir(&output)?;
+        struct Output(std::path::PathBuf);impl Drop for Output{fn drop(&mut self){let _=std::fs::remove_dir(&self.0);}}
+        let output=Output(output);
+        let controls=native_context::CommonControls::activate(Some(&output.0))?;
+        ensure!(controls.version()[0]>=6,"v6 fixture activation failed");
+        let fixture=fixture()?;
+        ensure!(list_identity(fixture.list,2).is_some(),"v6 stable row identity is unavailable");
+        select(fixture.list,0);select(fixture.list,1);
+        ensure!(prepare(fixture.owner,fixture.owner,row_point(fixture.list,2,35)?)?==ViewMenuTarget::Selection,"v6 row hit missing");
+        ensure!(selected(fixture.list)==[2],"v6 selected an unrelated row");
+        select(fixture.list,0);
+        ensure!(prepare(fixture.owner,fixture.owner,row_point(fixture.list,0,220)?)?==ViewMenuTarget::Selection,"v6 subitem hit missing");
+        ensure!(selected(fixture.list)==[0,2],"v6 lost existing multi-selection");
+        Ok(())
+    })
 }

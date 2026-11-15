@@ -52,7 +52,10 @@ fn automation_hit(automation:&IUIAutomation,object:&IAccessible,child:&VARIANT)-
 fn accessible_selection(object:&IAccessible,child:&VARIANT)->Result<()>{
     let state=unsafe{object.get_accState(child)}.and_then(|value|u32::try_from(&value))?;
     if state&STATE_SYSTEM_SELECTED==0{
-        unsafe{object.accSelect((SELFLAG_TAKESELECTION|SELFLAG_TAKEFOCUS)as i32,child)}?;
+        // The v5 ListView provider abandons the entire combined request when
+        // foreground focus is unavailable (S_FALSE, with no selection change).
+        // A context-menu target only needs selection; verify it independently.
+        unsafe{object.accSelect(SELFLAG_TAKESELECTION as i32,child)}?;
         let selected=unsafe{object.get_accState(child)}.and_then(|value|u32::try_from(&value))?;
         if selected&STATE_SYSTEM_SELECTED==0{return Err(Error::new(HRESULT(0x800704c7u32 as i32),"点击的文件尚未选中，请重试"));}
     }
