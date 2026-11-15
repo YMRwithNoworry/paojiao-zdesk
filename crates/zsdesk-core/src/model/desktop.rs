@@ -219,6 +219,12 @@ impl DesktopConfig {
     pub fn is_released_key(&self, key: &str) -> bool {
         self.released_items.iter().any(|item| item.members.iter().any(|member| member.eq_ignore_ascii_case(key)))
     }
+    /// Explicit groups and manual loose icons may be restored by parsing name.
+    /// Automatic loose icons must be proved by the fresh desktop inventory.
+    pub fn restorable_desktop_members(&self)->impl Iterator<Item=&String>{
+        self.fences.iter().chain(self.released_items.iter().filter(|item|!item.auto_released))
+            .filter(|item|item.is_desktop()).flat_map(|item|item.members.iter())
+    }
     pub fn distributed_items(&self,items:&[ItemInfo])->Vec<Vec<usize>> {
         let mut groups=distribute(&self.fences,items);
         for group in &mut groups { group.retain(|index|!self.released_identity(items,&items[*index].key)); }
@@ -594,6 +600,32 @@ pub fn auto_layout(count: usize, area_w: i32, area_h: i32) -> Vec<Bounds> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn automatic_aliases_need_live_evidence_and_manual_items_keep_their_exact_state(){
+        let mut config=DesktopConfig::default();
+        for id in 1..=7{let mut group=Fence::new(id,format!("Saved {id}"),FenceSource::Desktop,Placement::default());group.members.push(format!("group-{id}"));config.fences.push(group);}
+        config.next_id=8;
+        // Explicitly released items remain user-owned even when their paths
+        // are absent from the desktop snapshot or refer outside the desktop.
+        for index in 0..6{config.release_item_exact(format!(r"C:\Saved\manual-{index}.txt"),Placement{x:index*100,y:70,..Default::default()});}
+        let manual=config.released_items.clone();let groups=config.fences.clone();
+        let system="::{645FF040-5081-101B-9F08-00AA002F954E}";
+        let id=config.release_item_exact(system.into(),Placement::default());config.fence_mut(id).unwrap().auto_released=true;
+        let visible_system=config.fence(id).unwrap().clone();
+        for key in [r"C:\Users\Test\Desktop",r"C:\Users\Test",r"C:\Users\Test\Music",r"C:\Users\Test\Downloads",r"C:\Users\Test\Pictures",r"C:\Users\Test\Videos",r"C:\Users\Test\Documents",r"E:\Cloud\Provider"]{
+            let id=config.release_item_exact(key.into(),Placement::default());config.fence_mut(id).unwrap().auto_released=true;
+        }
+        let mut config:DesktopConfig=serde_json::from_slice(&serde_json::to_vec(&config).unwrap()).unwrap();
+        let restored=config.restorable_desktop_members().cloned().collect::<Vec<_>>();assert_eq!(restored.len(),13);
+        assert!(manual.iter().all(|item|restored.contains(&item.members[0])));assert!(!restored.contains(&system.to_owned()));
+        assert!(!restored.contains(&r"C:\Users\Test\Documents".to_owned()));
+        let next_id=config.next_id;
+        assert!(config.reconcile_uncollected(&[info(system,false)],|_|panic!("existing visible icon must not allocate another ID")));
+        assert_eq!(config.fences,groups);assert_eq!(&config.released_items[..6],manual.as_slice());
+        assert_eq!(config.released_items.len(),7);assert_eq!(config.released_items[6],visible_system);assert_eq!(config.next_id,next_id);
+        assert!(!config.reconcile_uncollected(&[info(system,false)],|_|Placement::default()));
+        assert!(config.reconcile_uncollected(&[],|_|Placement::default()));assert_eq!(config.released_items,manual);assert_eq!(config.fences,groups);assert_eq!(config.next_id,next_id);
+    }
     #[test]
     fn disabled_collection_stays_off_and_uncollected_files_remain_visible(){
         let mut config=DesktopConfig::default();let mut group=fence(1,None,false);group.members.push("kept.txt".into());config.fences.push(group);config.next_id=2;

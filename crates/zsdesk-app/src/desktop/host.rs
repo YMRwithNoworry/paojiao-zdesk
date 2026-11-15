@@ -1214,7 +1214,7 @@ impl DesktopHost {
         #[cfg(test)]{self.desktop_entries=self.desktop_test_entries.clone().unwrap_or_else(desktop::enumerate_desktop);}
         #[cfg(not(test))]{self.desktop_entries = desktop::enumerate_desktop();}
         let mut known: HashSet<String> = self.desktop_entries.iter().map(|e| e.key.to_lowercase()).collect();
-        for key in self.config.fences.iter().chain(&self.config.released_items).filter(|f| f.is_desktop()).flat_map(|f| &f.members) {
+        for key in self.config.restorable_desktop_members() {
             if known.contains(&key.to_lowercase()) { continue; }
             if let Some(entry) = desktop::entry_from_parsing_name(key) {
                 if let Some(existing) = self.desktop_entries.iter_mut().find(|e| e.pidl == entry.pidl) {

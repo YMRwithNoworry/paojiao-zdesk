@@ -17,7 +17,7 @@ use windows::{
             Variant::VARIANT,
             Com::{CoCreateInstance, CoTaskMemFree, IServiceProvider, CLSCTX_ALL, CLSCTX_INPROC_SERVER},
             Ole::IDropTarget,
-            Registry::{RegDeleteKeyValueW, RegGetValueW, RegSetKeyValueW, HKEY_CURRENT_USER, REG_SZ, RRF_RT_REG_SZ, RRF_RT_REG_DWORD},
+            Registry::{RegDeleteKeyValueW, RegGetValueW, RegSetKeyValueW, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, REG_SZ, RRF_RT_REG_SZ, RRF_RT_REG_DWORD},
             SystemServices::{SFGAO_DROPTARGET, SFGAO_FILESYSTEM, SFGAO_FOLDER, SFGAO_GHOSTED, SFGAO_LINK, SFGAO_STREAM, SFGAO_FLAGS},
         },
         UI::{
@@ -29,7 +29,7 @@ use windows::{
                 FOS_FORCEFILESYSTEM, FOS_PICKFOLDERS, FWF_NOICONS, KF_FLAG_DEFAULT, SEE_MASK_INVOKEIDLIST, SHCONTF_FOLDERS,
                 SHCONTF_INCLUDEHIDDEN, SHCONTF_NONFOLDERS, SHELLEXECUTEINFOW, SHGDN_FOREDITING, SHGDN_INFOLDER, SHGDN_NORMAL,
                 SIGDN_DESKTOPABSOLUTEPARSING, SIGDN_FILESYSPATH, SVGIO_ALLVIEW, SWC_DESKTOP, SWFO_NEEDDISPATCH, SID_STopLevelBrowser,
-                IShellItem,
+                IShellItem, IShellItem2,
             },
             WindowsAndMessaging::{
                 FindWindowExW, FindWindowW, GetAncestor, GetClassNameW, GetParent, IsWindowVisible, SendMessageW,
@@ -160,32 +160,89 @@ pub fn enumerate_desktop() -> Vec<ShellEntry> {
     let Ok(desktop) = (unsafe { SHGetDesktopFolder() }) else { return Vec::new() };
     let empty: Vec<u8> = vec![0, 0];
     // Prefer the live desktop view: it already applies "桌面图标设置" and hidden-file rules.
-    if let Ok(view) = desktop_view() {
-        if let Ok(items) = unsafe { view.Items::<IEnumIDList>(SVGIO_ALLVIEW) } {
-            let entries = collect(&desktop, &empty, &items, 5000);
-            if !entries.is_empty() { return entries; }
-        }
+    let live=desktop_view().and_then(|view|{
+        let flags_before=unsafe{view.GetCurrentFolderFlags()}?;
+        if flags_before&FWF_NOICONS.0 as u32!=0{return Ok(DesktopSnapshot{entries:Vec::new(),flags_before,flags_after:flags_before});}
+        let items=unsafe{view.Items::<IEnumIDList>(SVGIO_ALLVIEW)}?;
+        let entries=collect_desktop_snapshot(&desktop,&empty,&items,5000)?;
+        let flags_after=unsafe{view.GetCurrentFolderFlags()}?;
+        Ok(DesktopSnapshot{entries,flags_before,flags_after})
+    });
+    select_desktop_snapshot(live,||{
+        let flags = (SHCONTF_FOLDERS.0 | SHCONTF_NONFOLDERS.0 | if show_hidden() { SHCONTF_INCLUDEHIDDEN.0 } else { 0 }) as u32;
+        let mut items = None;
+        let _ = unsafe { desktop.EnumObjects(HWND::default(), flags, &mut items) };
+        let Some(items) = items else { return Vec::new() };
+        let roots:Vec<_>=[user_desktop(),public_desktop()].into_iter().flatten().collect();
+        let mut entries = collect(&desktop, &empty, &items, 5000);
+        entries.retain(|entry|fallback_desktop_entry(entry,&roots,||{
+            // Desktop namespace aliases can have filesystem parsing names,
+            // e.g. Documents or a cloud drive. Keep their original PIDLs and
+            // apply the namespace visibility policy instead of treating every
+            // filesystem-backed alias as a physical desktop file.
+            let namespace=desktop_namespace_key(entry);
+            namespace.as_deref().is_some_and(namespace_icon_visible)
+        }));entries
+    })
+}
+
+struct DesktopSnapshot{entries:Vec<ShellEntry>,flags_before:u32,flags_after:u32}
+fn select_desktop_snapshot(live:Result<DesktopSnapshot>,fallback:impl FnOnce()->Vec<ShellEntry>)->Vec<ShellEntry>{
+    // FWF_NOICONS is used by our organize mode itself and can suppress the
+    // view inventory. Empty is authoritative only when neither boundary read
+    // is suppressed; a flag-query/read failure also uses the filtered source.
+    match live{
+        Ok(snapshot) if (snapshot.flags_before|snapshot.flags_after)&FWF_NOICONS.0 as u32==0=>snapshot.entries,
+        _=>fallback(),
     }
-    let flags = (SHCONTF_FOLDERS.0 | SHCONTF_NONFOLDERS.0 | if show_hidden() { SHCONTF_INCLUDEHIDDEN.0 } else { 0 }) as u32;
-    let mut items = None;
-    let _ = unsafe { desktop.EnumObjects(HWND::default(), flags, &mut items) };
-    let Some(items) = items else { return Vec::new() };
-    let mut entries = collect(&desktop, &empty, &items, 5000);
-    entries.retain(|e| e.is_file_system || namespace_icon_visible(&e.key));
-    entries
+}
+fn direct_desktop_child(entry:&ShellEntry,roots:&[PathBuf])->bool{
+    use std::os::windows::ffi::OsStrExt;
+    let units=|path:&Path|path.as_os_str().encode_wide().map(|unit|if unit==47{92}else{unit}).collect::<Vec<_>>();
+    entry.is_file_system&&entry.path.as_deref().and_then(Path::parent).is_some_and(|parent|roots.iter().any(|root|{
+        let mut parent=units(parent);let mut root=units(root);while parent.len()>3&&parent.last()==Some(&92){parent.pop();}while root.len()>3&&root.last()==Some(&92){root.pop();}
+        (unsafe{windows::Win32::Globalization::CompareStringOrdinal(&parent,&root,true)})==windows::Win32::Globalization::CSTR_EQUAL
+    }))
+}
+fn fallback_desktop_entry(entry:&ShellEntry,roots:&[PathBuf],namespace_visible:impl FnOnce()->bool)->bool{
+    direct_desktop_child(entry,roots)||namespace_visible()
+}
+fn desktop_namespace_key(entry:&ShellEntry)->Option<String>{
+    // System.NamespaceCLSID is public Shell metadata (propkey.h); parsing-name
+    // strings alone lose this identity for filesystem-backed namespace icons.
+    const KEY:windows::Win32::Foundation::PROPERTYKEY=windows::Win32::Foundation::PROPERTYKEY{
+        fmtid:windows::core::GUID::from_u128(0x28636aa6_953d_11d2_b5d6_00c04fd918d0),pid:6};
+    let namespace=pidl::item_from_pidl(&entry.pidl).and_then(|item|item.cast::<IShellItem2>())
+        .and_then(|item|unsafe{item.GetCLSID(&KEY)}).ok().filter(|id|*id!=windows::core::GUID::zeroed());
+    namespace.map(|id|format!("::{{{id:?}}}")).or_else(||entry.key.starts_with("::{").then(||entry.key.clone()))
+}
+fn namespace_visibility(user:Option<u32>,machine:Option<u32>,default_visible:bool)->bool{
+    user.or(machine).map_or(default_visible,|value|value==0)
 }
 
 /// Default visibility of desktop namespace icons ("桌面图标设置").
 fn namespace_icon_visible(key: &str) -> bool {
-    let Some(clsid) = key.strip_prefix("::") else { return true };
+    let Some(clsid) = key.strip_prefix("::") else { return false };
     let name: Vec<u16> = clsid.encode_utf16().chain(Some(0)).collect();
-    let mut value = 0u32;
-    let mut size = 4u32;
-    let ok = unsafe { RegGetValueW(HKEY_CURRENT_USER, w!("Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\HideDesktopIcons\\NewStartPanel"),
-        PCWSTR(name.as_ptr()), RRF_RT_REG_DWORD, None, Some((&mut value as *mut u32).cast()), Some(&mut size)) }.is_ok();
-    if ok { return value == 0; }
+    let read=|hive|{let mut value=0u32;let mut size=4u32;
+        unsafe{RegGetValueW(hive,w!("Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\HideDesktopIcons\\NewStartPanel"),
+            PCWSTR(name.as_ptr()),RRF_RT_REG_DWORD,None,Some((&mut value as*mut u32).cast()),Some(&mut size))}.is_ok().then_some(value)};
     // Without a stored value only the Recycle Bin is shown.
-    clsid.eq_ignore_ascii_case("{645FF040-5081-101B-9F08-00AA002F954E}")
+    namespace_visibility(read(HKEY_CURRENT_USER),read(HKEY_LOCAL_MACHINE),clsid.eq_ignore_ascii_case("{645FF040-5081-101B-9F08-00AA002F954E}"))
+}
+
+fn collect_desktop_snapshot(folder:&IShellFolder,parent:&[u8],items:&IEnumIDList,limit:usize)->Result<Vec<ShellEntry>>{
+    let mut entries=Vec::new();loop{
+        let mut child=[std::ptr::null_mut::<ITEMIDLIST>()];let mut fetched=0;
+        let status=unsafe{items.Next(&mut child,Some(&mut fetched))};
+        if status.is_err()||fetched==0||entries.len()>=limit{
+            if !child[0].is_null(){unsafe{CoTaskMemFree(Some(child[0].cast()))};}
+            status.ok()?;if fetched==0{return Ok(entries);}
+            return Err(windows::core::Error::from_hresult(windows::core::HRESULT(0x800700eau32 as i32)));
+        }
+        let entry=if !child[0].is_null(){let entry=describe(folder,parent,child[0]);unsafe{CoTaskMemFree(Some(child[0].cast()))};entry}else{None};
+        entries.push(entry.ok_or_else(||windows::core::Error::from_hresult(windows::core::HRESULT(0x80004005u32 as i32)))?);
+    }
 }
 
 /// Contents of a folder (absolute path).
@@ -391,6 +448,48 @@ pub fn set_autostart(value_name:&str,expected:&str,enabled:bool)->Result<()> {
         }
         AutostartChange::Delete => unsafe { RegDeleteKeyValueW(HKEY_CURRENT_USER, RUN_KEY, PCWSTR(name.as_ptr())) }.ok(),
         AutostartChange::Unchanged=>Ok(()),
+    }
+}
+
+#[cfg(test)]mod desktop_inventory_tests{
+    use super::*;
+    fn entry(path:&str)->ShellEntry{ShellEntry{key:path.into(),name:path.into(),pidl:vec![2,0,0,0],is_folder:true,is_file_system:true,is_link:false,is_stream:false,can_drop:true,ghosted:false,path:Some(path.into()),size:None,modified:None}}
+    #[test]fn empty_live_desktop_is_not_replaced_with_namespace_enumeration(){
+        assert!(select_desktop_snapshot(Ok(DesktopSnapshot{entries:Vec::new(),flags_before:0,flags_after:0}),||panic!("successful unsuppressed empty view must remain empty")).is_empty());
+        let fallback=entry(r"C:\Users\Test\Desktop\file.txt");
+        let value=select_desktop_snapshot(Err(windows::core::Error::from_hresult(windows::core::HRESULT(0x80004005u32 as i32))),||vec![fallback.clone()]);
+        assert_eq!(value,vec![fallback]);
+    }
+    #[test]fn suppressed_live_inventory_uses_filtered_desktop_items_instead_of_deleting_them(){
+        let physical=entry(r"C:\Users\Test\Desktop\file.txt");
+        let roots=vec![PathBuf::from(r"C:\Users\Test\Desktop")];
+        let hidden_alias=entry(r"C:\Users\Test\Documents");
+        let suppressed=FWF_NOICONS.0 as u32;
+        for (flags_before,flags_after) in [(suppressed,suppressed),(suppressed,0),(0,suppressed)]{
+            let actual=select_desktop_snapshot(Ok(DesktopSnapshot{entries:Vec::new(),flags_before,flags_after}),||{
+                [physical.clone(),hidden_alias.clone()].into_iter().filter(|item|fallback_desktop_entry(item,&roots,||false)).collect()
+            });
+            assert_eq!(actual,vec![physical.clone()],"hiding desktop icons must preserve real automatic loose items without admitting hidden namespace aliases");
+        }
+        let actual=select_desktop_snapshot(Ok(DesktopSnapshot{entries:vec![physical.clone()],flags_before:0,flags_after:0}),||panic!("complete live view needs no fallback"));
+        assert_eq!(actual,vec![physical]);
+    }
+    #[test]fn filesystem_aliases_are_not_physical_desktop_children(){
+        let roots=vec![PathBuf::from(r"C:\Users\Test\Desktop"),PathBuf::from(r"C:\Users\Public\Desktop")];
+        for path in [r"C:\Users\Test\Desktop",r"C:\Users\Test",r"C:\Users\Test\Documents",r"C:\Users\Test\Music",r"C:\Users\Test\Downloads",r"C:\Users\Test\Pictures",r"C:\Users\Test\Videos",r"E:\Cloud\Provider"]{
+            assert!(!fallback_desktop_entry(&entry(path),&roots,||false),"hidden namespace alias admitted: {path}");
+        }
+        for path in [r"C:\Users\Test\Desktop\folder",r"c:\users\test\desktop\link.lnk",r"C:\Users\Public\Desktop\shared.lnk"]{
+            assert!(fallback_desktop_entry(&entry(path),&roots,||panic!("physical desktop child needs no namespace exception")));
+        }
+        assert!(!fallback_desktop_entry(&entry(r"C:\Users\Test\Desktop\folder\nested.txt"),&roots,||false));
+        let visible_namespace=entry(r"C:\Users\Test");let saved=visible_namespace.clone();
+        assert!(fallback_desktop_entry(&visible_namespace,&roots,||true));assert_eq!(visible_namespace,saved,"visibility checking must preserve the original namespace PIDL");
+    }
+    #[test]fn desktop_namespace_visibility_honors_user_override_and_machine_defaults(){
+        assert!(namespace_visibility(Some(0),Some(1),false));assert!(!namespace_visibility(Some(1),Some(0),true));
+        assert!(namespace_visibility(None,Some(0),false));assert!(!namespace_visibility(None,Some(1),true));
+        assert!(namespace_visibility(None,None,true));assert!(!namespace_visibility(None,None,false));
     }
 }
 
