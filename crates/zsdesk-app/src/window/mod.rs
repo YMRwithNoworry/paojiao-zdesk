@@ -30,6 +30,7 @@ mod startup_settings;
 mod context_menu;
 mod context_manager;
 #[cfg(test)]mod context_menu_regression;
+#[cfg(test)]mod session_regression;
 mod listary;
 mod mouse_navigation;
 mod dual_pane;
@@ -470,6 +471,7 @@ struct WindowState {
     fullscreen_restore: Option<window_actions::FullscreenRestore>,
     wheel_remainder: i32,
     secondary_window: bool,
+    session_ownership: Option<crate::instance::Instance>,
     preview_rect: Option<LayoutRect>,
 }
 
@@ -499,6 +501,7 @@ impl WindowState {
             search_settings_job:None,
             fullscreen_restore:None,wheel_remainder:0,
             secondary_window:false,
+            session_ownership:None,
             preview_rect:None,
             shell_registry:None,
             shell_registration_warning:false,
@@ -795,6 +798,13 @@ impl WindowState {
 
     fn save(&mut self) {
         if self.picker.is_some(){return;}
+        if self.secondary_window{
+            match crate::instance::try_own_session(&self.config_path){
+                Ok(Some(owner))=>{self.session_ownership=Some(owner);self.secondary_window=false;},
+                Ok(None)=>{},
+                Err(error)=>{diagnostics::record("session","ownership-check-failed",None);crate::runtime::trace(&format!("session ownership: {error:#}"));},
+            }
+        }
         if let Ok(saved)=storage::load(&self.config_path){self.session.ui.file_dialog_takeover=saved.ui.file_dialog_takeover;}
         if let Some(options)=crate::context_preferences::current(&self.config_path){self.session.ui.context_menu=options;}
         match storage::save_window_with_shared_preferences(&self.config_path,&self.canonical_session(),self.secondary_window,&self.search_saved_preferences,&self.bookmarks_saved){

@@ -181,6 +181,17 @@ fn trim_cold_icons(icons: &mut HashMap<IconKey, IconSlot>, visible: &HashSet<Ico
     }
 }
 
+/// Collapse/hide releases rendering allocations and pending extraction, while
+/// retaining a small decoded working set for the next expansion. Shutdown and
+/// Shell change notifications still remove obsolete content completely.
+fn retain_decoded_icons(icons:&mut HashMap<IconKey,IconSlot>){
+    icons.retain(|_,slot|{
+        slot.bitmap=None;slot.request=None;
+        slot.wic.is_some()
+    });
+    trim_cold_icons(icons,&HashSet::new());
+}
+
 #[derive(Clone)]
 pub struct Monitor { pub name: String, pub work: RECT, pub dpi: u32, pub primary: bool }
 
@@ -1137,7 +1148,7 @@ impl DesktopHost {
     fn prune_icon_cache(&mut self) {
         let active = self.fences.iter().any(|w| (!self.config.settings.hidden || w.standalone) && self.config.fence(w.id).is_some_and(|f| !w.collapsed(f) && !f.is_hidden_tab()));
         if !active {
-            self.icons.clear();
+            retain_decoded_icons(&mut self.icons);
             self.loader.retain_requests(&HashSet::new());
             if self.icon_content_active { self.gfx.release_device_resources(); }
         } else {
@@ -1156,7 +1167,7 @@ impl DesktopHost {
             }
             self.prune_icon_cache(); return;
         }
-        self.icons.clear();
+        retain_decoded_icons(&mut self.icons);
         self.loader.retain_requests(&HashSet::new());
         self.gfx.release_device_resources();
         for win in &mut self.fences {
@@ -2893,6 +2904,26 @@ mod shortcut_tests {
 #[cfg(test)]
 mod memory_tests {
     use super::*;
+    #[test]
+    fn collapsed_icon_cache_keeps_decoded_pixels_and_cancels_stale_requests()->anyhow::Result<()>{
+        use windows::Win32::{System::Com::{CoInitializeEx,CoUninitialize,COINIT_APARTMENTTHREADED,CoCreateInstance,CLSCTX_INPROC_SERVER},
+            Graphics::Imaging::{IWICImagingFactory,CLSID_WICImagingFactory,GUID_WICPixelFormat32bppPBGRA}};
+        unsafe{CoInitializeEx(None,COINIT_APARTMENTTHREADED)}.ok()?;
+        struct Apartment;impl Drop for Apartment{fn drop(&mut self){unsafe{CoUninitialize();}}}let _apartment=Apartment;
+        let factory:IWICImagingFactory=unsafe{CoCreateInstance(&CLSID_WICImagingFactory,None,CLSCTX_INPROC_SERVER)}?;
+        let source:IWICBitmapSource=unsafe{factory.CreateBitmapFromMemory(1,1,&GUID_WICPixelFormat32bppPBGRA,4,&[1,2,3,255])}?.cast()?;
+        drop(factory);
+        let mut icons=HashMap::new();
+        for i in 0..160u64{let mut slot=IconSlot::new((Some(4),Some(i)),i);slot.wic=Some(source.clone());slot.source_bytes=4;slot.request=Some(i+1);icons.insert((i.to_string(),48),slot);}
+        let mut pending=IconSlot::new((None,None),200);pending.request=Some(999);icons.insert(("pending-only".into(),48),pending);
+        retain_decoded_icons(&mut icons);
+        assert_eq!(icons.len(),MAX_COLD_ICONS);assert!(!icons.contains_key(&("pending-only".into(),48)));
+        assert!(icons.values().all(|slot|slot.request.is_none()&&slot.bitmap.is_none()));
+        let slot=&icons[&("159".into(),48)];assert_eq!(slot.signature,(Some(4),Some(159)));
+        let mut pixels=[0u8;4];unsafe{slot.wic.as_ref().unwrap().CopyPixels(std::ptr::null(),4,&mut pixels)}?;assert_eq!(pixels,[1,2,3,255]);
+        retain_decoded_icons(&mut icons);assert_eq!(icons.len(),MAX_COLD_ICONS);
+        Ok(())
+    }
     #[test]
     fn cold_icon_cache_is_lru_bounded_without_evicting_visible_icons() {
         let mut icons = HashMap::new();
