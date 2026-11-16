@@ -180,9 +180,12 @@ fn native_screen_edges_reach_close_and_top_tabs()->Result<()>{
         Ok(serde_json::json!({"worker_pid":pid,"worker_exited":true,"checks":report}))
     })();
     let closed=unsafe{CloseDesktop(desktop)}!=0;let close_error=unsafe{windows::Win32::Foundation::GetLastError()}.0;
-    let reopened=unsafe{OpenDesktopW(encoded.as_ptr(),0,0,0x000f00ff)};let absent=reopened.is_null();if !absent{let _=unsafe{CloseDesktop(reopened)};}
-    let report=result?;ensure!(closed&&absent,"private desktop cleanup failed: {close_error}");
-    println!("{}",serde_json::json!({"state":"passed","result":report,"desktop_closed":true,"desktop_absent":true,"desktop_switched":false}));Ok(())
+    let reopened=unsafe{OpenDesktopW(encoded.as_ptr(),0,0,0x000f00ff)};let absent=reopened.is_null();
+    let inspection_closed=absent||unsafe{CloseDesktop(reopened)}!=0;
+    // CloseDesktop releases our handle; the window station can retain the
+    // named object. Verify owned windows/processes and every handle we opened.
+    let report=result?;ensure!(closed&&inspection_closed,"private desktop handle cleanup failed: {close_error}");
+    println!("{}",serde_json::json!({"state":"passed","result":report,"desktop_handle_closed":true,"desktop_name_still_exists":!absent,"desktop_switched":false}));Ok(())
 }
 
 struct FocusWindow(HWND);
