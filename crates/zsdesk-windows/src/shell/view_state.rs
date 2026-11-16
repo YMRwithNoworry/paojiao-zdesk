@@ -126,12 +126,8 @@ impl ExplorerBrowserHost {
     pub unsafe fn restore_view(&self,state:&ShellViewState) {
         let Ok(shell_view)=(unsafe {self.current_view()}) else {return;};
         let Ok(view)=shell_view.cast::<IFolderView2>() else {return;};
-        if (1..=8).contains(&state.mode) && (8..=512).contains(&state.icon_size) {
-            let mut mode=FOLDERVIEWMODE(0);let mut icon=0;
-            let unchanged=unsafe {view.GetViewModeAndIconSize(&mut mode,&mut icon)}.is_ok()
-                && (mode.0,icon)==(state.mode,state.icon_size);
-            if !unchanged {let _=unsafe {view.SetViewModeAndIconSize(FOLDERVIEWMODE(state.mode),state.icon_size)};}
-        }
+        // The Shell property bag owns the folder's view mode and icon size.
+        // A tab snapshot may be stale after another tab or window changes it.
         restore_layout(&shell_view,&view,state);
         let _=sync_column_header(&view);
         // Clear once. Passing DESELECTOTHERS to SelectAndPositionItems applies

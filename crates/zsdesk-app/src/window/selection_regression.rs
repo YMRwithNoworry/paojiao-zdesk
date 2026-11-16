@@ -5,7 +5,7 @@ use anyhow::ensure;
 use serde_json::{json, Value};
 use windows::Win32::Foundation::PROPERTYKEY;
 use windows::{core::Interface, Win32::UI::Shell::{IFolderView2, IShellView, IColumnManager, CM_COLUMNINFO, CM_MASK_WIDTH,
-    FVM_DETAILS, SVGIO_ALLVIEW, SVGIO_SELECTION, SVSI_DESELECT, SVSI_SELECT,
+    FVM_DETAILS, FVM_ICON, SVGIO_ALLVIEW, SVGIO_SELECTION, SVSI_DESELECT, SVSI_SELECT,
     SVSI_FOCUSED, SVSI_DESELECTOTHERS}};
 
 #[link(name = "user32")]
@@ -148,6 +148,21 @@ fn check_same_folder_tabs_and_preview(slot:&Slot)->Result<Value> {
     let first_index=slot.borrow().as_ref().unwrap().session.active_tab;
     let location=slot.borrow().as_ref().unwrap().current_location().clone();
     let first=configure_layout(slot,false)?;
+    let stale_snapshot=zsdesk_core::model::explorer::ShellViewState{mode:FVM_DETAILS.0,icon_size:16,..Default::default()};
+    {
+        let borrowed=slot.borrow();
+        let browser=borrowed.as_ref().unwrap().browser.as_ref().unwrap();
+        browser.set_view_mode(FVM_ICON.0,96)?;
+        unsafe{browser.restore_view(&stale_snapshot);}
+    }
+    pump(120);
+    ensure!(snapshot(slot)?.mode==FVM_ICON.0&&snapshot(slot)?.icon_size==96,
+        "restoring a tab's old snapshot replaced the folder's current view mode");
+    {
+        let borrowed=slot.borrow();
+        borrowed.as_ref().unwrap().browser.as_ref().unwrap().set_view_mode(first.mode,first.icon_size)?;
+    }
+    pump(80);
     unsafe {slot.borrow_mut().as_mut().unwrap().new_tab(location);}
     wait_navigation(slot)?;
     let second_index=slot.borrow().as_ref().unwrap().session.active_tab;
