@@ -6,6 +6,7 @@ use windows::{core::{w,BOOL,Interface,PCWSTR},Win32::{Foundation::{HWND,LPARAM,W
 use crate::window::picker::{Event,FileType,NativeReply,Options,Outcome,SelectionKind};
 pub(crate) mod guard;
 mod watcher;
+mod capabilities;
 #[cfg(test)]#[path="file_dialog_takeover/native_tests.rs"]mod native_tests;
 fn wide(value:&str)->Vec<u16>{value.encode_utf16().chain(Some(0)).collect()}
 fn class(window:HWND)->String{let mut value=[0u16;128];let n=unsafe{GetClassNameW(window,&mut value)}.max(0)as usize;String::from_utf16_lossy(&value[..n])}
@@ -201,6 +202,7 @@ fn run(profile:&Path,stop:&AtomicBool)->Result<()>{
     let mut watcher:Option<watcher::Connection>=None;let mut enabled=false;let mut returning=HashMap::<u64,PendingReturn>::new();
     let mut refresh=Instant::now()-Duration::from_secs(3);let mut last_error=None::<String>;let mut previous=String::new();let mut completed=0u64;
     let mut last_kind=None::<&'static str>;let mut last_confirmation=None::<&'static str>;
+    let mut preserved_native=0u64;let mut last_preservation=None::<&'static str>;
     while !stop.load(Ordering::Acquire){
         if refresh.elapsed()>=Duration::from_secs(1){
             enabled=crate::storage::load(profile).is_ok_and(|session|session.ui.file_dialog_takeover);refresh=Instant::now();
@@ -214,6 +216,9 @@ fn run(profile:&Path,stop:&AtomicBool)->Result<()>{
             Event::Ready{token,window}=>if let Some(session)=sessions.iter_mut().find(|session|session.token==token){
                 session.picker=Some(window);
                 if enabled&&session.source.matches(){
+                    if let Some(reason)=capabilities::preservation(session.source.hwnd(),&parts(session.source.hwnd()),automation.as_ref()){
+                        session.close_picker();preserved_native+=1;last_preservation=Some(reason.key());last_kind=Some("native");last_confirmation=None;continue;
+                    }
                     let result=if let Some(early)=&session.early{early.bind(window)}else{guard::Guard::hide(session.source.clone(),window,token).map(|guard|session.guard=Some(guard))};
                     if let Err(error)=result{last_error=Some(error.to_string());session.close_picker();}
                 }else{session.close_picker();}
@@ -277,6 +282,14 @@ fn run(profile:&Path,stop:&AtomicBool)->Result<()>{
             let mut index=0;
             while index<preparing.len()&&sessions.len()<4{
                 let source=preparing[index].source();let dialog=source.hwnd();let part=parts(dialog);let token=preparing[index].token();
+                if part.shell&&!part.name.0.is_null(){
+                    if let Some(reason)=capabilities::preservation(dialog,&part,automation.as_ref()){
+                        // Releasing an unbound claim restores the same native
+                        // window. No replica is opened and no choice is sent.
+                        contracts.remove(&token);drop(preparing.remove(index));
+                        preserved_native+=1;last_preservation=Some(reason.key());last_kind=Some("native");last_confirmation=None;continue;
+                    }
+                }
                 let Some(kind)=dialog_kind(dialog,&part,automation.as_ref()).filter(|_|part.shell&&!part.name.0.is_null())else{contracts.entry(token).or_default().reset();index+=1;continue;};
                 if let(Some(initial),Some(multiple))=(text(part.address).and_then(|value|initial_location(&value)),automation.as_ref().and_then(|automation|multiple(automation,dialog))){
                     let accept=unsafe{GetDlgItem(Some(dialog),1)}.ok().and_then(text).unwrap_or_default();
@@ -285,6 +298,10 @@ fn run(profile:&Path,stop:&AtomicBool)->Result<()>{
                     // controls before applying FOS_PICKFOLDERS. Keep the native
                     // window masked while its complete contract settles.
                     if !contracts.entry(token).or_default().observe(contract,Instant::now()){index+=1;continue;}
+                    if let Some(reason)=capabilities::preservation(dialog,&part,automation.as_ref()){
+                        contracts.remove(&token);drop(preparing.remove(index));
+                        preserved_native+=1;last_preservation=Some(reason.key());last_kind=Some("native");last_confirmation=None;continue;
+                    }
                     contracts.remove(&token);let early=preparing.remove(index);let(types,filter)=types(part.types);
                     let initial_name=if kind.folders(){String::new()}else{text(part.name).filter(|name|!name.contains(['*','?'])).unwrap_or_default()};
                     let options=Options{token,title:kind.title().into(),initial,multiple,kind,initial_name,types,filter,events:tx.clone()};
@@ -299,7 +316,7 @@ fn run(profile:&Path,stop:&AtomicBool)->Result<()>{
                 }else{contracts.entry(token).or_default().reset();index+=1;}
             }
         }
-        let status=serde_json::json!({"pid":std::process::id(),"enabled":enabled,"active_pickers":sessions.len(),"awaiting_caller":returning.len(),"last_kind":last_kind,"last_confirmation":last_confirmation,"completed":completed,"last_error":last_error,"early_masking":watcher.is_some()}).to_string();
+        let status=serde_json::json!({"pid":std::process::id(),"enabled":enabled,"active_pickers":sessions.len(),"awaiting_caller":returning.len(),"last_kind":last_kind,"last_confirmation":last_confirmation,"completed":completed,"last_error":last_error,"early_masking":watcher.is_some(),"preserved_native":preserved_native,"last_preservation":last_preservation}).to_string();
         if status!=previous{let _=crate::quick_search::control::atomic_write(&profile.with_file_name("file-dialog-takeover-status.json"),status.as_bytes());previous=status;}
         thread::sleep(Duration::from_millis(10));
     }
