@@ -12,10 +12,10 @@ const RESULTS:u32=WM_APP+101;const UPDATE:u32=WM_APP+102;const DEBOUNCE:usize=1;
 thread_local!{static SEARCH:Cell<isize>=const{Cell::new(0)};}
 #[cfg(test)]thread_local!{static TEST_NO_ACTIVATE:Cell<bool>=const{Cell::new(false)};}
 #[derive(Clone,Copy,PartialEq)]enum Kind{Search,About,Shortcuts}
-struct UpdateReply{alive:AtomicBool,value:Mutex<Option<Result<String,String>>>}
+struct UpdateReply{alive:AtomicBool,value:Mutex<Option<Result<crate::update_check::Outcome,String>>>}
 struct Panel{hwnd:HWND,edit:HWND,list:HWND,action:HWND,close:HWND,font:HFONT,title_font:HFONT,brush:HBRUSH,input_brush:HBRUSH,
     dpi:u32,palette:Palette,kind:Kind,profile:PathBuf,body:String,status:String,paths:Vec<PathBuf>,engine:Option<FastSearch>,generation:u64,reply:Arc<UpdateReply>,adopted:bool,
-    info:Vec<InfoRow>,scroll:i32,busy:bool,search_error:bool}
+    info:Vec<InfoRow>,scroll:i32,busy:bool,search_error:bool,update_release:Option<crate::update_check::Release>,update_package:Option<(PathBuf,bool,String)>}
 impl Drop for Panel{fn drop(&mut self){self.reply.alive.store(false,Ordering::Release);if let Some(engine)=&self.engine{engine.cancel();}
     unsafe{let _=DeleteObject(self.font.into());let _=DeleteObject(self.title_font.into());let _=DeleteObject(self.brush.into());let _=DeleteObject(self.input_brush.into());}}}
 fn wide(s:&str)->Vec<u16>{s.encode_utf16().chain(Some(0)).collect()}
@@ -54,6 +54,12 @@ pub(crate) fn show_search(profile:&Path)->Result<()>{
 }
 pub(crate) fn about(owner:HWND,profile:&Path)->Result<()>{show(owner,profile,Kind::About,
     format!("ZSDesk {} {}\r\n\r\n多标签文件管理器与桌面格子\r\n\r\n项目主页  github.com/qiu7824/zsdesk",env!("CARGO_PKG_VERSION"),crate::edition::name())).map(|_|())}
+pub(crate) fn offer_update(owner:HWND,profile:&Path,release:crate::update_check::Release)->Result<()>{
+    let hwnd=show(owner,profile,Kind::About,format!("ZSDesk {} {}",env!("CARGO_PKG_VERSION"),crate::edition::name()))?;
+    let pointer=unsafe{GetWindowLongPtrW(hwnd,GWLP_USERDATA)}as*const RefCell<Panel>;
+    if !pointer.is_null(){unsafe{&*pointer}.borrow_mut().update_result(Ok(crate::update_check::Outcome::Available(release)));}
+    Ok(())
+}
 pub(crate) fn shortcuts(owner:HWND,profile:&Path,body:&str)->Result<()>{
     let prefs=crate::quick_search::control::load(profile)?.preferences;
     let body=format!("{body}\n\n全局搜索\n{} 打开快速搜索（{}）",prefs.hotkey,if prefs.enabled{"已启用"}else{"未启用"});
@@ -71,7 +77,7 @@ fn show(owner:HWND,profile:&Path,kind:Kind,body:String)->Result<HWND>{
     let state=Rc::new(RefCell::new(Panel{hwnd:HWND::default(),edit:HWND::default(),list:HWND::default(),action:HWND::default(),close:HWND::default(),
         font:HFONT::default(),title_font:HFONT::default(),brush:HBRUSH::default(),input_brush:HBRUSH::default(),dpi:96,palette,kind,profile:profile.into(),body,
         status:match kind{Kind::Search=>"输入关键词搜索文件和文件夹".into(),Kind::Shortcuts=>"滚动查看全部快捷键 · Esc 关闭".into(),Kind::About=>String::new()},paths:Vec::new(),engine:None,generation:0,
-        reply:Arc::new(UpdateReply{alive:AtomicBool::new(true),value:Mutex::new(None)}),adopted:false,info,scroll:0,busy:false,search_error:false}));
+        reply:Arc::new(UpdateReply{alive:AtomicBool::new(true),value:Mutex::new(None)}),adopted:false,info,scroll:0,busy:false,search_error:false,update_release:None,update_package:None}));
     let pointer=Rc::into_raw(state.clone());
     let result=unsafe{CreateWindowExW(WINDOW_EX_STYLE::default(),w!("ZSDesk.UtilityPanel"),PCWSTR(wide(caption).as_ptr()),WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU|WS_THICKFRAME|WS_CLIPCHILDREN,
         CW_USEDEFAULT,CW_USEDEFAULT,740,560,(!owner.0.is_null()).then_some(owner),None,Some(instance),Some(pointer.cast()))};
@@ -124,7 +130,11 @@ impl Panel{
             unsafe{SendMessageW(self.list,LB_SETITEMHEIGHT,Some(WPARAM(0)),Some(LPARAM(self.s(58)as isize)));}
             self.action=self.child(w!("BUTTON"),"打开文件位置",12,WS_TABSTOP)?;
             let _=unsafe{EnableWindow(self.action,false)};
-        }else if self.kind==Kind::About{self.action=self.child(w!("BUTTON"),"检查更新",12,WS_TABSTOP)?;self.child(w!("BUTTON"),"项目主页",14,WS_TABSTOP)?;}
+        }else if self.kind==Kind::About{
+            self.action=self.child(w!("BUTTON"),"检查更新",12,WS_TABSTOP)?;self.child(w!("BUTTON"),"项目主页",14,WS_TABSTOP)?;
+            let automatic=self.child(w!("BUTTON"),"启动时检查更新",15,WS_TABSTOP|WINDOW_STYLE(BS_AUTOCHECKBOX as u32))?;
+            unsafe{SendMessageW(automatic,BM_SETCHECK,Some(WPARAM(usize::from(crate::update_check::automatic(&self.profile)))),None);}
+        }
         else{self.action=self.child(w!("BUTTON"),"搜索快捷键设置",12,WS_TABSTOP)?;}
         self.close=self.child(w!("BUTTON"),"关闭",13,WS_TABSTOP)?;self.layout();Ok(())
     }
@@ -134,6 +144,7 @@ impl Panel{
             (self.list,s(16),s(120),width-s(32),height-s(194)),(self.action,s(20),height-s(48),s(if self.kind==Kind::Shortcuts{176}else{148}),s(32)),(self.close,width-s(100),height-s(48),s(80),s(32))]{
             if !hwnd.0.is_null(){let _=unsafe{SetWindowPos(hwnd,None,x,y,w.max(1),h.max(1),SWP_NOZORDER|SWP_NOACTIVATE)};}}
         if let Ok(link)=unsafe{GetDlgItem(Some(self.hwnd),14)}{let _=unsafe{SetWindowPos(link,None,s(180),height-s(48),s(100),s(32),SWP_NOZORDER|SWP_NOACTIVATE)};}
+        if let Ok(check)=unsafe{GetDlgItem(Some(self.hwnd),15)}{let _=unsafe{SetWindowPos(check,None,s(290),height-s(48),s(150),s(32),SWP_NOZORDER|SWP_NOACTIVATE)};}
         self.update_scroll();let _=unsafe{InvalidateRect(Some(self.edit),None,false)};let _=unsafe{InvalidateRect(Some(self.hwnd),None,false)};
     }
     fn search(&mut self){
@@ -205,10 +216,27 @@ impl Panel{
         }else{let result=unsafe{ShellExecuteW(Some(self.hwnd),w!("open"),PCWSTR(wide(&path.to_string_lossy()).as_ptr()),None,None,SW_SHOWNORMAL)};
             if result.0 as isize<=32{self.status="无法打开文件，请检查关联程序和文件位置".into();}else{let _=unsafe{PostMessageW(Some(self.hwnd),WM_CLOSE,WPARAM(0),LPARAM(0))};}}
     }
-    fn updates(&mut self){self.status="正在检查更新…".into();unsafe{EnableWindow(self.action,false);}
+    fn update_result(&mut self,result:Result<crate::update_check::Outcome,String>){
+        use crate::update_check::Outcome;
+        match result{
+            Ok(Outcome::Available(release))=>{self.status=format!("发现新版本 {} · 是否下载更新？",release.tag);self.update_release=Some(release);set_text(self.action,"下载更新");},
+            Ok(Outcome::Current(message))=>{self.status=message;self.update_release=None;set_text(self.action,"检查更新");},
+            Ok(Outcome::Downloaded(path,portable,hash))=>{
+                self.status=if portable{"校验完成 · 退出程序后解压更新包，保留 data 目录".into()}else{"校验完成 · 安装前请退出正在运行的 ZSDesk".into()};
+                self.update_package=Some((path,portable,hash));set_text(self.action,if portable{"打开更新包"}else{"安装更新"});
+            },Err(error)=>self.status=error,
+        }
+        unsafe{EnableWindow(self.action,true);InvalidateRect(Some(self.hwnd),None,false);}
+    }
+    fn updates(&mut self){
+        if let Some((path,_,hash))=&self.update_package{
+            if let Err(error)=crate::update_check::open_download(self.hwnd,path,hash){self.status=format!("无法打开更新包：{error:#}");self.update_package=None;set_text(self.action,"重新下载");}return;
+        }
+        let release=self.update_release.clone();
+        self.status=if release.is_some(){"正在下载并校验更新…".into()}else{"正在检查更新…".into()};unsafe{EnableWindow(self.action,false);}
         let reply=self.reply.clone();let hwnd=self.hwnd.0 as isize;
         if std::thread::Builder::new().name("zsdesk-update-check".into()).spawn(move||{
-            let result=crate::update_check::check().map_err(|error|format!("检查失败：{error:#}"));
+            let result=match release{Some(release)=>crate::update_check::download(&release,&reply.alive),None=>crate::update_check::check()}.map_err(|error|format!("更新失败：{error:#}"));
             if reply.alive.load(Ordering::Acquire){*reply.value.lock().unwrap_or_else(|e|e.into_inner())=Some(result);let _=unsafe{PostMessageW(Some(HWND(hwnd as*mut _)),UPDATE,WPARAM(0),LPARAM(0))};}
         }).is_err(){self.status="无法启动更新检查".into();unsafe{EnableWindow(self.action,true);}}
     }
@@ -243,7 +271,7 @@ unsafe extern "system" fn procedure(hwnd:HWND,msg:u32,wp:WPARAM,lp:LPARAM)->LRES
     match msg{
         WM_SIZE=>state.layout(),WM_ERASEBKGND=>return LRESULT(1),
         WM_DPICHANGED if lp.0!=0=>state.dpi_changed((wp.0&0xffff)as u32,unsafe{*(lp.0 as*const RECT)}),
-        WM_GETMINMAXINFO if lp.0!=0=>{let limits=unsafe{&mut*(lp.0 as*mut MINMAXINFO)};limits.ptMinTrackSize=POINT{x:state.s(if state.kind==Kind::About{500}else{600}),y:state.s(if state.kind==Kind::About{400}else{420})};},
+        WM_GETMINMAXINFO if lp.0!=0=>{let limits=unsafe{&mut*(lp.0 as*mut MINMAXINFO)};limits.ptMinTrackSize=POINT{x:state.s(if state.kind==Kind::About{560}else{600}),y:state.s(if state.kind==Kind::About{400}else{420})};},
         WM_APPPLUS_SCROLL=>state.scroll_info(wp.0 as u32,lp.0 as i32),
         WM_APPPLUS_EMPTY if lp.0==state.list.0 as isize=>{let mut rect=RECT::default();if unsafe{GetClientRect(state.list,&mut rect)}.is_ok(){state.paint_empty_results(HDC(wp.0 as*mut _),rect);}return LRESULT(0);},
         WM_CTLCOLOREDIT|WM_CTLCOLORSTATIC=>{let dc=HDC(wp.0 as*mut _);unsafe{SetTextColor(dc,rgb(state.palette.text));SetBkColor(dc,rgb(state.palette.input_focused));}return LRESULT(state.input_brush.0 as isize);},
@@ -272,11 +300,17 @@ unsafe extern "system" fn procedure(hwnd:HWND,msg:u32,wp:WPARAM,lp:LPARAM)->LRES
                 if let Err(error)=crate::quick_search::launch(&state.profile,true){state.status=format!("无法打开设置：{error:#}");}
             }}}
             else if id==14&&state.kind==Kind::About{unsafe{ShellExecuteW(Some(hwnd),w!("open"),w!("https://github.com/qiu7824/zsdesk/releases"),None,None,SW_SHOWNORMAL);}}
+            else if id==15&&state.kind==Kind::About{
+                if let Ok(check)=unsafe{GetDlgItem(Some(hwnd),15)}{
+                    let enabled=unsafe{SendMessageW(check,BM_GETCHECK,None,None)}.0!=0;
+                    if let Err(error)=crate::update_check::set_automatic(&state.profile,enabled){state.status=format!("无法保存更新设置：{error:#}");unsafe{SendMessageW(check,BM_SETCHECK,Some(WPARAM(usize::from(!enabled))),None);}}
+                }
+            }
             else if id==10&&event==EN_CHANGE&&state.kind==Kind::Search{state.invalidate_query();unsafe{SetTimer(Some(hwnd),DEBOUNCE,200,None);}}
             else if id==11&&event==LBN_DBLCLK{state.open_selected(false);}},
         WM_TIMER if wp.0==DEBOUNCE=>{if unsafe{GetPropW(state.edit,w!("ZSDesk.ImeActive"))}.0.is_null(){let _=unsafe{KillTimer(Some(hwnd),DEBOUNCE)};state.search();}},
         WM_TIMER if wp.0==DEFERRED_RESULTS=>{let _=unsafe{KillTimer(Some(hwnd),DEFERRED_RESULTS)};state.results();},
-        RESULTS=>state.results(),UPDATE=>{let result=state.reply.value.lock().unwrap_or_else(|e|e.into_inner()).take();if let Some(result)=result{state.status=result.unwrap_or_else(|message|message);unsafe{EnableWindow(state.action,true);}}},
+        RESULTS=>state.results(),UPDATE=>{let result=state.reply.value.lock().unwrap_or_else(|e|e.into_inner()).take();if let Some(result)=result{state.update_result(result);}},
         WM_APPPLUS_OPEN=>state.open_selected(wp.0!=0),
         _=>return unsafe{DefWindowProcW(hwnd,msg,wp,lp)},
     }

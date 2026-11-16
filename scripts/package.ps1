@@ -157,6 +157,9 @@ try {
         if ($identity.product -ne 'ZSDesk' -or $identity.version -ne $version -or $identity.edition -ne $edition -or $identity.network -ne $definition.Network -or $identity.desktop -ne $definition.Desktop -or $identity.themed -ne $definition.Themed -or [bool]$identity.desktop_only -ne [bool]$definition.DesktopOnly) { throw "Executable edition/version mismatch: $edition" }
         [IO.Directory]::CreateDirectory($stage) | Out-Null
         Copy-Item -LiteralPath $exe -Destination (Join-Path $stage 'ZSDesk.exe')
+        $windowHook=(Get-Content -LiteralPath (Join-Path $TargetDir 'release\ZSDeskWindowHook.name') -Raw).Trim()
+        if($windowHook -notmatch '^ZSDeskWindowHook-[0-9a-f]{16}\.dll$'){throw 'Invalid window hook identity'}
+        Copy-Item -LiteralPath (Join-Path $TargetDir "release\$windowHook") -Destination (Join-Path $stage $windowHook)
         foreach ($runtime in $runtimeFiles) {
             Copy-Item -LiteralPath (Join-Path $RuntimeDir $runtime) -Destination (Join-Path $stage $runtime)
         }

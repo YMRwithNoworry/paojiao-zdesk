@@ -5,14 +5,14 @@ use zsdesk_core::model::explorer::ShellLocation;
 use super::WindowState;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum TerminalKind { PowerShell, WindowsPowerShell, Nushell }
+pub(super) enum TerminalKind { PowerShell, WindowsPowerShell, Nushell, CommandPrompt }
 
 impl TerminalKind {
     fn executable(self) -> &'static str {
-        match self { Self::PowerShell => "pwsh.exe", Self::WindowsPowerShell => "powershell.exe", Self::Nushell => "nu.exe" }
+        match self { Self::PowerShell => "pwsh.exe", Self::WindowsPowerShell => "powershell.exe", Self::Nushell => "nu.exe", Self::CommandPrompt => "cmd.exe" }
     }
     fn label(self) -> &'static str {
-        match self { Self::PowerShell => "PowerShell 7", Self::WindowsPowerShell => "Windows PowerShell", Self::Nushell => "Nushell" }
+        match self { Self::PowerShell => "PowerShell 7", Self::WindowsPowerShell => "Windows PowerShell", Self::Nushell => "Nushell", Self::CommandPrompt => "命令提示符" }
     }
 }
 
@@ -27,11 +27,15 @@ pub(super) fn parse(text: &str) -> Option<Result<TerminalRequest, &'static str>>
     let name = first.strip_suffix(".exe").unwrap_or(&first);
     let kind = match name {
         "pwsh" => TerminalKind::PowerShell, "powershell" => TerminalKind::WindowsPowerShell,
-        "nu" | "nushell" => TerminalKind::Nushell, _ => return None,
+        "nu" | "nushell" => TerminalKind::Nushell, "cmd" => TerminalKind::CommandPrompt, _ => return None,
     };
     let mut arguments = Vec::new();
     for word in words {
         let canonical = match (kind, word.to_ascii_lowercase().as_str()) {
+            (TerminalKind::CommandPrompt, "/d") => "/D",
+            (TerminalKind::CommandPrompt, "/q") => "/Q",
+            (TerminalKind::CommandPrompt, "/a") => "/A",
+            (TerminalKind::CommandPrompt, "/u") => "/U",
             (TerminalKind::PowerShell | TerminalKind::WindowsPowerShell, "-noprofile") => "-NoProfile",
             (TerminalKind::PowerShell | TerminalKind::WindowsPowerShell, "-nologo") => "-NoLogo",
             (TerminalKind::PowerShell | TerminalKind::WindowsPowerShell, "-noexit") => "-NoExit",
@@ -70,12 +74,16 @@ fn executable_on_path(name: &OsStr) -> Option<PathBuf> {
 }
 
 fn resolve(kind: TerminalKind) -> Option<PathBuf> {
+    if kind==TerminalKind::CommandPrompt {
+        return std::env::var_os("SystemRoot").map(PathBuf::from)
+            .filter(|root|root.is_absolute()).map(|root|root.join(r"System32\cmd.exe")).filter(|path|path.is_file());
+    }
     executable_on_path(OsStr::new(kind.executable())).or_else(|| match kind {
         TerminalKind::PowerShell => std::env::var_os("ProgramFiles").map(PathBuf::from)
             .map(|root| root.join(r"PowerShell\7\pwsh.exe")).filter(|path| path.is_file()),
         TerminalKind::WindowsPowerShell => std::env::var_os("SystemRoot").map(PathBuf::from)
             .map(|root| root.join(r"System32\WindowsPowerShell\v1.0\powershell.exe")).filter(|path| path.is_file()),
-        TerminalKind::Nushell => None,
+        TerminalKind::Nushell | TerminalKind::CommandPrompt => None,
     })
 }
 
@@ -96,6 +104,9 @@ impl WindowState {
 
     pub(super) fn launch_terminal(&mut self, request: &TerminalRequest) -> bool {
         let Some(directory) = self.terminal_working_directory() else { return false };
+        if request.kind==TerminalKind::CommandPrompt&&directory.to_string_lossy().starts_with(r"\\"){
+            self.show_message("CMD 不支持网络路径作为工作目录，请使用 PowerShell 或 pwsh".into());return false;
+        }
         let Some(executable) = resolve(request.kind) else {
             self.show_message(format!("未找到 {}（{}），请安装并加入 PATH", request.kind.label(), request.kind.executable()));
             return false;
@@ -129,10 +140,18 @@ mod tests {
         assert_eq!(pwsh.kind, TerminalKind::PowerShell);
         assert_eq!(pwsh.arguments, ["-NoProfile", "-NoLogo"]);
         assert_eq!(parse("nushell -n --no-history").unwrap().unwrap().kind, TerminalKind::Nushell);
-        for text in ["pwsh -Command Get-Date", "powershell -EncodedCommand abc", "nu -c ls", "nu script.nu", "pwsh -NoProfile;exit", "nu > out.txt", "pwsh -STA -MTA"] {
+        for text in ["pwsh -Command Get-Date", "powershell -EncodedCommand abc", "nu -c ls", "nu script.nu", "pwsh -NoProfile;exit", "nu > out.txt", "pwsh -STA -MTA", "cmd /c whoami", "cmd /k script.cmd", "cmd & calc"] {
             assert!(parse(text).unwrap().is_err(), "{text}");
         }
-        for text in [r"C:\pwsh", r".\pwsh.exe", "pwsh-backup", "cmd /c whoami", ""] { assert!(parse(text).is_none(), "{text}"); }
+        for text in [r"C:\pwsh", r".\pwsh.exe", "pwsh-backup", ""] { assert!(parse(text).is_none(), "{text}"); }
+    }
+    #[test]
+    fn command_prompt_uses_the_current_folder_without_evaluating_its_name() {
+        for text in ["cmd", "CMD.EXE", " cmd /d /q "] { assert_eq!(parse(text).unwrap().unwrap().kind,TerminalKind::CommandPrompt); }
+        let directory=Path::new(r"E:\中文 空格 & 资料");
+        let command=shell_command(Path::new(r"C:\Windows\System32\cmd.exe"), &["/D"], directory);
+        assert_eq!(command.get_current_dir(),Some(directory));
+        assert_eq!(command.get_args().collect::<Vec<_>>(),[OsStr::new("/D")]);
     }
     #[test]
     fn virtual_locations_do_not_fall_back_to_an_unrelated_directory() {

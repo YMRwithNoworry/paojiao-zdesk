@@ -528,7 +528,8 @@ impl Client{
             return Some(match error{Some(error)=>Err(self.last_status.as_ref().filter(|status|status.error.is_some()).map_or_else(||anyhow::anyhow!(error),worker_failure)),None=>Ok(self.last_status.as_ref().and_then(|status|status.outcome).unwrap_or(MenuOutcome::Dismissed))});
         }
         let showing=self.timing.parent_to_menu_microseconds.is_some();
-        if !self.committed&&!showing&&self.started.elapsed()>Duration::from_secs(30){
+        let preparation_limit=if matches!(self.mode,Mode::CatalogSelection|Mode::CatalogBackground){30}else{10};
+        if !self.committed&&!showing&&self.started.elapsed()>Duration::from_secs(preparation_limit){
             self.complete=true;self.cancel();let message="系统扩展菜单加载超时；文件管理窗口仍可使用，诊断已保留";
             self.record(None,Some(message));return Some(Err(anyhow::anyhow!(message)));
         }
@@ -575,6 +576,7 @@ pub struct AsyncClient {
     events:std::sync::mpsc::Receiver<AsyncEvent>,
     cancel:std::sync::Arc<std::sync::atomic::AtomicBool>,
     pid:std::sync::Arc<std::sync::atomic::AtomicU32>,complete:bool,
+    showing:std::sync::Arc<std::sync::atomic::AtomicBool>,
     layout:Option<ShellViewState>,
 }
 impl AsyncClient {
@@ -594,6 +596,7 @@ impl AsyncClient {
         let active=Active;
         let mut origin=Origin::capture();origin.layout=layout;origin.view_context=view_context;let owner=owner.0 as isize;let coordinates=(point.x,point.y);
         let (sender,events)=mpsc::sync_channel(4);let cancel=Arc::new(AtomicBool::new(false));let pid=Arc::new(AtomicU32::new(0));
+        let showing=Arc::new(AtomicBool::new(false));let shown=showing.clone();
         let stop=cancel.clone();let process=pid.clone();
         std::thread::Builder::new().name("zsdesk-menu-protocol".into()).spawn(move||{
             let _active=active;
@@ -617,12 +620,14 @@ impl AsyncClient {
                         }
                     }
                 });
+                shown.store(client.timing.parent_to_menu_microseconds.is_some(),Ordering::Release);
                 if let Some(result)=result {let layout=client.last_status.as_ref().and_then(|status|status.layout.clone());let created=client.last_status.as_ref().map(|status|status.created.clone()).unwrap_or_default();let catalog=client.last_status.as_ref().map(|status|status.catalog.clone()).unwrap_or_default();let _=sender.try_send(AsyncEvent::Finished(result,layout,created,catalog));notify_owner(owner);break;}
                 client.wait_for_progress(20);
             }
         }).context("无法启动菜单通信线程")?;
-        Ok(Self{events,cancel,pid,complete:false,layout:None,created:Vec::new(),catalog:Vec::new()})
+        Ok(Self{events,cancel,pid,showing,complete:false,layout:None,created:Vec::new(),catalog:Vec::new()})
     }
+    pub fn preparing(&self)->bool{!self.complete&&!self.cancel.load(Ordering::Acquire)&&!self.showing.load(Ordering::Acquire)}
     pub fn pid(&self)->Option<u32>{let pid=self.pid.load(Ordering::Acquire);(pid!=0).then_some(pid)}
     pub fn take_layout(&mut self)->Option<ShellViewState>{self.layout.take()}
     pub fn take_created(&mut self)->Vec<zsdesk_windows::shell::new_menu::CreatedItem>{std::mem::take(&mut self.created)}

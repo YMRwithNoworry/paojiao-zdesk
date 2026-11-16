@@ -1,9 +1,16 @@
 use super::*;
 use std::{cell::Cell,fs};
 use windows::{core::{implement,Ref},Win32::{System::{Com::CoTaskMemFree,Ole::{OleInitialize,OleUninitialize},Threading::GetCurrentThreadId},UI::Shell::*}};
+pub(super) static FIRST_ACTIVATION_ALPHA:std::sync::atomic::AtomicU64=std::sync::atomic::AtomicU64::new(999);
 unsafe extern "system" fn offscreen(code:i32,wp:WPARAM,lp:LPARAM)->windows::Win32::Foundation::LRESULT{
-    if code==HCBT_ACTIVATE as i32{return windows::Win32::Foundation::LRESULT(1);}
     let window=HWND(wp.0 as*mut _);
+    if code==HCBT_ACTIVATE as i32{
+        // Let the product's global hook run before blocking fixture activation.
+        let _=unsafe{CallNextHookEx(None,code,wp,lp)};
+        if class(window)=="#32770"{let mut alpha=255;let _=unsafe{GetLayeredWindowAttributes(window,None,Some(&mut alpha),None)};
+            let _=FIRST_ACTIVATION_ALPHA.compare_exchange(999,u64::from(alpha),Ordering::Relaxed,Ordering::Relaxed);}
+        return windows::Win32::Foundation::LRESULT(1);
+    }
     if lp.0!=0&&class(window)=="#32770"{
         if code==HCBT_CREATEWND as i32{let create=unsafe{&mut*(lp.0 as*mut CBT_CREATEWNDW)};if !create.lpcs.is_null(){unsafe{(*create.lpcs).x=-30000;(*create.lpcs).y=-30000;(*create.lpcs).dwExStyle|=WS_EX_NOACTIVATE|WS_EX_TOOLWINDOW;}}}
         if code==HCBT_MOVESIZE as i32{let rect=unsafe{&mut*(lp.0 as*mut windows::Win32::Foundation::RECT)};let width=rect.right-rect.left;let height=rect.bottom-rect.top;rect.left=-30000;rect.top=-30000;rect.right=rect.left+width;rect.bottom=rect.top+height;}
@@ -25,7 +32,7 @@ unsafe extern "system" fn offscreen(code:i32,wp:WPARAM,lp:LPARAM)->windows::Win3
     fn OnTypeChange(&self,dialog:Ref<IFileDialog>)->windows::core::Result<()>{if let Some(dialog)=dialog.as_ref(){eprintln!("native type changed: {:?}",unsafe{dialog.GetFileTypeIndex()});}Ok(())}
     fn OnOverwrite(&self,_:Ref<IFileDialog>,_:Ref<IShellItem>)->windows::core::Result<FDE_OVERWRITE_RESPONSE>{Ok(FDEOR_DEFAULT)}
 }
-fn original(directory:PathBuf,ready:mpsc::Sender<isize>,kind:SelectionKind,accept_label:Option<&str>)->Result<(Vec<PathBuf>,u32,bool)>{
+pub(super) fn original(directory:PathBuf,ready:mpsc::Sender<isize>,kind:SelectionKind,accept_label:Option<&str>)->Result<(Vec<PathBuf>,u32,bool)>{
     let hook=unsafe{SetWindowsHookExW(WH_CBT,Some(offscreen),None,GetCurrentThreadId())}?;struct Hook(HHOOK);impl Drop for Hook{fn drop(&mut self){let _=unsafe{UnhookWindowsHookEx(self.0)};}}let _hook=Hook(hook);
     unsafe{OleInitialize(None)}?;struct Apartment;impl Drop for Apartment{fn drop(&mut self){unsafe{OleUninitialize();}}}let _apartment=Apartment;
     let dialog:IFileOpenDialog=unsafe{CoCreateInstance(&FileOpenDialog,None,CLSCTX_INPROC_SERVER)}?;
@@ -64,7 +71,7 @@ fn exercise(root:&Path)->Result<serde_json::Value>{
         let (filters,index)=types(part.types);ensure!(filters.len()==2&&index==0&&filters[0].pattern=="*.txt","native file filters mismatch");
         let accept=unsafe{GetDlgItem(Some(window),1)}.ok().and_then(text).context("original accept label")?;
         ensure!(dialog_kind(window,&part,Some(&automation))==Some(SelectionKind::Files),"file upload was not recognized as files: {accept}");
-        let mut session=Session{source:guard::Identity::capture(window).context("source identity")?,name:part.name,types:part.types,kind:SelectionKind::Files,multiple:true,accept,token:1,picker:None,guard:None,worker:None,fallback:false};
+        let mut session=Session{source:guard::Identity::capture(window).context("source identity")?,name:part.name,types:part.types,kind:SelectionKind::Files,multiple:true,accept,token:1,picker:None,guard:None,early:None,worker:None,fallback:false};
         if !cancelled{if let Some(executable)=std::env::var_os("ZSDESK_GUARD_TEST_EXE"){
             let picker=unsafe{CreateWindowExW(WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE,w!("STATIC"),None,WS_POPUP,-30000,-30000,50,50,None,None,None,None)}?;
             struct Picker(HWND);impl Drop for Picker{fn drop(&mut self){let _=unsafe{DestroyWindow(self.0)};}}let _picker=Picker(picker);
@@ -102,7 +109,7 @@ fn exercise(root:&Path)->Result<serde_json::Value>{
             }thread::sleep(Duration::from_millis(30));
         };
         let accept=unsafe{GetDlgItem(Some(window),1)}.ok().and_then(text).context("folder accept label")?;
-        let mut session=Session{source:guard::Identity::capture(window).context("folder source identity")?,name:part.name,types:HWND::default(),kind:SelectionKind::Folders,multiple:false,accept,token:2,picker:None,guard:None,worker:None,fallback:false};
+        let mut session=Session{source:guard::Identity::capture(window).context("folder source identity")?,name:part.name,types:HWND::default(),kind:SelectionKind::Folders,multiple:false,accept,token:2,picker:None,guard:None,early:None,worker:None,fallback:false};
         if cancelled{session.finish(Outcome::Cancelled)?;}else{
             ensure!(session.finish(Outcome::Selected{paths:vec![expected[0].clone()],filter:0}).is_err(),"folder caller accepted a file");
             ensure!(unsafe{IsWindow(Some(window))}.as_bool(),"rejected result closed native folder dialog");

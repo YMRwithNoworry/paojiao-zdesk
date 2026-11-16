@@ -559,6 +559,7 @@ impl WindowState {
             if let Err(error) = crate::quick_search::start_if_enabled(&self.config_path) {
                 self.show_message(format!("后台搜索启动失败：{error:#}"));
             }
+            crate::update_check::start_daily(&self.config_path,hwnd);
         }
         self.update_shell_registry();
         Ok(())
@@ -848,6 +849,12 @@ impl WindowState {
 
     unsafe fn destroy(&mut self) {
         if std::mem::replace(&mut self.destroyed,true){return;}
+        if let Some(picker)=&self.picker{
+            // Return while the UI is closing, before Shell COM teardown can
+            // delay completion and cause the original caller to reappear.
+            let _=picker.options.events.send(picker::Event::Finished{token:picker.options.token,result:Ok(picker.result.borrow().clone())});
+            unsafe{let _=ShowWindow(self.hwnd,SW_HIDE);}
+        }
         #[cfg(test)]println!("window teardown: registry");
         if let Some(mut registry)=self.shell_registry.take(){registry.stop();}
         pane_input::discard(self.hwnd);
@@ -1213,7 +1220,7 @@ unsafe fn reentrant(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
             let _=unsafe{SetPropW(hwnd,DEFERRED_PAINT_PROPERTY,Some(windows::Win32::Foundation::HANDLE(1usize as*mut _)))};
             LRESULT(0)
         }
-        WM_CLOSE | WM_LAYOUT | WM_ACTION | WM_SHELL_NAVIGATED | WM_SHELL_FOLDER_INVOKED | WM_SHELL_NAVIGATION_FAILED | WM_BOOKMARK_PATH_DROPPED
+        WM_CLOSE | picker::WM_NATIVE_REPLY | WM_LAYOUT | WM_ACTION | WM_SHELL_NAVIGATED | WM_SHELL_FOLDER_INVOKED | WM_SHELL_NAVIGATION_FAILED | WM_BOOKMARK_PATH_DROPPED
         | WM_OPEN_REQUEST | WM_TREE_NAVIGATE | WM_SHELL_SELECTION_CHANGED | crate::routing_control::WM_RESULT | WM_FAST_SEARCH | WM_DIAGNOSTIC
         | WM_CANCELMODE | WM_CAPTURECHANGED | WM_THEMECHANGED | WM_DWMCOMPOSITIONCHANGED | WM_SYSCOLORCHANGE | pane_input::MESSAGE | crate::shell_window_registry::WM_SELECT => {
             defer_message(hwnd,msg,wp,lp);
@@ -1295,6 +1302,7 @@ impl WindowState {
         if dual_pane::browser_message(msg) && !self.routing_pane_message { return self.route_browser_message(msg,wp,lp); }
         let point = || POINT { x: x_lparam(lp.0), y: y_lparam(lp.0) };
         match msg {
+            picker::WM_NATIVE_REPLY=>{self.picker_native_reply(wp.0 as u64,lp.0);return Some(LRESULT(0));},
             WM_QUERYENDSESSION=>return Some(LRESULT(1)),
             WM_ENDSESSION=>{self.session_ending=wp.0!=0;if self.session_ending{self.save();}return None;},
             WM_CLOSE if self.picker.is_none()&&!self.session_ending&&self.session.has_locked_tabs()=>{
@@ -1302,7 +1310,7 @@ impl WindowState {
             },
             // Release Shell hosts while the owner is still a live window.
             // WM_DESTROY is the fallback for direct/native destruction.
-            WM_CLOSE=>{unsafe{self.destroy();}return None;},
+            WM_CLOSE=>{if !self.session_ending&&self.picker_close_pending(){return Some(LRESULT(0));}unsafe{self.destroy();}return None;},
             WM_PAINT => {
                 let mut ps = PAINTSTRUCT::default();
                 let dc = unsafe { BeginPaint(self.hwnd, &mut ps) };
@@ -1430,6 +1438,9 @@ impl WindowState {
             WM_OPEN_REQUEST => if lp.0 != 0 { unsafe { self.open_requested(*Box::from_raw(lp.0 as *mut crate::instance::OpenRequest)); } },
             WM_FAST_SEARCH => self.poll_pane_searches(),
             WM_DIAGNOSTIC=>if lp.0!=0{let request=unsafe{Box::from_raw(lp.0 as *mut crate::instance::DiagnosticRequest)};let _=self.write_diagnostics(&request);},
+            crate::update_check::NOTICE=>if let Some(release)=crate::update_check::take_notice(&self.config_path){
+                if let Err(error)=crate::utility_panel::offer_update(self.hwnd,&self.config_path,release){self.show_message(format!("无法显示更新信息：{error:#}"));}
+            },
             crate::routing_control::WM_RESULT => if lp.0!=0{self.show_message(unsafe{*Box::from_raw(lp.0 as *mut String)});},
             message if message>=0xC000&&message==zsdesk_windows::shell::file_transfer::result_message()=>{
                 let code=wp.0 as u32;

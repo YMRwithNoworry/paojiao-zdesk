@@ -49,7 +49,7 @@ fn exercise(root:&Path)->Result<serde_json::Value>{
     let instance=HINSTANCE(unsafe{GetModuleHandleW(None)}?.0);let name=windows::core::w!("ZSDesk.Native.PickerRegression");
     unsafe{RegisterClassW(&WNDCLASSW{lpfnWndProc:Some(window_proc),hInstance:instance,lpszClassName:name,..Default::default()});}
     for (cancelled,multiple) in [(false,false),(false,true),(true,false)]{
-        let(tx,_rx)=std::sync::mpsc::channel();let result=Rc::new(RefCell::new(Outcome::Cancelled));
+        let(tx,rx)=std::sync::mpsc::channel();let result=Rc::new(RefCell::new(Outcome::Cancelled));
         let options=Options{token:100+u64::from(cancelled)+u64::from(multiple)*2,title:"选择文件".into(),initial:ShellLocation::Path(first.clone()),multiple,kind:SelectionKind::Files,initial_name:String::new(),
             types:vec![FileType{label:"文本文件 (*.txt)".into(),pattern:"*.txt".into()}],filter:0,events:tx};
         let mut state=WindowState::new(saved.clone(),profile.clone(),None,false);state.picker=Some(State::new(options,result.clone()));state.secondary_window=true;
@@ -83,14 +83,16 @@ fn exercise(root:&Path)->Result<serde_json::Value>{
             let button={let slot=fixture.slot.borrow();let picker=slot.as_ref().unwrap().picker.as_ref().unwrap();if cancelled{picker.cancel}else{picker.accept}};
             unsafe{SendMessageW(button,BM_CLICK,None,None);}
         }else{unsafe{SendMessageW(window,message,Some(WPARAM(ACCEPT)),Some(LPARAM(0)));}}pump(150);
-        ensure!(!unsafe{IsWindow(Some(window))}.as_bool(),"picker did not close after result");
-        match &*result.borrow(){Outcome::Cancelled=>ensure!(cancelled,"selection was cancelled"),Outcome::Selected{paths,filter}=>{
+        ensure!(unsafe{IsWindow(Some(window))}.as_bool(),"picker closed before caller confirmation");
+        let submitted=rx.try_iter().find_map(|event|match event{Event::Submit{outcome,..}=>Some(outcome),_=>None}).context("selection was not submitted")?;
+        ensure!(matches!(&*result.borrow(),Outcome::Cancelled),"unconfirmed selection was committed");
+        match &submitted{Outcome::Cancelled=>ensure!(cancelled,"selection was cancelled"),Outcome::Selected{paths,filter}=>{
             let mut expected=vec![second.join("selected.txt")];if multiple{expected.push(second.join("second.txt"));}expected.sort();let mut actual=paths.clone();actual.sort();
             ensure!(!cancelled&&actual==expected&&*filter==0,"selection returned wrong folder or filter");}}
         ensure!(fs::read(&profile)?==before,"picker overwrote the explorer tab session");drop(fixture);
     }
     for selected_child in [false,true]{
-        let(tx,_rx)=std::sync::mpsc::channel();let result=Rc::new(RefCell::new(Outcome::Cancelled));
+        let(tx,rx)=std::sync::mpsc::channel();let result=Rc::new(RefCell::new(Outcome::Cancelled));
         let options=Options{token:200+u64::from(selected_child),title:"选择文件夹".into(),initial:ShellLocation::Path(first.clone()),multiple:false,kind:SelectionKind::Folders,
             initial_name:String::new(),types:Vec::new(),filter:0,events:tx};
         let mut state=WindowState::new(saved.clone(),profile.clone(),None,false);state.picker=Some(State::new(options,result.clone()));state.secondary_window=true;
@@ -108,9 +110,10 @@ fn exercise(root:&Path)->Result<serde_json::Value>{
         }pump(80);
         let button=fixture.slot.borrow().as_ref().unwrap().picker.as_ref().unwrap().accept;
         unsafe{SendMessageW(button,BM_CLICK,None,None);}pump(150);
-        ensure!(!unsafe{IsWindow(Some(window))}.as_bool(),"folder selection did not finish");
+        ensure!(unsafe{IsWindow(Some(window))}.as_bool(),"folder picker closed without caller confirmation");
+        let submitted=rx.try_iter().find_map(|event|match event{Event::Submit{outcome,..}=>Some(outcome),_=>None}).context("folder selection was not submitted")?;
         let expected=if selected_child{first.join("child")}else{first.clone()};
-        ensure!(matches!(&*result.borrow(),Outcome::Selected{paths,..} if paths==&vec![expected]),"wrong selected/current folder");
+        ensure!(matches!(submitted,Outcome::Selected{paths,..} if paths==vec![expected]),"wrong selected/current folder");
         ensure!(fs::read(&profile)?==before,"folder picker overwrote session");drop(fixture);
     }
     storage::save_file_dialog_takeover(&profile,false)?;

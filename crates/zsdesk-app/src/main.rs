@@ -21,6 +21,7 @@ mod folder_size_data;
 mod quick_search;
 mod win_e_bridge;
 mod explorer_forwarder;
+mod early_window_hook;
 mod file_dialog_takeover;
 mod folder_dde;
 mod runtime;

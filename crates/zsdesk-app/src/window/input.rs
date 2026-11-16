@@ -740,7 +740,18 @@ impl WindowState {
             Some("desktop-quit") => self.launch_desktop(&["--quit".into()]),
             Some("desktop-tray") => self.launch_desktop(&["--tray".into()]),
             Some(id @ ("integration-off" | "integration-context" | "integration-default" | "integration-restore")) => self.set_integration(id),
-            Some("integration-forward-unhandled") => {self.session.ui.forward_unhandled_windows=!self.session.ui.forward_unhandled_windows;self.save();let _=crate::quick_search::start_if_enabled(&self.config_path);},
+            Some("integration-forward-unhandled") => {
+                let registered=zsdesk_windows::integration::current()==zsdesk_windows::integration::Integration::Default;
+                let current=storage::load(&self.config_path).map(|saved|saved.ui).unwrap_or_else(|_|self.session.ui.clone());
+                let enabled=if registered{!current.forward_unhandled_windows}else{!current.forward_while_running};
+                match storage::save_forwarding(&self.config_path,registered,enabled){
+                    Ok(())=>{
+                        if registered{self.session.ui.forward_unhandled_windows=enabled;}else{self.session.ui.forward_while_running=enabled;}
+                        let _=crate::quick_search::control::signal(&self.config_path,"reload");
+                        if let Err(error)=crate::quick_search::start_if_enabled(&self.config_path){self.show_message(format!("窗口接管启动失败：{error:#}"));}
+                    },Err(error)=>self.show_message(format!("无法保存窗口接管设置：{error:#}")),
+                }
+            },
             Some("integration-file-dialog-takeover") => self.toggle_file_dialog_takeover(),
             Some("bookmark") => self.add_current_bookmark(),
             Some("folder-options") => open_folder_options(),

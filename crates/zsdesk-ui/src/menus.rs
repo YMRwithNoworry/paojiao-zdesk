@@ -429,7 +429,7 @@ pub fn app_menu_with_capabilities(state: AppMenuState, ui: &ExplorerUi, themed: 
         entry("不接管系统资源管理器", "integration-off", true, state.integration == 0),
         entry("右键菜单“使用 ZSDesk 打开”", "integration-context", true, state.integration == 1),
         entry("默认打开文件夹、磁盘和此电脑", "integration-default", true, state.integration == 2),
-        entry("同时接管新出现的系统浏览窗口", "integration-forward-unhandled", state.integration == 2, state.forward_unhandled_windows),
+        entry("接管新出现的系统浏览窗口", "integration-forward-unhandled", true, if state.integration==2{state.forward_unhandled_windows}else{ui.forward_while_running}),
         entry("接管文件选择窗口（多标签）", "integration-file-dialog-takeover", true, ui.file_dialog_takeover),
         MenuItemSpec::Separator,
         item("开机启动与全局快捷键…", "quick-search-settings"),

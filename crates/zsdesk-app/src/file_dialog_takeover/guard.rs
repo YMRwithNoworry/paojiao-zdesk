@@ -5,6 +5,8 @@ use windows::Win32::{Foundation::{CloseHandle,FILETIME,HANDLE,WAIT_TIMEOUT},Syst
 const PROPERTY:PCWSTR=windows::core::w!("ZSDesk.FileDialogLease.v1");
 #[derive(Clone,Debug,serde::Serialize,serde::Deserialize)]pub(super) struct Identity{pub window:isize,pub pid:u32,pub thread:u32,pub created:u64}
 struct Handle(HANDLE);impl Drop for Handle{fn drop(&mut self){let _=unsafe{CloseHandle(self.0)};}}
+pub(super) struct OwnedHandle(pub HANDLE);impl Drop for OwnedHandle{fn drop(&mut self){let _=unsafe{CloseHandle(self.0)};}}
+pub(super) fn process_created(process:HANDLE)->Option<u64>{created(process)}
 fn created(process:HANDLE)->Option<u64>{let(mut start,mut end,mut kernel,mut user)=(FILETIME::default(),FILETIME::default(),FILETIME::default(),FILETIME::default());
     unsafe{GetProcessTimes(process,&mut start,&mut end,&mut kernel,&mut user)}.ok()?;Some((u64::from(start.dwHighDateTime)<<32)|u64::from(start.dwLowDateTime))}
 impl Identity{
@@ -58,6 +60,7 @@ impl Drop for Guard{fn drop(&mut self){
     if let Some(reader)=self.reader.take(){let _=reader.join();}
 }}
 pub(crate) fn run_if_requested()->Option<Result<()>>{
+    if let Some(result)=super::watcher::run_if_requested(){return Some(result);}
     if std::env::args_os().nth(1).as_deref()!=Some(std::ffi::OsStr::new("--file-picker-guard")){return None;}Some(run())
 }
 fn run()->Result<()>{

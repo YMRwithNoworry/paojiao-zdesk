@@ -2,6 +2,7 @@
 use super::*;
 use std::{path::{Path,PathBuf},sync::mpsc::Sender};
 use zsdesk_windows::gfx::{Canvas,RectF};
+use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 #[cfg(test)]#[path="picker_regression.rs"]mod native_tests;
 
 pub(crate) const MARKER:PCWSTR=windows::core::w!("ZSDesk.FilePicker.v1");
@@ -10,6 +11,13 @@ pub(super) const CANCEL:usize=7302;
 const NAME:usize=7303;
 const FILTER:usize=7304;
 const FOOTER_H:i32=76;
+pub(crate) const WM_NATIVE_REPLY:u32=WM_APP+147;
+#[derive(Clone,Copy)]pub(crate) enum NativeReply{Accepted=1,Cancelled=2,Rejected=3,Waiting=4,Fallback=5}
+pub(crate) fn native_reply(window:isize,token:u64,reply:NativeReply)->bool{
+    let window=HWND(window as*mut _);
+    if unsafe{GetPropW(window,MARKER)}.0 as usize!=token as usize{return false;}
+    unsafe{PostMessageW(Some(window),WM_NATIVE_REPLY,WPARAM(token as usize),LPARAM(reply as isize))}.is_ok()
+}
 #[derive(Clone,Debug,serde::Serialize,serde::Deserialize)]
 pub(crate) struct FileType{pub label:String,pub pattern:String}
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
@@ -26,12 +34,29 @@ impl SelectionKind{
     Selected{paths:Vec<PathBuf>,filter:usize},
     #[default] Cancelled,
 }
-pub(crate) enum Event{Ready{token:u64,window:isize},Finished{token:u64,result:Result<Outcome,String>}}
+pub(crate) enum Event{Ready{token:u64,window:isize},Submit{token:u64,outcome:Outcome},Finished{token:u64,result:Result<Outcome,String>}}
+#[derive(Default)]struct Submission{waiting:bool,cancel_requested:bool,confirmed:bool,selected:Option<Outcome>}
+impl Submission{
+    fn begin(&mut self,outcome:&Outcome)->bool{
+        let cancelled=matches!(outcome,Outcome::Cancelled);
+        if self.confirmed||(self.waiting&&!cancelled)||(cancelled&&self.cancel_requested){return false;}
+        if !cancelled{self.selected=Some(outcome.clone());}
+        self.waiting=true;self.cancel_requested=cancelled;true
+    }
+    fn reply(&mut self,reply:NativeReply)->Option<Outcome>{
+        match reply{
+            NativeReply::Accepted=>{self.confirmed=true;self.waiting=false;self.selected.take()},
+            NativeReply::Cancelled|NativeReply::Fallback=>{self.confirmed=true;self.waiting=false;Some(Outcome::Cancelled)},
+            NativeReply::Rejected=>{self.waiting=false;self.cancel_requested=false;self.selected=None;None},
+            NativeReply::Waiting=>None,
+        }
+    }
+}
 pub(super) struct State{
-    pub options:Options,pub result:Rc<RefCell<Outcome>>,name:HWND,filter:HWND,accept:HWND,cancel:HWND,edited:bool,
+    pub options:Options,pub result:Rc<RefCell<Outcome>>,name:HWND,filter:HWND,accept:HWND,cancel:HWND,edited:bool,submission:Submission,
 }
 impl State{
-    pub fn new(options:Options,result:Rc<RefCell<Outcome>>)->Self{let edited=!options.initial_name.is_empty();Self{options,result,name:HWND::default(),filter:HWND::default(),accept:HWND::default(),cancel:HWND::default(),edited}}
+    pub fn new(options:Options,result:Rc<RefCell<Outcome>>)->Self{let edited=!options.initial_name.is_empty();Self{options,result,name:HWND::default(),filter:HWND::default(),accept:HWND::default(),cancel:HWND::default(),edited,submission:Submission::default()}}
     pub fn pattern(&self)->&str{if self.options.kind.folders(){"*"}else{self.options.types.get(self.options.filter).map_or("*",|value|value.pattern.as_str())}}
     fn controls(&self)->[HWND;4]{[self.name,self.filter,self.accept,self.cancel]}
 }
@@ -51,6 +76,26 @@ pub(crate) fn run(session:ExplorerSession,profile:PathBuf,options:Options)->Resu
     let outcome=result.borrow().clone();Ok(outcome)
 }
 impl WindowState{
+    pub(super) fn picker_close_pending(&mut self)->bool{
+        if self.picker.as_ref().is_none_or(|picker|picker.submission.confirmed){return false;}
+        self.picker_submit(Outcome::Cancelled);true
+    }
+    fn picker_submit(&mut self,outcome:Outcome){
+        let Some(picker)=self.picker.as_mut()else{return;};
+        if !picker.submission.begin(&outcome){return;}
+        if picker.options.events.send(Event::Submit{token:picker.options.token,outcome}).is_err(){
+            picker.submission.confirmed=true;*picker.result.borrow_mut()=Outcome::Cancelled;post(self.hwnd,WM_CLOSE,0,0);return;
+        }
+        unsafe{let _=EnableWindow(picker.accept,false);}
+        self.show_message("正在等待原程序确认选择…".into());
+    }
+    pub(super) fn picker_native_reply(&mut self,token:u64,code:isize){
+        let reply=match code{1=>NativeReply::Accepted,2=>NativeReply::Cancelled,3=>NativeReply::Rejected,4=>NativeReply::Waiting,5=>NativeReply::Fallback,_=>return};
+        let Some(picker)=self.picker.as_mut().filter(|picker|picker.options.token==token)else{return;};
+        if let Some(outcome)=picker.submission.reply(reply){*picker.result.borrow_mut()=outcome;post(self.hwnd,WM_CLOSE,0,0);return;}
+        unsafe{let _=EnableWindow(picker.accept,!picker.submission.waiting);}
+        self.show_message(match reply{NativeReply::Rejected=>"原程序未接受选择，请检查后重试",_=>"原程序尚未完成选择，可取消后重新打开"}.into());
+    }
     pub(super) fn picker_height(&self)->i32{if self.picker.is_some(){self.s(FOOTER_H)}else{0}}
     pub(super) fn initialize_picker(&mut self)->Result<()>{
         let Some(picker)=self.picker.as_mut()else{return Ok(());};
@@ -110,6 +155,7 @@ impl WindowState{
     pub(super) fn picker_accept_view(&mut self){if let Some(picker)=self.picker.as_mut(){picker.edited=false;}self.picker_accept();}
     pub(super) fn picker_accept(&mut self){
         let Some(picker)=self.picker.as_ref()else{return;};
+        if picker.submission.waiting{return;}
         if self.pending.is_some()||self.queued.is_some(){self.show_message("文件夹正在加载，请稍后选择".into());return;}
         let kind=picker.options.kind;
         let mut paths=if picker.edited{let text=control_text(picker.name);if kind.folders()&&text.trim().is_empty(){Vec::new()}else{match parse_names(&text,self.current_location().as_path()){Ok(paths)=>paths,Err(error)=>{self.show_message(error);return;}}}}
@@ -120,7 +166,7 @@ impl WindowState{
         if kind.folders()&&paths.is_empty(){if let Some(path)=self.current_location().as_path(){paths.push(path.to_path_buf());}}
         let Some(picker)=self.picker.as_ref()else{return;};
         if let Err(error)=validate_paths(&paths,picker.options.multiple,kind){self.show_message(error);return;}
-        *picker.result.borrow_mut()=Outcome::Selected{paths,filter:picker.options.filter};post(self.hwnd,WM_CLOSE,0,0);
+        self.picker_submit(Outcome::Selected{paths,filter:picker.options.filter});
     }
 }
 fn control_text(window:HWND)->String{let mut value=vec![0u16;32768];let len=unsafe{GetWindowTextW(window,&mut value)}.max(0)as usize;String::from_utf16_lossy(&value[..len])}
@@ -150,6 +196,23 @@ pub(super) fn pre_translate(slot:&Slot,message:&MSG)->bool{
 }
 #[cfg(test)]mod tests{
     use super::*;
+    #[test]fn selection_waits_for_native_confirmation_and_does_not_resubmit(){
+        let selected=Outcome::Selected{paths:vec![PathBuf::from(r"E:\folder")],filter:0};
+        let mut submission=Submission::default();
+        assert!(submission.begin(&selected));assert!(!submission.confirmed);
+        assert!(!submission.begin(&selected),"pending selection must remain single-shot");
+        assert!(submission.reply(NativeReply::Waiting).is_none());assert!(!submission.confirmed&&submission.waiting);
+        assert!(matches!(submission.reply(NativeReply::Accepted),Some(Outcome::Selected{..})));
+        assert!(submission.confirmed);assert!(!submission.begin(&selected));
+    }
+    #[test]fn cancel_and_rejection_do_not_commit_a_tentative_selection(){
+        let selected=Outcome::Selected{paths:vec![PathBuf::from(r"E:\folder")],filter:0};
+        let mut submission=Submission::default();assert!(submission.begin(&selected));
+        assert!(submission.reply(NativeReply::Rejected).is_none());assert!(!submission.waiting&&!submission.confirmed);
+        assert!(submission.begin(&selected));assert!(submission.begin(&Outcome::Cancelled));
+        assert!(!submission.begin(&Outcome::Cancelled));assert!(matches!(submission.reply(NativeReply::Cancelled),Some(Outcome::Cancelled)));
+        assert!(submission.confirmed);
+    }
     #[test]fn filenames_keep_spaces_and_unicode_without_executing_text(){
         let paths=parse_names("\"甲 乙.txt\" \"丙.txt\"",Some(Path::new(r"E:\目录"))).unwrap();
         assert_eq!(paths,vec![PathBuf::from(r"E:\目录\甲 乙.txt"),PathBuf::from(r"E:\目录\丙.txt")]);

@@ -1,17 +1,31 @@
 //! Routes compatible Open dialogs into the existing ZSDesk explorer window.
 //! The original caller still performs its own validation and receives results.
-use std::{collections::{HashSet,HashMap},path::{Path,PathBuf},sync::{Arc,atomic::{AtomicBool,AtomicU64,Ordering},mpsc},thread::{self,JoinHandle},time::{Duration,Instant}};
+use std::{collections::{HashSet,HashMap},path::{Path,PathBuf},sync::{Arc,atomic::{AtomicBool,Ordering},mpsc},thread::{self,JoinHandle},time::{Duration,Instant}};
 use anyhow::{Context,Result,ensure};
 use windows::{core::{w,BOOL,Interface,PCWSTR},Win32::{Foundation::{HWND,LPARAM,WPARAM},System::{Com::{CoCreateInstance,CoInitializeEx,CoUninitialize,CLSCTX_INPROC_SERVER,COINIT_MULTITHREADED},Variant::VARIANT},UI::{Accessibility::*,Controls::*,Input::KeyboardAndMouse::IsWindowEnabled,WindowsAndMessaging::*}}};
-use crate::window::picker::{Event,FileType,Options,Outcome,SelectionKind};
+use crate::window::picker::{Event,FileType,NativeReply,Options,Outcome,SelectionKind};
 pub(crate) mod guard;
+mod watcher;
 #[cfg(test)]#[path="file_dialog_takeover/native_tests.rs"]mod native_tests;
-static SERIAL:AtomicU64=AtomicU64::new(1);
 fn wide(value:&str)->Vec<u16>{value.encode_utf16().chain(Some(0)).collect()}
 fn class(window:HWND)->String{let mut value=[0u16;128];let n=unsafe{GetClassNameW(window,&mut value)}.max(0)as usize;String::from_utf16_lossy(&value[..n])}
 fn send(window:HWND,message:u32,wp:usize,lp:isize)->Option<usize>{let mut result=0;(unsafe{SendMessageTimeoutW(window,message,WPARAM(wp),LPARAM(lp),SMTO_ABORTIFHUNG|SMTO_BLOCK,250,Some(&mut result))}.0!=0).then_some(result)}
 fn text(window:HWND)->Option<String>{let mut value=vec![0u16;32768];let n=send(window,WM_GETTEXT,value.len(),value.as_mut_ptr()as isize)?;Some(String::from_utf16_lossy(&value[..n.min(value.len()-1)]))}
-#[derive(Default)]struct Parts{name:HWND,types:HWND,address:HWND,shell:bool,folder_label:bool}
+#[derive(Default)]struct Parts{name:HWND,types:HWND,address:HWND,shell:bool,native:bool,folder_label:bool}
+// Child visibility is meaningful before the top-level dialog is first shown.
+// Do not mistake a hidden file-type control for a folder picker (or vice versa).
+fn control_visible(mut window:HWND)->bool{
+    if window.0.is_null(){return false;}
+    let root=unsafe{GetAncestor(window,GA_ROOT)};
+    for _ in 0..32{
+        if window.0.is_null(){return false;}
+        // Common dialogs can contain hidden child dialogs. Only the actual
+        // top-level window may be ignored during pre-show recognition.
+        if window==root{return class(root)=="#32770";}
+        if unsafe{GetWindowLongPtrW(window,GWL_STYLE)}as u32&WS_VISIBLE.0==0{return false;}
+        window=unsafe{GetParent(window)}.unwrap_or_default();
+    }false
+}
 fn control_label(value:&str)->String{
     let value=value.replace('&',"");let mut value=value.trim().trim_end_matches([':', '：']).trim();
     // Native dialogs can append a localized accelerator, e.g. 上传(&U).
@@ -24,15 +38,17 @@ fn control_label(value:&str)->String{
     value.to_lowercase()
 }
 fn directory_label(value:&str)->bool{matches!(control_label(value).as_str(),"文件夹"|"目录"|"folder"|"directory")}
+fn folder_title(value:&str)->bool{matches!(control_label(value).as_str(),"选择文件夹"|"选择目录"|"select folder"|"choose folder"|"select directory"|"choose directory")}
 fn parts(dialog:HWND)->Parts{
     unsafe extern "system" fn visit(window:HWND,p:LPARAM)->BOOL{let value=unsafe{&mut*(p.0 as*mut Parts)};let kind=class(window);let id=unsafe{GetDlgCtrlID(window)};
         // Common dialogs use either cmb13 (1148) or edt1 (1152). Folder
         // pickers expose the standalone edt1 instead of the file-name combo.
         if [1148,1152].contains(&id)&&kind=="Edit"{
-            if value.name.0.is_null()||class(value.name)!="Edit"||unsafe{IsWindowVisible(window)}.as_bool(){value.name=window;}
+            if value.name.0.is_null()||class(value.name)!="Edit"||control_visible(window){value.name=window;}
         }else if id==1148&&value.name.0.is_null()&&kind=="ComboBox"{value.name=window;}
         if id==1136&&kind=="ComboBox"{value.types=window;}if id==1001&&kind=="ToolbarWindow32"{value.address=window;}
-        if kind=="Static"&&unsafe{IsWindowVisible(window)}.as_bool()&&text(window).is_some_and(|value|directory_label(&value)){value.folder_label=true;}
+        if kind=="Static"&&control_visible(window)&&text(window).is_some_and(|value|directory_label(&value)){value.folder_label=true;}
+        if kind=="DUIViewWndClassName"{value.native=true;}
         if kind=="SHELLDLL_DefView"{value.shell=true;}true.into()}
     let mut value=Parts::default();let _=unsafe{EnumChildWindows(Some(dialog),Some(visit),LPARAM(&mut value as*mut _ as isize))};value
 }
@@ -60,8 +76,9 @@ fn folder_field_label(automation:&IUIAutomation,name:HWND)->bool{
 }
 fn dialog_kind(dialog:HWND,parts:&Parts,automation:Option<&IUIAutomation>)->Option<SelectionKind>{
     let accept=unsafe{GetDlgItem(Some(dialog),1)}.ok().and_then(text)?;
-    let visible_types=!parts.types.0.is_null()&&unsafe{IsWindowVisible(parts.types)}.as_bool();
-    let folder_field=parts.folder_label||(!visible_types&&automation.is_some_and(|automation|folder_field_label(automation,parts.name)));
+    let visible_types=control_visible(parts.types);
+    let folder_field=parts.folder_label||text(dialog).is_some_and(|title|folder_title(&title))
+        ||(!visible_types&&automation.is_some_and(|automation|folder_field_label(automation,parts.name)));
     selection_kind(&accept,visible_types,folder_field)
 }
 fn initial_location(value:&str)->Option<zsdesk_core::model::explorer::ShellLocation>{
@@ -93,13 +110,43 @@ fn multiple(automation:&IUIAutomation,dialog:HWND)->Option<bool>{
         if let Ok(selection)=unsafe{item.GetCurrentPatternAs::<IUIAutomationSelectionPattern>(UIA_SelectionPatternId)}{return unsafe{selection.CurrentCanSelectMultiple()}.ok().map(|value|value.as_bool());}}
     None
 }
-struct Session{source:guard::Identity,name:HWND,types:HWND,kind:SelectionKind,multiple:bool,accept:String,token:u64,picker:Option<isize>,guard:Option<guard::Guard>,worker:Option<JoinHandle<()>>,fallback:bool}
+#[derive(Clone,PartialEq)]
+struct Contract{kind:SelectionKind,name:isize,types:isize,multiple:bool,accept:String,initial:zsdesk_core::model::explorer::ShellLocation}
+#[derive(Default)]struct StableContract(Option<(Contract,Instant)>);
+impl StableContract{
+    fn observe(&mut self,value:Contract,now:Instant)->bool{
+        if self.0.as_ref().is_none_or(|(previous,_)|previous!=&value){self.0=Some((value,now));return false;}
+        self.0.as_ref().is_some_and(|(_,since)|now.saturating_duration_since(*since)>=Duration::from_millis(150))
+    }
+    fn reset(&mut self){self.0=None;}
+}
+struct Session{source:guard::Identity,name:HWND,types:HWND,kind:SelectionKind,multiple:bool,accept:String,token:u64,picker:Option<isize>,guard:Option<guard::Guard>,early:Option<watcher::Claim>,worker:Option<JoinHandle<()>>,fallback:bool}
+struct PendingReturn{outcome:Outcome,started:Instant,reported_wait:bool,folder_navigation:Option<PathBuf>}
+fn same_folder(location:Option<zsdesk_core::model::explorer::ShellLocation>,path:&Path)->bool{
+    location.and_then(|location|location.as_path().map(Path::to_path_buf)).is_some_and(|folder|crate::explorer_forwarder::same_path(&folder,path))
+}
+fn folder_navigation_pending(kind:SelectionKind,outcome:&Outcome,location:Option<zsdesk_core::model::explorer::ShellLocation>)->Option<PathBuf>{
+    if !kind.folders()||location.is_none(){return None;}
+    let Outcome::Selected{paths,..}=outcome else{return None;};
+    (paths.len()==1&&!same_folder(location,&paths[0])).then(||paths[0].clone())
+}
+fn folder_navigation_ready(target:&Path,location:Option<zsdesk_core::model::explorer::ShellLocation>,name:&str)->bool{
+    let name=name.trim().trim_matches('"');
+    same_folder(location,target)&&(name.is_empty()||target.file_name().is_some_and(|leaf|name==leaf.to_string_lossy()))
+}
+fn native_choice(source:HWND,id:i32)->Result<()>{
+    let button=unsafe{GetDlgItem(Some(source),id)}.context("原窗口的确认或取消按钮不可用")?;
+    // A real BN_CLICKED notification carries the originating button HWND.
+    // lParam=0 is a menu command and can follow a different caller path.
+    unsafe{PostMessageW(Some(source),WM_COMMAND,WPARAM(id as usize),LPARAM(button.0 as isize))}?;Ok(())
+}
 impl Session{
-    fn restore(&mut self){self.guard.take();}
+    fn restore(&mut self){self.guard.take();self.early.take();}
     fn picker_alive(&self)->bool{self.picker.is_some_and(|window|unsafe{GetPropW(HWND(window as*mut _),crate::window::picker::MARKER)}.0 as usize==self.token as usize)}
-    fn close_picker(&mut self){self.restore();self.fallback=true;if let Some(window)=self.picker{let _=unsafe{PostMessageW(Some(HWND(window as*mut _)),WM_CLOSE,WPARAM(0),LPARAM(0))};}}
+    fn close_picker(&mut self){self.restore();self.fallback=true;if let Some(window)=self.picker{let _=crate::window::picker::native_reply(window,self.token,NativeReply::Fallback);}}
     fn poll(&mut self,enabled:bool){
         if !enabled||!self.source.matches(){self.close_picker();return;}
+        if self.early.as_ref().is_some_and(|claim|!claim.active()){self.close_picker();return;}
         if self.guard.as_mut().is_some_and(guard::Guard::exited){
             // The picker can close before its STA has finished COM teardown.
             // Its eventual Selected result must still reach the caller.
@@ -107,9 +154,9 @@ impl Session{
         }
     }
     fn finish(&mut self,outcome:Outcome)->Result<()>{
-        self.restore();if self.fallback||!self.source.matches(){return Ok(());}
+        if self.fallback||!self.source.matches(){self.restore();return Ok(());}
         match outcome{
-            Outcome::Cancelled=>{let _=unsafe{PostMessageW(Some(self.source.hwnd()),WM_COMMAND,WPARAM(2),LPARAM(0))};},
+            Outcome::Cancelled=>{native_choice(self.source.hwnd(),2)?;},
             Outcome::Selected{paths,filter}=>{
                 crate::window::picker::validate_paths(&paths,self.multiple,self.kind).map_err(anyhow::Error::msg)?;
                 let actual=parts(self.source.hwnd());let accept=unsafe{GetDlgItem(Some(self.source.hwnd()),1)}.ok().and_then(text);
@@ -124,11 +171,11 @@ impl Session{
                     send(owner,WM_COMMAND,1136|((CBN_CLOSEUP as usize)<<16),self.types.0 as isize).context("文件类型收尾失败")?;
                     #[cfg(test)]eprintln!("filter owner={} control_id={} selected={:?}",class(owner),unsafe{GetDlgCtrlID(self.types)},send(self.types,CB_GETCURSEL,0,0));
                 }
-                let value=paths.iter().map(|path|format!("\"{}\"",path.to_string_lossy())).collect::<Vec<_>>().join(" ");let value=wide(&value);
+                let current_folder=self.kind.folders()&&paths.len()==1&&same_folder(text(actual.address).and_then(|value|initial_location(&value)),&paths[0]);
+                let value=if current_folder{String::new()}else{paths.iter().map(|path|format!("\"{}\"",path.to_string_lossy())).collect::<Vec<_>>().join(" ")};let value=wide(&value);
                 ensure!(send(self.name,WM_SETTEXT,0,value.as_ptr()as isize).is_some_and(|result|result!=0),"文件选择结果未能返回");
-                unsafe{let _=SetForegroundWindow(self.source.hwnd());}
                 // Only the caller's Open command can validate and accept paths.
-                let _=unsafe{PostMessageW(Some(self.source.hwnd()),WM_COMMAND,WPARAM(1),LPARAM(0))};
+                native_choice(self.source.hwnd(),1)?;
             },
         }Ok(())
     }
@@ -150,62 +197,163 @@ fn run(profile:&Path,stop:&AtomicBool)->Result<()>{
     struct Owned(windows::Win32::Foundation::HANDLE);impl Drop for Owned{fn drop(&mut self){let _=unsafe{CloseHandle(self.0)};}}let _owned=Owned(mutex);if existing{return Ok(());}
     unsafe{CoInitializeEx(None,COINIT_MULTITHREADED)}.ok()?;struct Apartment;impl Drop for Apartment{fn drop(&mut self){unsafe{CoUninitialize();}}}let _apartment=Apartment;
     let mut automation:Option<IUIAutomation>=None;
-    let(tx,rx)=mpsc::channel();let mut sessions=Vec::<Session>::new();let mut seen=HashSet::new();let mut preparing=HashMap::new();let mut enabled=false;
+    let(tx,rx)=mpsc::channel();let mut sessions=Vec::<Session>::new();let mut preparing=Vec::<watcher::Claim>::new();let mut contracts=HashMap::<u64,StableContract>::new();
+    let mut watcher:Option<watcher::Connection>=None;let mut enabled=false;let mut returning=HashMap::<u64,PendingReturn>::new();
     let mut refresh=Instant::now()-Duration::from_secs(3);let mut last_error=None::<String>;let mut previous=String::new();let mut completed=0u64;
+    let mut last_kind=None::<&'static str>;let mut last_confirmation=None::<&'static str>;
     while !stop.load(Ordering::Acquire){
         if refresh.elapsed()>=Duration::from_secs(1){
             enabled=crate::storage::load(profile).is_ok_and(|session|session.ui.file_dialog_takeover);refresh=Instant::now();
+            if watcher.as_mut().is_some_and(watcher::Connection::exited){watcher.take();preparing.clear();}
+            if enabled&&watcher.is_none(){match watcher::Connection::spawn(){Ok(value)=>watcher=Some(value),Err(error)=>last_error=Some(error.to_string())}}
+            if let Some(watcher)=&watcher{let _=watcher.enable(enabled);let _=watcher.heartbeat();}
             if enabled&&automation.is_none(){match unsafe{CoCreateInstance(&CUIAutomation,None,CLSCTX_INPROC_SERVER)}{Ok(value)=>automation=Some(value),Err(error)=>last_error=Some(error.to_string())}}
-            if !enabled{automation=None;seen.clear();preparing.clear();}
+            if !enabled{automation=None;preparing.clear();contracts.clear();}
         }
         for event in rx.try_iter(){match event{
             Event::Ready{token,window}=>if let Some(session)=sessions.iter_mut().find(|session|session.token==token){
                 session.picker=Some(window);
-                if enabled&&session.source.matches(){match guard::Guard::hide(session.source.clone(),window,token){Ok(guard)=>session.guard=Some(guard),Err(error)=>{last_error=Some(error.to_string());if session.picker_alive(){session.close_picker();}}}}
-                else{session.close_picker();}
+                if enabled&&session.source.matches(){
+                    let result=if let Some(early)=&session.early{early.bind(window)}else{guard::Guard::hide(session.source.clone(),window,token).map(|guard|session.guard=Some(guard))};
+                    if let Err(error)=result{last_error=Some(error.to_string());session.close_picker();}
+                }else{session.close_picker();}
+            },
+            Event::Submit{token,outcome}=>if let Some(session)=sessions.iter_mut().find(|session|session.token==token){
+                if session.fallback||!session.source.matches(){continue;}
+                if returning.contains_key(&token)&&!matches!(outcome,Outcome::Cancelled){continue;}
+                let native=parts(session.source.hwnd());let folder_navigation=folder_navigation_pending(session.kind,&outcome,text(native.address).and_then(|value|initial_location(&value)));
+                match session.finish(outcome.clone()){
+                    Ok(())=>{last_confirmation=Some("pending");returning.insert(token,PendingReturn{outcome,started:Instant::now(),reported_wait:false,folder_navigation});},
+                    Err(error)=>{last_confirmation=Some("rejected");last_error=Some(format!("选择结果回传失败：{error:#}"));if let Some(window)=session.picker{let reply=if returning.contains_key(&token){NativeReply::Waiting}else{NativeReply::Rejected};let _=crate::window::picker::native_reply(window,token,reply);}},
+                }
             },
             Event::Finished{token,result}=>if let Some(index)=sessions.iter().position(|session|session.token==token){let mut session=sessions.remove(index);
-                match result{Ok(outcome)=>match session.finish(outcome){Ok(())=>completed+=1,Err(error)=>last_error=Some(error.to_string())},Err(error)=>{session.restore();last_error=Some(error);}}
+                returning.remove(&token);session.restore();if let Err(error)=result{last_error=Some(error);}
             },
         }}
-        for session in &mut sessions{session.poll(enabled);}
-        seen.retain(|(window,pid)|{let mut current=0;unsafe{GetWindowThreadProcessId(HWND(*window as*mut _),Some(&mut current));}current==*pid&&current!=0});
-        preparing.retain(|(window,pid),_|{let mut current=0;unsafe{GetWindowThreadProcessId(HWND(*window as*mut _),Some(&mut current));}current==*pid&&current!=0});
-        if enabled&&sessions.len()<4{
-            let dialog=unsafe{GetForegroundWindow()};let mut pid=0;unsafe{GetWindowThreadProcessId(dialog,Some(&mut pid));}
-            if pid!=0&&pid!=std::process::id()&&class(dialog)=="#32770"&&!seen.contains(&(dialog.0 as isize,pid))&&!sessions.iter().any(|session|session.source.window==dialog.0 as isize)&&unsafe{IsWindowEnabled(dialog)}.as_bool(){
-                let part=parts(dialog);let kind=dialog_kind(dialog,&part,automation.as_ref());
-                if let Some(kind)=kind.filter(|_|part.shell&&!part.name.0.is_null()){
-                    let key=(dialog.0 as isize,pid);let since=*preparing.entry(key).or_insert_with(Instant::now);
-                    if since.elapsed()<Duration::from_millis(150){thread::sleep(Duration::from_millis(30));continue;}
-                    if let (Some(source),Some(initial),Some(multiple))=(guard::Identity::capture(dialog),text(part.address).and_then(|value|initial_location(&value)),automation.as_ref().and_then(|automation|multiple(automation,dialog))){
-                        seen.insert(key);preparing.remove(&key);
-                        let(token,(types,filter))=(SERIAL.fetch_add(1,Ordering::Relaxed).max(1),types(part.types));
-                        // A folder dialog can display its current folder name
-                        // in this field. It is not a child path to append again.
-                        let initial_name=if kind.folders(){String::new()}else{text(part.name).filter(|name|!name.contains(['*','?'])).unwrap_or_default()};
-                        let options=Options{token,title:kind.title().into(),initial,multiple,kind,initial_name,types,filter,events:tx.clone()};
-                        let config=profile.to_path_buf();let report=tx.clone();
-                        let worker=thread::Builder::new().name("zsdesk-picker-window".into()).spawn(move||{
-                            let result=std::panic::catch_unwind(||crate::storage::load(&config).and_then(|session|crate::window::picker::run(session,config,options)))
-                                .map_err(|_|"文件选择窗口异常退出".to_owned()).and_then(|result|result.map_err(|error|format!("{error:#}")));
-                            let _=report.send(Event::Finished{token,result});
-                        })?;
-                        let accept=unsafe{GetDlgItem(Some(dialog),1)}.ok().and_then(text).unwrap_or_default();
-                        sessions.push(Session{source,name:part.name,types:if kind.folders(){HWND::default()}else{part.types},kind,multiple,accept,token,picker:None,guard:None,worker:Some(worker),fallback:false});
-                    }else if since.elapsed()>Duration::from_secs(8){seen.insert(key);preparing.remove(&key);last_error=Some("文件选择窗口的目录或选择模式不可读取，已保留系统窗口".into());
+        let mut index=0;
+        while index<sessions.len(){
+            let session=&mut sessions[index];let token=session.token;
+            if let Some(pending)=returning.get_mut(&token){
+                if !session.source.matches(){
+                    let reply=if matches!(pending.outcome,Outcome::Cancelled){NativeReply::Cancelled}else{NativeReply::Accepted};
+                    if session.picker.is_some_and(|window|crate::window::picker::native_reply(window,token,reply))||!session.picker_alive(){
+                        last_confirmation=Some(if matches!(pending.outcome,Outcome::Cancelled){"cancelled"}else{"accepted"});
+                        sessions.remove(index);returning.remove(&token);completed+=1;last_error=None;continue;
+                    }
+                    index+=1;continue;
+                }
+                if pending.started.elapsed()>=Duration::from_millis(150)&&unsafe{IsWindowEnabled(session.source.hwnd())}.as_bool(){
+                    if let Some(target)=pending.folder_navigation.as_ref(){
+                        let native=parts(session.source.hwnd());let location=text(native.address).and_then(|value|initial_location(&value));
+                        if native.name==session.name&&text(native.name).is_some_and(|name|folder_navigation_ready(target,location,&name)){
+                            // Some folder pickers consume a typed absolute path
+                            // as navigation first. Confirm the current folder
+                            // only after both navigation and text consumption
+                            // are observed; never repeat the initial submission.
+                            pending.folder_navigation=None;pending.started=Instant::now();
+                            let empty=wide("");
+                            if send(session.name,WM_SETTEXT,0,empty.as_ptr()as isize).is_some_and(|result|result!=0){
+                                if let Err(error)=native_choice(session.source.hwnd(),1){last_error=Some(format!("文件夹确认失败：{error:#}"));}
+                            }else{last_error=Some("原程序的文件夹输入状态未能完成确认".into());}
+                        }
                     }
                 }
+                if !pending.reported_wait&&pending.started.elapsed()>=Duration::from_secs(2){
+                    last_confirmation=Some("awaiting_caller");
+                    pending.reported_wait=true;last_error=Some("原程序尚未确认选择结果，选择窗口保持打开".into());
+                    if let Some(window)=session.picker{let _=crate::window::picker::native_reply(window,token,NativeReply::Waiting);}
+                }
+                if matches!(pending.outcome,Outcome::Cancelled)&&pending.started.elapsed()>=Duration::from_secs(8){
+                    last_error=Some("原程序未响应取消，已恢复原选择窗口".into());session.close_picker();
+                }
+            }
+            session.poll(enabled);if session.fallback{returning.remove(&token);}index+=1;
+        }
+        if let Some(watcher)=&watcher{preparing.extend(watcher.claims());}
+        preparing.retain(watcher::Claim::active);
+        contracts.retain(|token,_|preparing.iter().any(|claim|claim.token()==*token));
+        if enabled&&sessions.len()<4{
+            let mut index=0;
+            while index<preparing.len()&&sessions.len()<4{
+                let source=preparing[index].source();let dialog=source.hwnd();let part=parts(dialog);let token=preparing[index].token();
+                let Some(kind)=dialog_kind(dialog,&part,automation.as_ref()).filter(|_|part.shell&&!part.name.0.is_null())else{contracts.entry(token).or_default().reset();index+=1;continue;};
+                if let(Some(initial),Some(multiple))=(text(part.address).and_then(|value|initial_location(&value)),automation.as_ref().and_then(|automation|multiple(automation,dialog))){
+                    let accept=unsafe{GetDlgItem(Some(dialog),1)}.ok().and_then(text).unwrap_or_default();
+                    let contract=Contract{kind,name:part.name.0 as isize,types:if kind.folders(){0}else{part.types.0 as isize},multiple,accept:accept.clone(),initial:initial.clone()};
+                    // Initialization may briefly expose the default file-mode
+                    // controls before applying FOS_PICKFOLDERS. Keep the native
+                    // window masked while its complete contract settles.
+                    if !contracts.entry(token).or_default().observe(contract,Instant::now()){index+=1;continue;}
+                    contracts.remove(&token);let early=preparing.remove(index);let(types,filter)=types(part.types);
+                    let initial_name=if kind.folders(){String::new()}else{text(part.name).filter(|name|!name.contains(['*','?'])).unwrap_or_default()};
+                    let options=Options{token,title:kind.title().into(),initial,multiple,kind,initial_name,types,filter,events:tx.clone()};
+                    let config=profile.to_path_buf();let report=tx.clone();
+                    let worker=thread::Builder::new().name("zsdesk-picker-window".into()).spawn(move||{
+                        let result=std::panic::catch_unwind(||crate::storage::load(&config).and_then(|session|crate::window::picker::run(session,config,options)))
+                            .map_err(|_|"文件选择窗口异常退出".to_owned()).and_then(|result|result.map_err(|error|format!("{error:#}")));
+                        let _=report.send(Event::Finished{token,result});
+                    })?;
+                    last_kind=Some(if kind.folders(){"folder"}else{"file"});last_confirmation=None;
+                    sessions.push(Session{source,name:part.name,types:if kind.folders(){HWND::default()}else{part.types},kind,multiple,accept,token,picker:None,guard:None,early:Some(early),worker:Some(worker),fallback:false});
+                }else{contracts.entry(token).or_default().reset();index+=1;}
             }
         }
-        let status=serde_json::json!({"pid":std::process::id(),"enabled":enabled,"active_pickers":sessions.len(),"completed":completed,"last_error":last_error}).to_string();
+        let status=serde_json::json!({"pid":std::process::id(),"enabled":enabled,"active_pickers":sessions.len(),"awaiting_caller":returning.len(),"last_kind":last_kind,"last_confirmation":last_confirmation,"completed":completed,"last_error":last_error,"early_masking":watcher.is_some()}).to_string();
         if status!=previous{let _=crate::quick_search::control::atomic_write(&profile.with_file_name("file-dialog-takeover-status.json"),status.as_bytes());previous=status;}
-        thread::sleep(Duration::from_millis(100));
+        thread::sleep(Duration::from_millis(10));
     }
     for session in &mut sessions{session.close_picker();}Ok(())
 }
+
 #[cfg(test)]mod tests{
     use super::*;
+    #[test]fn folder_followup_requires_confirmed_navigation_and_consumed_input(){
+        use zsdesk_core::model::explorer::ShellLocation;
+        let target=PathBuf::from(r"E:\selected folder");let selected=Outcome::Selected{paths:vec![target.clone()],filter:0};
+        assert_eq!(folder_navigation_pending(SelectionKind::Folders,&selected,Some(ShellLocation::ThisPc)),Some(target.clone()));
+        assert!(folder_navigation_pending(SelectionKind::Folders,&selected,Some(ShellLocation::Path(target.clone()))).is_none());
+        assert!(folder_navigation_pending(SelectionKind::Files,&selected,Some(ShellLocation::ThisPc)).is_none());
+        assert!(!folder_navigation_ready(&target,Some(ShellLocation::ThisPc),""));
+        assert!(!folder_navigation_ready(&target,Some(ShellLocation::Path(target.clone())),r#""E:\selected folder""#));
+        assert!(folder_navigation_ready(&target,Some(ShellLocation::Path(target.clone())),"selected folder"));
+        assert!(folder_navigation_ready(&target,Some(ShellLocation::Path(target.clone())),""));
+        assert!(folder_navigation_pending(SelectionKind::Folders,&Outcome::Cancelled,Some(ShellLocation::ThisPc)).is_none());
+    }
+    #[test]fn exact_folder_picker_titles_preserve_the_directory_contract(){
+        for title in ["选择文件夹","Select folder","选择目录","Choose directory"]{
+            assert_eq!(selection_kind("Open",false,folder_title(title)),Some(SelectionKind::Folders));
+        }
+        for title in ["选择文件","选择文件夹中的文件","Select files","Upload"]{assert!(!folder_title(title));}
+        assert_eq!(selection_kind("Save",false,folder_title("Select folder")),None);
+        assert_eq!(selection_kind("Open",true,folder_title("Select folder")),None);
+    }
+    #[test]fn folder_mode_must_settle_after_transient_file_controls(){
+        let start=Instant::now();let mut observed=StableContract::default();
+        let file=Contract{kind:SelectionKind::Files,name:1,types:2,multiple:true,accept:"上传".into(),initial:zsdesk_core::model::explorer::ShellLocation::ThisPc};
+        assert!(!observed.observe(file.clone(),start));
+        assert!(!observed.observe(file.clone(),start+Duration::from_millis(100)));
+        let folder=Contract{kind:SelectionKind::Folders,types:0,multiple:false,..file};
+        assert!(!observed.observe(folder.clone(),start+Duration::from_millis(120)));
+        assert!(!observed.observe(folder.clone(),start+Duration::from_millis(269)));
+        assert!(observed.observe(folder.clone(),start+Duration::from_millis(270)));
+        observed.reset();assert!(!observed.observe(folder,start+Duration::from_millis(300)));
+    }
+    #[test]
+    #[ignore="Owned hidden window hierarchy; no input or caller windows"]
+    fn native_folder_mode_ignores_a_hidden_nested_dialog()->Result<()>{
+        let root=unsafe{CreateWindowExW(WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE,w!("#32770"),w!("Nested control visibility fixture"),WS_POPUP,-30000,-30000,200,100,None,None,None,None)}?;
+        struct Window(HWND);impl Drop for Window{fn drop(&mut self){let _=unsafe{DestroyWindow(self.0)};}}let _root=Window(root);
+        let group=unsafe{CreateWindowExW(WINDOW_EX_STYLE(0),w!("#32770"),None,WS_CHILD,0,0,100,50,Some(root),None,None,None)}?;
+        let types=unsafe{CreateWindowExW(WINDOW_EX_STYLE(0),w!("COMBOBOX"),None,WS_CHILD|WS_VISIBLE,0,0,80,20,Some(group),None,None,None)}?;
+        assert!(!control_visible(types),"hidden inner dialog exposed a file-type control");
+        assert_eq!(selection_kind("上传",control_visible(types),true),Some(SelectionKind::Folders));
+        unsafe{let _=ShowWindow(group,SW_SHOWNA);}
+        assert!(!unsafe{IsWindowVisible(root)}.as_bool());
+        assert!(control_visible(types),"only the top-level pre-show state may be ignored");
+        unsafe{let _=ShowWindow(types,SW_HIDE);}
+        assert!(!control_visible(types));Ok(())
+    }
     #[test]fn only_open_dialogs_are_admitted(){for value in ["打开(&O)","Open","选择文件"]{assert!(open_label(value));}for value in ["保存(&S)","Save","确定","Cancel","选择文件夹","Select Folder"]{assert!(!open_label(value));}}
     #[test]fn folder_selection_requires_an_explicit_folder_contract(){
         for label in ["选择文件夹","选择此文件夹","Select Folder","Choose directory"]{

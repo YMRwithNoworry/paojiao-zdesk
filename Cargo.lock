@@ -1035,6 +1035,7 @@ name = "zsdesk-app"
 version = "0.3.15"
 dependencies = [
  "anyhow",
+ "cc",
  "dirs",
  "embed-resource",
  "pinyin",

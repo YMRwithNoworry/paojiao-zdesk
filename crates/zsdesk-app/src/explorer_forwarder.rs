@@ -23,6 +23,13 @@ pub fn owns_integration(profile:&Path)->bool{
     std::path::absolute(profile).ok().zip(std::path::absolute(crate::storage::config_path()).ok()).is_some_and(|(a,b)|same_path(&a,&b))
         && std::env::current_exe().is_ok_and(|exe|integration::owns_folder_integration(&exe))
 }
+fn forwarding_policy(registered:bool,window_open:bool,permanent:bool,temporary:bool)->bool{
+    if registered{permanent}else{window_open&&temporary}
+}
+pub(crate) fn enabled(profile:&Path)->bool{
+    !crate::edition::DESKTOP_ONLY&&crate::storage::load(profile).is_ok_and(|session|
+        forwarding_policy(owns_integration(profile),find_target(profile).is_some(),session.ui.forward_unhandled_windows,session.ui.forward_while_running))
+}
 struct Apartment;
 impl Drop for Apartment{fn drop(&mut self){unsafe{CoUninitialize();}}}
 #[derive(Clone)]
@@ -110,9 +117,9 @@ const EMPTY_OBSERVATION_MS:u64=600;
 const SELECTED_OBSERVATION_MS:u64=450;
 const SELECTION_STABLE_MS:u64=150;
 const CLOSE_RESERVE_MS:u64=120;
-struct Candidate{lease:Lease,hidden:bool,hide_requested:bool,activation_launched:bool,ready_at:Option<u64>,first:Option<Snapshot>,observed:Option<(Snapshot,u64)>,sent:Option<Snapshot>,launched:bool,committed:bool}
+struct Candidate{lease:Lease,hidden:bool,activation_launched:bool,ready_at:Option<u64>,first:Option<Snapshot>,observed:Option<(Snapshot,u64)>,sent:Option<Snapshot>,launched:bool,committed:bool}
 impl Candidate{
-    fn new(lease:Lease)->Self{Self{lease,hidden:false,hide_requested:false,activation_launched:false,ready_at:None,first:None,observed:None,sent:None,launched:false,committed:false}}
+    fn new(lease:Lease)->Self{Self{lease,hidden:false,activation_launched:false,ready_at:None,first:None,observed:None,sent:None,launched:false,committed:false}}
 }
 fn packet(snapshot:&Snapshot)->Result<Vec<u8>>{
     if snapshot.this_pc{Ok(serde_json::to_vec(&(Some(zsdesk_core::model::explorer::ShellLocation::ThisPc),None::<String>))?)}
@@ -155,27 +162,8 @@ fn activate_from_source(profile:&Path,snapshot:&Snapshot,target:HWND,launched:&m
 }
 fn update_candidate(profile:&Path,guard:&Connection,candidate:&mut Candidate,snapshot:&Snapshot)->Result<()>{
     if !candidate.hidden{
-        ensure!(guard.preparing(&candidate.lease),"来源窗口准备阶段已结束");
-        ensure!(snapshot.pid==candidate.lease.identity.pid&&snapshot.window.0 as isize==candidate.lease.identity.window,"来源窗口身份已改变");
-        let stamp=visibility_guard::now();
-        if candidate.first.as_ref().is_none_or(|first|!first.same_location(snapshot)){
-            candidate.first=Some(snapshot.clone());candidate.ready_at=Some(stamp);candidate.observed=None;
-        }
-        if candidate.observed.as_ref().is_none_or(|(last,_)|!last.equivalent(snapshot)){candidate.observed=Some((snapshot.clone(),stamp));}
-        if !can_deliver(candidate.ready_at.unwrap_or(stamp),stamp,false){return Ok(());}
-        let Some(target)=find_target(profile)else{launch_target_once(&mut candidate.launched,||start_target(profile,snapshot))?;return Ok(());};
-        let bytes=packet(snapshot)?;
-        if candidate.sent.as_ref().is_none_or(|sent|!sent.equivalent(snapshot)){
-            if !send_with_budget(target,if snapshot.this_pc{crate::instance::OPEN_MAGIC}else{crate::reveal::COPYDATA_TAG},&bytes,25){return Ok(());}
-            candidate.sent=Some(snapshot.clone());
-        }
-        let ready=candidate.ready_at.unwrap_or(stamp);let stable=candidate.observed.as_ref().map_or(stamp,|(_,at)|*at);
-        if !close_due(candidate.lease.started.saturating_add(visibility_guard::PREPARE_MS),stamp,ready,stable,!snapshot.selected.is_empty()){return Ok(());}
-        if !send_with_budget(target,if snapshot.this_pc{crate::reveal::VERIFY_THIS_PC}else{crate::reveal::VERIFY_TAG},if snapshot.this_pc{&[]}else{&bytes},25){return Ok(());}
-        if !candidate.hide_requested{
-            if unsafe{GetForegroundWindow()}==snapshot.window&&!activate_from_source(profile,snapshot,target,&mut candidate.activation_launched)?{return Ok(());}
-            guard.hide_ready(&candidate.lease)?;candidate.hide_requested=true;
-        }
+        // Visibility is acquired by the independent reader immediately after
+        // creation, before this thread enters any Shell COM call.
         return Ok(());
     }
     ensure!(guard.active(&candidate.lease),"来源窗口隐藏租约已结束");
@@ -183,14 +171,18 @@ fn update_candidate(profile:&Path,guard:&Connection,candidate:&mut Candidate,sna
         &&visibility_guard::matches_identity(&candidate.lease.identity),"来源窗口身份已改变");
     ensure!(unsafe{IsWindowEnabled(snapshot.window)}.as_bool()&&!visibility_guard::shift_down(),"来源窗口已中断接管");
     let stamp=visibility_guard::now();
+    // Explorer can initialize its default location before applying the
+    // requested path. While masked, treat that navigation as preparation.
+    if candidate.first.as_ref().is_none_or(|first|!first.same_location(snapshot)){
+        candidate.first=Some(snapshot.clone());candidate.ready_at=Some(stamp);candidate.observed=None;
+    }
     let ready=*candidate.ready_at.get_or_insert(stamp);
-    if let Some(first)=&candidate.first{ensure!(first.same_location(snapshot),"来源窗口已导航到其他位置");}
-    else{candidate.first=Some(snapshot.clone());}
     if candidate.observed.as_ref().is_none_or(|(last,_)|!last.equivalent(snapshot)){
         candidate.observed=Some((snapshot.clone(),stamp));
     }
     if !can_deliver(ready,stamp,!snapshot.selected.is_empty())||candidate.committed{return Ok(());}
     let Some(target)=find_target(profile)else{
+        ensure!(owns_integration(profile),"临时接管已结束，系统窗口保持打开");
         launch_target_once(&mut candidate.launched,||start_target(profile,snapshot))?;
         return Ok(());
     };
@@ -201,7 +193,11 @@ fn update_candidate(profile:&Path,guard:&Connection,candidate:&mut Candidate,sna
     if candidate.sent.as_ref().is_none_or(|sent|!sent.equivalent(snapshot)){
         if !send_with_budget(target,if snapshot.this_pc{crate::instance::OPEN_MAGIC}else{crate::reveal::COPYDATA_TAG},&bytes,budget){return Ok(());}
         candidate.sent=Some(snapshot.clone());
-        if candidate.lease.foreground||unsafe{GetForegroundWindow()}==snapshot.window{crate::instance::request_activation(target);}
+        if candidate.lease.foreground||unsafe{GetForegroundWindow()}==snapshot.window{
+            // Foreground permission is best effort, never a reason to discard
+            // a successfully delivered request and leave two folder windows.
+            let _=activate_from_source(profile,snapshot,target,&mut candidate.activation_launched);
+        }
     }
     // Silence cannot prove that no future /select will arrive. Retain a longer
     // observation for an empty selection and restart the stability period on
@@ -232,7 +228,7 @@ impl Bridge{
             let mut refresh=Instant::now()-Duration::from_secs(3);let mut heartbeat=Instant::now();let mut forwarded=0u64;
             while !signal.load(Ordering::Acquire){
                 if refresh.elapsed()>=Duration::from_secs(2){
-                    enabled=owns_integration(&profile)&&crate::storage::load(&profile).is_ok_and(|session|session.ui.forward_unhandled_windows);
+                    enabled=self::enabled(&profile);
                     refresh=Instant::now();
                     if !enabled{guard.take();shell=None;candidates.clear();write_status(&profile,false,forwarded,None,None);}
                     else if guard.is_none(){
@@ -241,6 +237,10 @@ impl Bridge{
                             Err(error)=>write_status(&profile,false,forwarded,Some(&format!("{error:#}")),None),
                         }
                     }
+                }
+                // A temporary session must not reopen ZSDesk after its last window closes.
+                if enabled&&find_target(&profile).is_none()&&!owns_integration(&profile){
+                    enabled=false;guard.take();shell=None;candidates.clear();write_status(&profile,false,forwarded,None,None);
                 }
                 if enabled{
                     if guard.as_mut().is_some_and(Connection::exited){guard.take();shell=None;candidates.clear();
@@ -269,7 +269,7 @@ impl Bridge{
                                             if let Err(error)=update_candidate(&profile,guard,candidate,snapshot){cancel.push((*id,format!("{error:#}")));}
                                         }
                                     }
-                                    for(id,error)in cancel{guard.restore(id);candidates.remove(&id);write_status(&profile,true,forwarded,Some(&error),Some(guard.pid()));}
+                                    for(id,error)in cancel{guard.restore(id);candidates.remove(&id);write_status(&profile,true,forwarded,Some(&error),Some(guard.pid()));crate::window::diagnostics::record("explorer-forwarding",&error,None);}
                                 },
                                 Err(error)=>{for id in candidates.keys(){guard.restore(*id);}candidates.clear();shell=None;
                                     write_status(&profile,true,forwarded,Some(&format!("{error:#}")),Some(guard.pid()));},
@@ -298,6 +298,13 @@ fn write_status(profile:&Path,active:bool,forwarded:u64,error:Option<&str>,guard
 
 #[cfg(test)] mod tests{
     use super::*;
+    #[test]fn temporary_forwarding_is_opt_in_and_ends_with_the_last_window(){
+        assert!(!forwarding_policy(false,true,true,false));
+        assert!(forwarding_policy(false,true,false,true));
+        assert!(!forwarding_policy(false,false,true,true));
+        assert!(forwarding_policy(true,false,true,false));
+        assert!(!forwarding_policy(true,true,false,true));
+    }
     #[test]fn late_selection_wait_is_bounded_and_does_not_renew_the_visibility_lease(){
         assert!(!can_deliver(100,249,false));assert!(can_deliver(100,250,false));
         assert!(can_deliver(100,100,true));

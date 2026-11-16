@@ -13,9 +13,12 @@ pub fn launch(profile: &Path, settings: bool) -> Result<()> {
     spawn_utility(profile,if settings {"--quick-search-settings"}else{"--quick-search"})
 }
 
+pub(crate) fn needs_background(profile:&Path)->bool{
+    crate::explorer_forwarder::owns_integration(profile)||crate::explorer_forwarder::enabled(profile)||dialog_enabled(profile)
+}
+
 pub fn start_if_enabled(profile: &Path) -> Result<()> {
-    if (!control::load(profile)?.preferences.enabled && !crate::explorer_forwarder::owns_integration(profile)
-        && !dialog_enabled(profile)) || control::running(profile) { return Ok(()); }
+    if (!control::load(profile)?.preferences.enabled && !needs_background(profile)) || control::running(profile) { return Ok(()); }
     spawn_utility(profile,"--background")
 }
 
@@ -52,14 +55,13 @@ pub fn run(profile: PathBuf, action: Action) -> Result<()> {
         Action::Disable => {
             let mut preferences = control::load(&profile)?.preferences;
             preferences.enabled = false; preferences.start_with_windows = false;
-            control::apply(&profile, preferences)?; let _ = control::signal(&profile, if crate::explorer_forwarder::owns_integration(&profile)||dialog_enabled(&profile){"reload"}else{"stop"})?;
+            control::apply(&profile, preferences)?; let _ = control::signal(&profile, if needs_background(&profile){"reload"}else{"stop"})?;
             println!("{}", serde_json::json!({"enabled":false,"start_with_windows":false})); return Ok(());
         }
         _ => {}
     }
     let configuration = control::load(&profile)?;
-    if action == Action::Resident && !configuration.preferences.enabled && !crate::explorer_forwarder::owns_integration(&profile)
-        && !dialog_enabled(&profile) { return Ok(()); }
+    if action == Action::Resident && !configuration.preferences.enabled && !needs_background(&profile) { return Ok(()); }
     let Some(instance) = control::Instance::acquire(&profile)? else {
         if action != Action::Resident { let _ = control::signal(&profile, if action == Action::Settings { "settings" } else { "open" })?; }
         return Ok(());

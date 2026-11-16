@@ -13,7 +13,7 @@ impl WindowState{
         Ok((results,crate::context_preferences::native(&self.session.ui.context_menu)))
     }
 }
-struct Session{generation:u64,identity:super::pane_input::Identity,view_window:HWND,foreground:HWND,view:IShellView,pidls:Vec<Vec<u8>>,folder:Option<PathBuf>,background:Option<Vec<u8>>,client:Client,catalog:bool,input:Option<super::global_search::InputWatch>,visual:Option<VisualSelection>,invocation_authorized:bool}
+struct Session{generation:u64,identity:super::pane_input::Identity,view_window:HWND,foreground:HWND,view:IShellView,pidls:Vec<Vec<u8>>,folder:Option<PathBuf>,background:Option<Vec<u8>>,client:Client,catalog:bool,input:Option<super::global_search::InputWatch>,visual:Option<VisualSelection>,invocation_authorized:bool,point:POINT,started:std::time::Instant,loading_notified:bool,mode:WorkerMode,extended:bool}
 thread_local!{static ACTIVE:RefCell<HashMap<isize,Session>>=RefCell::new(HashMap::new());}
 thread_local!{static GENERATIONS:RefCell<HashMap<isize,u64>>=RefCell::new(HashMap::new());static NEXT:Cell<u64>=const{Cell::new(1)};}
 fn generation(owner:HWND)->Option<u64>{GENERATIONS.with(|generations|generations.borrow().get(&(owner.0 as isize)).copied())}
@@ -145,6 +145,22 @@ pub(super) fn show_catalog(owner:HWND,view:&IShellView,identity:super::pane_inpu
     start(owner,unsafe{view.GetWindow()?},view,identity,POINT::default(),false,true,false,false,Some(preferences))
 }
 fn start(owner:HWND,window:HWND,view:&IShellView,identity:super::pane_input::Identity,point:POINT,new:bool,catalog:bool,keyboard:bool,background_click:bool,captured:Option<SourcePreferences>)->windows::core::Result<()>{
+    let extended=unsafe{GetKeyState(VK_SHIFT.0 as i32)}<0;
+    // Repeated clicks on an unchanged target must not cancel a slow first
+    // request and restart Shell/XAML initialization from scratch.
+    let repeated=if !new&&!catalog&&!keyboard{
+        let targets=if background_click{Vec::new()}else{snapshot(view)?};
+        let background=if targets.is_empty(){Some(background_pidl(view)?)}else{None};
+        ACTIVE.with(|active|{
+            let mut active=active.borrow_mut();let Some(session)=active.get_mut(&(owner.0 as isize))else{return false;};
+            if session.identity!=identity||session.view_window!=window||session.catalog||session.invocation_authorized
+                ||!matches!(session.mode,WorkerMode::More|WorkerMode::Background)||session.extended!=extended
+                ||session.point.x!=point.x||session.point.y!=point.y||!session.client.preparing()
+                ||session.background!=background||session.pidls!=targets{return false;}
+            session.input=super::global_search::InputWatch::new();session.foreground=unsafe{GetForegroundWindow()};true
+        })
+    }else{false};
+    if repeated{return Ok(());}
     close(owner);let foreground=unsafe{GetForegroundWindow()};let generation=generation(owner).unwrap();
     // A newly materialized DefView can asynchronously clear its highlight.
     // Restore its visual selection only while the same source has had no input
@@ -171,7 +187,7 @@ fn start(owner:HWND,window:HWND,view:&IShellView,identity:super::pane_input::Ide
     let client=Client::spawn_with_context(owner,point,targets,folder.clone(),options,MenuInterceptions{rename:true,open:true,file_actions},mode,unsafe{GetKeyState(VK_SHIFT.0 as i32)}<0,layout,Some(view_context))
         .map_err(|error|failure(&format!("无法启动系统菜单：{error:#}")))?;
     if !current(owner,generation){return Ok(());}
-    ACTIVE.with(|active|{active.borrow_mut().insert(owner.0 as isize,Session{generation,identity,view_window:window,foreground,view:view.clone(),pidls,folder,background,client,catalog,input,visual,invocation_authorized:false});});
+    ACTIVE.with(|active|{active.borrow_mut().insert(owner.0 as isize,Session{generation,identity,view_window:window,foreground,view:view.clone(),pidls,folder,background,client,catalog,input,visual,invocation_authorized:false,point,started:std::time::Instant::now(),loading_notified:false,mode,extended});});
     unsafe{SetTimer(Some(owner),TIMER,50,None)};Ok(())
 }
 
@@ -223,6 +239,9 @@ pub(super) fn poll(owner:HWND){
         if permit&&before_invoke{*invocation_authorized=true;}permit
     });
     if !current(owner,generation)||!live_source(owner,window,identity){return;}
+    if session.loading_notified&&(result.is_some()||!session.client.preparing()){
+        session.loading_notified=false;super::pane_input::post(owner,identity,super::pane_input::Intent::TransferMessage(String::new()));
+    }
     // Full PIDL enumeration belongs to validation barriers, not every 50 ms
     // while the user reads a menu. Native callbacks can be costly for multi-select.
     let layout=session.client.take_layout();
@@ -239,7 +258,12 @@ pub(super) fn poll(owner:HWND){
     }
     match result{
         Some(Ok(_)) if session.catalog=>{super::pane_input::post(owner,identity,super::pane_input::Intent::ContextCatalog(catalog));},
-        None=>{ACTIVE.with(|active|{active.borrow_mut().insert(owner.0 as isize,session);});},
+        None=>{
+            if !session.loading_notified&&session.client.preparing()&&session.started.elapsed()>=std::time::Duration::from_millis(250){
+                session.loading_notified=true;super::pane_input::post(owner,identity,super::pane_input::Intent::TransferMessage("正在加载右键菜单…".into()));
+            }
+            ACTIVE.with(|active|{active.borrow_mut().insert(owner.0 as isize,session);});
+        },
         Some(Ok(action @ (MenuOutcome::Copy|MenuOutcome::Cut|MenuOutcome::Paste|MenuOutcome::Delete{..}))) if valid=>{
             if session.input.as_ref().is_some_and(|watch|watch.changed()){return;}
             file_transfer::note_user_input(window);
