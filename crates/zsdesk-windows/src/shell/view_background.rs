@@ -3,7 +3,7 @@ use std::{cell::Cell,rc::Rc};
 use windows::{core::BOOL,Win32::{Foundation::{HWND,LPARAM,LRESULT,WPARAM,COLORREF,RECT,POINT},
     Graphics::Gdi::{CreateSolidBrush,DeleteObject,FillRect,HBRUSH,HDC,GetSysColorBrush,GetSysColor,COLOR_WINDOW,
         SaveDC,RestoreDC,ExcludeClipRect,MapWindowPoints},
-    UI::{Controls::{LVM_SETBKCOLOR,LVM_SETTEXTBKCOLOR,LVM_SETEXTENDEDLISTVIEWSTYLE,LVS_EX_DOUBLEBUFFER},
+    UI::{Controls::{LVM_SETBKCOLOR,LVM_SETTEXTBKCOLOR,LVM_SETEXTENDEDLISTVIEWSTYLE,LVS_EX_DOUBLEBUFFER,LVS_EX_TWOCLICKACTIVATE},
         Shell::{IShellView,SetWindowSubclass,GetWindowSubclass,RemoveWindowSubclass,DefSubclassProc},
         WindowsAndMessaging::{EnumChildWindows,GetClassNameW,GetClientRect,GetWindowRect,GetWindow,GetWindowLongPtrW,
             SendMessageW,GWL_STYLE,GW_CHILD,GW_HWNDNEXT,WS_VISIBLE,WM_ERASEBKGND,WM_NCDESTROY,WM_PARENTNOTIFY,WM_CREATE}}}};
@@ -26,10 +26,11 @@ fn paint_owner(hwnd:HWND)->Option<PaintOwner>{
 }
 fn prepare_list_view(hwnd:HWND,colors:Colors){
     let color=if colors.high_contrast{unsafe{GetSysColor(COLOR_WINDOW)}}else{colors.background};
-    // Mask only the buffering bit: keep Shell-owned selection, checkboxes and
-    // layout styles. Let the control erase within its own buffered paint.
+    // Keep Shell-owned selection and checkbox styles while enabling native
+    // hover feedback without selecting the hovered item.
     unsafe{
-        SendMessageW(hwnd,LVM_SETEXTENDEDLISTVIEWSTYLE,Some(WPARAM(LVS_EX_DOUBLEBUFFER as usize)),Some(LPARAM(LVS_EX_DOUBLEBUFFER as isize)));
+        let styles=LVS_EX_DOUBLEBUFFER|LVS_EX_TWOCLICKACTIVATE;
+        SendMessageW(hwnd,LVM_SETEXTENDEDLISTVIEWSTYLE,Some(WPARAM(styles as usize)),Some(LPARAM(styles as isize)));
         SendMessageW(hwnd,LVM_SETBKCOLOR,None,Some(LPARAM(color as isize)));
         SendMessageW(hwnd,LVM_SETTEXTBKCOLOR,None,Some(LPARAM(color as isize)));
     }
@@ -168,7 +169,8 @@ unsafe extern "system" fn procedure(hwnd:HWND,msg:u32,wp:WPARAM,lp:LPARAM,id:usi
             colors.set(Colors{background:color,dark,high_contrast:false});
             install_one(window.0,colors.clone(),paint_owner(window.0).unwrap());
             let styles=unsafe{SendMessageW(window.0,LVM_GETEXTENDEDLISTVIEWSTYLE,None,None)}.0 as u32;
-            assert_eq!(styles&(LVS_EX_DOUBLEBUFFER|LVS_EX_FULLROWSELECT),LVS_EX_DOUBLEBUFFER|LVS_EX_FULLROWSELECT);
+            assert_eq!(styles&(LVS_EX_DOUBLEBUFFER|LVS_EX_TWOCLICKACTIVATE|LVS_EX_FULLROWSELECT),
+                LVS_EX_DOUBLEBUFFER|LVS_EX_TWOCLICKACTIVATE|LVS_EX_FULLROWSELECT);
             assert_eq!(unsafe{SendMessageW(window.0,LVM_GETBKCOLOR,None,None)}.0 as u32,color);
         }
     }
