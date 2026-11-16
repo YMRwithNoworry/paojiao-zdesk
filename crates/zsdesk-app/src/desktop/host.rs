@@ -285,6 +285,7 @@ pub struct DesktopHost {
     pub internal_drag: Option<(u64, Vec<String>)>,
     internal_drag_data:Option<IDataObject>,drag_is_internal:bool,
     drag_geometry:Vec<(String,Bounds)>,
+    last_drop:Option<serde_json::Value>,
     pub(super) menu_input_started: Option<(u64,Instant)>,
     modal_holds:HashMap<u64,u32>,
     pending_menu:Option<(u64,u64)>,
@@ -307,7 +308,7 @@ impl DesktopHost {
         let mut host = Self { hwnd, config_path, explorer_config, config, fences: Vec::new(), desktop_entries: Vec::new(), #[cfg(test)]desktop_test_entries:None,gfx,
             cut_paths:HashSet::new(),icons: HashMap::new(), icon_clock: 0, next_icon_request: 1, icon_content_active: false, shutting_down: false, desktop_anchor: None, desktop_exposed:false,
             loader, desktop_notify: None, guard: None, pending: Vec::new(), known: HashSet::new(),desktop_snapshot_initialized:false, menu_input_started:None,
-            modal_holds:HashMap::new(),pending_menu:None,incoming_drag:None,drag_geometry:Vec::new(),
+            modal_holds:HashMap::new(),pending_menu:None,incoming_drag:None,drag_geometry:Vec::new(),last_drop:None,
             taskbar_created, palette: FencePalette::new(Mode::Dark, 55), drop_delegate: None, drop_data: None, internal_drag: None,internal_drag_data:None,drag_is_internal:false, tray: false,tray_version4:false,
             merge_target: None, tab_hover: None };
         host.update_palette();
@@ -1204,7 +1205,8 @@ impl DesktopHost {
             "icon_entries":self.icons.len(),"icon_pixel_bytes":self.icons.values().map(IconSlot::pixel_bytes).sum::<u64>(),
             "visible_icon_keys":visible.len(),"cold_icon_entries":cold.len(),"cold_icon_pixel_bytes":cold.iter().map(|s|s.pixel_bytes()).sum::<u64>(),
             "cold_entry_limit":MAX_COLD_ICONS,"cold_pixel_limit":MAX_COLD_ICON_BYTES,"pending_icon_requests":queue.pending,"queued_icon_requests":queue.queued,
-            "ready_icon_results":queue.ready,"ready_icon_pixel_bytes":queue.ready_pixel_bytes,"decoder_workers":zsdesk_windows::shell::icons::icon_worker_diagnostics(),"text_formats":formats,"render_target_live":target,"imaging_factory_live":self.gfx.imaging_factory_live(),"context_menu":super::menu_diagnostics()})
+            "ready_icon_results":queue.ready,"ready_icon_pixel_bytes":queue.ready_pixel_bytes,"decoder_workers":zsdesk_windows::shell::icons::icon_worker_diagnostics(),"text_formats":formats,"render_target_live":target,"imaging_factory_live":self.gfx.imaging_factory_live(),"context_menu":super::menu_diagnostics(),
+            "saved_loose_items":self.config.released_items.len(),"live_loose_windows":self.fences.iter().filter(|window|window.standalone).count(),"last_drop":self.last_drop})
     }
 
     pub fn write_diagnostics(&self, path: &Path) -> anyhow::Result<()> {
@@ -1332,20 +1334,32 @@ impl DesktopHost {
         let work_width=unscale(monitor.work.right-monitor.work.left,monitor.dpi);
         let work_height=unscale(monitor.work.bottom-monitor.work.top,monitor.dpi);
         let pointer=(unscale(point.x-monitor.work.left,monitor.dpi),unscale(point.y-monitor.work.top,monitor.dpi));
-        let mut occupied:Vec<Bounds>=self.config.fences.iter().chain(&self.config.released_items)
-            .filter(|item|item.placement.monitor==monitor.name && !item.is_hidden_tab()
-                && !(self.config.is_released(item.id)&&item.members.iter().any(|member|keys.iter().any(|key|member==key))))
-            .map(|item|Bounds::new(item.placement.x,item.placement.y,item.placement.width,if item.collapsed{TITLE_H}else{item.placement.height})).collect();
+        let work=Bounds::new(monitor.work.left,monitor.work.top,monitor.work.right-monitor.work.left,monitor.work.bottom-monitor.work.top);
+        let mut occupied:Vec<Bounds>=self.fences.iter().filter_map(|window|{
+            let visible=unsafe{IsWindowVisible(window.hwnd)}.as_bool()&&(!window.standalone||!window.entries.is_empty());
+            let dragged=window.standalone&&window.entries.iter().any(|entry|keys.iter().any(|key|key==&entry.key));
+            let mut rect=window.window_rect();
+            // A hover-expanded, collapsed fence rolls back up after the drag;
+            // its temporary preview must not push a loose icon far away.
+            if !window.standalone&&self.config.fence(window.id).is_some_and(|fence|fence.collapsed){rect.bottom=rect.top+scale(TITLE_H,window.dpi);}
+            super::drag_placement::visible_obstacle(Bounds::new(rect.left,rect.top,rect.right-rect.left,rect.bottom-rect.top),work,monitor.dpi,visible,dragged)
+        }).collect();
         let offsets:Vec<_>=keys.iter().enumerate().map(|(index,key)|self.drag_geometry.iter().find(|(name,_)|name==key)
             .map(|(_,bounds)|*bounds).unwrap_or(Bounds::new(-48+(index as i32%8)*96,-24+(index as i32/8)*104,width,height))).collect();
+        self.last_drop=Some(serde_json::json!({"status":"planning","screen_pointer":[point.x,point.y],"work_origin":[monitor.work.left,monitor.work.top],"dpi":monitor.dpi,
+            "pointer_dip":[pointer.0,pointer.1],"selected_count":keys.len(),"captured_hot_spots":keys.iter().filter(|key|self.drag_geometry.iter().any(|(name,_)|name==*key)).count(),"visible_obstacles":occupied.len(),
+            "offsets":offsets.iter().map(|b|[b.x,b.y,b.w,b.h]).collect::<Vec<_>>()}));
         let Some(positions)=super::drag_placement::place(&offsets,pointer,(work_width,work_height),&occupied)else{
+            if let Some(drop)=&mut self.last_drop{drop["status"]="no-space".into();}
             if self.config.settings.icons_hidden_by_zsdesk&&keys.iter().any(|key|!self.fences.iter().any(|window|window.entries.iter().any(|entry|&entry.key==key))){self.restore_desktop();}
             return Err("桌面可用空间不足，无法放置这组图标；文件仍保留在磁盘上。".into());
         };
+        if let Some(drop)=&mut self.last_drop{drop["positions_dip"]=serde_json::json!(positions.iter().map(|b|[b.x,b.y,b.w,b.h]).collect::<Vec<_>>());}
         let mut planned=Vec::new();let mut unique=HashSet::new();
         for (key,position) in keys.iter().zip(positions) {
             if !unique.insert(key.clone()){continue;}
             if desktop::entry_from_parsing_name(key).is_none() {
+                if let Some(drop)=&mut self.last_drop{drop["status"]="source-unavailable".into();}
                 self.config=original;self.refresh_desktop();
                 let unseen=keys.iter().any(|key|!self.fences.iter().any(|window|
                     unsafe{IsWindowVisible(window.hwnd)}.as_bool()&&window.entries.iter().any(|entry|entry.key.eq_ignore_ascii_case(key))));
@@ -1375,6 +1389,7 @@ impl DesktopHost {
             Ok(())
         })();
         if let Err(error)=publish {
+            if let Some(drop)=&mut self.last_drop{drop["status"]="rolled-back".into();}
             self.config=original;
             self.fences.retain_mut(|window|{
                 if original_ids.contains(&window.id){return true;}
@@ -1392,6 +1407,7 @@ impl DesktopHost {
             return Err(error);
         }
         let _=unsafe{KillTimer(Some(self.hwnd),TIMER_SAVE)};
+        if let Some(drop)=&mut self.last_drop{drop["status"]="saved".into();}
         self.repair_layer();Ok(planned.len())
     }
 
@@ -1532,7 +1548,15 @@ impl DesktopHost {
                             let rect=window.window_rect();let item_dpi=window.dpi;window.selected_entries().into_iter().map(move|entry|(entry.key.clone(),Bounds::new(
                                 unscale(rect.left-anchor.x,dpi),unscale(rect.top-anchor.y,dpi),unscale(rect.right-rect.left,item_dpi),unscale(rect.bottom-rect.top,item_dpi))))
                         }).collect()
-                    }else{Vec::new()};
+                    }else{
+                        let selected:Vec<_>=win.entries.iter().filter(|entry|win.selection.contains(&entry.key)).map(|entry|entry.key.clone()).collect();
+                        let grabbed=selected.iter().position(|entry|entry==&key).unwrap_or(0);
+                        let geometry=win.geometry(&fence);
+                        let target=super::fence::Geometry::desktop_item(96,104,96,48,1).cells[0].icon;
+                        let hot_spot=geometry.cells.get(item).map(|cell|(target.x+unscale(cursor.x-cell.icon.x,dpi),target.y+unscale(cursor.y-cell.icon.y,dpi))).unwrap_or((48,24));
+                        let offsets=super::drag_placement::incoming_offsets(selected.len(),grabbed,hot_spot,(96,104));
+                        selected.into_iter().zip(offsets).collect()
+                    };
                     return After::Drag { fence: id };
                 }
                 return After::Nothing;

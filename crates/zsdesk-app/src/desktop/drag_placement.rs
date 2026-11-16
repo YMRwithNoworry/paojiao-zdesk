@@ -6,6 +6,27 @@ pub(super) fn signed_scale(value:i32,numerator:u32,denominator:u32)->i32{
     ((value+value.signum()*i64::from(denominator/2))/i64::from(denominator.max(1))) as i32
 }
 
+/// Only rectangles that are actually visible on this work area can displace a
+/// drop. Saved positions for absent files are recovery data, not obstacles.
+pub(super) fn visible_obstacle(rect:Bounds,work:Bounds,dpi:u32,visible:bool,dragged:bool)->Option<Bounds>{
+    if !visible||dragged{return None;}
+    let left=rect.x.max(work.x);let top=rect.y.max(work.y);
+    let right=rect.right().min(work.right());let bottom=rect.bottom().min(work.bottom());
+    if left>=right||top>=bottom{return None;}
+    let x=signed_scale(left-work.x,96,dpi);let y=signed_scale(top-work.y,96,dpi);
+    Some(Bounds::new(x,y,(signed_scale(right-work.x,96,dpi)-x).max(1),(signed_scale(bottom-work.y,96,dpi)-y).max(1)))
+}
+
+/// A dense fence/list becomes desktop cells; keep the grabbed item under the
+/// same pointer hot spot instead of always anchoring the first selected item.
+pub(super) fn incoming_offsets(count:usize,grabbed:usize,hot_spot:(i32,i32),cell:(i32,i32))->Vec<Bounds>{
+    let columns=count.min(8).max(1)as i32;let grabbed=grabbed.min(count.saturating_sub(1))as i32;
+    (0..count).map(|index|{
+        let index=index as i32;
+        Bounds::new((index%columns-grabbed%columns)*cell.0-hot_spot.0,(index/columns-grabbed/columns)*cell.1-hot_spot.1,cell.0,cell.1)
+    }).collect()
+}
+
 /// Translate the whole selection once. Never repack individual selected icons.
 pub(super) fn place(offsets:&[Bounds],pointer:(i32,i32),area:(i32,i32),occupied:&[Bounds])->Option<Vec<Bounds>>{
     if offsets.is_empty(){return Some(Vec::new());}
@@ -54,6 +75,27 @@ pub(super) fn place(offsets:&[Bounds],pointer:(i32,i32),area:(i32,i32),occupied:
 
 #[cfg(test)]mod tests{
     use super::*;
+    #[test]fn an_absent_saved_icon_cannot_push_the_drop_away_from_the_pointer(){
+        let work=Bounds::new(0,0,2560,1440);let stale=Bounds::new(86,146,96,104);
+        let occupied:Vec<_>=visible_obstacle(stale,work,96,false,false).into_iter().collect();
+        let offsets=[Bounds::new(-28,-20,96,104)];
+        assert_eq!(place(&offsets,(120,180),(2560,1440),&occupied).unwrap()[0],Bounds::new(92,160,96,104));
+        assert_ne!(place(&offsets,(120,180),(2560,1440),&[stale]).unwrap()[0],Bounds::new(92,160,96,104));
+        assert!(visible_obstacle(stale,work,96,true,true).is_none());
+    }
+    #[test]fn obstacle_coordinates_use_the_destination_work_area_and_visible_intersection(){
+        let work=Bounds::new(-2560,40,2560,1400);
+        assert_eq!(visible_obstacle(Bounds::new(-2600,20,160,180),work,144,true,false),Some(Bounds::new(0,0,80,107)));
+        assert!(visible_obstacle(Bounds::new(0,100,96,104),work,144,true,false).is_none());
+    }
+    #[test]fn dragging_a_later_selected_fence_item_preserves_its_hot_spot(){
+        for grabbed in 0..4{
+            let offsets=incoming_offsets(4,grabbed,(29,37),(96,104));
+            let placed=place(&offsets,(900,600),(2560,1440),&[]).unwrap();
+            assert_eq!(placed[grabbed],Bounds::new(871,563,96,104));
+            for(index,b)in placed.iter().enumerate(){assert!(placed[..index].iter().all(|a|a.right()<=b.x||a.x>=b.right()||a.bottom()<=b.y||a.y>=b.bottom()));}
+        }
+    }
     #[test]fn hot_spot_and_multi_selection_offsets_survive_moves_and_monitor_scaling(){
         for dpi in [96,120,144,192]{
             let offsets=vec![Bounds::new(-24,-30,96,104),Bounds::new(146,70,96,104)];
