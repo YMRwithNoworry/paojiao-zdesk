@@ -42,7 +42,6 @@
 [Setup]
 AppId={#ProductAppId}
 AppName={#ProductName}
-AppMutex={#ProductMutex}
 AppVersion={#MyAppVersion}
 AppVerName=ZSDesk {#MyAppVersion} {#EditionName}
 AppPublisher=ZSDesk contributors
@@ -70,7 +69,7 @@ ArchitecturesInstallIn64BitMode=x64compatible
 MinVersion=10.0.18362
 SetupIconFile=..\..\crates\zsdesk-app\resources\zsdesk.ico
 UninstallDisplayIcon={app}\ZSDesk.exe
-CloseApplications=no
+CloseApplications=yes
 RestartApplications=no
 ShowLanguageDialog=auto
 LanguageDetectionMethod=uilanguage
@@ -124,12 +123,20 @@ chinesesimp.InvalidFolder=请输入完整的安装路径。
 english.InvalidFolder=Enter a full installation path.
 chinesesimp.RestoreFailed=当前安装的系统集成还原失败，卸载已停止；请在 ZSDesk 中恢复系统集成后重试。
 english.RestoreFailed=System integration could not be restored. Uninstall stopped; restore integration in ZSDesk and try again.
+chinesesimp.RunningApp=请先退出正在运行的 ZSDesk，再卸载。
+english.RunningApp=Close all running instances of ZSDesk before uninstalling.
 
 [Code]
 var
   Landing: TWizardPage;
   Location: TNewEdit;
   Shortcut: TNewCheckBox;
+
+function InitializeUninstall: Boolean;
+begin
+  Result := not CheckForMutexes('{#ProductMutex}');
+  if not Result then MsgBox(CustomMessage('RunningApp'), mbError, MB_OK);
+end;
 
 procedure ChooseFolder(Sender: TObject);
 var
