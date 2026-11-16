@@ -841,6 +841,7 @@ impl IExplorerBrowserEvents_Impl for BrowserEvents_Impl {
             if let Ok(view) = unsafe { browser.GetCurrentView::<IShellView>() } {
                 if self.results_active.get(){configure_results_columns(&view);}
                 if let Ok(folder)=view.cast::<IFolderView2>(){let _=super::view_state::sync_column_header(&folder);}
+                if self.results_active.get(){view_background::install(&view,self.background.clone());}
             }
         }
         let logical = if self.results_active.get() { self.results_location.borrow().clone() } else { None };
