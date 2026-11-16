@@ -867,7 +867,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
     // are controls, so keep the arrow cursor before forwarding it.
     if msg == WM_SETCURSOR && (lp.0 & 0xffff) as u32 == HTCLIENT {
         let mut point = POINT::default();
-        if unsafe { GetCursorPos(&mut point) }.is_ok() && unsafe { ScreenToClient(hwnd, &mut point) }.is_ok()
+        if unsafe { GetCursorPos(&mut point) }.is_ok() && unsafe { ScreenToClient(hwnd, &mut point) }.as_bool()
             && matches!(client_hit(hwnd, point), Some(Hit::Tab(_) | Hit::TabClose(_) | Hit::NewTab | Hit::TabList | Hit::AppMenu)) {
             if let Ok(cursor) = unsafe { LoadCursorW(None, IDC_ARROW) } {
                 unsafe { SetCursor(Some(cursor)); }

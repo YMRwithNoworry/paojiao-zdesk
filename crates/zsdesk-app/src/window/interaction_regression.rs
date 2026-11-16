@@ -231,8 +231,8 @@ fn run(output:&std::path::Path)->Result<serde_json::Value>{
     let tab_rect=slot.borrow().as_ref().unwrap().layout.tabs.first().context("tab bounds")?.rect;
     let mut tab_point=POINT{x:tab_rect.x+tab_rect.width/2,y:tab_rect.y+tab_rect.height/2};
     unsafe{ClientToScreen(hwnd,&mut tab_point)}.ok()?;
-    let mut previous_cursor=POINT::default();unsafe{GetCursorPos(&mut previous_cursor)}.ok()?;
-    unsafe{SetCursorPos(tab_point.x,tab_point.y)}.ok()?;
+    let mut previous_cursor=POINT::default();unsafe{GetCursorPos(&mut previous_cursor)}?;
+    unsafe{SetCursorPos(tab_point.x,tab_point.y)}?;
     let tab_cursor_result=unsafe{SendMessageW(hwnd,WM_SETCURSOR,Some(WPARAM(hwnd.0 as usize)),Some(LPARAM((HTCLIENT|(WM_MOUSEMOVE<<16))as isize)))};
     let tab_cursor=unsafe{GetCursor()};
     let _=unsafe{SetCursorPos(previous_cursor.x,previous_cursor.y)};
