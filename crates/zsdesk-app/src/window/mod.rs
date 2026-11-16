@@ -1331,7 +1331,7 @@ impl WindowState {
             WM_ACTION => unsafe { self.action(wp.0, lp.0) },
             pane_input::MESSAGE => self.receive_pane_input(wp.0),
             WM_SHELL_NAVIGATED => if lp.0 != 0 { unsafe { self.navigation_completed(*Box::from_raw(lp.0 as *mut ShellLocation)); } },
-            WM_SHELL_FOLDER_INVOKED => if lp.0 != 0 { unsafe { self.navigate_to(*Box::from_raw(lp.0 as *mut ShellLocation)); } },
+            WM_SHELL_FOLDER_INVOKED => if lp.0 != 0 { unsafe { self.navigate_from_contents(*Box::from_raw(lp.0 as *mut ShellLocation)); } },
             WM_SHELL_NAVIGATION_FAILED => unsafe { self.navigation_failed() },
             WM_SHELL_SELECTION_CHANGED => { unsafe { acknowledge_selection_changed(lp.0); } self.refresh_status(); }
             WM_TREE_NAVIGATE => if lp.0 != 0 {

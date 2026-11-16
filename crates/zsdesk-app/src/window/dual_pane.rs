@@ -207,7 +207,7 @@ impl WindowState {
         let other=source!=self.browser_source;
         if other && (source!=self.other_pane.browser_source || self.other_pane.browser.is_none()){return;}
         if other {self.background_pane=true;self.swap_pane_runtime();self.relayout();}
-        unsafe{self.navigate_to(location);}
+        unsafe{self.navigate_from_contents(location);}
         if other {self.swap_pane_runtime();self.background_pane=false;self.relayout();self.position_children();unsafe{self.update_address();}}
     }
 

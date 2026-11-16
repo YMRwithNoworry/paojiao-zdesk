@@ -121,6 +121,10 @@ pub struct NamespaceTreeHost {
 }
 
 impl NamespaceTreeHost {
+    pub fn is_quick_access_location(location: &ShellLocation) -> bool {
+        initial_root(location)==InitialRoot::QuickAccess
+    }
+
     /// Creates the navigation tree.
     ///
     /// # Safety
@@ -325,6 +329,28 @@ impl NamespaceTreeHost {
         self.pending_sync.begin(item,chain);
     }
 
+    /// Selects a folder opened from Quick access without expanding its path
+    /// beneath This PC. Only the Quick access root may be expanded.
+    /// # Safety
+    /// Must be called on the creating STA while the host and COM apartment live.
+    pub unsafe fn select_quick_access_location(&self,location:&ShellLocation) {
+        let root_location=ShellLocation::Shell{pidl:None,parsing_name:QUICK_ACCESS.into(),title:"快速访问".into()};
+        let Ok(root)=(unsafe{shell_item(&root_location)})else{self.clear_selection();return;};
+        unsafe{self.select_location_under_root(location,&root);}
+    }
+
+    unsafe fn select_location_under_root(&self,location:&ShellLocation,root:&IShellItem) {
+        self.pending_sync.cancel();self.last_auto_expand.set(false);
+        let _sync=TreeSyncScope::new(self.hwnd,self.syncing.clone(),self.pending_sync.generation.clone());
+        let Ok(item)=(unsafe{shell_item(location)})else{self.clear_selection();return;};
+        if let Some(row)=unsafe{self.shown_row_under(root,&item)} {
+            if unsafe{self.select_exposed(&row)} {
+                *self.last_location.borrow_mut()=Some(item);return;
+            }
+        }
+        self.pending_sync.begin_under(item,root.clone());
+    }
+
     /// Leaves a clicked tree row intact when its navigation completes.
     /// # Safety
     /// Call on the creating STA while its COM apartment remains initialized.
@@ -342,6 +368,10 @@ impl NamespaceTreeHost {
             row=unsafe {self.tree.GetNextItem(&current,NSTCGNI_NEXTVISIBLE)}.ok();
         }
         None
+    }
+
+    unsafe fn shown_row_under(&self,root:&IShellItem,item:&IShellItem)->Option<IShellItem> {
+        unsafe {shown_row_under(&self.tree,root,item)}
     }
 
     fn clear_selection(&self) {
@@ -398,6 +428,7 @@ impl NamespaceTreeHost {
 
 struct TreeSyncRequest {
     item:IShellItem,
+    anchor:Option<IShellItem>,
     ancestors:Vec<IShellItem>,
     expansion_requested:Vec<bool>,
     deadline:Instant,
@@ -425,8 +456,14 @@ impl PendingTreeSync {
         self.request.borrow_mut().take();self.stop_timer();
     }
     fn begin(&self,item:IShellItem,ancestors:Vec<IShellItem>) {
+        self.begin_with_anchor(item,ancestors,None);
+    }
+    fn begin_under(&self,item:IShellItem,root:IShellItem) {
+        self.begin_with_anchor(item,vec![root.clone()],Some(root));
+    }
+    fn begin_with_anchor(&self,item:IShellItem,ancestors:Vec<IShellItem>,anchor:Option<IShellItem>) {
         let expansion_requested=vec![false;ancestors.len()];
-        *self.request.borrow_mut()=Some(TreeSyncRequest{item,ancestors,expansion_requested,
+        *self.request.borrow_mut()=Some(TreeSyncRequest{item,anchor,ancestors,expansion_requested,
             deadline:Instant::now()+Duration::from_secs(5),attempts:0});
         self.advance();
     }
@@ -458,7 +495,12 @@ impl PendingTreeSync {
             }
         }
         if self.generation.get()!=generation {return;}
-        if unsafe {select_exposed(&self.tree,self.hwnd,&request.item)} {
+        let selected=match request.anchor.as_ref() {
+            Some(anchor)=>unsafe{shown_row_under(&self.tree,anchor,&request.item)}
+                .is_some_and(|row|unsafe{select_exposed(&self.tree,self.hwnd,&row)}),
+            None=>unsafe{select_exposed(&self.tree,self.hwnd,&request.item)},
+        };
+        if selected {
             if self.generation.get()==generation {*self.last_location.borrow_mut()=Some(request.item);self.stop_timer();}
             return;
         }
@@ -509,6 +551,24 @@ unsafe fn item_is_exposed(tree:&INameSpaceTreeControl,item:&IShellItem)->bool {
         cursor=parent;
     }
     false
+}
+
+unsafe fn shown_row_under(tree:&INameSpaceTreeControl,root:&IShellItem,item:&IShellItem)->Option<IShellItem> {
+    let hint=(SICHINT_CANONICAL.0|SICHINT_TEST_FILESYSPATH_IF_NOT_EQUAL.0)as u32;
+    let mut row=unsafe {tree.GetRootItems().and_then(|items|items.GetItemAt(0))}.ok();
+    for _ in 0..4096 {
+        let current=row?;
+        if unsafe {current.Compare(item,hint)}.is_ok_and(|order|order==0) {
+            let mut ancestor=current.clone();
+            for _ in 0..64 {
+                if unsafe {ancestor.Compare(root,hint)}.is_ok_and(|order|order==0) {return Some(current);}
+                let Ok(parent)=(unsafe {tree.GetNextItem(&ancestor,NSTCGNI_PARENT)}) else {break;};
+                ancestor=parent;
+            }
+        }
+        row=unsafe {tree.GetNextItem(&current,NSTCGNI_NEXTVISIBLE)}.ok();
+    }
+    None
 }
 
 unsafe fn select_exposed(tree:&INameSpaceTreeControl,hwnd:HWND,item:&IShellItem)->bool {
@@ -798,7 +858,9 @@ mod tests {
         assert_eq!(initial_root(&ShellLocation::ThisPc),InitialRoot::ThisPc);
         assert_eq!(initial_root(&ShellLocation::Path(r"C:\\".into())),InitialRoot::ThisPc);
         for name in [QUICK_ACCESS,"SHELL:Home","shell:::{F874310E-B6B7-47DC-BC84-B9E6B38F5903}"] {
-            assert_eq!(initial_root(&ShellLocation::Shell{pidl:None, parsing_name:name.into(),title:String::new()}),InitialRoot::QuickAccess);
+            let location=ShellLocation::Shell{pidl:None, parsing_name:name.into(),title:String::new()};
+            assert_eq!(initial_root(&location),InitialRoot::QuickAccess);
+            assert!(NamespaceTreeHost::is_quick_access_location(&location));
         }
         let recycle=ShellLocation::Shell{pidl:None, parsing_name:"shell:RecycleBinFolder".into(),title:String::new()};
         assert_eq!(initial_root(&recycle),InitialRoot::Neither);
@@ -979,7 +1041,7 @@ mod tests {
         let location=ShellLocation::Path(target.clone());
         let branch_item=unsafe{shell_item(&ShellLocation::Path(branch.clone()))?};
         let target_item=unsafe{shell_item(&location)?};
-        let unrelated_item=unsafe{shell_item(&ShellLocation::Path(unrelated))?};
+        let unrelated_item=unsafe{shell_item(&ShellLocation::Path(unrelated.clone()))?};
         let trace_items=[("root",&root_item),("branch",&branch_item),("target",&target_item),("unrelated",&unrelated_item)];
         trace(&host,"before-default",&trace_items);
         unsafe{host.select_location_with_policy(&location,false);}pump();
@@ -1024,6 +1086,47 @@ mod tests {
         drop(host);assert!(PENDING_SYNCS.with(|pending|!pending.borrow().contains_key(&tree_hwnd)),"destroyed tree retained its retry route");
         drop(owner);pump();drop(apartment);
         assert!(foreground==unsafe{GetForegroundWindow()},"foreground changed during tree regression");
+        Ok(())
+    }
+
+    #[test]
+    #[ignore="Hidden Quick access namespace synchronization regression; requires ZSDESK_NATIVE_TEST_OUTPUT"]
+    fn native_quick_access_sync_keeps_this_pc_collapsed()->std::result::Result<(),Box<dyn std::error::Error>>{
+        use windows::Win32::{System::Ole::{OleInitialize,OleUninitialize},UI::WindowsAndMessaging::*};
+        use std::{path::PathBuf,thread,time::{Duration,Instant}};
+        fn pump(){let start=Instant::now();while start.elapsed()<Duration::from_millis(120){let mut message=MSG::default();
+            while unsafe{PeekMessageW(&mut message,None,0,0,PM_REMOVE)}.as_bool(){unsafe{let _=TranslateMessage(&message);DispatchMessageW(&message);}}
+            thread::sleep(Duration::from_millis(4));}}
+        struct Apartment;impl Drop for Apartment{fn drop(&mut self){unsafe{OleUninitialize();}}}
+        struct Window(HWND);impl Drop for Window{fn drop(&mut self){let _=unsafe{DestroyWindow(self.0)};}}
+        struct Dirs(Vec<PathBuf>);impl Drop for Dirs{fn drop(&mut self){for path in self.0.iter().rev(){let _=std::fs::remove_dir(path);}}}
+        let output=PathBuf::from(std::env::var_os("ZSDESK_NATIVE_TEST_OUTPUT").ok_or("set native test output")?);
+        assert!(output.is_absolute(),"native test output must be absolute");
+        let root=output.join("quick-access-sync-fixture");let target=root.join("pinned-folder");
+        let mut directories=Dirs(Vec::new());
+        for path in [&root,&target]{std::fs::create_dir(path)?;directories.0.push(path.clone());}
+        let _directories=directories;
+        unsafe{OleInitialize(None)?;}let _apartment=Apartment;
+        let owner=Window(unsafe{CreateWindowExW(WS_EX_NOACTIVATE,windows::core::w!("STATIC"),windows::core::w!("Quick access sync"),
+            WS_POPUP,0,0,320,400,None,None,None,None)?});
+        let host=unsafe{NamespaceTreeHost::create_for_location(owner.0,RECT{left:0,top:0,right:280,bottom:370},&ShellLocation::ThisPc)?};
+        let root_item=unsafe{shell_item(&ShellLocation::Path(root))?};
+        let target_item=unsafe{shell_item(&ShellLocation::Path(target.clone()))?};
+        let pc_item=unsafe{shell_item(&ShellLocation::ThisPc)?};
+        unsafe{host.pending_sync.cancel();host.tree.RemoveAllRoots()?;
+            host.tree.AppendRoot(&root_item,navigation_enum_flags(),NSTCRS_VISIBLE.0 as u32,&host._filter)?;
+            host.tree.AppendRoot(&pc_item,navigation_enum_flags(),NSTCRS_VISIBLE.0 as u32,&host._filter)?;}
+        pump();
+        unsafe{host.select_location_under_root(&ShellLocation::Path(target.clone()),&root_item);}
+        let started=Instant::now();while host.pending_sync.request.borrow().is_some()&&started.elapsed()<Duration::from_secs(3){pump();}
+        assert!(host.pending_sync.request.borrow().is_none(),"Quick access synchronization retained a retry");
+        assert!(unsafe{host.tree.GetItemState(&root_item,NSTCIS_EXPANDED.0 as u32)?}&NSTCIS_EXPANDED.0 as u32!=0,
+            "Quick access anchor was not expanded");
+        assert!(unsafe{host.tree.GetItemState(&target_item,NSTCIS_SELECTED.0 as u32)?}&NSTCIS_SELECTED.0 as u32!=0,
+            "target was not selected under Quick access");
+        assert_eq!(unsafe{host.tree.GetItemState(&pc_item,NSTCIS_EXPANDED.0 as u32)?}&NSTCIS_EXPANDED.0 as u32,0,
+            "Quick access synchronization expanded This PC");
+        drop(host);drop(owner);pump();drop(_apartment);
         Ok(())
     }
 }

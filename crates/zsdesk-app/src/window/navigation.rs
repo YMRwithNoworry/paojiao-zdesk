@@ -8,8 +8,10 @@ pub(super) struct NavigationRequest {
     /// Started by clicking the navigation tree: the tree already shows the
     /// user's choice and is left alone when the folder opens.
     pub from_tree:bool,
+    /// Started by opening a folder from the Quick access contents view.
+    pub from_quick_access:bool,
 }
-impl NavigationRequest { pub(super) fn new(tab:ExplorerTab)->Self {Self{tab,from_tree:false}} }
+impl NavigationRequest { pub(super) fn new(tab:ExplorerTab)->Self {Self{tab,from_tree:false,from_quick_access:false}} }
 
 impl WindowState {
     pub(super) fn navigation_tree_options(&self)->zsdesk_windows::shell::NamespaceTreeOptions {
@@ -75,16 +77,22 @@ impl WindowState {
         unsafe {self.request_navigation(request);}
     }
     pub(super) unsafe fn navigate_to(&mut self,location:ShellLocation) {
-        unsafe {self.navigate_active(location,false);}
+        unsafe {self.navigate_active(location,false,false);}
     }
     /// Opens a folder clicked in the navigation tree in the active tab.
     pub(super) unsafe fn navigate_from_tree(&mut self,location:ShellLocation) {
-        unsafe {self.navigate_active(location,true);}
+        unsafe {self.navigate_active(location,true,false);}
     }
-    unsafe fn navigate_active(&mut self,location:ShellLocation,from_tree:bool) {
+    /// Opens a folder invoked from the current folder view and retains whether
+    /// that view was the Quick access namespace until navigation completes.
+    pub(super) unsafe fn navigate_from_contents(&mut self,location:ShellLocation) {
+        let from_quick_access=NamespaceTreeHost::is_quick_access_location(self.current_location());
+        unsafe {self.navigate_active(location,false,from_quick_access);}
+    }
+    unsafe fn navigate_active(&mut self,location:ShellLocation,from_tree:bool,from_quick_access:bool) {
         unsafe {self.capture_active();}
         let mut tab=self.session.active_tab().clone();
-        if tab.navigate(location) {unsafe {self.request_navigation(NavigationRequest{tab,from_tree});}}
+        if tab.navigate(location) {unsafe {self.request_navigation(NavigationRequest{tab,from_tree,from_quick_access});}}
     }
     pub(super) unsafe fn navigation_completed(&mut self,location:ShellLocation) {
         self.navigation_epoch=self.navigation_epoch.wrapping_add(1);
@@ -132,8 +140,10 @@ impl WindowState {
             }
         }
         let mut from_tree=false;
+        let mut from_quick_access=false;
         if let Some(mut request)=self.pending.take() {
             from_tree=request.from_tree;
+            from_quick_access=request.from_quick_access;
             request.tab.replace_current(location);
             if let Some(index)=self.session.tabs.iter().position(|t|t.id==request.tab.id) {
                 request.tab.locked=self.session.tabs[index].locked;
@@ -158,11 +168,15 @@ impl WindowState {
         unsafe {self.rebuild_tabs();}
         if self.queued.is_none() {
             let current=self.current_location().clone();
-            // Tree clicks already express an explicit tree choice. Other navigation
-            // (file view, address bar, history, or tab restore) leaves the tree alone.
-            if from_tree && !self.background_pane && !matches!(&current,ShellLocation::Search{..}) {
+            // Tree clicks preserve their row; only folder opens from the Quick access
+            // contents view synchronize the tree to a Quick access entry.
+            if !self.background_pane && !matches!(&current,ShellLocation::Search{..}) {
                 if let Some(tree)=self.tree.as_ref().filter(|_|self.session.ui.show_tree) {
-                    unsafe { tree.adopt_location(&current); }
+                    if from_tree {
+                        unsafe { tree.adopt_location(&current); }
+                    } else if from_quick_access {
+                        unsafe { tree.select_quick_access_location(&current); }
+                    }
                 }
             }
             self.theme_children();
