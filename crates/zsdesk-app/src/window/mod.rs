@@ -863,6 +863,18 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
     // Child controls own their cursor, including edit/IME and native Shell
     // cursors. Returning FALSE lets the child finish WM_SETCURSOR processing.
     if msg == WM_SETCURSOR && wp.0 != hwnd.0 as usize { return LRESULT(0); }
+    // DWM may consume the cursor message for the extended caption; tab labels
+    // are controls, so keep the arrow cursor before forwarding it.
+    if msg == WM_SETCURSOR && (lp.0 & 0xffff) as u32 == HTCLIENT {
+        let mut point = POINT::default();
+        if unsafe { GetCursorPos(&mut point) }.is_ok() && unsafe { ScreenToClient(hwnd, &mut point) }.is_ok()
+            && matches!(client_hit(hwnd, point), Some(Hit::Tab(_) | Hit::TabClose(_) | Hit::NewTab | Hit::TabList | Hit::AppMenu)) {
+            if let Ok(cursor) = unsafe { LoadCursorW(None, IDC_ARROW) } {
+                unsafe { SetCursor(Some(cursor)); }
+                return LRESULT(1);
+            }
+        }
+    }
     if msg == WM_SETCURSOR {
         if (lp.0&0xffff)as u32==HTCAPTION{
             if let Ok(cursor)=unsafe{LoadCursorW(None,IDC_ARROW)}{unsafe{SetCursor(Some(cursor));}return LRESULT(1);}
@@ -1159,6 +1171,13 @@ fn caption_button_hit_code(buttons: &[LayoutRect; 3], x: i32, y: i32) -> Option<
     buttons.iter().position(|button| button.contains(x, y)).map(|index| [HTMINBUTTON, HTMAXBUTTON, HTCLOSE][index])
 }
 
+fn client_hit(hwnd: HWND, point: POINT) -> Option<Hit> {
+    let pointer = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *const Slot;
+    if pointer.is_null() { return None; }
+    unsafe { &*pointer }.try_borrow().ok()
+        .and_then(|slot| slot.as_ref().map(|state| state.layout.hit(point.x, point.y)))
+}
+
 unsafe fn hit_test(hwnd: HWND, lp: LPARAM) -> LRESULT {
     let mut point = POINT { x: x_lparam(lp.0), y: y_lparam(lp.0) };
     let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
@@ -1176,9 +1195,7 @@ unsafe fn hit_test(hwnd: HWND, lp: LPARAM) -> LRESULT {
     let _ = unsafe { ScreenToClient(hwnd, &mut point) };
     let mut client = RECT::default();let _ = unsafe { GetClientRect(hwnd, &mut client) };
     if point.x < 0 || point.y < 0 || point.x >= client.right || point.y >= client.bottom { return default; }
-    let pointer = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *const Slot;
-    let hit = (!pointer.is_null()).then(|| unsafe { &*pointer }.try_borrow().ok()
-        .and_then(|s| s.as_ref().map(|s| s.layout.hit(point.x, point.y)))).flatten();
+    let hit = client_hit(hwnd, point);
     match hit {
         Some(Hit::Caption) => LRESULT(HTCAPTION as isize),
         None if point.y < scale(STRIP_H, dpi) => LRESULT(HTCAPTION as isize),

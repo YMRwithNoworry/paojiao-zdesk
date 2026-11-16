@@ -228,6 +228,15 @@ fn run(output:&std::path::Path)->Result<serde_json::Value>{
         let result=unsafe{SendMessageW(hwnd,WM_SETCURSOR,Some(WPARAM(hwnd.0 as usize)),Some(LPARAM((hit|(WM_MOUSEMOVE<<16))as isize)))};
         ensure!(result.0==1&&unsafe{GetCursor()}==unsafe{LoadCursorW(None,id)?},"resize cursor missing for hit {hit}");
     }
+    let tab_rect=slot.borrow().as_ref().unwrap().layout.tabs.first().context("tab bounds")?.rect;
+    let mut tab_point=POINT{x:tab_rect.x+tab_rect.width/2,y:tab_rect.y+tab_rect.height/2};
+    unsafe{ClientToScreen(hwnd,&mut tab_point)}.ok()?;
+    let mut previous_cursor=POINT::default();unsafe{GetCursorPos(&mut previous_cursor)}.ok()?;
+    unsafe{SetCursorPos(tab_point.x,tab_point.y)}.ok()?;
+    let tab_cursor_result=unsafe{SendMessageW(hwnd,WM_SETCURSOR,Some(WPARAM(hwnd.0 as usize)),Some(LPARAM((HTCLIENT|(WM_MOUSEMOVE<<16))as isize)))};
+    let tab_cursor=unsafe{GetCursor()};
+    let _=unsafe{SetCursorPos(previous_cursor.x,previous_cursor.y)};
+    ensure!(tab_cursor_result.0==1&&tab_cursor==unsafe{LoadCursorW(None,IDC_ARROW)?},"tab title used a text cursor");
     for _ in 0..3{
         caption_click(hwnd,1)?;
         ensure!(unsafe{IsZoomed(hwnd)}.as_bool(),"maximize failed");
@@ -291,7 +300,7 @@ fn run(output:&std::path::Path)->Result<serde_json::Value>{
     let dual=dual_pane::native_exercise(&slot,output,pump)?;
     caption_click(hwnd,2)?;ensure!(!unsafe{IsWindow(Some(hwnd))}.as_bool(),"caption close failed");
     ensure!(storage::load(&config)?.ui.window==Some(saved),"closing changed saved normal geometry");
-    let report=serde_json::json!({"dual_pane":dual,"caption_button_clicks":true,"all_resize_cursor_handles":true,"saved_geometry_reopens":true,"manual_resize":frames,"saved_size":[saved.width,saved.height],"maximize_restore_cycles":3,"fullscreen_normal_and_maximized":true,"materials":materials,
+    let report=serde_json::json!({"dual_pane":dual,"caption_button_clicks":true,"all_resize_cursor_handles":true,"tab_cursor":"arrow","saved_geometry_reopens":true,"manual_resize":frames,"saved_size":[saved.width,saved.height],"maximize_restore_cycles":3,"fullscreen_normal_and_maximized":true,"materials":materials,
         "ctrl_wheel_high_resolution_and_direction":true,"wheel_text_edit_preserved":true,"view_presets":presets,"focus_cycle":true,"tab_shortcuts":true,"native_shell_loaded":true,"tab_positions":["left","right","top"],
         "caption_input":"queued down/up with bounded tracking watchdog","caption_cancel_releases_capture":true,"caption_drag_out_and_back":true,"caption_visual_per_hwnd":true,
         "theme_composition_systemcolor_notifications":true,"high_contrast_notification_reentrant":true,"windows_theme_preferences_changed":false,
