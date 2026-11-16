@@ -599,6 +599,10 @@ impl WindowState {
         caption_rects(self.hwnd)
     }
 
+    pub(super) fn chrome_hit(&self,x:i32,y:i32)->Hit{
+        self.layout.hit_with_top_edge(x,y,screen_edge_window(self.hwnd))
+    }
+
     /// Width covered by the DWM caption buttons, in client pixels.
     fn caption_width(&self) -> i32 {
         if window_actions::fullscreen(self.hwnd) { return self.s(46*3); }
@@ -916,7 +920,20 @@ fn caption_rects(hwnd:HWND)->Option<[LayoutRect;3]>{
 }
 fn caption_hit(hwnd:HWND,mut point:POINT)->Option<u32>{
     unsafe{ScreenToClient(hwnd,&mut point)}.ok().ok()?;
-    caption_rects(hwnd)?.iter().zip([HTMINBUTTON,HTMAXBUTTON,HTCLOSE]).find_map(|(rect,hit)|rect.contains(point.x,point.y).then_some(hit))
+    let mut buttons=caption_rects(hwnd)?;
+    if screen_edge_window(hwnd){
+        let mut client=RECT::default();unsafe{GetClientRect(hwnd,&mut client)}.ok()?;
+        buttons=geometry::screen_edge_caption_buttons(buttons,client.right);
+    }
+    buttons.iter().zip([HTMINBUTTON,HTMAXBUTTON,HTCLOSE]).find_map(|(rect,hit)|rect.contains(point.x,point.y).then_some(hit))
+}
+fn screen_edge_window(hwnd:HWND)->bool{
+    window_actions::fullscreen(hwnd)||unsafe{IsZoomed(hwnd)}.as_bool()
+}
+fn caption_padding_hit(hwnd:HWND,mut point:POINT)->bool{
+    if !screen_edge_window(hwnd)||caption_hit(hwnd,point).is_none(){return false;}
+    if !unsafe{ScreenToClient(hwnd,&mut point)}.as_bool(){return false;}
+    caption_rects(hwnd).is_some_and(|buttons|buttons.iter().all(|rect|!rect.contains(point.x,point.y)))
 }
 fn native_caption(hwnd:HWND)->bool{
     !window_actions::fullscreen(hwnd)&&!unsafe{GetPropW(hwnd,windows::core::w!("ZSDesk.NativeCaption"))}.0.is_null()
@@ -927,7 +944,19 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
     if msg==WM_NCDESTROY{release_window_properties(hwnd);}
     let native_caption = native_caption(hwnd);
     let caption_message = matches!(msg, WM_NCHITTEST | WM_NCMOUSEMOVE | WM_NCMOUSELEAVE | WM_NCLBUTTONDOWN | WM_NCLBUTTONUP | WM_NCLBUTTONDBLCLK);
-    if native_caption && caption_message {
+    if msg==WM_NCHITTEST&&screen_edge_window(hwnd){
+        let mut point=POINT{x:x_lparam(lp.0),y:y_lparam(lp.0)};
+        if let Some(hit)=caption_hit(hwnd,point){return LRESULT(hit as isize);}
+        if unsafe{ScreenToClient(hwnd,&mut point)}.as_bool(){
+            let pointer=unsafe{GetWindowLongPtrW(hwnd,GWLP_USERDATA)}as*const Slot;
+            if !pointer.is_null(){if let Ok(slot)=unsafe{&*pointer}.try_borrow(){
+                if slot.as_ref().is_some_and(|state|matches!(state.chrome_hit(point.x,point.y),Hit::Tab(_)|Hit::TabClose(_))){return LRESULT(HTCLIENT as isize);}
+            }}
+        }
+    }
+    let owns_caption_press=!unsafe{GetPropW(hwnd,windows::core::w!("ZSDesk.CaptionPress"))}.0.is_null();
+    let padding_press=msg==WM_NCLBUTTONDOWN&&caption_padding_hit(hwnd,POINT{x:x_lparam(lp.0),y:y_lparam(lp.0)});
+    if native_caption && caption_message && !owns_caption_press && !padding_press {
         let mut result = LRESULT(0);
         if unsafe { DwmDefWindowProc(hwnd, msg, wp, lp, &mut result) }.as_bool() {
             if msg==WM_NCHITTEST&&unsafe{IsZoomed(hwnd)}.as_bool()&&geometry::is_resize_hit(result.0 as u32){return unsafe{hit_test(hwnd,lp)};}
@@ -1246,7 +1275,7 @@ unsafe fn hit_test(hwnd: HWND, lp: LPARAM) -> LRESULT {
     if point.x < 0 || point.y < 0 || point.x >= client.right || point.y >= client.bottom { return default; }
     let pointer = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *const Slot;
     let hit = (!pointer.is_null()).then(|| unsafe { &*pointer }.try_borrow().ok()
-        .and_then(|s| s.as_ref().map(|s| s.layout.hit(point.x, point.y)))).flatten();
+        .and_then(|s| s.as_ref().map(|s| s.chrome_hit(point.x, point.y)))).flatten();
     match hit {
         Some(Hit::Caption) => LRESULT(HTCAPTION as isize),
         None if point.y < scale(STRIP_H, dpi) => LRESULT(HTCAPTION as isize),
@@ -1349,7 +1378,7 @@ impl WindowState {
                     let mut p = POINT::default();
                     let _ = unsafe { GetCursorPos(&mut p) };
                     let _ = unsafe { ScreenToClient(self.hwnd, &mut p) };
-                    let cursor = match self.layout.hit(p.x, p.y) {
+                    let cursor = match self.chrome_hit(p.x, p.y) {
                         Hit::Splitter | Hit::PaneSplitter | Hit::TabSplitter => Some(IDC_SIZEWE),
                         Hit::Address if !self.address_editing && self.crumb_at(p.x, p.y).is_none() => Some(IDC_IBEAM),
                         _ => None,

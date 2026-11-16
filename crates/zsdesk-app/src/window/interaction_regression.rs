@@ -112,10 +112,13 @@ unsafe extern "system" fn trace_caption(hwnd:HWND,msg:u32,wp:WPARAM,lp:LPARAM,_i
 struct CaptionTrace(HWND);
 impl Drop for CaptionTrace{fn drop(&mut self){if unsafe{IsWindow(Some(self.0))}.as_bool(){let _=unsafe{RemoveWindowSubclass(self.0,Some(trace_caption),0x5a54)};}}}
 fn caption_click(hwnd:HWND,index:usize)->Result<()>{
+    caption_click_at(hwnd,index,None)
+}
+pub(super) fn caption_click_at(hwnd:HWND,index:usize,client_point:Option<POINT>)->Result<()>{
     CAPTION_TRACE.with(|trace|trace.borrow_mut().clear());
     unsafe{SetWindowSubclass(hwnd,Some(trace_caption),0x5a54,0)}.ok()?;let _trace=CaptionTrace(hwnd);
     let rect=caption_rects(hwnd).context("caption rectangles")?[index];
-    let mut point=POINT{x:rect.x+rect.width/2,y:rect.y+rect.height/2};
+    let mut point=client_point.unwrap_or(POINT{x:rect.x+rect.width/2,y:rect.y+rect.height/2});
     unsafe{ClientToScreen(hwnd,&mut point)}.ok()?;
     let packed=LPARAM((((point.x as u32)&0xffff)|(((point.y as u32)&0xffff)<<16))as isize);
     let hit=unsafe{SendMessageW(hwnd,WM_NCHITTEST,None,Some(packed))}.0 as u32;

@@ -25,6 +25,11 @@ pub(super) fn is_resize_hit(value: u32) -> bool {
     [HTLEFT,HTRIGHT,HTTOP,HTBOTTOM,HTTOPLEFT,HTTOPRIGHT,HTBOTTOMLEFT,HTBOTTOMRIGHT].contains(&value)
 }
 
+pub(super) fn screen_edge_caption_buttons(mut buttons:[zsdesk_ui::chrome::Rect;3],width:i32)->[zsdesk_ui::chrome::Rect;3]{
+    for rect in &mut buttons{let bottom=rect.bottom();rect.y=0;rect.height=bottom.max(0);}
+    buttons[2].width=(width-buttons[2].x).max(0);buttons
+}
+
 pub(super) fn captionless_client(window: RECT, mut native_client: RECT, maximized: bool, frame_y: i32) -> RECT {
     native_client.top = window.top.saturating_add(if maximized { frame_y.max(0) } else { 0 }).min(native_client.bottom);
     native_client
@@ -73,5 +78,22 @@ mod tests {
         assert!(restore_maximized(SW_SHOWMINIMIZED.0 as u32, WPF_RESTORETOMAXIMIZED.0));
         assert!(!restore_maximized(SW_SHOWMINIMIZED.0 as u32, 0));
         assert!(!restore_maximized(1, WPF_RESTORETOMAXIMIZED.0));
+    }
+
+    #[test]
+    fn maximized_caption_targets_reach_the_top_and_right_without_overlap(){
+        use zsdesk_ui::chrome::{Rect,scale};
+        for dpi in [96,120,144,192]{
+            let width=scale(1200,dpi);let button=scale(46,dpi);let inset=scale(2,dpi);
+            let drawn=[0,1,2].map(|index|Rect::new(width-inset-button*(3-index),inset,button,scale(32,dpi)));
+            let hit=screen_edge_caption_buttons(drawn,width);
+            assert!(hit[2].contains(width-1,0));
+            assert!(!hit[2].contains(width,0));assert!(!hit[2].contains(width-1,-1));
+            for index in 0..3{
+                assert!(hit[index].contains(drawn[index].x,0));
+                assert_eq!(hit[index].bottom(),drawn[index].bottom());
+                if index<2{assert_eq!(hit[index].right(),hit[index+1].x);}
+            }
+        }
     }
 }

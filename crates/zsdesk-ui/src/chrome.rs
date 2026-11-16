@@ -498,6 +498,15 @@ impl ChromeLayout {
         layout
     }
 
+    /// Top tabs reach the screen edge when the host is maximized or fullscreen.
+    /// The extension selects the tab; its close button keeps its visible bounds.
+    pub fn hit_with_top_edge(&self,x:i32,y:i32,extend:bool)->Hit{
+        if extend&&!self.vertical_tabs&&self.strip.contains(x,y){
+            if let Some(slot)=self.tabs.iter().find(|slot|x>=slot.rect.x&&x<slot.rect.right()&&y<slot.rect.y){return Hit::Tab(slot.index);}
+        }
+        self.hit(x,y)
+    }
+
     /// Classifies a client point.
     pub fn hit(&self, x: i32, y: i32) -> Hit {
         if self.strip.contains(x, y)||self.tab_panel.contains(x,y) {
@@ -778,6 +787,26 @@ mod tests {
         let (id, r) = l.commands[0];
         assert_eq!(l.hit(r.x + 1, r.y + 1), Hit::Command(id));
         assert_eq!(l.hit(l.splitter.x + 1, l.splitter.y + 10), Hit::Splitter);
+    }
+
+    #[test]
+    fn screen_edge_selects_top_tabs_without_extending_their_close_buttons(){
+        for dpi in [96,120,144,192]{
+            let l=ChromeLayout::new(&input(1400,3,1,dpi));
+            for tab in &l.tabs{
+                for x in [tab.rect.x,tab.rect.x+tab.rect.width/2,tab.rect.right()-1]{
+                    assert_eq!(l.hit_with_top_edge(x,0,true),Hit::Tab(tab.index));
+                    assert_eq!(l.hit_with_top_edge(x,tab.rect.y-1,true),Hit::Tab(tab.index));
+                    assert_eq!(l.hit_with_top_edge(x,0,false),Hit::Caption);
+                }
+                assert_eq!(l.hit_with_top_edge(tab.close.x+1,0,true),Hit::Tab(tab.index));
+                assert_eq!(l.hit_with_top_edge(tab.close.x+1,tab.close.y+1,true),Hit::TabClose(tab.index));
+            }
+            assert_eq!(l.hit_with_top_edge(l.new_tab.right()+20,0,true),Hit::Caption);
+            assert_eq!(l.hit_with_top_edge(l.tabs[0].rect.x,-1,true),Hit::None);
+            let mut side=l.clone();side.vertical_tabs=true;
+            assert_eq!(side.hit_with_top_edge(side.tabs[0].rect.x,0,true),Hit::Caption);
+        }
     }
 
     #[test]

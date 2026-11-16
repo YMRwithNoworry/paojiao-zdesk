@@ -189,7 +189,7 @@ impl WindowState {
         if let Some(mut drag)=self.bookmark_drag {
             let x=unsafe{GetSystemMetricsForDpi(SM_CXDRAG,self.dpi)}.max(1);let y=unsafe{GetSystemMetricsForDpi(SM_CYDRAG,self.dpi)}.max(1);
             if (p.x-drag.start.x).abs()>x||(p.y-drag.start.y).abs()>y{drag.moved=true;}
-            drag.point=p;self.bookmark_drag=Some(drag);self.set_hover(self.layout.hit(p.x,p.y),None);self.invalidate_rect(self.layout.bookmarks_row);return;
+            drag.point=p;self.bookmark_drag=Some(drag);self.set_hover(self.chrome_hit(p.x,p.y),None);self.invalidate_rect(self.layout.bookmarks_row);return;
         }
         if let Some((start_x,ratio))=self.pane_splitter_drag {
             let width=self.layout.browser.width+self.layout.other_browser.width;
@@ -231,7 +231,7 @@ impl WindowState {
             self.tab_drag = Some(drag);
             return;
         }
-        let hit = self.layout.hit(p.x, p.y);
+        let hit = self.chrome_hit(p.x, p.y);
         let crumb = if hit == Hit::Address { self.crumb_at(p.x, p.y) } else { None };
         self.set_hover(hit, crumb);
     }
@@ -248,7 +248,7 @@ impl WindowState {
     }
 
     pub(super) fn mouse_down(&mut self, p: POINT) {
-        let hit = self.layout.hit(p.x, p.y);
+        let hit = self.chrome_hit(p.x, p.y);
         if hit != Hit::Address { self.end_address_edit(); }
         self.pressed = Some(hit);
         if self.side_tabs_mouse_down(hit,p){return;}
@@ -289,7 +289,7 @@ impl WindowState {
             return;
         }
         if had_capture { let _ = unsafe { ReleaseCapture() }; }
-        let hit = self.layout.hit(p.x, p.y);
+        let hit = self.chrome_hit(p.x, p.y);
         if let Some(row) = self.row_of(hit) { self.invalidate_rect(row); }
         if pressed != Some(hit) { return; }
         let ctrl = unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0;
@@ -316,7 +316,7 @@ impl WindowState {
     }
 
     pub(super) fn middle_click(&mut self, p: POINT) {
-        match self.layout.hit(p.x, p.y) {
+        match self.chrome_hit(p.x, p.y) {
             Hit::Tab(i) | Hit::TabClose(i) => unsafe { self.close_tab(i) },
             Hit::Bookmark(i) => unsafe { self.open_bookmark(i, true) },
             Hit::Address => if let Some(CrumbPart::Crumb(i)) = self.crumb_at(p.x, p.y) {
@@ -328,7 +328,7 @@ impl WindowState {
     }
 
     pub(super) fn double_click(&mut self,p:POINT) {
-        if let Hit::Bookmark(slot)=self.layout.hit(p.x,p.y) {
+        if let Hit::Bookmark(slot)=self.chrome_hit(p.x,p.y) {
             if unsafe{self.bookmark_double_click(slot)} {
                 self.bookmark_drag=None;self.pressed=None;
                 if unsafe{GetCapture()}==self.hwnd{let _=unsafe{ReleaseCapture()};}
@@ -336,7 +336,7 @@ impl WindowState {
             }
         }
         if self.session.ui.double_click_close_tab {
-            if let Hit::Tab(index)=self.layout.hit(p.x,p.y) {
+            if let Hit::Tab(index)=self.chrome_hit(p.x,p.y) {
                 self.tab_drag=None;self.pressed=None;
                 if unsafe{GetCapture()}==self.hwnd{let _=unsafe{ReleaseCapture()};}
                 unsafe{self.close_tab(index);}return;
@@ -346,7 +346,7 @@ impl WindowState {
     }
 
     pub(super) fn right_click(&mut self, p: POINT) {
-        match self.layout.hit(p.x, p.y) {
+        match self.chrome_hit(p.x, p.y) {
             Hit::Tab(i) | Hit::TabClose(i) => unsafe { self.tab_menu(i) },
             Hit::Bookmark(i) => unsafe { self.bookmark_menu(i) },
             Hit::BookmarksBar | Hit::BookmarkOverflow => unsafe { self.bookmarks_bar_menu() },

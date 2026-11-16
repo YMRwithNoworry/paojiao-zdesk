@@ -27,7 +27,7 @@ fn save_bmp(path:&Path,width:i32,height:i32,pixels:&[u8])->Result<()>{
 }
 
 #[test]
-fn opaque_tabs_keep_selected_background_marker_and_readable_text()->Result<()>{
+fn opaque_tabs_keep_selected_background_and_readable_text_without_accent_marker()->Result<()>{
     unsafe{OleInitialize(None)}?;
     struct Apartment;impl Drop for Apartment{fn drop(&mut self){unsafe{OleUninitialize();}}}let _apartment=Apartment;
     let window=unsafe{CreateWindowExW(WS_EX_NOACTIVATE,windows::core::w!("STATIC"),None,WS_POPUP,-30000,-30000,480,240,None,None,None,None)}?;
@@ -55,10 +55,9 @@ fn opaque_tabs_keep_selected_background_marker_and_readable_text()->Result<()>{
             let selected_pixel=pixel(&surface,selected.x+50,selected.y+4);let other_pixel=pixel(&surface,other.x+50,other.y+4);
             ensure!(close(selected_pixel,state.palette.layer)&&close(other_pixel,state.palette.strip),"opaque tab backgrounds lost selection: dark={dark} active={active} vertical={vertical}, selected={selected_pixel:?}, other={other_pixel:?}");
             ensure!(selected_pixel!=other_pixel,"selected tab is indistinguishable from the strip");
-            let marker=if vertical{pixel(&surface,selected.x+3,selected.y+selected.height/2)}else{pixel(&surface,selected.x+selected.width/2,selected.bottom()-2)};
-            if !neutral_accent{ensure!(close(marker,state.palette.accent),"selected marker disappeared: dark={dark} active={active} vertical={vertical}: {marker:?}");}
+            let edge=if vertical{pixel(&surface,selected.x+3,selected.y+selected.height/2)}else{pixel(&surface,selected.x+selected.width/2,selected.bottom()-2)};
+            ensure!(close(edge,state.palette.layer),"unexpected accent decoration on selected tab: dark={dark} active={active} vertical={vertical}: {edge:?}");
             let background=[state.palette.layer.r,state.palette.layer.g,state.palette.layer.b,255];let mut readable=0;
-            ensure!(contrast(marker,background)>=3.0,"neutral accent concealed selected marker: {marker:?}");
             for y in selected.y+9..selected.bottom()-7{for x in selected.x+38..selected.right()-8{if contrast(pixel(&surface,x,y),background)>=3.0{readable+=1;}}}
             ensure!(readable>=20,"selected label has insufficient rendered contrast: dark={dark} active={active} vertical={vertical}");
             if !neutral_accent{
@@ -75,6 +74,6 @@ fn opaque_tabs_keep_selected_background_marker_and_readable_text()->Result<()>{
         }
     }
     let after=unsafe{GetForegroundWindow()};ensure!(after!=window,"tab raster fixture became foreground");
-    println!("{}",serde_json::json!({"modes":["light","dark"],"focused_and_unfocused":true,"top_and_side_tabs":true,"mica":false,"selected_background_and_marker":true,"neutral_accent_keeps_visible_marker":true,"readable_label_pixels":true,"fixture_not_foreground":true,"foreground_same_window":foreground==after,"rasters":raster_paths}));
+    println!("{}",serde_json::json!({"modes":["light","dark"],"focused_and_unfocused":true,"top_and_side_tabs":true,"mica":false,"selected_background_distinct":true,"no_accent_marker":true,"readable_label_pixels":true,"fixture_not_foreground":true,"foreground_same_window":foreground==after,"rasters":raster_paths}));
     Ok(())
 }

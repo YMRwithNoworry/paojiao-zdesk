@@ -18,15 +18,6 @@ fn pixel_aligned_icon(rect: RectF) -> RectF {
     RectF::new(rect.x.round(), rect.y.round(), rect.w.round().max(1.0), rect.h.round().max(1.0))
 }
 
-fn tab_marker_color(palette:&Palette)->zsdesk_ui::theme::Color{
-    let luminance=|color:zsdesk_ui::theme::Color|{
-        let channel=|value:u8|{let value=f64::from(value)/255.0;if value<=0.04045{value/12.92}else{((value+0.055)/1.055).powf(2.4)}};
-        0.2126*channel(color.r)+0.7152*channel(color.g)+0.0722*channel(color.b)
-    };
-    let (mark,background)=(luminance(palette.accent),luminance(palette.layer));
-    if (mark.max(background)+0.05)/(mark.min(background)+0.05)>=3.0{palette.accent}else{palette.text}
-}
-
 impl WindowState {
     pub(super) fn sf(&self, v: f32) -> f32 { v * self.dpi as f32 / 96.0 }
     pub(super) fn ui_style(&self) -> TextStyle { TextStyle::ui(self.sf(UI_TEXT)) }
@@ -117,11 +108,6 @@ impl WindowState {
             let hovered = matches!(self.hover, Hit::Tab(i) | Hit::TabClose(i) if i == slot.index);
             if is_active {
                 if self.layout.vertical_tabs{cv.round(r,self.sf(6.0),c(p.layer));}else{cv.tab_shape(r, radius, foot, c(p.layer));}
-                // Keep the selected tab identifiable on Windows 10's opaque
-                // frame and while another application owns foreground focus.
-                let marker=if self.layout.vertical_tabs{RectF::new(r.x+self.sf(2.0),r.y+self.sf(9.0),self.sf(3.0),(r.h-self.sf(18.0)).max(self.sf(4.0)))}
-                    else{let width=(r.w-self.sf(24.0)).clamp(self.sf(8.0),self.sf(48.0));RectF::new(r.x+(r.w-width)/2.0,r.bottom()-self.sf(3.0),width,self.sf(2.0))};
-                cv.round(marker,self.sf(1.0),c(tab_marker_color(p)));
             } else if hovered {
                 cv.round(RectF::new(r.x + self.sf(2.0), r.y + self.sf(2.0), r.w - self.sf(4.0), r.h - self.sf(6.0)), self.sf(6.0), c(p.hover));
             } else {
