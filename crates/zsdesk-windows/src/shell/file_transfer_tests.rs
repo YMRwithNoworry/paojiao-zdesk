@@ -22,7 +22,11 @@ use super::*;
             }
             unsafe{ReleaseStgMedium(&mut medium)};
         }
-        assert_eq!(crate::ole::hdrop_paths(&data),paths);
+        // Shell expands 8.3 parent paths (for example a runner's TEMP path).
+        // Verify the same files in the same order, independent of that spelling.
+        let actual=crate::ole::hdrop_paths(&data).iter().map(std::fs::canonicalize).collect::<std::io::Result<Vec<_>>>().unwrap();
+        let expected=paths.iter().map(std::fs::canonicalize).collect::<std::io::Result<Vec<_>>>().unwrap();
+        assert_eq!(actual,expected);
     }
     assert_eq!(unsafe{GetClipboardSequenceNumber()},sequence);
 }
