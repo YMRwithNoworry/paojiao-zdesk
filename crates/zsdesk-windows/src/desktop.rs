@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use windows::{
     core::{w, Interface, Result, PCWSTR},
     Win32::{
-        Foundation::{HWND, LPARAM, POINT, WPARAM},
+        Foundation::{HWND, LPARAM, POINT, RECT, WPARAM},
         System::{
             Variant::VARIANT,
             Com::{CoCreateInstance, CoTaskMemFree, IServiceProvider, CLSCTX_ALL, CLSCTX_INPROC_SERVER},
@@ -108,6 +108,36 @@ pub fn desktop_view() -> Result<IFolderView2> {
     let browser: IShellBrowser = unsafe { provider.QueryService(&SID_STopLevelBrowser)? };
     let view = unsafe { browser.QueryActiveShellView()? };
     view.cast()
+}
+
+/// Read Explorer's alignment policy and lattice without changing its layout.
+/// Coordinates and spacing are physical pixels in the caller's PMv2 context.
+#[derive(Clone, Copy, Debug)]
+pub struct DesktopIconGrid { pub flags:u32, pub spacing:POINT, pub origin:POINT, pub dpi:u32 }
+pub fn icon_grid(work:RECT)->Result<DesktopIconGrid>{
+    let view=desktop_view()?;
+    let flags=unsafe{view.GetCurrentFolderFlags()?};
+    let mut spacing=POINT::default();unsafe{view.GetSpacing(&mut spacing)?;}
+    if spacing.x<=0||spacing.y<=0{return Err(windows::core::Error::from_hresult(windows::core::HRESULT(0x80004005u32 as i32)));}
+    let list=desktop_list().or_else(desktop_defview).ok_or_else(windows::core::Error::from_thread)?;
+    let dpi=unsafe{windows::Win32::UI::HiDpi::GetDpiForWindow(list)}.max(96);
+    let mut screen=POINT::default();let _=unsafe{windows::Win32::Graphics::Gdi::ClientToScreen(list,&mut screen)};
+    let mut origin=POINT{x:work.left,y:work.top};let mut first=None;
+    // Prefer an item on the destination monitor: work-area insets and mixed
+    // monitor origins need not share the primary monitor's lattice phase.
+    let count=unsafe{view.ItemCount(SVGIO_ALLVIEW)}.unwrap_or(0).min(4096);
+    for index in 0..count{
+        let Ok(item)=(unsafe{view.Item(index)})else{continue;};
+        let point=unsafe{view.GetItemPosition(item)};unsafe{CoTaskMemFree(Some(item.cast()))};
+        let Ok(point)=point else{continue;};
+        first.get_or_insert(point);
+        let point=POINT{x:screen.x+point.x,y:screen.y+point.y};
+        if point.x>=work.left&&point.x<work.right&&point.y>=work.top&&point.y<work.bottom{
+            origin=point;first=None;break;
+        }
+    }
+    if let Some(point)=first{origin=POINT{x:work.left+point.x.rem_euclid(spacing.x),y:work.top+point.y.rem_euclid(spacing.y)};}
+    Ok(DesktopIconGrid{flags,spacing,origin,dpi})
 }
 
 /// Whether Explorer currently shows desktop icons.

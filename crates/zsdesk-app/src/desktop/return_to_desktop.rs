@@ -11,6 +11,7 @@ use windows::{core::{implement, Error, HRESULT, Interface, PCWSTR, Ref, Result},
 }};
 use zsdesk_windows::{desktop::{self, ShellEntry}, ole::{DropHandler, DropRegistration}};
 use super::{host, with_host};
+pub(super) const DROP_CLASS:&str="ZSDesk.DesktopReturnDrop";
 #[cfg(test)]#[path="external_drop_regression.rs"]mod external_drop_regression;
 
 static ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -165,6 +166,7 @@ impl DropHandler for ReturnDrop {
     fn dropped(&self,data:&IDataObject,keys:u32,point:POINT,allowed:DROPEFFECT)->DROPEFFECT {
         if data!=&self.expected || self.effect(keys,allowed)==DROPEFFECT_NONE { return DROPEFFECT_NONE; }
         let requested=self.effect(keys,allowed);
+        with_host(|host|host.last_drop_route=Some(serde_json::json!({"surface":"desktop","source":self.source,"screen_pointer":[point.x,point.y],"effect":requested.0})));
         let complete=return_entries(self.owner,&self.entries,point,requested==DROPEFFECT_MOVE);
         *self.completed.borrow_mut()=complete;
         let (effect,performed,logical)=super::drop_effects(requested==DROPEFFECT_MOVE,complete);
@@ -235,7 +237,7 @@ impl DesktopDropSurfaces {
         let enabled=with_host(|host|host.config.settings.organize).unwrap_or(false);
         if !enabled { return surfaces; }
         let Some(desktop)=desktop::desktop_defview().map(|view|unsafe { GetAncestor(view,GA_ROOT) }).filter(|root|!root.0.is_null()) else { return surfaces; };
-        let class=windows::core::w!("ZSDesk.DesktopReturnDrop");
+        let class_name:Vec<u16>=DROP_CLASS.encode_utf16().chain(Some(0)).collect();let class=PCWSTR(class_name.as_ptr());
         let instance=unsafe { windows::Win32::System::LibraryLoader::GetModuleHandleW(None) }.ok().map(|value|windows::Win32::Foundation::HINSTANCE(value.0));
         unsafe { RegisterClassW(&WNDCLASSW { lpfnWndProc:Some(surface_proc),hInstance:instance.unwrap_or_default(),lpszClassName:class,..Default::default() }); }
         for monitor in host::monitors() {

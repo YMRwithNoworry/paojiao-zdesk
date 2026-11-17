@@ -285,7 +285,9 @@ pub struct DesktopHost {
     pub internal_drag: Option<(u64, Vec<String>)>,
     internal_drag_data:Option<IDataObject>,drag_is_internal:bool,
     drag_geometry:Vec<(String,Bounds)>,
+    drag_anchor:Option<String>,
     last_drop:Option<serde_json::Value>,
+    pub(super) last_drop_route:Option<serde_json::Value>,
     pub(super) menu_input_started: Option<(u64,Instant)>,
     modal_holds:HashMap<u64,u32>,
     pending_menu:Option<(u64,u64)>,
@@ -308,7 +310,7 @@ impl DesktopHost {
         let mut host = Self { hwnd, config_path, explorer_config, config, fences: Vec::new(), desktop_entries: Vec::new(), #[cfg(test)]desktop_test_entries:None,gfx,
             cut_paths:HashSet::new(),icons: HashMap::new(), icon_clock: 0, next_icon_request: 1, icon_content_active: false, shutting_down: false, desktop_anchor: None, desktop_exposed:false,
             loader, desktop_notify: None, guard: None, pending: Vec::new(), known: HashSet::new(),desktop_snapshot_initialized:false, menu_input_started:None,
-            modal_holds:HashMap::new(),pending_menu:None,incoming_drag:None,drag_geometry:Vec::new(),last_drop:None,
+            modal_holds:HashMap::new(),pending_menu:None,incoming_drag:None,drag_geometry:Vec::new(),drag_anchor:None,last_drop:None,last_drop_route:None,
             taskbar_created, palette: FencePalette::new(Mode::Dark, 55), drop_delegate: None, drop_data: None, internal_drag: None,internal_drag_data:None,drag_is_internal:false, tray: false,tray_version4:false,
             merge_target: None, tab_hover: None };
         host.update_palette();
@@ -950,7 +952,9 @@ impl DesktopHost {
         }
         let desktop = anchor.hwnd;
         let mut after = unsafe { GetWindow(desktop, GW_HWNDPREV) }.unwrap_or_default();
-        while !after.0.is_null() && (unsafe { GetWindowLongPtrW(after, GWL_EXSTYLE) } as u32 & WS_EX_TOPMOST.0 != 0 || self.fences.iter().any(|f| f.hwnd == after)) {
+        // The return-to-desktop surface must stay below fences. Using it as
+        // the insertion predecessor puts every fence behind its OLE target.
+        while !after.0.is_null() && (unsafe { GetWindowLongPtrW(after, GWL_EXSTYLE) } as u32 & WS_EX_TOPMOST.0 != 0 || self.fences.iter().any(|f|f.hwnd==after) || super::desktop_layer_class(&super::class_name(after))) {
             after = unsafe { GetWindow(after, GW_HWNDPREV) }.unwrap_or_default();
         }
         let after = if after.0.is_null() { HWND_TOP } else { after };
@@ -979,6 +983,7 @@ impl DesktopHost {
     fn application_window(&self, window: HWND) -> Option<RECT> {
         let mut rect=RECT::default();
         (window!=self.hwnd && !self.fences.iter().any(|fence|fence.hwnd==window)
+            && !super::desktop_layer_class(&super::class_name(window))
             && !matches!(super::class_name(window).as_str(),"WorkerW"|"Progman")
             && unsafe{IsWindowVisible(window)}.as_bool() && !unsafe{IsIconic(window)}.as_bool() && !is_cloaked(window)
             && unsafe{GetWindowLongPtrW(window,GWL_EXSTYLE)}as u32 & WS_EX_TOPMOST.0==0
@@ -1206,7 +1211,7 @@ impl DesktopHost {
             "visible_icon_keys":visible.len(),"cold_icon_entries":cold.len(),"cold_icon_pixel_bytes":cold.iter().map(|s|s.pixel_bytes()).sum::<u64>(),
             "cold_entry_limit":MAX_COLD_ICONS,"cold_pixel_limit":MAX_COLD_ICON_BYTES,"pending_icon_requests":queue.pending,"queued_icon_requests":queue.queued,
             "ready_icon_results":queue.ready,"ready_icon_pixel_bytes":queue.ready_pixel_bytes,"decoder_workers":zsdesk_windows::shell::icons::icon_worker_diagnostics(),"text_formats":formats,"render_target_live":target,"imaging_factory_live":self.gfx.imaging_factory_live(),"context_menu":super::menu_diagnostics(),
-            "saved_loose_items":self.config.released_items.len(),"live_loose_windows":self.fences.iter().filter(|window|window.standalone).count(),"last_drop":self.last_drop})
+            "saved_loose_items":self.config.released_items.len(),"live_loose_windows":self.fences.iter().filter(|window|window.standalone).count(),"last_drop":self.last_drop,"last_drop_route":self.last_drop_route})
     }
 
     pub fn write_diagnostics(&self, path: &Path) -> anyhow::Result<()> {
@@ -1346,10 +1351,25 @@ impl DesktopHost {
         }).collect();
         let offsets:Vec<_>=keys.iter().enumerate().map(|(index,key)|self.drag_geometry.iter().find(|(name,_)|name==key)
             .map(|(_,bounds)|*bounds).unwrap_or(Bounds::new(-48+(index as i32%8)*96,-24+(index as i32/8)*104,width,height))).collect();
+        let native_grid=desktop::icon_grid(monitor.work).ok();
+        let grid=match native_grid{
+            Some(value) if value.flags&windows::Win32::UI::Shell::FWF_SNAPTOGRID.0 as u32==0=>None,
+            Some(value)=>Some(super::drag_placement::Grid{
+                origin:(unscale(value.origin.x-monitor.work.left,monitor.dpi),unscale(value.origin.y-monitor.work.top,monitor.dpi)),
+                spacing:(unscale(value.spacing.x,value.dpi).max(1),unscale(value.spacing.y,value.dpi).max(1))}),
+            None=>Some(super::drag_placement::Grid{origin:(0,0),spacing:(width,height)}),
+        };
+        let grabbed=self.drag_anchor.as_ref().and_then(|anchor|keys.iter().position(|key|key==anchor)).unwrap_or(0);
         self.last_drop=Some(serde_json::json!({"status":"planning","screen_pointer":[point.x,point.y],"work_origin":[monitor.work.left,monitor.work.top],"dpi":monitor.dpi,
             "pointer_dip":[pointer.0,pointer.1],"selected_count":keys.len(),"captured_hot_spots":keys.iter().filter(|key|self.drag_geometry.iter().any(|(name,_)|name==*key)).count(),"visible_obstacles":occupied.len(),
+            "grabbed_index":grabbed,"grid":grid.map(|grid|serde_json::json!({"origin":[grid.origin.0,grid.origin.1],"spacing":[grid.spacing.0,grid.spacing.1]})),
+            "native_grid":native_grid.map(|value|serde_json::json!({"flags":value.flags,"spacing_pixels":[value.spacing.x,value.spacing.y],"origin_pixels":[value.origin.x,value.origin.y],"dpi":value.dpi})),
             "offsets":offsets.iter().map(|b|[b.x,b.y,b.w,b.h]).collect::<Vec<_>>()}));
-        let Some(positions)=super::drag_placement::place(&offsets,pointer,(work_width,work_height),&occupied)else{
+        let positions=match grid{
+            Some(grid)=>super::drag_placement::place_on_grid(&offsets,grabbed,pointer,(work_width,work_height),&occupied,grid),
+            None=>super::drag_placement::place(&offsets,pointer,(work_width,work_height),&occupied),
+        };
+        let Some(positions)=positions else{
             if let Some(drop)=&mut self.last_drop{drop["status"]="no-space".into();}
             if self.config.settings.icons_hidden_by_zsdesk&&keys.iter().any(|key|!self.fences.iter().any(|window|window.entries.iter().any(|entry|&entry.key==key))){self.restore_desktop();}
             return Err("桌面可用空间不足，无法放置这组图标；文件仍保留在磁盘上。".into());
@@ -1542,6 +1562,7 @@ impl DesktopHost {
                         win.selection = HashSet::from([win.entries[item].key.clone()]);
                     }
                     let hwnd=win.hwnd;let dpi=win.dpi;let standalone=win.standalone;
+                    self.drag_anchor=Some(key.clone());
                     let mut anchor=cursor;let _=unsafe{windows::Win32::Graphics::Gdi::ClientToScreen(hwnd,&mut anchor)};
                     self.drag_geometry=if standalone{
                         self.fences.iter().filter(|window|window.standalone&&!window.selection.is_empty()).flat_map(|window|{
@@ -2621,6 +2642,7 @@ impl DesktopHost {
     /// Prepares a drop. Returns the Shell target to call outside the borrow, if any.
     pub fn take_drop(&mut self, id: u64, data: &IDataObject, keys:u32, point: POINT, allowed:DROPEFFECT) -> PreparedDrop {
         let effect=if self.incoming_drag==Some(id){self.drag_over(id,keys,point,allowed)}else{DROPEFFECT_NONE};
+        self.last_drop_route=Some(serde_json::json!({"surface":"fence","id":id,"screen_pointer":[point.x,point.y],"effect":effect.0,"incoming":self.incoming_drag,"internal":self.drag_is_internal}));
         if effect==DROPEFFECT_NONE{self.drag_leave(id);return PreparedDrop::Rejected;}
         if let Some(index) = self.win_index(id) { self.fences[index].drop_hover = None; self.fences[index].drop_tab = None; }
         self.tab_hover = None;
@@ -2692,7 +2714,7 @@ impl DesktopHost {
         delegate.map_or(PreparedDrop::Rejected,PreparedDrop::Shell)
     }
     pub(super) fn begin_internal_drag(&mut self,fence:u64,keys:Vec<String>,data:&IDataObject){self.internal_drag=Some((fence,keys));self.internal_drag_data=Some(data.clone());}
-    pub(super) fn end_internal_drag(&mut self){self.internal_drag=None;self.internal_drag_data=None;self.drag_is_internal=false;self.drag_geometry.clear();}
+    pub(super) fn end_internal_drag(&mut self){self.internal_drag=None;self.internal_drag_data=None;self.drag_is_internal=false;self.drag_geometry.clear();self.drag_anchor=None;}
 }
 
 fn fence_hidden_tab(config: &DesktopConfig, id: u64) -> bool { config.fence(id).is_some_and(Fence::is_hidden_tab) }

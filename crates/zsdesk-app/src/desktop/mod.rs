@@ -242,8 +242,12 @@ unsafe extern "system" fn foreground_hook(_: windows::Win32::UI::Accessibility::
 }
 unsafe extern "system" fn layer_window_hook(_:windows::Win32::UI::Accessibility::HWINEVENTHOOK,_:u32,hwnd:HWND,object:i32,child:i32,_:u32,_:u32){
     if object!=0||child!=0||hwnd.0.is_null()||unsafe{GetAncestor(hwnd,GA_ROOT)}!=hwnd{return;}
-    if matches!(class_name(hwnd).as_str(),host::FENCE_CLASS|HOST_CLASS){return;}
+    if desktop_layer_class(&class_name(hwnd)){return;}
     let host=HOST_HWND.with(Cell::get);if host!=0{let _=unsafe{PostMessageW(Some(HWND(host as*mut _)),WM_REPAIR_LAYER,WPARAM(1),LPARAM(hwnd.0 as isize))};}
+}
+
+fn desktop_layer_class(class:&str)->bool{
+    matches!(class,host::FENCE_CLASS|HOST_CLASS|return_to_desktop::DROP_CLASS)
 }
 
 /// Runs `f` on the host unless it is already borrowed by an outer call.

@@ -27,6 +27,51 @@ pub(super) fn incoming_offsets(count:usize,grabbed:usize,hot_spot:(i32,i32),cell
     }).collect()
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Grid { pub origin:(i32,i32), pub spacing:(i32,i32) }
+
+/// Snap the grabbed icon to the nearest available lattice position. A group
+/// already on the lattice keeps its shape; crowded/oversized groups reflow
+/// into nearby grid cells, never into arbitrary obstacle-edge coordinates.
+pub(super) fn place_on_grid(offsets:&[Bounds],grabbed:usize,pointer:(i32,i32),area:(i32,i32),occupied:&[Bounds],grid:Grid)->Option<Vec<Bounds>>{
+    if offsets.is_empty(){return Some(Vec::new());}
+    if grid.spacing.0<=0||grid.spacing.1<=0||offsets.iter().any(|b|b.w<=0||b.h<=0||b.w>area.0||b.h>area.1){return None;}
+    let width=offsets.iter().map(|b|b.w).max()?;let height=offsets.iter().map(|b|b.h).max()?;
+    // Respect denser system spacing as far as the current icon/label size
+    // permits. Rounding up to a multiple would needlessly skip every other
+    // native cell when a 96x104 item meets a 75x85 system grid.
+    let step=(grid.spacing.0.max(width),grid.spacing.1.max(height));
+    let origin=(grid.origin.0.rem_euclid(step.0),grid.origin.1.rem_euclid(step.1));
+    let columns=(area.0-width-origin.0).div_euclid(step.0)+1;let rows=(area.1-height-origin.1).div_euclid(step.1)+1;
+    if columns<=0||rows<=0||i64::from(columns)*i64::from(rows)>16384{return None;}
+    let overlaps=|a:Bounds,b:Bounds|a.x<b.right()&&a.right()>b.x&&a.y<b.bottom()&&a.bottom()>b.y;
+    let inside=|b:Bounds|b.x>=0&&b.y>=0&&b.right()<=area.0&&b.bottom()<=area.1;
+    let distance=|a:(i32,i32),b:(i32,i32)|{let dx=i64::from(a.0)-i64::from(b.0);let dy=i64::from(a.1)-i64::from(b.1);dx*dx+dy*dy};
+    let mut cells=Vec::new();
+    for row in 0..rows{for column in 0..columns{cells.push((origin.0+column*step.0,origin.1+row*step.1));}}
+    let grabbed=grabbed.min(offsets.len()-1);let anchor=offsets[grabbed];let desired=(pointer.0+anchor.x,pointer.1+anchor.y);
+    cells.sort_by_key(|p|(distance(*p,desired),p.1,p.0));
+    let relative:Vec<_>=offsets.iter().map(|b|Bounds::new((b.x-anchor.x+step.0/2).div_euclid(step.0)*step.0,
+        (b.y-anchor.y+step.1/2).div_euclid(step.1)*step.1,b.w,b.h)).collect();
+    let distinct=relative.iter().enumerate().all(|(i,b)|relative[..i].iter().all(|a|!overlaps(*a,*b)));
+    if distinct{
+        for &(x,y) in &cells{
+            let translated:Vec<_>=relative.iter().map(|b|Bounds::new(b.x+x,b.y+y,b.w,b.h)).collect();
+            if translated.iter().all(|b|inside(*b)&&occupied.iter().all(|o|!overlaps(*b,*o))){return Some(translated);}
+        }
+    }
+    let mut result=vec![Bounds::default();offsets.len()];let mut used=occupied.to_vec();let mut actual_anchor=desired;
+    let order=std::iter::once(grabbed).chain((0..offsets.len()).filter(|index|*index!=grabbed));
+    for index in order{
+        let b=offsets[index];let target=if index==grabbed{desired}else{(actual_anchor.0+b.x-anchor.x,actual_anchor.1+b.y-anchor.y)};
+        let &(x,y)=cells.iter().filter(|&&(x,y)|used.iter().all(|o|!overlaps(Bounds::new(x,y,b.w,b.h),*o)))
+            .min_by_key(|p|(distance(**p,target),p.1,p.0))?;
+        result[index]=Bounds::new(x,y,b.w,b.h);used.push(result[index]);
+        if index==grabbed{actual_anchor=(x,y);}
+    }
+    Some(result)
+}
+
 /// Translate the whole selection once. Never repack individual selected icons.
 pub(super) fn place(offsets:&[Bounds],pointer:(i32,i32),area:(i32,i32),occupied:&[Bounds])->Option<Vec<Bounds>>{
     if offsets.is_empty(){return Some(Vec::new());}
@@ -75,6 +120,45 @@ pub(super) fn place(offsets:&[Bounds],pointer:(i32,i32),area:(i32,i32),occupied:
 
 #[cfg(test)]mod tests{
     use super::*;
+    #[test]fn a_dense_system_grid_does_not_double_the_icon_spacing(){
+        let grid=Grid{origin:(0,5),spacing:(75,85)};
+        let offsets=[Bounds::new(-40,-50,96,104),Bounds::new(56,-50,96,104)];
+        let result=place_on_grid(&offsets,0,(240,270),(2560,1392),&[],grid).unwrap();
+        assert_eq!(result,[Bounds::new(192,213,96,104),Bounds::new(288,213,96,104)]);
+    }
+    #[test]fn native_grid_snaps_near_the_hot_spot_and_stays_aligned_at_obstacles_and_edges(){
+        let grid=Grid{origin:(0,5),spacing:(114,132)};let offsets=[Bounds::new(-40,-50,96,104)];
+        assert_eq!(place_on_grid(&offsets,0,(278,326),(2560,1392),&[],grid).unwrap(),[Bounds::new(228,269,96,104)]);
+        let blocked=Bounds::new(228,269,96,104);
+        let next=place_on_grid(&offsets,0,(278,326),(2560,1392),&[blocked],grid).unwrap()[0];
+        assert_eq!(next,Bounds::new(342,269,96,104));
+        for pointer in [(9,887),(-100,-100),(3000,1600)]{
+            let b=place_on_grid(&offsets,0,pointer,(2560,1392),&[],grid).unwrap()[0];
+            assert_eq!(b.x%114,0);assert_eq!((b.y-5)%132,0);
+            assert!(b.x>=0&&b.y>=0&&b.right()<=2560&&b.bottom()<=1392);
+        }
+    }
+    #[test]fn grid_preserves_the_grabbed_member_and_relative_cells_across_scaled_monitors(){
+        let offsets=[Bounds::new(-268,-182,96,104),Bounds::new(-40,-50,96,104)];
+        for dpi in [96,120,144,192]{
+            let physical=(-2560+signed_scale(610,dpi,96),40+signed_scale(583,dpi,96));
+            let pointer=(signed_scale(physical.0+2560,96,dpi),signed_scale(physical.1-40,96,dpi));
+            let result=place_on_grid(&offsets,1,pointer,(1706,928),&[],Grid{origin:(0,5),spacing:(114,132)}).unwrap();
+            assert_eq!(result[1],Bounds::new(570,533,96,104));
+            assert_eq!((result[1].x-result[0].x,result[1].y-result[0].y),(228,132));
+        }
+    }
+    #[test]fn grid_reflows_dense_selection_without_collisions_or_partial_success(){
+        let offsets=incoming_offsets(10,4,(31,22),(96,104));
+        let grid=Grid{origin:(0,5),spacing:(114,132)};
+        let result=place_on_grid(&offsets,4,(430,200),(600,600),&[],grid).unwrap();
+        for (i,b) in result.iter().enumerate(){
+            assert_eq!(b.x%114,0);assert_eq!((b.y-5)%132,0);
+            assert!(result[..i].iter().all(|a|a.right()<=b.x||b.right()<=a.x||a.bottom()<=b.y||b.bottom()<=a.y));
+        }
+        assert!(place_on_grid(&offsets,4,(430,200),(200,200),&[],grid).is_none());
+        assert!(place_on_grid(&offsets[..1],0,(430,200),(600,600),&[Bounds::new(0,0,600,600)],grid).is_none());
+    }
     #[test]fn an_absent_saved_icon_cannot_push_the_drop_away_from_the_pointer(){
         let work=Bounds::new(0,0,2560,1440);let stale=Bounds::new(86,146,96,104);
         let occupied:Vec<_>=visible_obstacle(stale,work,96,false,false).into_iter().collect();
