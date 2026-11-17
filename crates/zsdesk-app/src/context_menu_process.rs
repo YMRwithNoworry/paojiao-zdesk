@@ -1,8 +1,8 @@
 //! Bounded process isolation for Shell extensions. Each request owns a fresh
 //! immutable selection/menu; an idle STA may serve a later verified request.
-use std::{fs,io::Read,path::{Path,PathBuf},process::{Child,Command,Stdio},sync::{Mutex,atomic::{AtomicU64,Ordering}},time::{Duration,Instant}};
+use std::{fs,io::Read,path::{Path,PathBuf},sync::{Mutex,atomic::{AtomicU64,Ordering}},time::{Duration,Instant}};
 #[cfg(test)]use std::thread;
-use std::os::windows::{process::CommandExt,fs::MetadataExt,io::AsRawHandle};
+use std::os::windows::{fs::MetadataExt,io::AsRawHandle};
 use anyhow::{Context,Result,ensure};
 use serde::{Deserialize,Serialize};
 use windows::{core::{PCWSTR,w},Win32::{Foundation::{HWND,HINSTANCE,LPARAM,LRESULT,WPARAM,POINT,HANDLE,CloseHandle,FILETIME},
@@ -11,22 +11,25 @@ use windows::{core::{PCWSTR,w},Win32::{Foundation::{HWND,HINSTANCE,LPARAM,LRESUL
 use zsdesk_windows::shell::menu::{ContextMenuOptions,MenuInterceptions,MenuOutcome,ShellMenu,forward_menu_message};
 use zsdesk_core::model::explorer::ShellViewState;
 #[path="context_menu_background.rs"]mod background_view;
+#[path="context_menu_child.rs"]mod child;
+use child::OwnedChild as Child;
 
 const MAX_REQUEST:u64=16*1024*1024;
+const MAX_STATUS:u64=2*1024*1024;
 const MAX_ITEMS:usize=8192;
 const WORKER_MEMORY_LIMIT:usize=512*1024*1024;
 static SERIAL:AtomicU64=AtomicU64::new(1);
 static RETIRING:Mutex<Vec<RetiredChild>>=Mutex::new(Vec::new());
-const IDLE_TIMEOUT:Duration=Duration::from_secs(60);
+const IDLE_TIMEOUT:Duration=Duration::from_secs(30);
 const MAX_SESSION_REQUESTS:u32=32;
-const MAX_IDLE_WORKERS:usize=4;
+const MAX_IDLE_WORKERS:usize=1;
 static IDLE:Mutex<Vec<IdleWorker>>=Mutex::new(Vec::new());
 static DIAGNOSTICS_LOCK:Mutex<()>=Mutex::new(());
 static PREPARING:std::sync::atomic::AtomicUsize=std::sync::atomic::AtomicUsize::new(0);
 static REAPING:std::sync::atomic::AtomicBool=std::sync::atomic::AtomicBool::new(false);
-struct Origin {thread:u32,desktop:usize,started:Instant,counter:u64,layout:Option<ShellViewState>,#[cfg(test)]probe:Option<String>}
+struct Origin {thread:u32,desktop:usize,started:Instant,counter:u64,layout:Option<ShellViewState>,view_context:Option<MenuViewContext>,#[cfg(test)]probe:Option<String>}
 impl Origin {fn capture()->Self{let thread=unsafe{windows::Win32::System::Threading::GetCurrentThreadId()};Self{
-    thread,desktop:unsafe{GetThreadDesktop(thread)}as usize,started:Instant::now(),counter:monotonic_us(),layout:None,
+    thread,desktop:unsafe{GetThreadDesktop(thread)}as usize,started:Instant::now(),counter:monotonic_us(),layout:None,view_context:None,
     #[cfg(test)]probe:std::env::var("ZSDESK_MENU_TEST_PROBE").ok()}}}
 
 struct EventSet { request:usize,status:usize,decision:usize,cancel:usize }
@@ -163,11 +166,11 @@ fn retain_retired_fault(worker:&RetiredChild,exit:Option<i32>){
     let Some(root)=worker.workspace.parent()else{return;};let current=root.join("menu-diagnostics.current.json");
     let old=read_small::<serde_json::Value>(&current,128*1024).ok();
     if old.as_ref().is_some_and(|old|old["worker_pid"].as_u64()==Some(u64::from(worker.child.id()))&&old["worker_exit_code"].as_i64()==exit.map(i64::from)){return;}
-    let status=read_small::<Status>(&worker.workspace.join("status.json"),65536).ok();
+    let status=read_small::<Status>(&worker.workspace.join("status.json"),MAX_STATUS).ok();
     let value=serde_json::json!({"schema":"ZSDesk.MenuDiagnostics.v1","timestamp_unix_ms":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok().map(|time|time.as_millis()as u64),
         "parent_pid":std::process::id(),"worker_pid":worker.child.id(),"worker_created":worker.identity,
         "phase":status.as_ref().map(|status|status.phase.as_str()).unwrap_or("retiring"),"worker_exit_code":exit,"worker_exit_hex":exit.map(|code|format!("0x{:08X}",code as u32)),
-        "committed":worker.committed,"timing":status.as_ref().map(|status|&status.timing),"fault":read_small::<serde_json::Value>(&worker.workspace.join("fault.json"),16384).ok(),
+        "committed":worker.committed,"timing":status.as_ref().map(|status|&status.timing),"native_menu":status.as_ref().map(|status|&status.native_menu),"fault":read_small::<serde_json::Value>(&worker.workspace.join("fault.json"),16384).ok(),
         "error":"系统扩展菜单进程在请求完成后异常退出","stderr":redacted_error(&worker_stderr(&worker.workspace))});
     if let Some(old)=old{let _=write(&root.join("menu-diagnostics.previous.json"),&old);}let _=write(&current,&value);
 }
@@ -185,18 +188,28 @@ fn redacted_error(value:&str)->String{
 }
 #[link(name="user32")]unsafe extern "system"{fn GetThreadDesktop(thread:u32)->*mut core::ffi::c_void;}
 #[derive(Clone,Copy,Debug,Serialize,Deserialize,PartialEq,Eq)]
-pub enum Mode{More,Properties,Open,Background,New}
+pub enum Mode{More,Properties,Open,Paste,Background,New,CatalogSelection,CatalogBackground}
+#[derive(Clone,Debug,Default,Serialize,Deserialize)]
+pub struct MenuViewContext{
+    pub folder:Option<Vec<u8>>,
+    pub results:bool,
+    pub keyboard:bool,
+    pub f10:bool,
+}
 #[derive(Clone,Serialize,Deserialize)]
 struct Request{
     token:String,parent:u32,parent_created:u64,owner:isize,point:[i32;2],pidls:Vec<Vec<u8>>,folder:Option<PathBuf>,
     #[serde(default)]session:String,
     #[serde(default)]ordinal:u32,
     options:ContextMenuOptions,rename:bool,open:bool,mode:Mode,extended:bool,
+    #[serde(default)]file_actions:bool,
     #[serde(default)]layout:Option<ShellViewState>,
+    #[serde(default)]view_context:Option<MenuViewContext>,
     #[cfg(test)]probe:Option<String>,
 }
 #[derive(Clone,Debug,Default,Serialize,Deserialize)]
 pub struct MenuTimings {
+    #[serde(default)]pub background_view_reused:bool,
     pub worker_thread:u32,
     pub fault_report_available:bool,
     pub reused_process:bool,pub request_write_microseconds:u64,pub process_spawn_microseconds:u64,
@@ -207,17 +220,49 @@ pub struct MenuTimings {
     #[serde(default)]pub tracking_to_menu_microseconds:Option<u64>,
 }
 #[derive(Clone,Serialize,Deserialize)]
-struct Status{token:String,pid:u32,window:isize,phase:String,validation:u64,before_invoke:bool,outcome:Option<MenuOutcome>,error:Option<String>,bind_microseconds:u64,populate_microseconds:u64,
+struct Status{token:String,pid:u32,window:isize,phase:String,validation:u64,before_invoke:bool,outcome:Option<MenuOutcome>,error:Option<String>,
+    #[serde(default)]error_hresult:Option<i32>,#[serde(default)]error_phase:Option<String>,bind_microseconds:u64,populate_microseconds:u64,
+    #[serde(default)]catalog:Vec<zsdesk_windows::shell::menu::MenuCatalogItem>,
     #[serde(default)]created:Vec<zsdesk_windows::shell::new_menu::CreatedItem>,
     #[serde(default)]layout:Option<ShellViewState>,
+    #[serde(default)]layout_sort_changed:bool,
     #[serde(default)]reusable:bool,
     #[serde(default)]timing:MenuTimings,
     #[serde(default)]native_menu:serde_json::Value,
     #[cfg(test)]#[serde(default)]probe_menu_open:bool,
+    #[cfg(test)]#[serde(default)]probe_classic_loop:bool,
+    #[cfg(test)]#[serde(default)]probe_expanded_requested:bool,
     #[cfg(test)]#[serde(default)]probe_command_messages:u64,
+    #[cfg(test)]#[serde(default)]probe_clipboard_after_invoke:serde_json::Value,
 }
 #[derive(Serialize,Deserialize)]
 struct Decision{token:String,validation:u64,permit:bool}
+#[derive(Debug)]
+struct MenuFailure{phase:String,code:Option<i32>,detail:String,invoked:bool}
+impl std::fmt::Display for MenuFailure{fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result{write!(f,"{}",self.detail)}}
+impl std::error::Error for MenuFailure{}
+fn worker_failure(status:&Status)->anyhow::Error{MenuFailure{
+    phase:status.error_phase.clone().unwrap_or_else(||status.phase.clone()),code:status.error_hresult,
+    detail:status.error.clone().unwrap_or_else(||"系统菜单未返回结果".into()),invoked:status.before_invoke,
+}.into()}
+pub fn failure_code(error:&anyhow::Error)->windows::core::HRESULT{
+    windows::core::HRESULT(error.downcast_ref::<MenuFailure>().and_then(|error|error.code)
+        .or_else(||error.chain().find_map(|cause|cause.downcast_ref::<windows::core::Error>().map(|error|error.code().0)))
+        .or_else(||error.chain().find_map(|cause|cause.downcast_ref::<std::io::Error>().and_then(|error|{
+            match error.raw_os_error(){Some(code)if code<0=>Some(code),Some(code)if code>0=>Some(windows::core::HRESULT::from_win32(code as u32).0),
+                _ if error.kind()==std::io::ErrorKind::PermissionDenied=>Some(0x80070005u32 as i32),_=>None}
+        })))
+        .unwrap_or(0x80004005u32 as i32))
+}
+pub fn failure_message(error:&anyhow::Error)->String{
+    if let Some(failure)=error.downcast_ref::<MenuFailure>(){
+        let action=if failure.invoked{"右键菜单命令执行失败"}else{match failure.phase.as_str(){
+            "binding"=>"无法获取当前位置的系统菜单","populating"=>"系统菜单项目加载失败","tracking"=>"系统菜单显示失败",_=>"系统菜单未完成",
+        }};
+        return format!("{action}：{}",failure.detail);
+    }
+    format!("系统菜单未完成：{error:#}")
+}
 fn wide(value:&str)->Vec<u16>{value.encode_utf16().chain(Some(0)).collect()}
 fn created(pid:u32)->Option<u64>{
     let process=unsafe{OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,false,pid)}.ok()?;
@@ -254,12 +299,21 @@ fn read_small<T:serde::de::DeserializeOwned>(path:&Path,limit:u64)->Result<T>{
     let mut bytes=Vec::new();fs::File::open(path)?.take(limit+1).read_to_end(&mut bytes)?;ensure!(bytes.len()as u64<=limit,"菜单协议文件过大");Ok(serde_json::from_slice(&bytes)?)
 }
 fn worker_stderr(workspace:&Path)->String{
+    use std::io::{Seek,SeekFrom};
     let path=workspace.join("worker.stderr.log");
     let Ok(metadata)=fs::symlink_metadata(&path)else{return String::new();};
     if !metadata.is_file()||metadata.file_attributes()&0x400!=0{return String::new();}
-    let mut bytes=Vec::new();
-    if fs::File::open(path).and_then(|file|file.take(4096).read_to_end(&mut bytes)).is_err(){return String::new();}
-    String::from_utf8_lossy(&bytes).trim().to_owned()
+    let mut bytes=Vec::new();let mut skipped=false;
+    let read=(||->std::io::Result<()>{
+        let mut file=fs::File::open(path)?;let start=file.metadata()?.len().saturating_sub(4096);skipped=start!=0;
+        file.seek(SeekFrom::Start(start))?;file.take(4096).read_to_end(&mut bytes)?;Ok(())
+    })();
+    if read.is_err(){return String::new();}
+    // A reused worker keeps appending. Preserve its latest complete lines, and
+    // discard a cut leading line so a truncated path cannot evade redaction.
+    let bytes=if skipped{let Some(end)=bytes.iter().position(|b|*b==b'\n')else{return String::new();};&bytes[end+1..]}else{&bytes[..]};
+    let text=String::from_utf8_lossy(bytes);let mut lines=text.lines().rev().take(24).collect::<Vec<_>>();lines.reverse();
+    lines.join("\n").trim().to_owned()
 }
 fn valid_pidl(bytes:&[u8])->bool{
     if bytes.len()<2||bytes.len()>65536{return false;}
@@ -275,11 +329,12 @@ fn validate(request:&Request)->Result<()>{
     ensure!(request.pidls.len()<=MAX_ITEMS&&request.pidls.iter().all(|pidl|valid_pidl(pidl)),"菜单选择数据无效或过多");
     ensure!(request.pidls.iter().map(Vec::len).sum::<usize>()<=3*1024*1024,"菜单选择标识总量过大");
     ensure!(!request.pidls.is_empty()||request.folder.is_some(),"没有可用的系统菜单目标");
-    ensure!(!matches!(request.mode,Mode::Background|Mode::New)||request.pidls.len()==1,"背景菜单需要一个文件夹标识");
+    ensure!(!matches!(request.mode,Mode::Background|Mode::New|Mode::CatalogBackground)||request.pidls.len()==1,"背景菜单需要一个文件夹标识");
     ensure!(request.folder.as_ref().is_none_or(|folder|folder.is_absolute()),"菜单目录必须是绝对路径");
-    ensure!(request.options.hidden_verbs.len()<=128&&request.options.hidden_verbs.iter().all(|verb|verb.len()<=128&&!verb.contains('\0')),"菜单设置无效");
+    if let Some(context)=&request.view_context{ensure!(context.folder.as_ref().is_none_or(|pidl|valid_pidl(pidl)),"菜单源文件夹标识无效");}
+    for keys in [&request.options.hidden_verbs,&request.options.shown_verbs]{ensure!(keys.len()<=1024&&keys.iter().all(|verb|verb.len()<=512&&!verb.contains('\0')),"菜单设置无效");}
     if let Some(layout)=&request.layout {
-        ensure!(matches!(request.mode,Mode::Background|Mode::New)&&(1..=8).contains(&layout.mode)&&(8..=512).contains(&layout.icon_size)
+        ensure!(matches!(request.mode,Mode::Background|Mode::New|Mode::CatalogBackground|Mode::More|Mode::CatalogSelection)&&(1..=8).contains(&layout.mode)&&(8..=512).contains(&layout.icon_size)
             &&layout.sort_columns.len()<=64&&layout.columns.is_empty()&&layout.selected.is_empty()&&layout.focused.is_none()&&layout.first_visible.is_none(),"背景视图设置无效");
     }
     Ok(())
@@ -315,6 +370,14 @@ impl Client{
     pub fn spawn_extended(owner:HWND,point:POINT,pidls:Vec<Vec<u8>>,folder:Option<PathBuf>,options:ContextMenuOptions,intercept:MenuInterceptions,mode:Mode,extended:bool)->Result<Self>{
         Self::spawn_at(owner,point,pidls,folder,options,intercept,mode,extended,Origin::capture())
     }
+    pub fn spawn_with_layout(owner:HWND,point:POINT,pidls:Vec<Vec<u8>>,folder:Option<PathBuf>,options:ContextMenuOptions,intercept:MenuInterceptions,mode:Mode,extended:bool,layout:Option<ShellViewState>)->Result<Self>{
+        let mut origin=Origin::capture();origin.layout=layout;
+        Self::spawn_at(owner,point,pidls,folder,options,intercept,mode,extended,origin)
+    }
+    pub fn spawn_with_context(owner:HWND,point:POINT,pidls:Vec<Vec<u8>>,folder:Option<PathBuf>,options:ContextMenuOptions,intercept:MenuInterceptions,mode:Mode,extended:bool,layout:Option<ShellViewState>,view_context:MenuViewContext)->Result<Self>{
+        let mut origin=Origin::capture();origin.layout=layout;origin.view_context=Some(view_context);
+        Self::spawn_at(owner,point,pidls,folder,options,intercept,mode,extended,origin)
+    }
     fn spawn_at(owner:HWND,point:POINT,pidls:Vec<Vec<u8>>,folder:Option<PathBuf>,options:ContextMenuOptions,intercept:MenuInterceptions,mode:Mode,extended:bool,origin:Origin)->Result<Self>{
         let started=origin.started;let started_counter=origin.counter;
         let root=diagnostics_directory();ensure!(root.is_absolute(),"菜单缓存目录必须是绝对路径");fs::create_dir_all(&root)?;
@@ -322,12 +385,24 @@ impl Client{
         retire_expired_idle();
         let thread=origin.thread;let desktop=origin.desktop;
         let token=format!("{}-{}-{}",std::process::id(),SERIAL.fetch_add(1,Ordering::Relaxed),std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos());
-        let cached={let mut pool=IDLE.lock().unwrap_or_else(|error|error.into_inner());pool.iter().position(|idle|idle.thread==thread).map(|index|pool.swap_remove(index))};
-        let reusable=cached.filter(|idle|idle.desktop==desktop&&idle.workspace.parent()==Some(root.as_path())&&idle.count<MAX_SESSION_REQUESTS
-            &&idle.last_used.elapsed()<IDLE_TIMEOUT.saturating_sub(Duration::from_secs(2))
-            &&idle.child.as_ref().is_some_and(|child|created(child.id())==Some(idle.created))
-            &&read_small::<Status>(&idle.workspace.join("status.json"),65536).is_ok_and(|status|
-                status.phase=="idle"&&status.reusable&&status.token==idle.token&&idle.child.as_ref().is_some_and(|child|status.pid==child.id())));
+        let mut reusable=None;
+        for _ in 0..MAX_IDLE_WORKERS{
+            let cached={let mut pool=IDLE.lock().unwrap_or_else(|error|error.into_inner());
+                let compatible=|idle:&IdleWorker|idle.desktop==desktop&&idle.workspace.parent()==Some(root.as_path())&&idle.count<MAX_SESSION_REQUESTS
+                    &&idle.last_used.elapsed()<IDLE_TIMEOUT.saturating_sub(Duration::from_secs(2));
+                // The child retains its own STA; changing the parent window
+                // sends a fresh serialized request, never a COM interface.
+                let index=pool.iter().position(|idle|idle.thread==thread&&compatible(idle))
+                    .or_else(||pool.iter().position(compatible));
+                index.map(|index|pool.swap_remove(index))};
+            let Some(idle)=cached else{break;};
+            let valid=idle.child.as_ref().is_some_and(|child|created(child.id())==Some(idle.created))
+                &&read_small::<Status>(&idle.workspace.join("status.json"),MAX_STATUS).is_ok_and(|status|
+                    status.phase=="idle"&&status.reusable&&status.token==idle.token&&idle.child.as_ref().is_some_and(|child|status.pid==child.id()));
+            if valid{reusable=Some(idle);break;}
+            // Retirement keeps the existing committed-operation lifetime rule.
+            drop(idle);
+        }
         let (mut child,mut job,workspace,session,events,ordinal,child_created,reused,inherited_commit)=if let Some(mut idle)=reusable{
             (idle.child.take(),idle.job.take(),idle.workspace.clone(),idle.session.clone(),idle.events.take().unwrap(),idle.count+1,idle.created,true,idle.committed)
         }else{
@@ -340,7 +415,7 @@ impl Client{
         let mut owner_name=[0u16;128];let owner_length=unsafe{GetClassNameW(owner,&mut owner_name)}.max(0)as usize;
         let owner_class=String::from_utf16_lossy(&owner_name[..owner_length]);
         let request=Request{token:token.clone(),session:session.clone(),ordinal,parent:std::process::id(),parent_created,owner:owner.0 as isize,
-            point:[point.x,point.y],pidls,folder,options,rename:intercept.rename,open:intercept.open,mode,extended,layout:origin.layout,
+            point:[point.x,point.y],pidls,folder,options,rename:intercept.rename,open:intercept.open,file_actions:intercept.file_actions,mode,extended,layout:origin.layout,view_context:origin.view_context,
             #[cfg(test)]probe:origin.probe,};
         let write_started=Instant::now();
         if let Err(error)=validate(&request).and_then(|_|write(&workspace.join("request.json"),&request)){
@@ -349,12 +424,10 @@ impl Client{
         let mut timing=MenuTimings{reused_process:reused,request_write_microseconds:micros(write_started.elapsed()),..Default::default()};
         let identity=if !reused{
             let stderr=match fs::File::create(workspace.join("worker.stderr.log")){Ok(file)=>file,Err(error)=>{cleanup(&workspace);return Err(error.into());}};
-            let mut command=Command::new(std::env::current_exe()?);
-            #[cfg(not(test))]command.arg("--context-menu-worker").arg(workspace.join("request.json"));
-            #[cfg(test)]command.arg("context_menu_process::tests::native_extension_worker_entry").args(["--ignored","--exact","--nocapture"]);
-            command.env("ZSDESK_MENU_WORKSPACE",&workspace).env("ZSDESK_MENU_SESSION",&session)
-                .creation_flags(0x08000000).stdin(Stdio::null()).stdout(Stdio::null()).stderr(stderr);
-            let spawn_started=Instant::now();let mut spawned=match command.spawn(){Ok(child)=>child,Err(error)=>{cleanup(&workspace);return Err(error.into());}};
+            #[cfg(not(test))]let arguments=vec!["--context-menu-worker".into(),workspace.join("request.json").into_os_string()];
+            #[cfg(test)]let arguments=vec!["context_menu_process::tests::native_extension_worker_entry".into(),"--ignored".into(),"--exact".into(),"--nocapture".into()];
+            let spawn_started=Instant::now();let spawned=child::spawn(&std::env::current_exe()?,&arguments,&workspace,&session,&stderr);drop(stderr);
+            let mut spawned=match spawned{Ok(child)=>child,Err(error)=>{cleanup(&workspace);return Err(error.into());}};
             let identity=created(spawned.id()).context("无法核对菜单进程创建时间");
             let boundary=(||->Result<usize>{
                 let handle=unsafe{CreateJobObjectW(None,PCWSTR::null())}?;
@@ -378,6 +451,9 @@ impl Client{
     }
     pub fn pid(&self)->Option<u32>{self.child.as_ref().map(Child::id)}
     pub fn timings(&self)->Option<(u64,u64)>{self.last_status.as_ref().map(|status|(status.bind_microseconds,status.populate_microseconds))}
+    pub fn created_items(&self)->Vec<zsdesk_windows::shell::new_menu::CreatedItem>{self.last_status.as_ref().map(|status|status.created.clone()).unwrap_or_default()}
+    pub fn result_layout(&self)->Option<ShellViewState>{self.last_status.as_ref().and_then(|status|status.layout.clone())}
+    pub fn result_sort_changed(&self)->bool{self.last_status.as_ref().is_some_and(|status|status.layout_sort_changed)}
     pub fn detailed_timings(&self)->MenuTimings{self.timing.clone()}
     /// Waits for a status transition or a queued UI/COM message, never for a
     /// fixed file-poll interval. The caller continues pumping its own STA.
@@ -388,7 +464,7 @@ impl Client{
     }
     fn read_status(&mut self){
         self.timing.status_reads=self.timing.status_reads.saturating_add(1);
-        if let Ok(status)=read_small::<Status>(&self.workspace.join("status.json"),65536){
+        if let Ok(status)=read_small::<Status>(&self.workspace.join("status.json"),MAX_STATUS){
             if status.token==self.token&&self.pid()==Some(status.pid){
                 self.timing.worker_thread=status.timing.worker_thread;
                 self.timing.fault_report_available=status.timing.fault_report_available;
@@ -416,9 +492,10 @@ impl Client{
         let value=serde_json::json!({"schema":"ZSDesk.MenuDiagnostics.v1","timestamp_unix_ms":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok().map(|time|time.as_millis()as u64),
             "parent_pid":std::process::id(),"worker_pid":self.pid(),"worker_created":self.child_created,"owner_class":self.owner_class,"mode":self.mode,"selection_count":self.item_count,
             "phase":self.last_status.as_ref().map(|status|status.phase.as_str()).unwrap_or("launch"),"worker_exit_code":exit,
+            "error_phase":self.last_status.as_ref().and_then(|status|status.error_phase.as_deref()),"error_hresult":self.last_status.as_ref().and_then(|status|status.error_hresult).map(|code|format!("0x{:08X}",code as u32)),
             "worker_exit_hex":exit.map(|code|format!("0x{:08X}",code as u32)),"committed":self.committed,
             "bind_microseconds":self.last_status.as_ref().map(|status|status.bind_microseconds),"populate_microseconds":self.last_status.as_ref().map(|status|status.populate_microseconds),
-            "timing":self.timing,"fault":read_small::<serde_json::Value>(&self.workspace.join("fault.json"),16384).ok(),
+            "timing":self.timing,"native_menu":self.last_status.as_ref().map(|status|&status.native_menu),"fault":read_small::<serde_json::Value>(&self.workspace.join("fault.json"),16384).ok(),
             "error":error.map(redacted_error),"stderr":redacted_error(&worker_stderr(&self.workspace))});
         let current=root.join("menu-diagnostics.current.json");let previous=root.join("menu-diagnostics.previous.json");
         if let Ok(old)=read_small::<serde_json::Value>(&current,128*1024){let _=write(&previous,&old);}
@@ -439,7 +516,7 @@ impl Client{
             }
             if matches!(status.phase.as_str(),"done"|"idle"){
                 self.complete=true;self.record(None,status.error.as_deref());
-                return Some(match status.error{Some(error)=>Err(anyhow::anyhow!(error)),None=>Ok(status.outcome.unwrap_or(MenuOutcome::Dismissed))});
+                return Some(match &status.error{Some(_)=>Err(worker_failure(&status)),None=>Ok(status.outcome.unwrap_or(MenuOutcome::Dismissed))});
             }
         }
         if let Some(exit)=self.child.as_mut().and_then(|child|child.try_wait().ok().flatten()){
@@ -448,10 +525,11 @@ impl Client{
                 else if let Some(status)=self.last_status.as_ref().filter(|status|matches!(status.phase.as_str(),"done"|"idle")){status.error.clone()}
                 else{Some("系统扩展菜单未返回完整结果，请重试".into())};
             self.record(exit.code(),error.as_deref());
-            return Some(match error{Some(error)=>Err(anyhow::anyhow!(error)),None=>Ok(self.last_status.as_ref().and_then(|status|status.outcome).unwrap_or(MenuOutcome::Dismissed))});
+            return Some(match error{Some(error)=>Err(self.last_status.as_ref().filter(|status|status.error.is_some()).map_or_else(||anyhow::anyhow!(error),worker_failure)),None=>Ok(self.last_status.as_ref().and_then(|status|status.outcome).unwrap_or(MenuOutcome::Dismissed))});
         }
         let showing=self.timing.parent_to_menu_microseconds.is_some();
-        if !self.committed&&!showing&&self.started.elapsed()>Duration::from_secs(30){
+        let preparation_limit=if matches!(self.mode,Mode::CatalogSelection|Mode::CatalogBackground){30}else{10};
+        if !self.committed&&!showing&&self.started.elapsed()>Duration::from_secs(preparation_limit){
             self.complete=true;self.cancel();let message="系统扩展菜单加载超时；文件管理窗口仍可使用，诊断已保留";
             self.record(None,Some(message));return Some(Err(anyhow::anyhow!(message)));
         }
@@ -478,7 +556,7 @@ impl Drop for Client{fn drop(&mut self){
     if let Some(child)=self.child.take(){retire_child(child,self.job.take(),self.workspace.clone(),self.child_created,committed);}
 }}
 
-enum AsyncEvent {Validate{before:bool,answer:std::sync::mpsc::SyncSender<bool>},Finished(Result<MenuOutcome>,Option<ShellViewState>,Vec<zsdesk_windows::shell::new_menu::CreatedItem>)}
+enum AsyncEvent {Validate{before:bool,answer:std::sync::mpsc::SyncSender<bool>},Finished(Result<MenuOutcome>,Option<ShellViewState>,Vec<zsdesk_windows::shell::new_menu::CreatedItem>,Vec<zsdesk_windows::shell::menu::MenuCatalogItem>)}
 /// Posted to an [`AsyncClient`] owner whenever a validation barrier or the
 /// result is waiting, so the owner answers at once instead of on its next
 /// polling tick (each barrier otherwise added up to one timer period).
@@ -493,10 +571,12 @@ fn notify_owner(owner:isize){
 /// Preparation, IPC and diagnostic I/O run off the window STA. Only the exact
 /// selection validation barrier is delivered back to that STA.
 pub struct AsyncClient {
+    catalog:Vec<zsdesk_windows::shell::menu::MenuCatalogItem>,
     created:Vec<zsdesk_windows::shell::new_menu::CreatedItem>,
     events:std::sync::mpsc::Receiver<AsyncEvent>,
     cancel:std::sync::Arc<std::sync::atomic::AtomicBool>,
     pid:std::sync::Arc<std::sync::atomic::AtomicU32>,complete:bool,
+    showing:std::sync::Arc<std::sync::atomic::AtomicBool>,
     layout:Option<ShellViewState>,
 }
 impl AsyncClient {
@@ -507,18 +587,22 @@ impl AsyncClient {
         Self::spawn_with_layout(owner,point,pidls,folder,options,intercept,mode,extended,None)
     }
     pub fn spawn_with_layout(owner:HWND,point:POINT,pidls:Vec<Vec<u8>>,folder:Option<PathBuf>,options:ContextMenuOptions,intercept:MenuInterceptions,mode:Mode,extended:bool,layout:Option<ShellViewState>)->Result<Self>{
+        Self::spawn_with_context(owner,point,pidls,folder,options,intercept,mode,extended,layout,None)
+    }
+    pub fn spawn_with_context(owner:HWND,point:POINT,pidls:Vec<Vec<u8>>,folder:Option<PathBuf>,options:ContextMenuOptions,intercept:MenuInterceptions,mode:Mode,extended:bool,layout:Option<ShellViewState>,view_context:Option<MenuViewContext>)->Result<Self>{
         use std::sync::{Arc,atomic::{AtomicBool,AtomicU32},mpsc};
         ensure!(PREPARING.fetch_update(Ordering::AcqRel,Ordering::Acquire,|n|(n<4).then_some(n+1)).is_ok(),"菜单正在处理其他请求，请稍后重试");
         struct Active;impl Drop for Active{fn drop(&mut self){PREPARING.fetch_sub(1,Ordering::AcqRel);}}
         let active=Active;
-        let mut origin=Origin::capture();origin.layout=layout;let owner=owner.0 as isize;let coordinates=(point.x,point.y);
+        let mut origin=Origin::capture();origin.layout=layout;origin.view_context=view_context;let owner=owner.0 as isize;let coordinates=(point.x,point.y);
         let (sender,events)=mpsc::sync_channel(4);let cancel=Arc::new(AtomicBool::new(false));let pid=Arc::new(AtomicU32::new(0));
+        let showing=Arc::new(AtomicBool::new(false));let shown=showing.clone();
         let stop=cancel.clone();let process=pid.clone();
         std::thread::Builder::new().name("zsdesk-menu-protocol".into()).spawn(move||{
             let _active=active;
             if stop.load(Ordering::Acquire){return;}
             let client=Client::spawn_at(HWND(owner as *mut _),POINT{x:coordinates.0,y:coordinates.1},pidls,folder,options,intercept,mode,extended,origin);
-            let mut client=match client{Ok(client)=>client,Err(error)=>{let _=sender.try_send(AsyncEvent::Finished(Err(error),None,Vec::new()));notify_owner(owner);return;}};
+            let mut client=match client{Ok(client)=>client,Err(error)=>{let _=sender.try_send(AsyncEvent::Finished(Err(error),None,Vec::new(),Vec::new()));notify_owner(owner);return;}};
             process.store(client.pid().unwrap_or(0),Ordering::Release);
             loop {
                 if stop.load(Ordering::Acquire){client.cancel();break;}
@@ -536,20 +620,23 @@ impl AsyncClient {
                         }
                     }
                 });
-                if let Some(result)=result {let layout=client.last_status.as_ref().and_then(|status|status.layout.clone());let created=client.last_status.as_ref().map(|status|status.created.clone()).unwrap_or_default();let _=sender.try_send(AsyncEvent::Finished(result,layout,created));notify_owner(owner);break;}
+                shown.store(client.timing.parent_to_menu_microseconds.is_some(),Ordering::Release);
+                if let Some(result)=result {let layout=client.last_status.as_ref().and_then(|status|status.layout.clone());let created=client.last_status.as_ref().map(|status|status.created.clone()).unwrap_or_default();let catalog=client.last_status.as_ref().map(|status|status.catalog.clone()).unwrap_or_default();let _=sender.try_send(AsyncEvent::Finished(result,layout,created,catalog));notify_owner(owner);break;}
                 client.wait_for_progress(20);
             }
         }).context("无法启动菜单通信线程")?;
-        Ok(Self{events,cancel,pid,complete:false,layout:None,created:Vec::new()})
+        Ok(Self{events,cancel,pid,showing,complete:false,layout:None,created:Vec::new(),catalog:Vec::new()})
     }
+    pub fn preparing(&self)->bool{!self.complete&&!self.cancel.load(Ordering::Acquire)&&!self.showing.load(Ordering::Acquire)}
     pub fn pid(&self)->Option<u32>{let pid=self.pid.load(Ordering::Acquire);(pid!=0).then_some(pid)}
     pub fn take_layout(&mut self)->Option<ShellViewState>{self.layout.take()}
     pub fn take_created(&mut self)->Vec<zsdesk_windows::shell::new_menu::CreatedItem>{std::mem::take(&mut self.created)}
+    pub fn take_catalog(&mut self)->Vec<zsdesk_windows::shell::menu::MenuCatalogItem>{std::mem::take(&mut self.catalog)}
     pub fn poll(&mut self,before:&mut dyn FnMut(bool)->bool)->Option<Result<MenuOutcome>> {
         if self.complete{return None;}
         for _ in 0..4 {match self.events.try_recv() {
             Ok(AsyncEvent::Validate{before:invoke,answer})=>{let permit=!self.cancel.load(Ordering::Acquire)&&before(invoke);let _=answer.try_send(permit);},
-            Ok(AsyncEvent::Finished(result,layout,created))=>{self.complete=true;self.layout=layout;self.created=created;return Some(result);},
+            Ok(AsyncEvent::Finished(result,layout,created,catalog))=>{self.complete=true;self.layout=layout;self.created=created;self.catalog=catalog;return Some(result);},
             Err(std::sync::mpsc::TryRecvError::Empty)=>return None,
             Err(std::sync::mpsc::TryRecvError::Disconnected)=>{self.complete=true;return Some(Err(anyhow::anyhow!("菜单通信已结束，请重新打开菜单")));},
         }}None
@@ -563,12 +650,18 @@ struct Watch{
     menu_open:std::cell::Cell<bool>,
     tracking_started:std::cell::Cell<u64>,
     #[cfg(test)]command:std::cell::Cell<Option<u32>>,
+    #[cfg(test)]classic_loop:std::cell::Cell<bool>,
+    #[cfg(test)]expanded_requested:std::cell::Cell<bool>,
+    #[cfg(test)]classic_commands:std::cell::Cell<u64>,
+    #[cfg(test)]menu:std::cell::Cell<HMENU>,
 }
 extern "C"{fn zs_menu_is_open(owner:HWND)->i32;}
 #[cfg(test)]extern "C"{fn zs_menu_command_messages()->u64;}
+#[cfg(test)]extern "C"{fn zs_menu_test_request_expanded(owner:HWND,point:POINT)->windows::core::HRESULT;}
 impl Worker<'_>{
     fn state(&mut self,phase:&str)->Result<()>{
         self.status.phase=phase.into();self.status.native_menu=serde_json::to_value(zsdesk_windows::shell::menu_diagnostics())?;
+        self.status.native_menu["presentation"]=zsdesk_windows::shell::menu::presentation_name().into();
         write(&self.path.with_file_name("status.json"),&self.status)?;EventSet::signal(self.events.status);Ok(())
     }
     fn allow(&mut self,before_invoke:bool)->windows::core::Result<()>{
@@ -616,8 +709,10 @@ fn classic_menu_visible()->bool{
 impl Watch{
     fn observe_open(&self,hwnd:HWND){
         if self.menu_open.get(){return;}
-        let observation=if self.request.options.modern&&unsafe{zs_menu_is_open(hwnd)}!=0{Some("native-presenter-open")}
+        let observation=if zsdesk_windows::shell::menu::drawn_menu_window().is_some_and(|window|unsafe{IsWindowVisible(window)}.as_bool()){Some("drawn-win11-menu")}
+            else if self.request.options.modern&&unsafe{zs_menu_is_open(hwnd)}!=0{Some("native-presenter-open")}
             else if classic_menu_visible(){Some("visible-classic-menu")}else{None};
+        #[cfg(test)]let observation=observation.or_else(||(self.classic_loop.get()&&self.request.probe.as_deref()==Some("modern-owner-copy")).then_some("classic-menu-entered"));
         if let Some(observation)=observation{
             self.menu_open.set(true);
             #[cfg(test)]if self.request.probe.as_deref()==Some("menu-dismiss"){unsafe{SetTimer(Some(hwnd),2,80,None);}}
@@ -632,15 +727,36 @@ unsafe extern "system" fn procedure(hwnd:HWND,msg:u32,wp:WPARAM,lp:LPARAM)->LRES
     let state=unsafe{GetWindowLongPtrW(hwnd,GWLP_USERDATA)}as*const Watch;
     if !state.is_null(){let state=unsafe{&*state};
         if matches!(msg,WM_ENTERMENULOOP|WM_INITMENUPOPUP){unsafe{SetTimer(Some(hwnd),1,15,None);}
-            #[cfg(test)]if state.request.probe.as_deref()==Some("menu-dismiss"){unsafe{SetTimer(Some(hwnd),2,80,None);}}
+            #[cfg(test)]if msg==WM_ENTERMENULOOP{state.classic_loop.set(true);}
+            #[cfg(test)]if msg==WM_INITMENUPOPUP&&state.request.probe.as_deref()==Some("modern-expand-copy")&&state.classic_loop.get(){
+                state.menu.set(HMENU(wp.0 as*mut _));state.command.set(zsdesk_windows::shell::menu::active_command_by_verb("copy"));
+            }
+            #[cfg(test)]if state.request.probe.as_deref()==Some("menu-dismiss")||(state.request.probe.as_deref()==Some("modern-expand")&&msg==WM_ENTERMENULOOP){unsafe{SetTimer(Some(hwnd),2,80,None);}}
         }
         #[cfg(test)]if msg==WM_TIMER&&wp.0==2{let _=unsafe{KillTimer(Some(hwnd),2)};let _=zsdesk_windows::shell::menu::dismiss_active_menu(hwnd);let _=unsafe{EndMenu()};return LRESULT(0);}
         if msg==WM_TIMER{
             if !owner_alive(&state.request)||EventSet::signaled(state.cancel_event){let _=zsdesk_windows::shell::menu::dismiss_active_menu(hwnd);let _=unsafe{EndMenu()};}
             state.observe_open(hwnd);
-            #[cfg(test)]if matches!(state.request.probe.as_deref(),Some("modern-owner-copy"|"modern-owner-new-folder"))&&state.menu_open.get(){
-                if let Some(command)=state.command.take(){let message=unsafe{RegisterWindowMessageW(w!("FILE_EXPLORER_CONTEXTMENU_INVOKEMENUITEM"))};
-                    if message!=0{let _=unsafe{PostMessageW(Some(hwnd),message,WPARAM(command as usize),LPARAM(0))};}}
+            #[cfg(test)]if matches!(state.request.probe.as_deref(),Some("modern-expand"|"modern-expand-copy"))&&state.menu_open.get()&&!state.expanded_requested.replace(true){
+                unsafe{SetTimer(Some(hwnd),2,2000,None);}
+                let result=unsafe{zs_menu_test_request_expanded(hwnd,POINT{x:state.request.point[0].saturating_add(43),y:state.request.point[1].saturating_add(89)})};
+                if result.is_err(){eprintln!("expanded probe failed: {result:?}");}
+            }
+            #[cfg(test)]if state.request.probe.as_deref()==Some("modern-owner-extension")&&state.menu_open.get()&&!state.expanded_requested.replace(true){
+                unsafe extern "C"{fn zs_menu_test_extension_id()->u32;}
+                let command=unsafe{zs_menu_test_extension_id()};if command!=0{state.command.set(Some(command));}
+            }
+            #[cfg(test)]if matches!(state.request.probe.as_deref(),Some("modern-owner-copy"|"modern-expand-copy"|"modern-owner-new-folder"|"modern-owner-static-probe"|"modern-owner-properties"|"modern-owner-extension"))&&state.menu_open.get(){
+                if let Some(command)=state.command.take(){
+                    if state.classic_loop.get()&&unsafe{zs_menu_is_open(hwnd)}==0&&matches!(state.request.probe.as_deref(),Some("modern-owner-copy"|"modern-expand-copy")){
+                        let mut label=[0u16;1024];let count=unsafe{GetMenuStringW(state.menu.get(),command,Some(&mut label),MF_BYCOMMAND)}.max(0)as usize;
+                        let mut mnemonic=None;let mut index=0;
+                        while index+1<count{if label[index]==b'&' as u16{if label[index+1]==b'&' as u16{index+=2;continue;}mnemonic=Some(label[index+1]);break;}index+=1;}
+                        if let Some(key)=mnemonic{if unsafe{PostMessageW(Some(hwnd),WM_CHAR,WPARAM(key as usize),LPARAM(1))}.is_ok(){state.classic_commands.set(state.classic_commands.get()+1);}}
+                        else{eprintln!("classic copy fixture has no keyboard mnemonic");let _=unsafe{EndMenu()};}
+                    }else{let message=unsafe{RegisterWindowMessageW(w!("FILE_EXPLORER_CONTEXTMENU_INVOKEMENUITEM"))};
+                        if message!=0{let _=unsafe{PostMessageW(Some(hwnd),message,WPARAM(command as usize),LPARAM(0))};}}
+                }
             }
         }
     }
@@ -649,9 +765,9 @@ unsafe extern "system" fn procedure(hwnd:HWND,msg:u32,wp:WPARAM,lp:LPARAM)->LRES
 }
 fn run_request(path:&Path,request:Request,events:&EventSet,com_us:u64,fault_report_available:bool)->Result<bool>{
     let setup=Instant::now();let worker_started=monotonic_us();
-    let mut state=Box::new(Worker{status:Status{token:request.token.clone(),pid:std::process::id(),window:0,phase:"starting".into(),validation:0,before_invoke:false,outcome:None,error:None,bind_microseconds:0,populate_microseconds:0,
-        reusable:false,layout:None,created:Vec::new(),timing:MenuTimings{worker_thread:unsafe{windows::Win32::System::Threading::GetCurrentThreadId()},fault_report_available,com_microseconds:com_us,..Default::default()},native_menu:serde_json::Value::Null,
-        #[cfg(test)]probe_menu_open:false,#[cfg(test)]probe_command_messages:0},request,path:path.into(),events});
+    let mut state=Box::new(Worker{status:Status{token:request.token.clone(),pid:std::process::id(),window:0,phase:"starting".into(),validation:0,before_invoke:false,outcome:None,error:None,error_hresult:None,error_phase:None,bind_microseconds:0,populate_microseconds:0,
+        reusable:false,layout:None,layout_sort_changed:false,created:Vec::new(),catalog:Vec::new(),timing:MenuTimings{worker_thread:unsafe{windows::Win32::System::Threading::GetCurrentThreadId()},fault_report_available,com_microseconds:com_us,..Default::default()},native_menu:serde_json::Value::Null,
+        #[cfg(test)]probe_menu_open:false,#[cfg(test)]probe_classic_loop:false,#[cfg(test)]probe_expanded_requested:false,#[cfg(test)]probe_command_messages:0,#[cfg(test)]probe_clipboard_after_invoke:serde_json::Value::Null},request,path:path.into(),events});
     state.state("starting")?;
     #[cfg(test)]if state.request.probe.as_deref()==Some("crash"){unsafe{RaiseException(0xc0000005,1,0,std::ptr::null());}std::process::exit(0x51);}
     #[cfg(test)]if state.request.probe.as_deref()==Some("memory-limit"){
@@ -664,14 +780,21 @@ fn run_request(path:&Path,request:Request,events:&EventSet,com_us:u64,fault_repo
     let instance=HINSTANCE(unsafe{GetModuleHandleW(None)}.context("menu owner module")?.0);let class=w!("ZSDesk.ExtensionMenu.Worker");
     unsafe{RegisterClassW(&WNDCLASSW{hInstance:instance,lpfnWndProc:Some(procedure),lpszClassName:class,..Default::default()});}
     let watch=Box::new(Watch{request:state.request.clone(),path:path.into(),status_event:events.status,cancel_event:events.cancel,
-        worker_started,menu_open:std::cell::Cell::new(false),tracking_started:std::cell::Cell::new(0),#[cfg(test)]command:std::cell::Cell::new(None)});
-    let window=unsafe{CreateWindowExW(WS_EX_TOOLWINDOW,class,w!("ZSdesk"),WS_POPUP,0,0,0,0,None,None,Some(instance),Some((&*watch as*const Watch).cast()))}.context("create menu owner window")?;
+        worker_started,menu_open:std::cell::Cell::new(false),tracking_started:std::cell::Cell::new(0),#[cfg(test)]command:std::cell::Cell::new(None),
+        #[cfg(test)]classic_loop:std::cell::Cell::new(false),#[cfg(test)]expanded_requested:std::cell::Cell::new(false),#[cfg(test)]classic_commands:std::cell::Cell::new(0),#[cfg(test)]menu:std::cell::Cell::new(HMENU::default())});
+    let owner=unsafe{GetAncestor(HWND(state.request.owner as*mut _),GA_ROOT)};
+    ensure!(owner_alive(&state.request),"菜单所属窗口已关闭");
+    let window=unsafe{CreateWindowExW(WS_EX_TOOLWINDOW,class,w!("ZSdesk"),WS_POPUP,0,0,0,0,Some(owner),None,Some(instance),Some((&*watch as*const Watch).cast()))}.context("create menu owner window")?;
     struct Window(HWND);impl Drop for Window{fn drop(&mut self){let _=unsafe{DestroyWindow(self.0)};}}let owned_window=Window(window);
     state.status.window=window.0 as isize;unsafe{SetTimer(Some(window),1,15,None);}
     state.status.timing.worker_setup_microseconds=micros(setup.elapsed());
     let result=(||->Result<MenuOutcome>{
         let request=state.request.clone();zsdesk_windows::shell::menu::set_context_menu_options(request.options.clone());
         #[cfg(test)]if request.probe.as_deref()==Some("dismiss"){state.allow(false)?;return Ok(MenuOutcome::Dismissed);}
+        #[cfg(test)]if request.probe.as_deref()==Some("retirement-dialog"){
+            state.allow(false)?;state.allow(true)?;
+            return Ok(MenuOutcome::NativeHandled);
+        }
         if request.mode==Mode::Properties{
             state.allow(true)?;
             let pidls=if request.pidls.is_empty(){vec![zsdesk_windows::shell::pidl::location_pidl(&zsdesk_core::model::explorer::ShellLocation::Path(request.folder.clone().context("目录缺失")?)).context("目录标识无效")?]}else{request.pidls.clone()};
@@ -679,22 +802,70 @@ fn run_request(path:&Path,request:Request,events:&EventSet,com_us:u64,fault_repo
             unsafe{windows::Win32::UI::Shell::SHMultiFileProperties(&data,0)}?;
             return Ok(MenuOutcome::ShellInvoked);
         }
-        let started=Instant::now();
-        let background=if matches!(request.mode,Mode::Background|Mode::New){Some(zsdesk_windows::shell::pidl::item_from_pidl(&request.pidls[0])?)}else{None};
-        let background_view=background.as_ref().map(|item|background_view::BackgroundView::create(item,&request,events)).transpose()?;
-        if let (Some(host),Some(layout))=(&background_view,&request.layout){zsdesk_windows::shell::restore_view_layout(&host.view,layout);}
-        let initial_layout=background_view.as_ref().and_then(|host|zsdesk_windows::shell::capture_view_layout(&host.view));
+        state.state("binding")?;let started=Instant::now();
+        let is_background=matches!(request.mode,Mode::Background|Mode::New|Mode::CatalogBackground)||(request.mode==Mode::Paste&&request.pidls.is_empty());
+        let background=if is_background{
+            Some(if let Some(pidl)=request.pidls.first(){zsdesk_windows::shell::pidl::item_from_pidl(pidl)?}
+                else{unsafe{zsdesk_windows::shell::shell_item(&zsdesk_core::model::explorer::ShellLocation::Path(request.folder.clone().context("粘贴目标缺失")?))}?})
+        }else{None};
+        let effective_options=zsdesk_windows::shell::menu::context_menu_options();
+        let classic_selection=zsdesk_windows::theme::os_build()<22000&&!effective_options.modern&&!effective_options.drawn
+            &&!request.pidls.is_empty()&&!is_background;
+        let background_view=if let Some(item)=&background{Some(background_view::BackgroundView::create(item,&request,events)?)}
+            else if !request.pidls.is_empty()&&!classic_selection{
+                let origin=match request.view_context.as_ref(){
+                    Some(context) if context.results=>background_view::SelectionOrigin::Results,
+                    Some(context) if context.folder.is_some()=>background_view::SelectionOrigin::Folder(context.folder.as_deref().unwrap()),
+                    _=>background_view::SelectionOrigin::Unspecified,
+                };
+                Some(background_view::for_selection(&request.pidls,origin,&request,events)?)
+            }else{None};
+        state.status.timing.background_view_reused=is_background&&background_view.is_some()&&background_view::reused();
+        if is_background{if let (Some(host),Some(layout))=(&background_view,&request.layout){zsdesk_windows::shell::restore_view_layout(&host.view,layout);}}
+        let initial_layout=background_view.as_ref().filter(|_|is_background).and_then(|host|zsdesk_windows::shell::capture_view_layout(&host.view));
+        let full_context=matches!(request.mode,Mode::More|Mode::Background|Mode::CatalogSelection|Mode::CatalogBackground);
+        let classic_gesture=request.extended&&!request.view_context.as_ref().is_some_and(|context|context.keyboard&&context.f10);
+        let packaged=full_context&&(effective_options.drawn||!effective_options.modern||classic_gesture||matches!(request.mode,Mode::CatalogSelection|Mode::CatalogBackground));
         let menu=if let Some(host)=&background_view{
-            if request.mode==Mode::New{zsdesk_windows::shell::new_menu::for_view(&host.view)?}else{ShellMenu::for_view(&host.view,false)?}
+            if request.mode==Mode::New{zsdesk_windows::shell::new_menu::for_view(&host.view)?}
+            else if packaged{ShellMenu::for_view_with_packages(&host.view,&host.browser,window,!is_background)?}
+            else{ShellMenu::for_view(&host.view,!is_background)?}
         }else if request.pidls.is_empty(){let folder=zsdesk_windows::desktop::folder_for_path(request.folder.as_deref().context("目录缺失")?)?;ShellMenu::for_folder_background(window,&folder)?}else{ShellMenu::for_items(window,&request.pidls)?};
-        let creation=background_view.as_ref().filter(|_|request.folder.is_some()).map(|host|zsdesk_windows::shell::new_menu::CreationCapture::attach(&menu,&host.view)).transpose()?;
-        state.status.bind_microseconds=started.elapsed().as_micros()as u64;let started=Instant::now();
-        if request.mode==Mode::Open{
+        menu.set_directory(request.folder.as_deref());
+        if let Some(context)=&request.view_context{menu.set_input_context(context.keyboard,context.f10);}
+        // Creation selection feedback is optional for generic background
+        // handlers. A missing site must not make their entire menu unusable.
+        let creation=if let Some(host)=background_view.as_ref().filter(|_|is_background&&request.folder.is_some()){
+            match zsdesk_windows::shell::new_menu::CreationCapture::attach(&menu,&host.view){
+                Ok(capture)=>Some(capture),
+                Err(error) if request.mode!=Mode::New&&matches!(error.code().0 as u32,0x80004002|0x80004001)=>None,
+                Err(error)=>return Err(error.into()),
+            }
+        }else{None};
+        state.status.bind_microseconds=started.elapsed().as_micros()as u64;state.state("populating")?;let started=Instant::now();
+        if matches!(request.mode,Mode::Open|Mode::Paste){
             menu.populate_for_invoke(request.extended)?;state.status.populate_microseconds=started.elapsed().as_micros()as u64;
-            state.allow(true)?;menu.invoke_verb(window,"open",false)?;return Ok(MenuOutcome::ShellInvoked);
+            let verb=if request.mode==Mode::Paste{"paste"}else{"open"};
+            state.allow(true)?;menu.invoke_verb(window,verb,false)?;return Ok(MenuOutcome::ShellInvoked);
         }
-        menu.populate(request.rename,request.extended)?;state.status.populate_microseconds=started.elapsed().as_micros()as u64;
+        if effective_options.modern&&!effective_options.drawn&&matches!(request.mode,Mode::More|Mode::Background){
+            menu.populate_compact(request.rename,request.extended)?;
+        }else{menu.populate(request.rename,request.extended)?;}
+        #[cfg(test)]watch.menu.set(menu.hmenu());
+        state.status.populate_microseconds=started.elapsed().as_micros()as u64;
+        if matches!(request.mode,Mode::CatalogSelection|Mode::CatalogBackground){
+            state.allow(false)?;state.status.catalog=menu.catalog();return Ok(MenuOutcome::Dismissed);
+        }
         state.allow(false)?;
+        #[cfg(test)]if matches!(request.probe.as_deref(),Some("modern-owner-extension"|"modern-ui-nested-extension")){
+            use windows::{core::{GUID,Interface},Win32::{System::Com::{CoCreateInstance,CLSCTX_INPROC_SERVER},UI::Shell::IExplorerCommand}};
+            unsafe extern "C"{fn zs_menu_test_extension(command:*mut core::ffi::c_void);}
+            let command:IExplorerCommand=unsafe{CoCreateInstance(&GUID::from_u128(0xb3489bd3_6c40_4aaa_9610_d72754252627),None,CLSCTX_INPROC_SERVER)}?;
+            unsafe{zs_menu_test_extension(command.as_raw());}
+        }
+        #[cfg(test)]if request.probe.as_deref()==Some("properties-direct"){
+            state.allow(true)?;menu.invoke_verb(window,"properties",false)?;return Ok(MenuOutcome::ShellInvoked);
+        }
         #[cfg(test)]if request.probe.as_deref()==Some("modern-owner-copy"){
             ensure!(request.options.modern,"modern owner probe requires the native Windows 11 presenter");
             let count=unsafe{GetMenuItemCount(Some(menu.hmenu()))};
@@ -706,12 +877,25 @@ fn run_request(path:&Path,request:Request,events:&EventSet,com_us:u64,fault_repo
             ensure!(request.options.modern,"modern creation probe requires the native presenter");
             watch.command.set(Some(isolation_tests::new_item_command(&menu,false)?));
         }
+        #[cfg(test)]if request.probe.as_deref()==Some("modern-owner-properties"){
+            let command=(0..unsafe{GetMenuItemCount(Some(menu.hmenu()))})
+                .map(|index|unsafe{GetMenuItemID(menu.hmenu(),index)})
+                .find(|id|menu.verb(*id).is_some_and(|verb|verb.eq_ignore_ascii_case("properties")))
+                .context("native properties command missing")?;
+            watch.command.set(Some(command));
+        }
+        #[cfg(test)]if request.probe.as_deref()==Some("modern-owner-static-probe"){
+            watch.command.set(Some(isolation_tests::static_background_command(&menu)?));
+        }
         let foreground_started=Instant::now();
         unsafe{let _=ShowWindow(window,SW_SHOWNOACTIVATE);let _=SetForegroundWindow(window);}
         state.status.timing.foreground_microseconds=micros(foreground_started.elapsed());
         let point=POINT{x:request.point[0],y:request.point[1]};
         #[cfg(test)]let probe_outcome=if matches!(request.probe.as_deref(),Some("new-folder"|"new-text")){
             let command=isolation_tests::new_item_command(&menu,request.probe.as_deref()==Some("new-text"))?;
+            state.allow(true)?;menu.invoke(window,command,None,false,false)?;Some(MenuOutcome::ShellInvoked)
+        }else if request.probe.as_deref()==Some("background-static-probe"){
+            let command=isolation_tests::static_background_command(&menu)?;
             state.allow(true)?;menu.invoke(window,command,None,false,false)?;Some(MenuOutcome::ShellInvoked)
         }else if request.probe.as_deref()==Some("background-details"){
             ensure!(background_view.is_some(),"background view required");let command=isolation_tests::background_details_command(&menu)?;
@@ -721,27 +905,48 @@ fn run_request(path:&Path,request:Request,events:&EventSet,com_us:u64,fault_repo
         watch.tracking_started.set(monotonic_us());
         let outcome=if let Some(outcome)=probe_outcome{outcome}
             else if request.mode==Mode::New{menu.track_new(window,point,&mut||state.allow(true))?}
-            else if let (Some(item),Some(host))=(&background,&background_view){menu.track_background_view(window,point,item,&host.browser,&mut||state.allow(true))?}
-            else if request.pidls.is_empty(){menu.track_folder_background(window,point,request.folder.as_deref().unwrap(),0,&mut||state.allow(true))?}
-            else{menu.track_selected_before(window,point,&request.pidls,0,MenuInterceptions{rename:request.rename,open:request.open},&mut||state.allow(true))?};
+            else if let (Some(item),Some(host))=(&background,&background_view){menu.track_background_view_with_interceptions(window,point,item,&host.browser,MenuInterceptions{file_actions:request.file_actions,..Default::default()},&mut||state.allow(true))?}
+            else if request.pidls.is_empty(){menu.track_folder_background_with_interceptions(window,point,request.folder.as_deref().unwrap(),0,MenuInterceptions{file_actions:request.file_actions,..Default::default()},&mut||state.allow(true))?}
+            else if let Some(host)=&background_view{menu.track_selected_in_view_before(window,point,&request.pidls,&host.browser,
+                MenuInterceptions{rename:request.rename,open:request.open,file_actions:request.file_actions},&mut||state.allow(true))?}
+            else{menu.track_selected_before(window,point,&request.pidls,0,MenuInterceptions{rename:request.rename,open:request.open,file_actions:request.file_actions},&mut||state.allow(true))?};
         if matches!(outcome,MenuOutcome::ShellInvoked|MenuOutcome::NativeHandled){
             pump(150);
             // ShellNew can open a modeless shortcut/template wizard. Its site
             // must remain alive until the wizard finishes its create callback.
             if creation.is_some(){while process_visible_windows(std::process::id(),window){pump(50);}}
             if let Some(creation)=&creation{state.status.created=creation.take();}
-            let layout=background_view.as_ref().and_then(|host|zsdesk_windows::shell::capture_view_layout(&host.view));
-            if layout!=initial_layout{state.status.layout=layout;}
+            let layout=background_view.as_ref().filter(|_|is_background).and_then(|host|zsdesk_windows::shell::capture_view_layout(&host.view));
+            if layout!=initial_layout{
+                state.status.layout_sort_changed=layout.as_ref().zip(initial_layout.as_ref()).is_some_and(|(after,before)|after.sort_columns!=before.sort_columns);
+                state.status.layout=layout;
+            }
         }
         Ok(outcome)
     })();
 
+    #[cfg(test)]let _retirement_dialog=if state.request.probe.as_deref()==Some("retirement-dialog")&&result.is_ok(){
+        unsafe extern "system" fn dialog_proc(hwnd:HWND,message:u32,wp:WPARAM,lp:LPARAM)->LRESULT{unsafe{DefWindowProcW(hwnd,message,wp,lp)}}
+        // Match the normal tracking path's first-show handoff before creating
+        // a modeless extension window in the hidden worker process.
+        unsafe{let _=ShowWindow(window,SW_SHOWNOACTIVATE);}
+        let name=w!("ZSDesk.Test.PendingExtension");
+        unsafe{RegisterClassW(&WNDCLASSW{hInstance:instance,lpfnWndProc:Some(dialog_proc),lpszClassName:name,..Default::default()});}
+        let popup=Window(unsafe{CreateWindowExW(WS_EX_TOOLWINDOW,name,name,WS_OVERLAPPEDWINDOW,20,20,240,100,None,None,Some(instance),None)}?);
+        unsafe{let _=ShowWindow(popup.0,SW_SHOWNOACTIVATE);}
+        let visible=unsafe{IsWindowVisible(popup.0)}.as_bool();let enumerable=process_visible_windows(std::process::id(),window);
+        let mut bounds=windows::Win32::Foundation::RECT::default();let bounds_result=unsafe{GetWindowRect(popup.0,&mut bounds)};
+        ensure!(visible&&enumerable,"controlled extension window is not visible/enumerable: visible={visible}, enumerable={enumerable}, bounds={bounds:?}, result={bounds_result:?}, hwnd={:?}",popup.0);
+        Some(popup)
+    }else{None};
     match result{
         Ok(outcome)=>state.status.outcome=Some(outcome),
-        Err(error) if error.downcast_ref::<windows::core::Error>().is_some_and(|error|matches!(error.code().0 as u32,0x80004004|0x800704c7))=>state.status.outcome=Some(MenuOutcome::Dismissed),
-        Err(error)=>state.status.error=Some(format!("{error:#}")),
+        Err(error) if error.downcast_ref::<windows::core::Error>().is_some_and(|error|zsdesk_windows::shell::file_transfer::is_cancelled(error.code()))=>state.status.outcome=Some(MenuOutcome::Dismissed),
+          Err(error)=>{state.status.error_hresult=Some(failure_code(&error).0);
+            state.status.error_phase=Some(state.status.phase.clone());state.status.error=Some(format!("{error:#}"));},
     }
-    #[cfg(test)]{state.status.probe_menu_open=watch.menu_open.get();state.status.probe_command_messages=unsafe{zs_menu_command_messages()};}
+    #[cfg(test)]{state.status.probe_menu_open=watch.menu_open.get();state.status.probe_classic_loop=watch.classic_loop.get();state.status.probe_expanded_requested=watch.expanded_requested.get();state.status.probe_command_messages=unsafe{zs_menu_command_messages()}+watch.classic_commands.get();
+        if state.request.probe.as_deref()==Some("modern-owner-copy"){state.status.probe_clipboard_after_invoke=isolation_tests::clipboard_metadata();}}
     let persistence_deadline=Instant::now()+Duration::from_secs(1);
     let persisted=loop{
         if !owns_clipboard(){break true;}
@@ -791,6 +996,13 @@ fn run_worker(path:&Path)->Result<()>{
     let com_started=Instant::now();unsafe{SetErrorMode(0x0001|0x0002);OleInitialize(None)?;}
     let mut com_us=micros(com_started.elapsed());
     struct Apartment;impl Drop for Apartment{fn drop(&mut self){unsafe{OleUninitialize();}}}let _apartment=Apartment;
+    struct MenuResources;impl Drop for MenuResources{fn drop(&mut self){
+        zsdesk_windows::shell::menu::release_menu_thread_resources();
+        // Reapers must finish removing the owned state workspaces before this
+        // isolated menu host exits. No provider command is invoked by them.
+        while zsdesk_windows::shell::pending_packaged_state_workers()>0 { pump(20); }
+    }}let _menu_resources=MenuResources;
+    let _background_cache=background_view::CacheLifetime;
     // An idle process may still host UI or clipboard data of a command it ran
     // for an earlier request (it is reusable while none is visible yet). Never
     // end those with the process.
@@ -877,10 +1089,21 @@ pub fn run_worker_if_requested()->Option<Result<()>>{
     }
     #[test]fn menu_protocol_rejects_unbounded_or_path_like_sessions(){
         let mut request=Request{token:"request-1".into(),session:"session-1".into(),ordinal:1,parent:1,parent_created:1,owner:1,
-            point:[0,0],pidls:vec![vec![0,0]],folder:None,options:Default::default(),rename:false,open:false,mode:Mode::More,extended:false,layout:None,probe:None};
+            point:[0,0],pidls:vec![vec![0,0]],folder:None,options:Default::default(),rename:false,open:false,file_actions:false,mode:Mode::More,extended:false,layout:None,view_context:None,probe:None};
         assert!(validate(&request).is_ok());
         for value in ["",r"..\escape","bad/session","bad\0session"]{request.session=value.into();assert!(validate(&request).is_err());}
         request.session="session-1".into();for ordinal in [0,MAX_SESSION_REQUESTS+1]{request.ordinal=ordinal;assert!(validate(&request).is_err());}
+    }
+    #[test]fn filesystem_action_interception_is_opt_in_on_the_wire()->Result<()>{
+        let request=Request{token:"request-1".into(),session:"session-1".into(),ordinal:1,parent:1,parent_created:1,owner:1,
+            point:[0,0],pidls:Vec::new(),folder:Some(PathBuf::from(r"E:\destination")),options:Default::default(),rename:false,open:false,
+            file_actions:true,mode:Mode::Paste,extended:false,layout:None,view_context:None,probe:None};
+        ensure!(validate(&request).is_ok(),"background paste target rejected");
+        let mut json=serde_json::to_value(&request)?;let restored:Request=serde_json::from_value(json.clone())?;assert!(restored.file_actions);
+        json.as_object_mut().unwrap().remove("file_actions");let legacy:Request=serde_json::from_value(json)?;assert!(!legacy.file_actions);
+        let mut invalid=legacy;invalid.folder=None;assert!(validate(&invalid).is_err());
+        for permanent in [false,true]{let value=MenuOutcome::Delete{permanent};assert_eq!(serde_json::from_str::<MenuOutcome>(&serde_json::to_string(&value)?)?,value);}
+        Ok(())
     }
     #[test]fn menu_events_wake_once_but_cancellation_stays_latched()->Result<()>{
         let events=EventSet::create(&format!("test-{}-{}",std::process::id(),SERIAL.fetch_add(1,Ordering::Relaxed)))?;
@@ -893,13 +1116,47 @@ pub fn run_worker_if_requested()->Option<Result<()>>{
         assert!(value.contains("0xC0000005")&&value.contains("WPS.dll"));
         assert!(!value.contains("Example")&&!value.contains("server")&&!value.contains("private"));
     }
+    #[test]fn reused_worker_diagnostics_keep_the_latest_failure_without_partial_paths()->Result<()>{
+        let root=std::env::temp_dir().join(format!("zsdesk-stderr-{}-{}",std::process::id(),SERIAL.fetch_add(1,Ordering::Relaxed)));
+        fs::create_dir(&root)?;
+        struct Fixture(PathBuf);impl Drop for Fixture{fn drop(&mut self){let _=fs::remove_file(self.0.join("worker.stderr.log"));let _=fs::remove_dir(&self.0);}}let _fixture=Fixture(root.clone());
+        let mut text="obsolete request\n".repeat(500);text.push_str(&format!("C:\\Users\\Private\\{}\n","hidden".repeat(800)));
+        text.push_str("latest failure 0x80004001\nsource C:\\Users\\Example\\secret.txt\n");
+        fs::write(root.join("worker.stderr.log"),text)?;
+        let raw=worker_stderr(&root);let visible=redacted_error(&raw);
+        assert!(visible.contains("latest failure 0x80004001"));assert!(!visible.contains("obsolete")&&!visible.contains("hidden")&&!visible.contains("secret")&&!visible.contains("Example"));
+        fs::write(root.join("worker.stderr.log"),"unfinished".repeat(900))?;assert!(worker_stderr(&root).is_empty());Ok(())
+    }
+    #[test]fn menu_failure_keeps_native_hresult_and_distinguishes_invocation(){
+        let failed=MenuFailure{phase:"invoking".into(),code:Some(0x80070005u32 as i32),detail:"权限不足 (0x80070005)".into(),invoked:true};
+        let error:anyhow::Error=failed.into();assert_eq!(failure_code(&error).0 as u32,0x80070005);
+        assert!(failure_message(&error).starts_with("右键菜单命令执行失败"));assert!(!failure_message(&error).contains("加载失败"));
+        let binding:anyhow::Error=MenuFailure{phase:"binding".into(),code:Some(0x80004005u32 as i32),detail:"namespace unavailable".into(),invoked:false}.into();
+        assert!(failure_message(&binding).starts_with("无法获取当前位置的系统菜单"));
+    }
+    #[test]fn filesystem_failures_keep_specific_codes_instead_of_generic_failure(){
+        for (native,expected) in [(5,0x80070005u32),(2,0x80070002),(0xc0000005u32 as i32,0xc0000005)]{
+            let error=anyhow::Error::new(std::io::Error::from_raw_os_error(native)).context("operation failed");
+            assert_eq!(failure_code(&error).0 as u32,expected);
+        }
+        assert_eq!(failure_code(&anyhow::anyhow!("unspecified provider failure")).0 as u32,0x80004005);
+    }
     #[test]#[ignore="Internal subprocess entry for menu isolation regression"]
     fn native_extension_worker_entry()->Result<()>{
+        let _state_entry=zsdesk_windows::shell::packaged_state_worker_test_entry(&[
+            "context_menu_process::tests::native_packaged_state_worker_entry".into(),"--exact".into(),"--ignored".into(),"--nocapture".into()])?;
         #[link(name="user32")]unsafe extern "system"{fn OpenDesktopW(name:*const u16,flags:u32,inherit:i32,access:u32)->*mut core::ffi::c_void;fn SetThreadDesktop(desktop:*mut core::ffi::c_void)->i32;}
+        if let Ok(expected)=std::env::var("ZSDESK_MENU_TEST_STATION"){
+            ensure!(isolation_tests::current_station_name()?==expected,"worker did not connect to the private test window station");
+        }
         if let Ok(name)=std::env::var("ZSDESK_MENU_TEST_DESKTOP"){
             let desktop=unsafe{OpenDesktopW(wide(&name).as_ptr(),0,0,0x000f00ff)};ensure!(!desktop.is_null()&&unsafe{SetThreadDesktop(desktop)}!=0,"private worker desktop unavailable");
         }
         let root=PathBuf::from(std::env::var_os("ZSDESK_MENU_WORKSPACE").context("workspace")?);run_worker(&root.join("request.json"))
     }
+    #[test]#[ignore="Internal subprocess entry for packaged command state evaluation"]
+    fn native_packaged_state_worker_entry()->Result<()>{Ok(zsdesk_windows::shell::run_packaged_state_test_worker()?)}
 }
 #[cfg(test)]#[path="context_menu_process_tests.rs"]pub(crate) mod isolation_tests;
+#[cfg(test)]#[path="context_menu_namespace_tests.rs"]mod namespace_tests;
+#[cfg(test)]#[path="context_menu_runtime_tests.rs"]mod runtime_tests;

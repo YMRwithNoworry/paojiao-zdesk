@@ -9,6 +9,7 @@ unsafe extern "system" {
     fn CreateDesktopW(name:*const u16,device:*const u16,mode:*const c_void,flags:u32,access:u32,attributes:*const c_void)->*mut c_void;
     fn SetThreadDesktop(desktop:*mut c_void)->i32;
     fn CloseDesktop(desktop:*mut c_void)->i32;
+    fn OpenDesktopW(name:*const u16,flags:u32,inherit:i32,access:u32)->*mut c_void;
 }
 
 fn pump() {
@@ -92,6 +93,99 @@ fn native_resize_edges_and_restore_preserve_normal_bounds()->Result<()> {
     ensure!(foreground_unchanged,"foreground changed during private frame test");
     println!("{}",serde_json::json!({"state":"passed","checks":report,"desktop_closed":closed,"desktop_switched":false,"foreground_unchanged":foreground_unchanged}));
     Ok(())
+}
+
+fn screen_edge_cases(output:PathBuf,handle:usize)->Result<serde_json::Value>{
+        ensure!(unsafe{SetThreadDesktop(handle as*mut c_void)}!=0,"SetThreadDesktop failed");
+        let instance=HINSTANCE(unsafe{GetModuleHandleW(None)?}.0);
+        let class=windows::core::w!("ZSDesk.Native.EdgeRegression");
+        unsafe{RegisterClassW(&WNDCLASSW{lpfnWndProc:Some(window_proc),hInstance:instance,lpszClassName:class,..Default::default()});}
+        let mut cases=Vec::new();
+        for native in [false,true]{for full in [false,true]{
+            let profile=output.join(format!("edge-fixture-{native}-{full}.json"));ensure!(!profile.exists(),"existing fixture retained");
+            struct Profile(PathBuf);impl Drop for Profile{fn drop(&mut self){let _=std::fs::remove_file(&self.0);}}let _profile=Profile(profile.clone());
+            let slot=Box::new(RefCell::new(None::<WindowState>));
+            let window=unsafe{CreateWindowExW(WS_EX_NOACTIVATE,class,windows::core::w!("Edge regression"),WS_OVERLAPPEDWINDOW|WS_CLIPCHILDREN,
+                100,100,900,650,None,None,Some(instance),Some((&*slot as*const Slot).cast()))?};
+            let owner=FocusWindow(window);
+            if native{unsafe{SetPropW(window,windows::core::w!("ZSDesk.NativeCaption"),Some(windows::Win32::Foundation::HANDLE(1usize as*mut _)))?;}}
+            if full{
+                use windows::Win32::Graphics::Gdi::{GetMonitorInfoW,MonitorFromWindow,MONITORINFO,MONITOR_DEFAULTTONEAREST};
+                let mut monitor=MONITORINFO{cbSize:size_of::<MONITORINFO>()as u32,..Default::default()};
+                unsafe{GetMonitorInfoW(MonitorFromWindow(window,MONITOR_DEFAULTTONEAREST),&mut monitor)}.ok()?;
+                unsafe{SetPropW(window,window_actions::FULLSCREEN,Some(windows::Win32::Foundation::HANDLE(1usize as*mut _)))?;
+                    SetWindowLongPtrW(window,GWL_STYLE,GetWindowLongPtrW(window,GWL_STYLE)&!((WS_CAPTION|WS_THICKFRAME).0 as isize));
+                    let r=monitor.rcMonitor;SetWindowPos(window,None,r.left,r.top,r.right-r.left,r.bottom-r.top,SWP_FRAMECHANGED|SWP_NOZORDER|SWP_NOACTIVATE)?;
+                    let _=ShowWindow(window,SW_SHOWNOACTIVATE);}
+            }else{unsafe{let _=ShowWindow(window,SW_SHOWMAXIMIZED);}}
+            pump();ensure!(screen_edge_window(window),"edge mode not active");
+            let mut client=RECT::default();unsafe{GetClientRect(window,&mut client)}?;let dpi=unsafe{GetDpiForWindow(window)}.max(96);
+            let mut session=storage::default_session();session.tabs=vec![ExplorerTab::new(1,ShellLocation::ThisPc),ExplorerTab::new(2,ShellLocation::ThisPc)];session.active_tab=0;
+            let mut state=WindowState::new(session,profile,None,false);
+            state.hwnd=window;state.dpi=dpi;
+            let top=scale(zsdesk_ui::chrome::TAB_TOP,state.dpi);let width=scale(200,state.dpi);
+            state.layout.strip=LayoutRect::new(0,0,client.right,scale(STRIP_H,state.dpi));
+            state.layout.tabs=(0..2).map(|index|zsdesk_ui::chrome::TabSlot{index,rect:LayoutRect::new(scale(12,state.dpi)+index as i32*width,top,width-2,scale(STRIP_H,state.dpi)-top),..Default::default()}).collect();
+            let tab_x=state.layout.tabs[1].rect.x+width/2;
+            ensure!(state.chrome_hit(tab_x,0)==Hit::Tab(1),"top edge did not select its tab");
+            *slot.borrow_mut()=Some(state);
+            let mut point=POINT{x:tab_x,y:0};unsafe{ClientToScreen(window,&mut point)}.ok()?;
+            ensure!(unsafe{SendMessageW(window,WM_NCHITTEST,None,Some(packed(point)))}.0==HTCLIENT as isize,"top tab edge became caption/resize hit");
+            let edge=POINT{x:client.right-1,y:0};let mut screen=edge;unsafe{ClientToScreen(window,&mut screen)}.ok()?;
+            ensure!(unsafe{SendMessageW(window,WM_NCHITTEST,None,Some(packed(screen)))}.0==HTCLOSE as isize,"upper-right edge missed close");
+            super::interaction_regression::caption_click_at(window,2,Some(edge))?;
+            ensure!(!unsafe{IsWindow(Some(window))}.as_bool(),"upper-right edge click did not close its own window");
+            cases.push(serde_json::json!({"native_caption":native,"fullscreen":full,"dpi":dpi,"top_tab_client_hit":true,"corner_close_executed":true}));
+            drop(owner);pump();drop(slot);
+        }}
+        Ok(serde_json::json!({"cases":cases,"no_user_input":true}))
+}
+
+#[test]
+#[ignore="Owned process endpoint for the private-desktop edge regression"]
+fn native_screen_edge_worker_entry()->Result<()>{
+    let name=std::env::var("ZSDESK_EDGE_TEST_DESKTOP")?;
+    ensure!(name.starts_with("ZSDesk.EdgeRegression.")&&name.bytes().all(|byte|byte.is_ascii_alphanumeric()||byte==b'.'),"dedicated fixture desktop required");
+    let output=PathBuf::from(std::env::var_os("ZSDESK_NATIVE_TEST_OUTPUT").ok_or_else(||anyhow::anyhow!("fixture output required"))?);
+    ensure!(output.is_absolute(),"absolute fixture output required");
+    let desktop=unsafe{OpenDesktopW(wide(&name).as_ptr(),0,0,0x000f00ff)};
+    ensure!(!desktop.is_null(),"OpenDesktop failed");
+    let report=screen_edge_cases(output,desktop as usize)?;
+    // Shell/UI services may keep threads alive until process exit. The parent
+    // owns the desktop and verifies its closure after this worker exits.
+    println!("{}",serde_json::json!({"edge_worker_checks":report}));Ok(())
+}
+
+#[test]
+#[ignore="Real maximized/fullscreen edge input in an owned process on an unswitched private desktop"]
+fn native_screen_edges_reach_close_and_top_tabs()->Result<()>{
+    use std::{fs,os::windows::process::CommandExt,process::{Command,Stdio},time::Instant};
+    let output=PathBuf::from(std::env::var_os("ZSDESK_NATIVE_TEST_OUTPUT").ok_or_else(||anyhow::anyhow!("explicit fixture output required"))?);
+    ensure!(output.is_absolute(),"absolute fixture output required");
+    let name=format!("ZSDesk.EdgeRegression.{}",std::process::id());let encoded=wide(&name);
+    let desktop=unsafe{CreateDesktopW(encoded.as_ptr(),ptr::null(),ptr::null(),0,0x000f00ff,ptr::null())};
+    ensure!(!desktop.is_null(),"CreateDesktop failed");
+    let result=(||->Result<serde_json::Value>{
+        let log=output.join("edge-worker.current.log");
+        if log.exists(){use std::os::windows::fs::MetadataExt;ensure!(fs::symlink_metadata(&log)?.file_attributes()&0x400==0,"worker log is a reparse point");}
+        let stdout=fs::File::create(&log)?;let stderr=stdout.try_clone()?;
+        struct Worker(std::process::Child);impl Drop for Worker{fn drop(&mut self){if self.0.try_wait().ok().flatten().is_none(){let _=self.0.kill();let _=self.0.wait();}}}
+        let mut child=Worker(Command::new(std::env::current_exe()?).args(["window::geometry_regression::native_screen_edge_worker_entry","--exact","--ignored","--nocapture","--test-threads=1"])
+            .env("ZSDESK_EDGE_TEST_DESKTOP",&name).stdin(Stdio::null()).stdout(stdout).stderr(stderr).creation_flags(0x08000000).spawn()?);
+        let pid=child.0.id();let deadline=Instant::now()+Duration::from_secs(30);
+        let status=loop{if let Some(status)=child.0.try_wait()?{break status;}ensure!(Instant::now()<deadline,"owned edge worker timed out");thread::sleep(Duration::from_millis(10));};
+        let text=fs::read_to_string(&log)?;ensure!(status.success(),"edge worker failed: {text}");
+        let report=text.lines().filter_map(|line|serde_json::from_str::<serde_json::Value>(line).ok()).find_map(|value|value.get("edge_worker_checks").cloned()).ok_or_else(||anyhow::anyhow!("edge worker report missing"))?;
+        ensure!(report["cases"].as_array().is_some_and(|cases|cases.len()==4),"edge cases incomplete");
+        Ok(serde_json::json!({"worker_pid":pid,"worker_exited":true,"checks":report}))
+    })();
+    let closed=unsafe{CloseDesktop(desktop)}!=0;let close_error=unsafe{windows::Win32::Foundation::GetLastError()}.0;
+    let reopened=unsafe{OpenDesktopW(encoded.as_ptr(),0,0,0x000f00ff)};let absent=reopened.is_null();
+    let inspection_closed=absent||unsafe{CloseDesktop(reopened)}!=0;
+    // CloseDesktop releases our handle; the window station can retain the
+    // named object. Verify owned windows/processes and every handle we opened.
+    let report=result?;ensure!(closed&&inspection_closed,"private desktop handle cleanup failed: {close_error}");
+    println!("{}",serde_json::json!({"state":"passed","result":report,"desktop_handle_closed":true,"desktop_name_still_exists":!absent,"desktop_switched":false}));Ok(())
 }
 
 struct FocusWindow(HWND);

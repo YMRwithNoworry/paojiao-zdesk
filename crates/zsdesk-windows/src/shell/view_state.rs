@@ -27,15 +27,18 @@ pub fn capture_view_layout(shell:&IShellView)->Option<ShellViewState> {
     let mut mode=FOLDERVIEWMODE(0);let mut icon_size=0;
     unsafe{view.GetViewModeAndIconSize(&mut mode,&mut icon_size).ok()?;}
     Some(ShellViewState{mode:mode.0,icon_size,
-        sort_columns:read_sort_columns(&view).unwrap_or_default().into_iter().map(|column|ViewSortColumn{key:encode_key(column.propkey),ascending:column.direction==SORT_ASCENDING}).collect(),
-        grouping:read_grouping(&view).map(|(key,ascending)|ViewGrouping{key:(key!=NULL_KEY).then(||encode_key(key)),ascending}),
+        sort_columns:super::folder_totals::base_sort_columns(shell,read_sort_columns(&view).unwrap_or_default()).into_iter().map(|column|ViewSortColumn{key:encode_key(super::folder_totals::logical_sort_key(shell,column.propkey)),ascending:column.direction==SORT_ASCENDING}).collect(),
+        grouping:read_grouping(&view).map(|(key,ascending)|ViewGrouping{key:(key!=NULL_KEY).then(||encode_key(super::folder_totals::logical_sort_key(shell,key))),ascending}),
         ..Default::default()})
 }
 /// Restores menu-controlled layout without clearing selection or moving focus.
 pub fn restore_view_layout(shell:&IShellView,state:&ShellViewState) {
     let Ok(view)=shell.cast::<IFolderView2>()else{return;};
     if (1..=8).contains(&state.mode)&&(8..=512).contains(&state.icon_size) {
-        let _=unsafe{view.SetViewModeAndIconSize(FOLDERVIEWMODE(state.mode),state.icon_size)};
+        let mut mode=FOLDERVIEWMODE(0);let mut icon=0;
+        let unchanged=unsafe{view.GetViewModeAndIconSize(&mut mode,&mut icon)}.is_ok()
+            &&(mode.0,icon)==(state.mode,state.icon_size);
+        if !unchanged{let _=unsafe{view.SetViewModeAndIconSize(FOLDERVIEWMODE(state.mode),state.icon_size)};}
     }
     restore_layout(shell,&view,state);
     let _=sync_column_header(&view);
@@ -43,14 +46,20 @@ pub fn restore_view_layout(shell:&IShellView,state:&ShellViewState) {
 
 impl ExplorerBrowserHost {
     pub fn select_children(&self,names:&[std::ffi::OsString])->windows::core::Result<()> {
+        self.select_children_batch(names,true,&||true)
+    }
+    pub fn select_children_batch(&self,names:&[std::ffi::OsString],reset:bool,permit:&dyn Fn()->bool)->windows::core::Result<()> {
+        if names.len()>128{return Err(windows::core::Error::from_hresult(HRESULT(0x80070057u32 as i32)));}
         use std::os::windows::ffi::OsStrExt;
         use windows::{core::PCWSTR,Win32::{Foundation::HWND,UI::Shell::IShellFolder}};
         let shell=unsafe{self.current_view()?};let view:IFolderView2=shell.cast()?;let folder:IShellFolder=unsafe{view.GetFolder()?};
-        for(index,name)in names.iter().take(128).enumerate(){
+        for(index,name)in names.iter().enumerate(){
+            if !permit(){return Err(windows::core::Error::from_hresult(HRESULT(0x80004004u32 as i32)));}
             let name:Vec<u16>=name.encode_wide().chain(Some(0)).collect();let mut pidl=std::ptr::null_mut();
             unsafe{folder.ParseDisplayName(HWND::default(),None,PCWSTR(name.as_ptr()),None,&mut pidl,std::ptr::null_mut())?;}
-            let flags=SVSI_SELECT.0|if index==0{SVSI_DESELECTOTHERS.0|SVSI_FOCUSED.0|SVSI_ENSUREVISIBLE.0}else{0};
-            let result=(||{unsafe{shell.SelectItem(pidl,flags as u32)}?;
+            let flags=SVSI_SELECT.0|if index==0&&reset{SVSI_DESELECTOTHERS.0|SVSI_FOCUSED.0|SVSI_ENSUREVISIBLE.0}else{0};
+            let result=(||{if !permit(){return Err(windows::core::Error::from_hresult(HRESULT(0x80004004u32 as i32)));}
+                unsafe{shell.SelectItem(pidl,flags as u32)}?;
                 let selected=unsafe{view.GetSelectionState(pidl)}?;
                 if selected&SVSI_SELECT.0 as u32==0{return Err(windows::core::Error::from_hresult(HRESULT(0x8000000au32 as i32)));}
                 Ok(())})();
@@ -115,11 +124,12 @@ impl ExplorerBrowserHost {
         let mut visible_index=-1;
         let visible_status=unsafe {(view.vtable().GetVisibleItem)(view.as_raw(),-1,false.into(),&mut visible_index)};
         let first_visible=if visible_status==HRESULT(0) && visible_index>=0 {unsafe {item_bytes(&view,visible_index)}}else{None};
-        let sort_columns=read_sort_columns(&view).unwrap_or_default().into_iter()
-            .map(|column|ViewSortColumn{key:encode_key(column.propkey),ascending:column.direction==SORT_ASCENDING}).collect();
-        let columns=shell.cast::<IColumnManager>().ok().and_then(|manager|read_columns(&manager)).unwrap_or_default();
+        let sort_columns=super::folder_totals::base_sort_columns(&shell,read_sort_columns(&view).unwrap_or_default()).into_iter()
+            .map(|column|ViewSortColumn{key:encode_key(super::folder_totals::logical_sort_key(&shell,column.propkey)),ascending:column.direction==SORT_ASCENDING}).collect();
+        let mut columns=shell.cast::<IColumnManager>().ok().and_then(|manager|read_columns(&manager)).unwrap_or_default();
+        for column in &mut columns{if let Some(key)=decode_key(&column.key){column.key=encode_key(super::folder_totals::logical_column_key(&shell,key));}}
         let grouping=read_grouping(&view).map(|(key,ascending)|ViewGrouping{
-            key:(key!=NULL_KEY).then(||encode_key(key)),ascending});
+            key:(key!=NULL_KEY).then(||encode_key(super::folder_totals::logical_sort_key(&shell,key))),ascending});
         let column_dpi=if columns.is_empty(){0}else{view_dpi(&shell)};
         Some(ShellViewState {mode:mode.0,icon_size,selected,focused,first_visible,sort_columns,columns,grouping,column_dpi})
     }
@@ -225,7 +235,7 @@ fn restore_layout(shell:&IShellView,view:&IFolderView2,state:&ShellViewState) {
     if !state.columns.is_empty() && state.columns.len()<=MAX_COLUMNS {
         let target_dpi=view_dpi(shell);
         let desired:Option<Vec<_>>=state.columns.iter().map(|column|
-            Some((decode_key(&column.key)?,scaled_column_width(column.width,state.column_dpi,target_dpi)?))).collect();
+            Some((super::folder_totals::column_key(shell,decode_key(&column.key)?),scaled_column_width(column.width,state.column_dpi,target_dpi)?))).collect();
         if let (Some(desired),Ok(manager))=(desired,shell.cast::<IColumnManager>()) {
             let keys:Vec<_>=desired.iter().map(|(key,_)|*key).collect();
             let distinct=keys.iter().enumerate().all(|(index,key)|!keys[..index].contains(key));
@@ -247,7 +257,7 @@ fn restore_layout(shell:&IShellView,view:&IFolderView2,state:&ShellViewState) {
         }
     }
     if let Some(group)=&state.grouping {
-        let desired=match &group.key {Some(key)=>decode_key(key).map(|key|(key,group.ascending)),None=>Some((NULL_KEY,true))};
+        let desired=match &group.key {Some(key)=>decode_key(key).map(|key|(super::folder_totals::sort_key(shell,key),group.ascending)),None=>Some((NULL_KEY,true))};
         if let (Some((key,ascending)),Some(current))=(desired,read_grouping(view)) {
             if current!=(key,ascending) {let _=unsafe {view.SetGroupBy(&key,ascending)};}
         }
@@ -255,7 +265,7 @@ fn restore_layout(shell:&IShellView,view:&IFolderView2,state:&ShellViewState) {
     // Grouping can change the effective sort order; apply the captured sort last.
     if !state.sort_columns.is_empty() && state.sort_columns.len()<=MAX_COLUMNS {
         let desired:Option<Vec<_>>=state.sort_columns.iter().map(|column|Some(SORTCOLUMN{
-            propkey:decode_key(&column.key)?,direction:if column.ascending {SORT_ASCENDING}else{SORT_DESCENDING}})).collect();
+            propkey:super::folder_totals::sort_key(shell,decode_key(&column.key)?),direction:if column.ascending {SORT_ASCENDING}else{SORT_DESCENDING}})).collect();
         if let (Some(desired),Some(current))=(desired,read_sort_columns(view)) {
             if current!=desired {let _=unsafe {view.SetSortColumns(&desired)};}
         }

@@ -9,3 +9,6 @@ description = "ZSDesk domain model: tabs, grids, rules, layout and common types.
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
+
+[build-dependencies]
+serde_json.workspace = true

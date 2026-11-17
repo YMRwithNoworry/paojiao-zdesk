@@ -109,6 +109,16 @@ fn run(output:&Path)->Result<serde_json::Value> {
     ensure!(path(&runner)==ShellLocation::Path(third.clone()) && navigation::window_text(rename)=="unchanged filename","rename text input was navigated away");
     let _=unsafe { DestroyWindow(rename) };
     runner.slot.borrow().as_ref().unwrap().focus_view();pump(runner.hwnd,20);
+    // Root-relative Chinese paths used to panic before Shell saw the address.
+    for name in ["中文目录","施工记录😀","é中混合"]{
+        let target=output.join(name);std::fs::create_dir_all(&target)?;
+        unsafe{runner.slot.borrow_mut().as_mut().unwrap().focus_address();SetWindowTextW(edit,PCWSTR(wide(&target.to_string_lossy()).as_ptr()))?;}
+        address_input::handle(edit,WM_KEYDOWN,WPARAM(VK_RETURN.0 as usize));
+        address_input::handle(edit,WM_KEYUP,WPARAM(VK_RETURN.0 as usize));settled(&runner)?;
+        ensure!(path(&runner)==ShellLocation::Path(target),"Unicode Return did not navigate");
+        ensure!(unsafe{IsWindow(Some(runner.hwnd))}.as_bool(),"Unicode address destroyed the file window");
+    }
+    go(&runner,&third)?;
 
     let endpoint=unsafe { FindWindowExW(Some(runner.hwnd),None,listary::CLASS,None)? };
     let forged=wide(r"E:\not-the-current-folder");

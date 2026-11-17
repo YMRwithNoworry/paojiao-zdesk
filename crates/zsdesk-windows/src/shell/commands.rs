@@ -32,7 +32,7 @@ impl Column {
     }
     fn from_key(key: &PROPERTYKEY) -> Option<Self> {
         [Self::Name, Self::Modified, Self::Type, Self::Size, Self::Created].into_iter().find(|c| {
-            let k = c.key(); k.fmtid == key.fmtid && k.pid == key.pid })
+            let k = c.key(); k.fmtid == key.fmtid && k.pid == key.pid || *c==Column::Size&&*key==super::folder_totals::PKEY_TOTAL_SIZE })
     }
 }
 
@@ -66,15 +66,15 @@ impl ExplorerBrowserHost {
     /// Runs a verb on the selection ("cut", "copy", "delete", "properties" …).
     pub fn invoke_selection(&self, owner: HWND, verb: &str, shift: bool) -> Result<()> {
         let view = unsafe { self.current_view()? };
-        let direct=match verb {
-            "copy"=>Some(super::file_transfer::copy_view(&view,owner,false)),
-            "cut"=>Some(super::file_transfer::copy_view(&view,owner,true)),
-            "delete"=>Some(super::file_transfer::delete_view(&view,owner,shift)),
-            _=>None,
-        };
+        if matches!(verb,"copy"|"cut"|"delete")&&super::file_transfer::filesystem_selection(&view)?{
+            return match verb{
+                "copy"=>super::file_transfer::copy_view(&view,owner,false),
+                "cut"=>super::file_transfer::copy_view(&view,owner,true),
+                _=>super::file_transfer::delete_view(&view,unsafe{view.GetWindow()?},shift),
+            };
+        }
         // MTP and archive entries have Shell identities, not filesystem paths.
         // An accepted asynchronous filesystem operation never runs twice.
-        if direct.is_some_and(|result|result.is_ok()){return Ok(());}
         let menu = ShellMenu::for_view(&view, true)?;
         menu.populate_for_invoke(shift)?;
         menu.invoke_verb(owner, verb, shift)
@@ -83,10 +83,13 @@ impl ExplorerBrowserHost {
     /// Runs a verb on the folder background ("paste", "NewFolder", "properties").
     pub fn invoke_background(&self, owner: HWND, verb: &str) -> Result<()> {
         let view = unsafe { self.current_view()? };
-        if verb=="paste"&&super::file_transfer::paste_view(&view,owner).is_ok(){return Ok(());}
-        if verb.eq_ignore_ascii_case("NewFolder"){
-            if let Ok(path)=super::file_transfer::folder_path(&view){
-                if path.is_dir(){return super::file_transfer::new_folder(owner,&path);}
+        if verb=="paste"||verb.eq_ignore_ascii_case("NewFolder"){
+            if let Some(path)=super::file_transfer::filesystem_folder_path(&view)?{
+                let source=unsafe{view.GetWindow()?};
+                if verb!="paste"{return super::file_transfer::new_folder(source,&path);}
+                // MTP, archives and virtual-file providers can offer a Shell
+                // data object without CF_HDROP. Keep their native paste path.
+                if super::file_transfer::has_filesystem_clipboard(){return super::file_transfer::paste(source,&path);}
             }
         }
         let menu = ShellMenu::for_view(&view, false)?;
@@ -100,8 +103,9 @@ impl ExplorerBrowserHost {
         let menu = ShellMenu::for_view(&view, false)?;
         menu.populate(false, false)?;
         // Without a recognizable "新建" submenu show the whole background menu instead.
-        let sub = menu.submenu_with_verb("NewFolder").unwrap_or(menu.hmenu());
-        if let Some(id) = menu.track_unfiltered(owner, sub, point) {
+        let submenu = menu.submenu_with_verb("NewFolder");
+        let sub=submenu.unwrap_or(menu.hmenu());
+        if let Some(id) = menu.track_unfiltered_initialized(owner,sub,point,submenu.is_some())? {
             if ShellMenu::is_shell_id(id) { menu.invoke(owner, id, Some(point), false, false)?; }
         }
         Ok(())
@@ -129,8 +133,8 @@ impl ExplorerBrowserHost {
     }
 
     pub fn set_sort(&self, column: Column, ascending: bool) -> Result<()> {
-        let view = self.folder_view()?;
-        let columns = [SORTCOLUMN { propkey: column.key(), direction: if ascending { SORT_ASCENDING } else { SORT_DESCENDING } }];
+        let shell=unsafe{self.current_view()}?;let view:IFolderView2=shell.cast()?;
+        let columns = [SORTCOLUMN { propkey: super::folder_totals::sort_key(&shell,column.key()), direction: if ascending { SORT_ASCENDING } else { SORT_DESCENDING } }];
         unsafe { view.SetSortColumns(&columns) }
     }
 
@@ -143,8 +147,8 @@ impl ExplorerBrowserHost {
     }
 
     pub fn set_group(&self, column: Option<Column>) -> Result<()> {
-        let view = self.folder_view()?;
-        let key = column.map_or(PKEY_NULL, Column::key);
+        let shell=unsafe{self.current_view()}?;let view:IFolderView2=shell.cast()?;
+        let key = super::folder_totals::sort_key(&shell,column.map_or(PKEY_NULL, Column::key));
         unsafe { view.SetGroupBy(&key, true) }
     }
 

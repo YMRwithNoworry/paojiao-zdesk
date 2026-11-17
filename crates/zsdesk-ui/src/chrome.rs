@@ -48,19 +48,19 @@ impl CommandId {
         }
     }
     /// Label shown next to the icon; icon-only buttons return `None`.
-    pub const fn label(self) -> Option<&'static str> {
+    pub fn label(self) -> Option<&'static str> {
         match self {
             Self::New => Some("新建"), Self::Sort => Some("排序"), Self::View => Some("查看"),
             Self::PreviewPane => Some("预览"), Self::DetailsPane => Some("详细信息"), _ => None,
-        }
+        }.map(zsdesk_core::i18n::text)
     }
-    pub const fn tooltip(self) -> &'static str {
-        match self {
+    pub fn tooltip(self) -> &'static str {
+        zsdesk_core::i18n::text(match self {
             Self::New => "新建项目", Self::Cut => "剪切 (Ctrl+X)", Self::Copy => "复制 (Ctrl+C)",
             Self::Paste => "粘贴 (Ctrl+V)", Self::Rename => "重命名 (F2)", Self::Share => "共享",
             Self::Delete => "删除 (Del)", Self::Sort => "排序方式", Self::View => "布局和视图选项",
             Self::More => "查看更多", Self::PreviewPane => "预览窗格 (Alt+P)", Self::DetailsPane => "详细信息窗格 (Alt+Shift+P)",
-        }
+        })
     }
     pub const fn has_dropdown(self) -> bool { matches!(self, Self::New | Self::Sort | Self::View) }
     const fn width(self) -> i32 {
@@ -80,6 +80,8 @@ const COMMAND_GROUPS: &[&[CommandId]] = &[
 #[derive(Clone, Debug)]
 pub struct ChromeInput<'a> {
     pub tab_placement:zsdesk_core::model::explorer::TabPlacement,
+    pub side_tabs_width:i32,
+    pub side_tabs_compact:bool,
     pub width: i32,
     pub height: i32,
     pub dpi: u32,
@@ -89,9 +91,12 @@ pub struct ChromeInput<'a> {
     pub caption_button: Option<Rect>,
     pub tab_count: usize,
     pub active_tab: usize,
+    pub show_tab_list: bool,
     pub show_tree: bool,
     pub tree_width: i32,
     pub show_bookmarks: bool,
+    pub bookmarks_on_right: bool,
+    pub bookmarks_width: i32,
     /// Search is active; show the close action beside the fixed native edit.
     pub search_panel_open: bool,
     pub command_bar: &'a CommandBarPreferences,
@@ -204,6 +209,9 @@ pub struct ChromeLayout {
     pub dpi: u32,
     pub strip: Rect,
     pub tab_panel: Rect,
+    pub tab_splitter: Rect,
+    pub tab_scroll_track: Rect,
+    pub tab_scroll_thumb: Rect,
     pub vertical_tabs: bool,
     pub tabs: Vec<TabSlot>,
     pub new_tab: Rect,
@@ -218,11 +226,15 @@ pub struct ChromeLayout {
     pub search: Rect,
     pub search_panel: SearchPanelLayout,
     pub command_row: Rect,
+    pub command_toggle: Rect,
     pub commands: Vec<(CommandId, Rect)>,
     /// Icon-only command buttons when their normal labels do not fit one row.
     pub compact_commands: bool,
     pub separators: Vec<Rect>,
     pub bookmarks_row: Rect,
+    pub bookmarks_vertical: bool,
+    pub bookmark_splitter: Rect,
+    pub bookmarks_title: Rect,
     pub bookmarks: Vec<Rect>,
     pub bookmark_overflow: Rect,
     pub tree: Rect,
@@ -246,6 +258,8 @@ pub enum Hit {
     Caption,
     Tab(usize),
     TabClose(usize),
+    TabSplitter,
+    TabScrollbar,
     NewTab,
     TabList,
     AppMenu,
@@ -253,6 +267,7 @@ pub enum Hit {
     Forward,
     Up,
     Refresh,
+    ToggleCommandBar,
     Address,
     Search,
     SearchPanel(SearchPanelHit),
@@ -260,6 +275,7 @@ pub enum Hit {
     Bookmark(usize),
     BookmarkOverflow,
     BookmarksBar,
+    BookmarkSplitter,
     Splitter,
     PaneSplitter,
     PaneHeader(usize),
@@ -290,7 +306,7 @@ impl ChromeLayout {
         let right_edge = (caption_left - s(4)).max(0);
         if right_edge >= button {
             layout.app_menu = Rect::clamped(right_edge - button, button_y, button, button_h);
-            if layout.app_menu.x >= button + s(2) {
+            if input.show_tab_list && layout.app_menu.x >= button + s(2) {
                 layout.tab_list = Rect::clamped(layout.app_menu.x - s(2) - button, button_y, button, button_h);
             }
         }
@@ -316,12 +332,13 @@ impl ChromeLayout {
         }
 
         let full_width=width;
-        let panel_width=if input.tab_placement==zsdesk_core::model::explorer::TabPlacement::Top{0}else{s(210).min((width-s(440)).max(s(140))).min(width)};
+        let panel_width=if input.tab_placement==zsdesk_core::model::explorer::TabPlacement::Top{0}else{s(input.side_tabs_width.clamp(120,420)).min((width-s(440)).max(s(120))).min(width)};
         let content_offset=if input.tab_placement==zsdesk_core::model::explorer::TabPlacement::Left{panel_width}else{0};
         let width=(width-panel_width).max(0);
         // Bookmarks bar, directly under the tabs.
         let mut nav_y = layout.strip.bottom();
-        if input.show_bookmarks {
+        let right_bookmarks=input.show_bookmarks&&input.bookmarks_on_right&&width>=s(540);
+        if input.show_bookmarks&&!right_bookmarks {
             layout.bookmarks_row = Rect::clamped(0, nav_y, width, s(BOOKMARK_H));
             let chip_h = s(26);
             let chip_y = nav_y + (s(BOOKMARK_H) - chip_h) / 2;
@@ -351,7 +368,9 @@ impl ChromeLayout {
         let search_w = (width / 4).clamp(s(140), s(280));
         let field_h = s(32);
         let field_y = nav_y + (s(NAV_H) - field_h) / 2;
-        layout.search = Rect::clamped(width - s(12) - search_w, field_y, search_w, field_h);
+        let toggle_space=if width>=s(480){s(38)}else{0};
+        if toggle_space>0{layout.command_toggle=Rect::clamped(width-s(8)-s(32),field_y,s(32),field_h);}
+        layout.search = Rect::clamped(width - s(12) - search_w-toggle_space, field_y, search_w, field_h);
         let address_x = nx + s(6);
         let address_right = layout.search.x - s(8);
         layout.address = Rect::clamped(address_x, field_y, address_right - address_x, field_h);
@@ -432,23 +451,50 @@ impl ChromeLayout {
         } else {
             layout.browser = Rect::clamped(0, layout.top, width, content_h);
         }
+        if right_bookmarks{
+            let available=layout.browser;
+            let bookmark_width=input.bookmarks_width.clamp(s(120),s(600)).min((available.width-s(160)).max(s(100))).min(available.width);
+            layout.bookmarks_vertical=true;
+            layout.bookmarks_row=Rect::clamped(available.right()-bookmark_width,layout.top,bookmark_width,content_h);
+            let splitter_width=s(SPLITTER_W).min((available.width-bookmark_width).max(0));
+            layout.bookmark_splitter=Rect::clamped(layout.bookmarks_row.x-splitter_width,layout.top,splitter_width,content_h);
+            layout.browser.width=(available.width-bookmark_width-splitter_width).max(0);
+            let bar=layout.bookmarks_row;
+            layout.bookmarks_title=Rect::clamped(bar.x+s(8),(bar.y+s(4)).min(bar.bottom()),bar.width-s(16),s(28).min((bar.height-s(8)).max(0)));
+            let row=s(32);let top=(layout.bookmarks_title.bottom()+s(4)).min(bar.bottom());
+            let bottom=(bar.bottom()-s(6)).max(top);
+            let capacity=((bottom-top)/row).max(0)as usize;
+            let overflow=input.bookmark_widths.len()>capacity;
+            let visible=if overflow{capacity.saturating_sub(1)}else{capacity}.min(input.bookmark_widths.len());
+            for index in 0..visible{
+                layout.bookmarks.push(Rect::clamped(bar.x+s(6),top+index as i32*row,bar.width-s(12),row-s(2)));
+            }
+            if overflow{let y=(bottom-row).max(top);layout.bookmark_overflow=Rect::clamped(bar.x+s(6),y,bar.width-s(12),(row-s(2)).min((bar.bottom()-y).max(0)));}
+        }
         if panel_width>0{
             layout.vertical_tabs=true;
             let x=if input.tab_placement==zsdesk_core::model::explorer::TabPlacement::Left{0}else{full_width-panel_width};
             layout.tab_panel=Rect::clamped(x,layout.strip.bottom(),panel_width,height-layout.strip.bottom());
+            let left=input.tab_placement==zsdesk_core::model::explorer::TabPlacement::Left;
+            layout.tab_splitter=Rect::clamped(if left{x+panel_width-s(SPLITTER_W)}else{x},layout.tab_panel.y,s(SPLITTER_W),layout.tab_panel.height);
             layout.tabs.clear();
-            let row=s(36);let top=layout.tab_panel.y+s(6);
+            let row=s(if input.side_tabs_compact{30}else{36});let top=layout.tab_panel.y+s(6);
             let bottom=(layout.tab_panel.bottom()-row-s(10)).max(top);
             let visible=((bottom-top)/row).max(0)as usize;
             let first=first_visible(input.tab_count,input.active_tab,visible);
+            let scroll=input.tab_count>visible&&visible>0;
+            let inset_left=if left{0}else{s(SPLITTER_W)};
+            let inset_right=if left{s(SPLITTER_W)}else{0};
+            if scroll{layout.tab_scroll_track=Rect::clamped(x+panel_width-inset_right-s(10),top,s(8),visible as i32*row);}
             for (position,index) in (first..(first+visible).min(input.tab_count)).enumerate(){
-                let rect=Rect::clamped(x+s(6),top+position as i32*row,panel_width-s(12),row-s(2));
+                let rect=Rect::clamped(x+inset_left+s(6),top+position as i32*row,panel_width-inset_left-inset_right-s(12)-if scroll{s(10)}else{0},row-s(2));
                 let close=Rect::clamped(rect.right()-s(28),rect.y+(rect.height-s(24))/2,s(24),s(24));
                 layout.tabs.push(TabSlot{index,rect,close,show_close:true});
             }
-            layout.new_tab=Rect::clamped(x+s(6),(layout.tab_panel.bottom()-row-s(4)).max(layout.tab_panel.y),panel_width-s(12),row);
+            layout.new_tab=Rect::clamped(x+inset_left+s(6),(layout.tab_panel.bottom()-row-s(4)).max(layout.tab_panel.y),panel_width-inset_left-inset_right-s(12),row);
+            layout.set_tab_viewport(input.tab_count,first);
             for rect in [&mut layout.nav_row,&mut layout.back,&mut layout.forward,&mut layout.up,&mut layout.refresh,&mut layout.address,&mut layout.search,
-                &mut layout.command_row,&mut layout.bookmarks_row,&mut layout.bookmark_overflow,&mut layout.tree,&mut layout.splitter,&mut layout.browser,
+                &mut layout.command_row,&mut layout.command_toggle,&mut layout.bookmarks_row,&mut layout.bookmarks_title,&mut layout.bookmark_overflow,&mut layout.bookmark_splitter,&mut layout.tree,&mut layout.splitter,&mut layout.browser,
                 &mut layout.status,&mut layout.status_details,&mut layout.status_tiles,&mut layout.status_dual_pane]{rect.x+=content_offset;}
             for (_,rect) in &mut layout.commands{rect.x+=content_offset;}
             for rect in layout.bookmarks.iter_mut().chain(layout.separators.iter_mut()){rect.x+=content_offset;}
@@ -457,9 +503,20 @@ impl ChromeLayout {
         layout
     }
 
+    /// Top tabs reach the screen edge when the host is maximized or fullscreen.
+    /// The extension selects the tab; its close button keeps its visible bounds.
+    pub fn hit_with_top_edge(&self,x:i32,y:i32,extend:bool)->Hit{
+        if extend&&!self.vertical_tabs&&self.strip.contains(x,y){
+            if let Some(slot)=self.tabs.iter().find(|slot|x>=slot.rect.x&&x<slot.rect.right()&&y<slot.rect.y){return Hit::Tab(slot.index);}
+        }
+        self.hit(x,y)
+    }
+
     /// Classifies a client point.
     pub fn hit(&self, x: i32, y: i32) -> Hit {
         if self.strip.contains(x, y)||self.tab_panel.contains(x,y) {
+            if self.tab_splitter.contains(x,y){return Hit::TabSplitter;}
+            if self.tab_scroll_track.contains(x,y){return Hit::TabScrollbar;}
             for slot in &self.tabs {
                 if slot.rect.contains(x, y) {
                     if slot.show_close && slot.close.contains(x, y) { return Hit::TabClose(slot.index); }
@@ -474,7 +531,7 @@ impl ChromeLayout {
         if self.nav_row.contains(x, y) {
             if self.search_panel.close.contains(x,y) { return Hit::SearchPanel(SearchPanelHit::Close); }
             for (rect, hit) in [(self.back, Hit::Back), (self.forward, Hit::Forward), (self.up, Hit::Up),
-                (self.refresh, Hit::Refresh), (self.address, Hit::Address), (self.search, Hit::Search)] {
+                (self.refresh, Hit::Refresh), (self.command_toggle,Hit::ToggleCommandBar), (self.address, Hit::Address), (self.search, Hit::Search)] {
                 if rect.contains(x, y) { return hit; }
             }
             return Hit::None;
@@ -488,6 +545,7 @@ impl ChromeLayout {
             if self.bookmark_overflow.contains(x, y) { return Hit::BookmarkOverflow; }
             return Hit::BookmarksBar;
         }
+        if self.bookmark_splitter.contains(x,y){return Hit::BookmarkSplitter;}
         if self.splitter.contains(x, y) { return Hit::Splitter; }
         if self.pane_splitter.contains(x, y) { return Hit::PaneSplitter; }
         for (index, rect) in self.pane_headers.iter().enumerate() {
@@ -517,10 +575,22 @@ impl ChromeLayout {
         let mut first = first.min(count.saturating_sub(visible));
         if active < first { first = active; }
         else if active >= first + visible { first = active + 1 - visible; }
-        for (offset, slot) in self.tabs.iter_mut().enumerate() {
-            slot.index = first + offset;
+        self.set_tab_viewport(count,first);
+        for slot in self.tabs.iter_mut() {
             slot.show_close = self.vertical_tabs || slot.rect.width >= scale(96, self.dpi) || slot.index == active;
         }
+    }
+
+    /// Scroll only the tab list; selecting and navigating a tab are separate actions.
+    pub fn set_tab_viewport(&mut self,count:usize,first:usize){
+        self.tabs.truncate(count);
+        let visible=self.tabs.len();let first=first.min(count.saturating_sub(visible));
+        for (offset,slot) in self.tabs.iter_mut().enumerate(){slot.index=first+offset;}
+        let track=self.tab_scroll_track;
+        if track.is_empty()||visible>=count||visible==0{self.tab_scroll_track=Rect::default();self.tab_scroll_thumb=Rect::default();return;}
+        let height=((track.height as i64*visible as i64/count as i64)as i32).max(scale(24,self.dpi)).min(track.height);
+        let y=track.y+((track.height-height)as i64*first as i64/(count-visible)as i64)as i32;
+        self.tab_scroll_thumb=Rect::new(track.x,y,track.width,height);
     }
 
     /// A drag may move along the tab axis, but must not reorder tabs while the
@@ -553,7 +623,7 @@ fn first_visible(count: usize, active: usize, visible: usize) -> usize {
 /// Explorer-style size text ("1.20 MB").
 pub fn format_size(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["字节", "KB", "MB", "GB", "TB"];
-    if bytes < 1024 { return format!("{bytes} 字节"); }
+    if bytes < 1024 { return zsdesk_core::tr_format!("{bytes} 字节" , bytes=bytes); }
     let mut value = bytes as f64;
     let mut unit = 0;
     while value >= 1024.0 && unit + 1 < UNITS.len() { value /= 1024.0; unit += 1; }
@@ -569,9 +639,74 @@ mod tests {
     static DEFAULT_COMMAND_BAR: CommandBarPreferences = CommandBarPreferences { visible: true, hidden_items: Vec::new() };
 
     fn input(width: i32, tabs: usize, active: usize, dpi: u32) -> ChromeInput<'static> {
-        ChromeInput { tab_placement:zsdesk_core::model::explorer::TabPlacement::Top, width, height: 800, dpi, caption_width: scale(138, dpi), caption_button: None,
-            tab_count: tabs, active_tab: active, show_tree: true, tree_width: scale(220, dpi), show_bookmarks: true,
+        ChromeInput { tab_placement:zsdesk_core::model::explorer::TabPlacement::Top, side_tabs_width:210,side_tabs_compact:true,width, height: 800, dpi, caption_width: scale(138, dpi), caption_button: None,
+            tab_count: tabs, active_tab: active, show_tab_list:true, show_tree: true, tree_width: scale(220, dpi), show_bookmarks: true,bookmarks_on_right:false,bookmarks_width:scale(210,dpi),
             command_bar: &DEFAULT_COMMAND_BAR, status_bar: true, bookmark_widths: &[], search_panel_open: false }
+    }
+
+    #[test]fn bookmark_panel_resizes_without_covering_the_view_or_side_tabs(){
+        use zsdesk_core::model::explorer::TabPlacement;
+        for dpi in [96,120,144,192]{for placement in [TabPlacement::Top,TabPlacement::Left,TabPlacement::Right]{
+            let mut previous=0;
+            for width in [120,210,360,600]{
+                let layout=ChromeLayout::new(&ChromeInput{width:scale(1600,dpi),height:scale(900,dpi),
+                    bookmarks_on_right:true,bookmarks_width:scale(width,dpi),tab_placement:placement,..input(scale(1600,dpi),4,0,dpi)});
+                assert!(layout.bookmarks_row.width>previous);previous=layout.bookmarks_row.width;
+                assert_eq!(layout.browser.right(),layout.bookmark_splitter.x);
+                assert_eq!(layout.bookmark_splitter.right(),layout.bookmarks_row.x);
+                assert!(layout.browser.width>=scale(160,dpi));
+                assert_eq!(layout.hit(layout.bookmark_splitter.x+1,layout.bookmark_splitter.y+10),Hit::BookmarkSplitter);
+            }
+            for width in [i32::MIN,i32::MAX]{
+                let layout=ChromeLayout::new(&ChromeInput{bookmarks_on_right:true,bookmarks_width:width,tab_placement:placement,
+                    ..input(scale(800,dpi),4,0,dpi)});
+                assert!(layout.browser.width>=0&&layout.bookmarks_row.width>=0);
+                assert!(layout.bookmarks_row.right()<=scale(800,dpi));
+                assert_eq!(layout.browser.right(),layout.bookmark_splitter.x);
+            }
+        }}
+    }
+
+    #[test]fn side_tabs_resize_density_and_scroll_keep_every_tab_reachable(){
+        use zsdesk_core::model::explorer::TabPlacement;
+        for dpi in [96,144,192]{for placement in [TabPlacement::Left,TabPlacement::Right]{for width in [120,210,420,i32::MAX]{
+            let base=ChromeInput{tab_placement:placement,side_tabs_width:width,..input(scale(1200,dpi),100,0,dpi)};
+            let mut compact=ChromeLayout::new(&base);let regular=ChromeLayout::new(&ChromeInput{side_tabs_compact:false,..base});
+            assert_eq!(compact.tab_panel.width,scale(width.clamp(120,420),dpi));
+            assert!(compact.tabs.len()>regular.tabs.len());assert!(compact.browser.width>0);
+            assert_eq!(compact.hit(compact.tab_splitter.x,compact.tab_splitter.y+10),Hit::TabSplitter);
+            assert!(compact.tabs.iter().all(|slot|slot.rect.right()<=compact.tab_scroll_track.x&&slot.close.right()<=slot.rect.right()));
+            compact.set_tab_viewport(100,usize::MAX);assert_eq!(compact.tabs.last().unwrap().index,99);
+            assert_eq!(compact.tab_scroll_thumb.bottom(),compact.tab_scroll_track.bottom());
+            assert_eq!(compact.hit(compact.tab_scroll_thumb.x,compact.tab_scroll_thumb.y),Hit::TabScrollbar);
+            compact.set_tab_viewport(100,0);assert_eq!(compact.tabs.first().unwrap().index,0);assert_eq!(compact.tab_scroll_thumb.y,compact.tab_scroll_track.y);
+        }}}
+    }
+
+    #[test]fn right_bookmarks_keep_folder_and_tabs_separate_and_overflow_reachable(){
+        use zsdesk_core::model::explorer::TabPlacement;
+        let widths=vec![140;80];
+        for dpi in [96,144,192]{for placement in [TabPlacement::Top,TabPlacement::Left,TabPlacement::Right]{
+            let layout=ChromeLayout::new(&ChromeInput{bookmarks_on_right:true,bookmark_widths:&widths,tab_placement:placement,height:scale(800,dpi),..input(scale(1200,dpi),12,0,dpi)});
+            assert!(layout.bookmarks_vertical&&!layout.bookmarks.is_empty()&&!layout.bookmark_overflow.is_empty());
+            assert_eq!(layout.browser.right(),layout.bookmark_splitter.x);
+            assert_eq!(layout.bookmark_splitter.right(),layout.bookmarks_row.x);
+            assert!(layout.bookmarks_row.right()<=layout.nav_row.right());
+            for (index,rect) in layout.bookmarks.iter().enumerate(){
+                assert!(rect.x>=layout.bookmarks_row.x&&rect.right()<=layout.bookmarks_row.right()&&rect.bottom()<=layout.bookmarks_row.bottom());
+                assert_eq!(layout.hit(rect.x+1,rect.y+1),Hit::Bookmark(index));
+            }
+            let more=layout.bookmark_overflow;assert_eq!(layout.hit(more.x+1,more.y+1),Hit::BookmarkOverflow);
+            assert!(more.bottom()<=layout.status.y);
+        }}
+        let narrow=ChromeLayout::new(&ChromeInput{bookmarks_on_right:true,bookmark_widths:&widths,..input(450,1,0,96)});
+        assert!(!narrow.bookmarks_vertical&&!narrow.bookmark_overflow.is_empty());
+    }
+    #[test]fn hidden_tab_list_button_releases_space_without_hiding_the_app_menu(){
+        let before=ChromeLayout::new(&input(1200,4,0,96));
+        let after=ChromeLayout::new(&ChromeInput{show_tab_list:false,..input(1200,4,0,96)});
+        assert!(!before.tab_list.is_empty()&&after.tab_list.is_empty());assert_eq!(before.app_menu,after.app_menu);
+        assert_eq!(after.tabs.len(),4);assert!(after.new_tab.right()>=before.new_tab.right());
     }
 
     #[test]
@@ -685,6 +820,26 @@ mod tests {
     }
 
     #[test]
+    fn screen_edge_selects_top_tabs_without_extending_their_close_buttons(){
+        for dpi in [96,120,144,192]{
+            let l=ChromeLayout::new(&input(1400,3,1,dpi));
+            for tab in &l.tabs{
+                for x in [tab.rect.x,tab.rect.x+tab.rect.width/2,tab.rect.right()-1]{
+                    assert_eq!(l.hit_with_top_edge(x,0,true),Hit::Tab(tab.index));
+                    assert_eq!(l.hit_with_top_edge(x,tab.rect.y-1,true),Hit::Tab(tab.index));
+                    assert_eq!(l.hit_with_top_edge(x,0,false),Hit::Caption);
+                }
+                assert_eq!(l.hit_with_top_edge(tab.close.x+1,0,true),Hit::Tab(tab.index));
+                assert_eq!(l.hit_with_top_edge(tab.close.x+1,tab.close.y+1,true),Hit::TabClose(tab.index));
+            }
+            assert_eq!(l.hit_with_top_edge(l.new_tab.right()+20,0,true),Hit::Caption);
+            assert_eq!(l.hit_with_top_edge(l.tabs[0].rect.x,-1,true),Hit::None);
+            let mut side=l.clone();side.vertical_tabs=true;
+            assert_eq!(side.hit_with_top_edge(side.tabs[0].rect.x,0,true),Hit::Caption);
+        }
+    }
+
+    #[test]
     fn bookmarks_overflow_into_menu() {
         let widths = [120; 20];
         let l = ChromeLayout::new(&ChromeInput { bookmark_widths: &widths, ..input(1000, 1, 0, 96) });
@@ -746,6 +901,9 @@ mod tests {
             assert!(l.command_row.is_empty() && l.commands.is_empty() && l.separators.is_empty());
             assert_eq!(l.top, l.nav_row.bottom());
             assert_eq!(l.browser.y, l.nav_row.bottom());
+            assert!(!l.command_toggle.is_empty());
+            assert_eq!(l.hit(l.command_toggle.x+1,l.command_toggle.y+1),Hit::ToggleCommandBar);
+            assert!(l.search.right()<l.command_toggle.x);
         }
         let preferences = CommandBarPreferences { visible: true, hidden_items: CommandBarItem::ALL.to_vec() };
         let l = ChromeLayout::new(&ChromeInput { command_bar: &preferences, ..input(1400, 1, 0, 96) });

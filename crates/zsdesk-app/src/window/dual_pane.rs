@@ -22,6 +22,7 @@ pub(super) struct InactivePane {
     search_scope: Option<ShellLocation>,
     search_result: Option<ShellLocation>,
     browser_role: BrowserRole,
+    native_theme_dark:Option<bool>,
     fast_search: Option<crate::fast_search::FastSearch>,
     fast_generation: u64,
     fast_submitted: Option<integrated_search::SubmittedSearch>,
@@ -43,7 +44,7 @@ impl Default for InactivePane {
         Self { browser:None, browser_source:0, folder_sizes:Default::default(), view_hwnd:HWND::default(), navigation_epoch:0, pending:None,
             queued:None, shown_tab:None, closed_tabs:Vec::new(), view_status:ViewStatus::default(),
             view_mode:(0,0), search_panel:Default::default(), search_scope:None, search_result:None,
-            browser_role:BrowserRole::Fresh, fast_search:None, fast_generation:0, fast_submitted:None,
+            browser_role:BrowserRole::Fresh,native_theme_dark:None, fast_search:None, fast_generation:0, fast_submitted:None,
             fast_found:0, search_progress:None, fast_events:Default::default(), fast_reset_pending:false,
             fast_clearing:None, fast_restore:None, wheel_remainder:0, launch_selection:None,
             launch_selections:Vec::new(), deferred_selection:None, open_requests:Default::default() }
@@ -71,6 +72,12 @@ fn discard_message(message:u32,lp:LPARAM) {
 }
 
 impl WindowState {
+    pub(super) fn menu_source_is_results(&self,source:usize)->Option<bool>{
+        if source==self.browser_source{return Some(matches!(self.current_location(),ShellLocation::Search{..}));}
+        if source==self.other_pane.browser_source{
+            return self.session.secondary_pane.tabs.get(self.session.secondary_pane.active_tab).map(|tab|matches!(tab.current(),ShellLocation::Search{..}));
+        }None
+    }
     pub(super) fn shell_entries(&self)->Vec<crate::shell_window_registry::Entry>{
         let mut entries=Vec::with_capacity(2);
         if self.browser.is_some(){if let Some(tab)=self.session.tabs.get(self.session.active_tab){
@@ -117,7 +124,9 @@ impl WindowState {
         }?;
         if !cfg!(test) { browser.set_view_state_name(&view_memory::property_bag_name(&self.config_path))?; }
         browser.set_context_menu_options(crate::context_preferences::native(&self.session.ui.context_menu));
+        if let Some(picker)=&self.picker{browser.set_picker(picker.pattern(),picker.options.multiple,picker.options.kind.folders());}
         browser.set_content_background(self.dark,colorref(self.palette.content));
+        self.native_theme_dark=Some(self.dark);
         Ok(browser)
     }
 
@@ -125,7 +134,7 @@ impl WindowState {
         let other=&mut self.other_pane;
         macro_rules! swap { ($($field:ident),+ $(,)?) => { $(std::mem::swap(&mut self.$field,&mut other.$field);)+ }; }
         swap!(browser,browser_source,folder_sizes,view_hwnd,navigation_epoch,pending,queued,shown_tab,closed_tabs,view_status,
-            view_mode,search_panel,search_scope,search_result,browser_role,fast_search,fast_generation,
+            view_mode,search_panel,search_scope,search_result,browser_role,native_theme_dark,fast_search,fast_generation,
             fast_submitted,fast_found,search_progress,fast_events,fast_reset_pending,fast_clearing,
             fast_restore,wheel_remainder,launch_selection,launch_selections,deferred_selection,open_requests);
         std::mem::swap(&mut self.session.tabs,&mut self.session.secondary_pane.tabs);
@@ -157,8 +166,21 @@ impl WindowState {
         }
         if self.pending.is_none() && self.queued.is_none(){Some(self.browser_source)}else{None}
     }
+    pub(super) fn file_view_for_input(&self,target:HWND)->Option<(HWND,usize)>{
+        [self.view_hwnd,self.other_pane.view_hwnd].into_iter().find_map(|view|{
+            (!view.0.is_null()&&(target==view||unsafe{IsChild(view,target)}.as_bool()))
+                .then(||self.source_for_view(view).map(|source|(view,source))).flatten()
+        })
+    }
 
     pub(super) fn other_source(&self)->usize {self.other_pane.browser_source}
+    pub(super) fn file_input_loading(&self,target:HWND)->bool{
+        let focus=unsafe{GetFocus()};
+        let inside=|view:HWND|!view.0.is_null()&&(target==view||focus==view||unsafe{IsChild(view,target)}.as_bool()||unsafe{IsChild(view,focus)}.as_bool());
+        if inside(self.view_hwnd){return self.pending.is_some()||self.queued.is_some();}
+        if inside(self.other_pane.view_hwnd){return self.other_pane.pending.is_some()||self.other_pane.queued.is_some();}
+        (target==self.hwnd||focus==self.hwnd)&&(self.pending.is_some()||self.queued.is_some())
+    }
     pub(super) fn other_folder_destination(&self)->Option<PathBuf>{
         if !self.session.ui.dual_pane||self.other_pane.browser.is_none()||self.other_pane.pending.is_some()||self.other_pane.queued.is_some(){return None;}
         let tab=self.session.secondary_pane.tabs.get(self.session.secondary_pane.active_tab)?;
@@ -175,11 +197,12 @@ impl WindowState {
             let paths=zsdesk_windows::shell::file_transfer::selected_paths(&view)?;
             if paths.is_empty(){return Ok(());}
             if paths.iter().all(|path|path.parent().is_some_and(|parent|crate::explorer_forwarder::same_path(parent,&destination))){
-                return Err(windows::core::Error::new(windows::core::HRESULT(0x80070057u32 as i32),"两栏显示同一目录，无需复制或移动"));
+                return Err(windows::core::Error::new(windows::core::HRESULT(0x80070057u32 as i32),zsdesk_core::i18n::text("两栏显示同一目录，无需复制或移动")));
             }
             // Snapshot and submit one native batch. No clipboard roundtrip,
             // recursive Rust copy, or second enumeration of selected files.
-            zsdesk_windows::shell::file_transfer::transfer_paths(self.hwnd,paths,destination,moving)
+            let owner=self.other_pane.browser.as_ref().and_then(|browser|browser.view_window()).ok_or_else(||windows::core::Error::from_hresult(windows::core::HRESULT(0x8000000au32 as i32)))?;
+            zsdesk_windows::shell::file_transfer::transfer_paths(owner,paths,destination,moving)
         })();
         self.shell_result(Some(result));
     }
@@ -272,7 +295,7 @@ impl WindowState {
         self.swap_pane_runtime();self.relayout();
         match self.create_browser() {
             Ok(browser)=>{self.browser=Some(browser);unsafe{self.navigate_current();}},
-            Err(error)=>{self.session.ui.dual_pane=false;self.status=format!("无法打开双栏：{error}");},
+            Err(error)=>{self.session.ui.dual_pane=false;self.status=zsdesk_core::tr_format!("无法打开双栏：{error}", error=error);},
         }
         self.swap_pane_runtime();self.background_pane=false;
         self.relayout();self.position_children();unsafe{self.update_address();}self.save();
@@ -293,6 +316,8 @@ impl WindowState {
         self.navigation_epoch=self.navigation_epoch.wrapping_add(1);
         self.swap_pane_runtime();
         self.navigation_epoch=self.navigation_epoch.wrapping_add(1);
+        if let Some(identity)=self.identity_for_source(self.browser_source){let _=zsdesk_windows::shell::file_transfer::bind_origin(self.view_hwnd,identity.source,identity.tab,identity.epoch);}
+        if let Some(identity)=self.other_identity(){let _=zsdesk_windows::shell::file_transfer::bind_origin(self.other_pane.view_hwnd,identity.source,identity.tab,identity.epoch);}
         // The shared edit belongs to the newly activated pane even if both
         // panes last displayed a query in an identically positioned tab.
         self.search_panel.edit_tab=None;
@@ -339,6 +364,26 @@ impl WindowState {
         self.swap_pane_runtime();self.defer_selection(vec![name.to_os_string()],false);self.swap_pane_runtime();
     }
 
+    pub(super) fn receive_transfer_completion(&mut self,completion:&zsdesk_windows::shell::file_transfer::Completion){
+        let Some(origin)=completion.origin.as_ref() else{return;};
+        if !zsdesk_windows::shell::file_transfer::origin_current(origin){return;}
+        let identity=pane_input::Identity{source:origin.pane,tab:origin.tab,epoch:origin.epoch};
+        if self.identity_for_source(origin.pane)!=Some(identity){return;}
+        let other=origin.pane!=self.browser_source;
+        let view=if other{self.other_pane.view_hwnd}else{self.view_hwnd};
+        if origin.view!=view.0 as isize||!unsafe{IsWindow(Some(view))}.as_bool(){return;}
+        if other{self.background_pane=true;self.swap_pane_runtime();}
+        if self.pending.is_none()&&self.queued.is_none(){
+            if let Some(directory)=self.current_location().as_path(){
+                let names=completion.outputs.iter().filter(|path|path.parent().is_some_and(|parent|crate::explorer_forwarder::same_path(parent,directory)))
+                    .filter_map(|path|path.file_name().map(std::ffi::OsStr::to_os_string)).collect::<Vec<_>>();
+                let rename=matches!(completion.operation,zsdesk_windows::shell::file_transfer::Operation::NewFolder)&&completion.error.is_none()&&!completion.aborted;
+                self.defer_selection(names,rename);
+            }
+        }
+        if other{self.swap_pane_runtime();self.background_pane=false;}
+    }
+
     pub(super) fn poll_pane_selections(&mut self){
         self.poll_deferred_selection();
         if self.other_pane.browser.is_some()&&self.other_pane.deferred_selection.is_some(){
@@ -360,14 +405,25 @@ impl WindowState {
     }
 
     pub(super) fn poll_folder_sizes(&mut self) {
+        self.rebuild_color_scheme_views();
         self.sync_search_preferences();
+        self.poll_folder_sizes_inner();
+    }
+    pub(super) fn poll_folder_sizes_inner(&mut self) {
+        let previous=self.folder_sizes.status().clone();
         let location=self.current_location().clone();
-        let enabled=self.session.ui.everything_folder_sizes&&!self.session.ui.search_backend.is_builtin();
+        let enabled=self.session.ui.everything_folder_sizes;
         let message=self.folder_sizes.poll(self.browser.as_ref(),&location,enabled,self.pending.is_some(),&self.config_path);
         let other_location=self.session.secondary_pane.tabs.get(self.session.secondary_pane.active_tab).map(|tab|tab.current().clone());
         let other_message=other_location.and_then(|location|self.other_pane.folder_sizes.poll(self.other_pane.browser.as_ref(),&location,
             enabled && self.session.ui.dual_pane,self.other_pane.pending.is_some(),&self.config_path));
         if let Some(message)=message.or(other_message) {self.show_message(message);}
+        if previous!=*self.folder_sizes.status(){self.invalidate_rect(self.layout.status);self.invalidate_rect(self.layout.command_row);}
+        unsafe{if self.folder_sizes.busy()||self.other_pane.folder_sizes.busy(){SetTimer(Some(self.hwnd),TIMER_FOLDER_SIZES,100,None);}else{let _=KillTimer(Some(self.hwnd),TIMER_FOLDER_SIZES);}}
+    }
+    pub(super) fn folder_sizes_changed(&mut self){
+        self.folder_sizes.invalidate();self.other_pane.folder_sizes.invalidate();
+        if self.session.ui.everything_folder_sizes{unsafe{SetTimer(Some(self.hwnd),TIMER_FOLDER_SIZES,100,None);}}
     }
 
     pub(super) fn cancel_all_search_backends(&mut self){
@@ -406,6 +462,15 @@ impl WindowState {
         if let Some(browser)=&self.other_pane.browser {browser.set_content_background(self.dark,colorref(self.palette.content));}
     }
 
+    pub(super) fn rebuild_color_scheme_views(&mut self){
+        if self.browser.is_some()&&self.native_theme_dark!=Some(self.dark)&&self.pending.is_none()&&self.queued.is_none(){self.set_panes_with_rebuild(self.session.ui.show_preview,self.session.ui.show_details,true);}
+        if self.session.ui.dual_pane&&self.other_pane.browser.is_some()&&self.other_pane.native_theme_dark!=Some(self.dark)&&self.other_pane.pending.is_none()&&self.other_pane.queued.is_none(){
+            self.background_pane=true;self.swap_pane_runtime();self.relayout();
+            self.set_panes_with_rebuild(self.session.ui.show_preview,self.session.ui.show_details,true);
+            self.swap_pane_runtime();self.background_pane=false;self.relayout();self.position_children();
+        }
+    }
+
     pub(super) fn pane_title(&self,right:bool)->String {
         if right==self.active_pane_right { self.current_location().address() }
         else { self.session.secondary_pane.tabs.get(self.session.secondary_pane.active_tab).map(|t|t.current().address()).unwrap_or_default() }
@@ -428,7 +493,7 @@ impl WindowState {
 }
 
 pub(super) fn activate_for_message(slot:&Slot,message:&MSG) {
-    let pointer=matches!(message.message,WM_LBUTTONDOWN|WM_RBUTTONDOWN|WM_MBUTTONDOWN|WM_XBUTTONDOWN|WM_MOUSEWHEEL);
+    let pointer=matches!(message.message,WM_LBUTTONDOWN|WM_LBUTTONDBLCLK|WM_RBUTTONDOWN|WM_MBUTTONDOWN|WM_XBUTTONDOWN|WM_MOUSEWHEEL);
     let keyboard=matches!(message.message,WM_KEYDOWN|WM_SYSKEYDOWN);
     if !pointer && !keyboard { return; }
     if let Ok(mut slot)=slot.try_borrow_mut() {
@@ -531,8 +596,9 @@ pub(super) fn native_exercise(slot:&Slot,output:&std::path::Path,pump:fn(u64))->
     pump(100);std::fs::create_dir(&created)?;
     let deadline=std::time::Instant::now()+std::time::Duration::from_secs(8);
     loop{pump(50);let selected=slot.borrow().as_ref().unwrap().browser.as_ref().unwrap().selection_paths();
-        if selected.iter().any(|path|PathBuf::from(path)==created){break;}
-        ensure!(std::time::Instant::now()<deadline,"new folder was not selected after asynchronous enumeration");
+        let focus=unsafe{GetFocus()};let view=slot.borrow().as_ref().unwrap().view_hwnd;
+        if selected.iter().any(|path|PathBuf::from(path)==created)&&text_input_window(focus)&&unsafe{IsChild(view,focus)}.as_bool(){break;}
+        ensure!(std::time::Instant::now()<deadline,"new folder selection and inline rename did not finish after asynchronous enumeration");
     }
     let edit=unsafe{GetFocus()};
     ensure!(text_input_window(edit),"new folder did not enter inline rename");
@@ -575,7 +641,26 @@ pub(super) fn native_exercise(slot:&Slot,output:&std::path::Path,pump:fn(u64))->
             ensure!(std::time::Instant::now()<deadline,"direct pane {kind} did not complete");}
         ensure!(std::fs::read(&target).with_context(||format!("read completed pane transfer {}",target.display()))?==b"native direct pane transfer","direct pane transfer changed contents");
         ensure!(source.exists()!=moving,"copy/move source semantics differ");
+        let deadline=std::time::Instant::now()+std::time::Duration::from_secs(8);
+        loop{pump(25);let slot=slot.borrow();let state=slot.as_ref().unwrap();
+            if state.other_pane.browser.as_ref().unwrap().selection_paths().iter().any(|path|PathBuf::from(path)==target){break;}
+            ensure!(std::time::Instant::now()<deadline,"completed transfer was not selected in the destination pane");
+        }
+        ensure!(!slot.borrow().as_ref().unwrap().active_pane_right,"destination selection stole the active pane");
     }
+    let stale_name=format!("late-selection-{}.txt",std::process::id());let stale_source=left.join(&stale_name);std::fs::write(&stale_source,b"stale selection fixture")?;
+    {
+        let slot=slot.borrow();let state=slot.as_ref().unwrap();let target=state.other_pane.browser.as_ref().unwrap();
+        target.select_child(std::ffi::OsStr::new("right-only.txt"))?;
+        let window=target.view_window().context("destination view")?;
+        zsdesk_windows::shell::file_transfer::transfer_paths(window,vec![stale_source],right.clone(),false)?;
+        zsdesk_windows::shell::file_transfer::note_user_input(window);
+    }
+    let deadline=std::time::Instant::now()+std::time::Duration::from_secs(8);
+    loop{pump(25);if zsdesk_windows::shell::file_transfer::pending_operations()==0&&right.join(&stale_name).is_file(){break;}
+        ensure!(std::time::Instant::now()<deadline,"stale selection fixture copy did not complete");}
+    pump(100);
+    ensure!(slot.borrow().as_ref().unwrap().other_pane.browser.as_ref().unwrap().selection_paths().iter().any(|path|path.ends_with("right-only.txt")),"late completion replaced the user's newer selection");
     let view={let mut slot=slot.borrow_mut();let state=slot.as_mut().unwrap();state.activate_pane(true);
         state.set_view_dimensions(windows::Win32::UI::Shell::FVM_ICON.0,48);state.view_hwnd};
     // Sent input bypasses the outer GetMessage loop, exercising the native
@@ -630,10 +715,27 @@ pub(super) fn native_exercise(slot:&Slot,output:&std::path::Path,pump:fn(u64))->
     }
     ready()?;
     ensure!(slot.borrow().as_ref().unwrap().current_location().as_path()==Some(left.as_path()),"late closed-pane completion altered remaining pane");
+    let batch=output.join("batch-selection");std::fs::create_dir_all(&batch)?;
+    let names:Vec<std::ffi::OsString>=(0..160).map(|index|format!("批量-{index:03}.txt").into()).collect();
+    for name in &names{std::fs::write(batch.join(name),b"batch")?;}
+    {let mut slot=slot.borrow_mut();let state=slot.as_mut().unwrap();unsafe{state.navigate_to(ShellLocation::Path(batch.clone()));}}
+    ready()?;
+    slot.borrow_mut().as_mut().unwrap().defer_selection(names,false);
+    let deadline=std::time::Instant::now()+std::time::Duration::from_secs(12);
+    loop{pump(25);if slot.borrow().as_ref().unwrap().browser.as_ref().unwrap().selection_paths().len()==160{break;}
+        ensure!(std::time::Instant::now()<deadline,"batched result selection stopped at the old 128-item cap");}
+    {
+        let mut slot=slot.borrow_mut();let state=slot.as_mut().unwrap();
+        state.browser.as_ref().unwrap().set_sort(zsdesk_windows::shell::commands::Column::Name,false)?;
+        unsafe{state.action(Command::Refresh.id()as usize,0);}
+        ensure!(state.pending.is_none(),"refresh incorrectly restarted navigation");
+    }
+    pump(300);
+    ensure!(slot.borrow().as_ref().unwrap().browser.as_ref().unwrap().sort()==Some((zsdesk_windows::shell::commands::Column::Name,false)),"refresh reset the user's sort order");
     Ok(serde_json::json!({"independent_native_views":true,"background_navigation_does_not_steal_active_pane":true,
         "sent_ctrl_wheel":true,"double_click_closes_one_tab":true,"disable_releases_native_view":true,"right_folder_persisted":true,
         "last_pane_tab_preserves_other_pane":true,"closed_pane_late_navigation_rejected":true,
         "same_folder_two_panes_repeated_navigation_and_selection":true,"new_folder_delayed_selection_and_rename":true,
         "external_reveal_waits_for_file_enumeration":true,"batch_drop_preserves_all_paths_and_inactive_pane":true,
-        "direct_other_pane_copy_and_move":true}))
+        "direct_other_pane_copy_and_move":true,"destination_outputs_selected":true,"late_result_preserves_new_selection":true,"batch_selection_over_128":true,"refresh_keeps_sort_without_navigation":true}))
 }

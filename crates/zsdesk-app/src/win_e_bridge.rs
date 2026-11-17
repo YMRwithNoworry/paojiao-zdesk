@@ -17,7 +17,7 @@ use windows::Win32::{
     UI::{
         Input::KeyboardAndMouse::{
             GetAsyncKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT,
-            KEYEVENTF_KEYUP, VIRTUAL_KEY,
+            KEYEVENTF_KEYUP, KEYEVENTF_EXTENDEDKEY, VIRTUAL_KEY,
         },
         WindowsAndMessaging::{
             CallNextHookEx, DispatchMessageW, GetMessageW, PeekMessageW, PostThreadMessageW,
@@ -30,6 +30,7 @@ use windows::Win32::{
 #[derive(Default)]
 struct Chord {
     captured: bool,
+    masked_windows:u8,
 }
 #[derive(Debug, PartialEq, Eq)]
 enum Decision {
@@ -38,6 +39,12 @@ enum Decision {
     Launch,
 }
 impl Chord {
+    fn capture_windows(&mut self,left:bool,right:bool){self.masked_windows|=u8::from(left)|(u8::from(right)<<1);}
+    fn mask_release(&mut self,key:u32,down:bool)->bool{
+        let bit=match key{0x5b=>1,0x5c=>2,_=>0};
+        if down||bit==0||self.masked_windows&bit==0{return false;}
+        self.masked_windows&=!bit;true
+    }
     fn input(
         &mut self,
         key: u32,
@@ -69,15 +76,23 @@ impl Chord {
 }
 
 enum Request {
-    Launch,
+    Launch(Arc<AtomicBool>),
     Stop,
 }
 struct HookContext {
     chord: Chord,
     enabled: Arc<AtomicBool>,
     requests: mpsc::SyncSender<Request>,
+    mask_ready: Option<Arc<AtomicBool>>,
 }
 thread_local! { static HOOK_CONTEXT: RefCell<Option<HookContext>> = const { RefCell::new(None) }; }
+const INPUT_TAG:usize=0x5a53454d;
+fn masked_release_inputs(key:u32)->[INPUT;3]{
+    let event=|key:u16,flags|INPUT{r#type:INPUT_KEYBOARD,Anonymous:INPUT_0{ki:KEYBDINPUT{wVk:VIRTUAL_KEY(key),dwFlags:flags,dwExtraInfo:INPUT_TAG,..Default::default()}}};
+    // Preserve the Windows key-up in the same input batch as the harmless
+    // menu-mask key. A new foreground window must not see a bare Win release.
+    [event(0xe8,Default::default()),event(key as u16,KEYEVENTF_KEYUP|KEYEVENTF_EXTENDEDKEY),event(0xe8,KEYEVENTF_KEYUP)]
+}
 
 unsafe extern "system" fn keyboard_hook(code: i32, message: WPARAM, data: LPARAM) -> LRESULT {
     if code < 0 || data.0 == 0 {
@@ -88,7 +103,23 @@ unsafe extern "system" fn keyboard_hook(code: i32, message: WPARAM, data: LPARAM
     if !down && !matches!(message_id, WM_KEYUP | WM_SYSKEYUP) {
         return unsafe { CallNextHookEx(None, code, message, data) };
     }
-    let key = unsafe { (*(data.0 as *const KBDLLHOOKSTRUCT)).vkCode };
+    let input=unsafe{&*(data.0 as*const KBDLLHOOKSTRUCT)};
+    if input.dwExtraInfo==INPUT_TAG{
+        if input.vkCode==0xe8&&!down{
+            HOOK_CONTEXT.with(|slot|{if let Ok(mut slot)=slot.try_borrow_mut(){if let Some(context)=slot.as_mut(){
+                if let Some(ready)=context.mask_ready.take(){ready.store(true,Ordering::Release);}
+            }}});
+        }
+        return unsafe{CallNextHookEx(None,code,message,data)};
+    }
+    let key = input.vkCode;
+    let mask_release=HOOK_CONTEXT.with(|slot|slot.try_borrow_mut().ok().and_then(|mut slot|slot.as_mut().map(|context|context.chord.mask_release(key,down))).unwrap_or(false));
+    if mask_release{
+        let events=masked_release_inputs(key);
+        if unsafe{SendInput(&events,std::mem::size_of::<INPUT>()as i32)}==events.len()as u32{return LRESULT(1);}
+        // An injection failure must not strand a logically pressed modifier.
+        return unsafe{CallNextHookEx(None,code,message,data)};
+    }
     if key != 0x45 {
         return unsafe { CallNextHookEx(None, code, message, data) };
     }
@@ -107,14 +138,12 @@ unsafe extern "system" fn keyboard_hook(code: i32, message: WPARAM, data: LPARAM
             other,
             context.enabled.load(Ordering::Acquire),
         );
-        if decision == Decision::Launch && context.requests.try_send(Request::Launch).is_err() {
-            // Never consume a chord when its handler cannot accept the launch.
-            context.chord.captured = false;
-            return Decision::Pass;
-        }
+        if decision==Decision::Launch{context.chord.capture_windows(pressed(0x5b),pressed(0x5c));}
         decision
     });
     if decision == Decision::Launch {
+        let ready=Arc::new(AtomicBool::new(false));
+        HOOK_CONTEXT.with(|slot|{if let Some(context)=slot.borrow_mut().as_mut(){context.mask_ready=Some(ready.clone());}});
         // Mark the held Windows key as used, so releasing it does not also open
         // Start. 0xE8 is unassigned; no ordinary character or shortcut is sent.
         let key_down = INPUT {
@@ -122,6 +151,7 @@ unsafe extern "system" fn keyboard_hook(code: i32, message: WPARAM, data: LPARAM
             Anonymous: INPUT_0 {
                 ki: KEYBDINPUT {
                     wVk: VIRTUAL_KEY(0xe8),
+                    dwExtraInfo:INPUT_TAG,
                     ..Default::default()
                 },
             },
@@ -132,11 +162,23 @@ unsafe extern "system" fn keyboard_hook(code: i32, message: WPARAM, data: LPARAM
                 ki: KEYBDINPUT {
                     wVk: VIRTUAL_KEY(0xe8),
                     dwFlags: KEYEVENTF_KEYUP,
+                    dwExtraInfo:INPUT_TAG,
                     ..Default::default()
                 },
             },
         };
-        let _ = unsafe { SendInput(&[key_down, key_up], std::mem::size_of::<INPUT>() as i32) };
+        let inserted=unsafe{SendInput(&[key_down,key_up],std::mem::size_of::<INPUT>()as i32)};
+        // Do not activate another foreground window until the input stream has
+        // acknowledged the mask. Enqueuing Launch first races Shell's Win-key
+        // state, especially on Windows 11 23H2.
+        let accepted=inserted==2&&HOOK_CONTEXT.with(|slot|slot.borrow().as_ref()
+            .is_some_and(|context|context.requests.try_send(Request::Launch(ready)).is_ok()));
+        if !accepted{
+            HOOK_CONTEXT.with(|slot|{if let Some(context)=slot.borrow_mut().as_mut(){
+                context.chord.captured=false;context.chord.masked_windows=0;context.mask_ready=None;
+            }});
+            return unsafe{CallNextHookEx(None,code,message,data)};
+        }
     }
     if decision != Decision::Pass {
         LRESULT(1)
@@ -148,6 +190,11 @@ unsafe extern "system" fn keyboard_hook(code: i32, message: WPARAM, data: LPARAM
 fn owned(executable: &Path) -> bool {
     use zsdesk_windows::integration::{self, Integration};
     integration::current() == Integration::Default && integration::win_e_enabled(executable)
+}
+fn wait_for_mask(ready:&AtomicBool,timeout:Duration)->bool{
+    let deadline=std::time::Instant::now()+timeout;
+    while !ready.load(Ordering::Acquire)&&std::time::Instant::now()<deadline{thread::sleep(Duration::from_millis(2));}
+    ready.load(Ordering::Acquire)
 }
 
 fn write_status(
@@ -220,6 +267,7 @@ impl Bridge {
                                 chord: Chord::default(),
                                 enabled: hook_enabled,
                                 requests: hook_requests,
+                                mask_ready: None,
                             })
                         });
                         let _ = ready.send(Ok(unsafe { GetCurrentThreadId() }));
@@ -280,9 +328,12 @@ impl Bridge {
                         let changed = current != active;
                         active = current;
                         worker_enabled.store(active, Ordering::Release);
-                        let launch = matches!(request, Ok(Request::Launch));
+                        let launch = matches!(request, Ok(Request::Launch(_)));
                         if launch {
-                            let result = if active {
+                            let mask_ready=match request{Ok(Request::Launch(ready))=>ready,_=>unreachable!()};
+                            let result = if !wait_for_mask(&mask_ready,Duration::from_millis(250)){
+                                Err(anyhow::anyhow!("Win+E 按键状态未就绪，已保留系统打开方式"))
+                            } else if active {
                                 crate::quick_search::spawn_utility(&profile, "--win-e")
                             } else {
                                 crate::app::open_original_explorer("shell:MyComputerFolder".into())
@@ -340,6 +391,30 @@ impl Drop for Bridge {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn launch_waits_for_its_own_mask_acknowledgement(){
+        let ready=Arc::new(AtomicBool::new(false));assert!(!wait_for_mask(&ready,Duration::ZERO));
+        let pending=ready.clone();let worker=thread::spawn(move||wait_for_mask(&pending,Duration::from_secs(1)));
+        thread::sleep(Duration::from_millis(10));ready.store(true,Ordering::Release);assert!(worker.join().unwrap());
+        assert!(!wait_for_mask(&AtomicBool::new(false),Duration::ZERO));
+    }
+    #[test]
+    fn captured_windows_releases_are_masked_once_without_eating_other_chords(){
+        let mut chord=Chord::default();
+        assert!(!chord.mask_release(0x5b,false));
+        assert_eq!(chord.input(0x45,true,true,false,true),Decision::Launch);
+        chord.capture_windows(true,true);
+        assert_eq!(chord.input(0x44,true,true,false,true),Decision::Pass);
+        assert!(!chord.mask_release(0x5b,true));
+        assert!(chord.mask_release(0x5b,false));assert!(!chord.mask_release(0x5b,false));
+        assert!(chord.mask_release(0x5c,false));assert!(!chord.mask_release(0x5c,false));
+        assert_eq!(chord.input(0x45,false,false,false,true),Decision::Suppress);
+        for key in [0x5b,0x5c]{let inputs=masked_release_inputs(key);let a=unsafe{inputs[0].Anonymous.ki};let b=unsafe{inputs[1].Anonymous.ki};let c=unsafe{inputs[2].Anonymous.ki};
+            assert_eq!(a.wVk.0,0xe8);assert_eq!(b.wVk.0,key as u16);assert_eq!(c.wVk.0,0xe8);
+            assert!(!a.dwFlags.contains(KEYEVENTF_KEYUP)&&b.dwFlags.contains(KEYEVENTF_KEYUP)&&c.dwFlags.contains(KEYEVENTF_KEYUP));
+            assert_eq!([a.dwExtraInfo,b.dwExtraInfo,c.dwExtraInfo],[INPUT_TAG;3]);
+        }
+    }
     #[test]
     fn win_e_launches_once_and_consumes_its_repeat_and_release() {
         let mut chord = Chord::default();

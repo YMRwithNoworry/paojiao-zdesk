@@ -29,7 +29,18 @@ inline ExtensionFunction originalExtension=nullptr;
 inline UpdateFunction originalUpdate=nullptr;
 inline PolicyProbe policyProbe=nullptr;
 inline ModelAugmenter modelAugmenter=nullptr;
+inline HRESULT(*testInsertion)(IUnknown*,HMENU)=nullptr;
 inline thread_local unsigned createDepth=0;
+inline thread_local HMENU expectedProjectionRoot=nullptr;
+inline thread_local bool expectedProjectionObserved=false;
+struct ProjectionProbe{
+    HMENU previous;bool previousObserved,enabled;
+    ProjectionProbe(HMENU menu,bool active):previous(expectedProjectionRoot),previousObserved(expectedProjectionObserved),enabled(active){
+        if(enabled){expectedProjectionRoot=menu;expectedProjectionObserved=false;}
+    }
+    bool Observed()const{return enabled&&expectedProjectionObserved;}
+    ~ProjectionProbe(){if(enabled){expectedProjectionRoot=previous;expectedProjectionObserved=previousObserved;}}
+};
 inline SRWLOCK setupLock=SRWLOCK_INIT;
 inline HMODULE retainedModule=nullptr;
 inline HRESULT setupFailure=S_OK;
@@ -108,6 +119,8 @@ inline bool Policy(IUnknown* native,uint32_t& policy) noexcept {
 inline IUnknown** __fastcall CreateModels(IUnknown* native,IUnknown** output,HMENU menu) {
     ++createDepth;
     struct DepthScope { ~DepthScope(){--createDepth;} } depthScope;
+    if(expectedProjectionRoot&&menu==expectedProjectionRoot)expectedProjectionObserved=true;
+    if(createDepth==1&&testInsertion&&FAILED(testInsertion(native,menu)))++failures;
     auto result=originalCreate(native,output,menu);
     if(createDepth==1&&output&&*output&&modelAugmenter&&FAILED(modelAugmenter(native,output)))++failures;
     uint32_t policy=0;

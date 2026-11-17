@@ -3,6 +3,8 @@ use windows::Win32::Graphics::{Direct2D::ID2D1Bitmap, Imaging::IWICBitmapSource}
 use zsdesk_ui::{chrome::{format_size, CommandId}, theme::glyph};
 use zsdesk_windows::{gfx::{Align, Canvas, Color, RectF, TextStyle}, shell::{icons, pidl}};
 
+#[cfg(test)]#[path="tab_contrast_regression.rs"]mod tab_contrast_regression;
+
 /// Shell icon converted once to WIC and uploaded per render-target generation.
 pub(super) struct IconEntry { wic: Option<IWICBitmapSource>, bitmap: Option<(u64, ID2D1Bitmap)> }
 
@@ -14,6 +16,16 @@ const ICON_DIP: i32 = 16;
 
 fn pixel_aligned_icon(rect: RectF) -> RectF {
     RectF::new(rect.x.round(), rect.y.round(), rect.w.round().max(1.0), rect.h.round().max(1.0))
+}
+
+/// Window-independent tab painting also used by the memory-raster regression.
+fn paint_selected_tab(cv:&Canvas,r:RectF,vertical:bool,dpi:u32,appearance:zsdesk_ui::theme::TabAppearance){
+    let Some(fill)=appearance.fill else{return;};let s=|value:f32|value*dpi as f32/96.0;
+    if let Some(border)=appearance.border{
+        let card=RectF::new(r.x+s(1.0),r.y+s(1.0),(r.w-s(2.0)).max(0.0),(r.h-s(2.0)).max(0.0));
+        cv.round(card,s(6.0),c(fill));cv.stroke_round(card,s(6.0),c(border),s(1.0));
+    }else if vertical{cv.round(r,s(6.0),c(fill));}
+    else{cv.tab_shape(r,s(8.0),s(6.0),c(fill));}
 }
 
 impl WindowState {
@@ -53,10 +65,11 @@ impl WindowState {
             self.paint_strip(cv, &tab_icons);
             self.paint_nav(cv, address_icon.as_ref());
             self.paint_commands(cv);
-            self.paint_bookmarks(cv, &bookmark_icons);
             self.paint_search_panel(cv);
             self.paint_content(cv);
+            self.paint_bookmarks(cv, &bookmark_icons);
             self.paint_status(cv);
+            self.paint_picker(cv);
         });
         if result.is_err() { self.icons.values_mut().for_each(|e| e.bitmap = None); }
     }
@@ -83,25 +96,28 @@ impl WindowState {
         cv.clear_rect(strip);
         // Fullscreen has no extended DWM frame: transparent pixels otherwise
         // become black and hide the dark caption glyphs.
-        if !self.mica || window_actions::fullscreen(self.hwnd) { cv.fill(strip, if self.active { c(p.strip) } else { c(p.layer) }); }
+        if !self.mica || window_actions::fullscreen(self.hwnd) { cv.fill(strip, c(p.strip)); }
         let text = if self.active { c(p.text) } else { c(p.text_secondary) };
         let active = self.session.active_tab;
-        let radius = self.sf(8.0);
-        let foot = self.sf(6.0);
         if self.layout.vertical_tabs{
             cv.fill(rf(self.layout.tab_panel),c(p.strip));
+            if self.hover==Hit::TabSplitter||self.side_tab_resize.is_some(){cv.fill(rf(self.layout.tab_splitter),c(p.hover));}
+            if !self.layout.tab_scroll_thumb.is_empty(){cv.round(rf(self.layout.tab_scroll_thumb),self.sf(4.0),c(if self.hover==Hit::TabScrollbar||self.side_tab_scroll_drag.is_some(){p.text}else{p.text_secondary}));}
             let edge = if self.layout.nav_row.x > 0 { self.layout.tab_panel.right() as f32 - 0.5 } else { self.layout.tab_panel.x as f32 + 0.5 };
             cv.line(edge, self.layout.tab_panel.y as f32, edge, self.layout.tab_panel.bottom() as f32, c(p.divider), 1.0);
             let title=self.session.current_location().title();
-            cv.text(&title,RectF::new(self.sf(14.0),strip.y,(self.layout.tab_list.x as f32-self.sf(24.0)).max(0.0),strip.h),&self.ui_style(),text);
+            let title_end=if self.layout.tab_list.is_empty(){self.layout.app_menu.x}else{self.layout.tab_list.x};
+            cv.text(&title,RectF::new(self.sf(14.0),strip.y,(title_end as f32-self.sf(24.0)).max(0.0),strip.h),&self.ui_style(),text);
         }
         for (n, slot) in self.layout.tabs.iter().enumerate() {
             let r = rf(slot.rect);
             if self.layout.vertical_tabs { cv.push_clip(r); }
             let is_active = slot.index == active;
+            let appearance=p.tab_appearance(is_active,self.active,self.session.ui.tab_selection_emphasis);
+            let text=c(appearance.text);
             let hovered = matches!(self.hover, Hit::Tab(i) | Hit::TabClose(i) if i == slot.index);
             if is_active {
-                if self.layout.vertical_tabs{cv.round(r,self.sf(6.0),c(p.layer));}else{cv.tab_shape(r, radius, foot, c(p.layer));}
+                paint_selected_tab(cv,r,self.layout.vertical_tabs,self.dpi,appearance);
             } else if hovered {
                 cv.round(RectF::new(r.x + self.sf(2.0), r.y + self.sf(2.0), r.w - self.sf(4.0), r.h - self.sf(6.0)), self.sf(6.0), c(p.hover));
             } else {
@@ -121,7 +137,7 @@ impl WindowState {
             let title_right = if slot.show_close { slot.close.x as f32 - self.sf(2.0) } else { r.right() - self.sf(10.0) };
             let title = self.session.tabs[slot.index].current().title();
             let title_x = icon_rect.right() + self.sf(8.0);
-            cv.text(&title, RectF::new(title_x, r.y, (title_right - title_x).max(0.0), r.h), &self.ui_style(), text);
+            cv.text(&title, RectF::new(title_x, r.y, (title_right - title_x).max(0.0), r.h), &self.ui_style().weight(appearance.weight), text);
             if slot.show_close {
                 let close = rf(slot.close);
                 if self.hover == Hit::TabClose(slot.index) { cv.round(close, self.sf(4.0), c(p.hover)); }
@@ -135,7 +151,7 @@ impl WindowState {
             let r=rf(self.layout.new_tab);
             if self.layout.vertical_tabs{
                 cv.glyph(glyph::ADD,RectF::new(r.x,r.y,self.sf(32.0),r.h),self.sf(12.0),text);
-                cv.text("新建标签页",RectF::new(r.x+self.sf(34.0),r.y,(r.w-self.sf(38.0)).max(0.0),r.h),&self.ui_style(),text);
+                cv.text(zsdesk_core::i18n::text("新建标签页"),RectF::new(r.x+self.sf(34.0),r.y,(r.w-self.sf(38.0)).max(0.0),r.h),&self.ui_style(),text);
             }else{cv.glyph(glyph::ADD,r,self.sf(12.0),text);}
         }
         if !self.layout.tab_list.is_empty() {
@@ -192,6 +208,10 @@ impl WindowState {
         for (rect, hit, g, enabled) in buttons {
             if enabled { self.button_fill(cv, rect, hit, self.sf(4.0)); }
             cv.glyph(g, rf(rect), self.sf(14.0), if enabled { c(p.text) } else { c(p.text_disabled) });
+        }
+        if !l.command_toggle.is_empty(){
+            self.button_fill(cv,l.command_toggle,Hit::ToggleCommandBar,self.sf(4.0));
+            cv.glyph(if self.session.ui.command_bar.visible{glyph::CHEVRON_UP}else{glyph::CHEVRON_DOWN},rf(l.command_toggle),self.sf(12.0),c(p.text_secondary));
         }
         // Address box.
         let address = rf(l.address);
@@ -299,22 +319,29 @@ impl WindowState {
         let l = &self.layout;
         if l.bookmarks_row.is_empty() { return; }
         self.paint_chrome_layer(cv, rf(l.bookmarks_row));
+        if l.bookmarks_vertical{
+            let r=l.bookmarks_row;cv.line(r.x as f32,r.y as f32,r.x as f32,r.bottom()as f32,c(p.divider),1.0);
+            cv.text(zsdesk_core::i18n::text("收藏夹"),rf(l.bookmarks_title),&self.ui_style(),c(p.text_secondary));
+        }
         if self.session.bookmarks.is_empty() {
             let r = rf(l.bookmarks_row);
-            cv.text("将文件夹拖到这里，或按 Ctrl+D 收藏当前文件夹", RectF::new(r.x + self.sf(14.0), r.y, r.w - self.sf(28.0), r.h), &self.ui_style(), c(p.text_secondary));
+            let (text,y,h)=if l.bookmarks_vertical{(zsdesk_core::i18n::text("拖入文件夹或按 Ctrl+D"),l.bookmarks_title.bottom()as f32+self.sf(6.0),self.sf(32.0))}else{(zsdesk_core::i18n::text("将文件夹拖到这里，或按 Ctrl+D 收藏当前文件夹"),r.y,r.h)};
+            cv.text(text, RectF::new(r.x + self.sf(14.0), y, r.w - self.sf(28.0), h), &self.ui_style(), c(p.text_secondary));
         }
         for (i, rect) in l.bookmarks.iter().enumerate() {
             let Some(index)=self.bookmark_index(i)else{continue;};
             if self.rename_id == Some(self.session.bookmarks[index].id) {
-                let r = rf(LayoutRect::new(rect.x, rect.y, rect.width.max(self.s(140)), rect.height));
+                let r = rf(LayoutRect::new(rect.x, rect.y, if l.bookmarks_vertical{rect.width}else{rect.width.max(self.s(140))}, rect.height));
                 self.text_box(cv, r, true, false);
                 continue;
             }
             self.button_fill(cv, *rect, Hit::Bookmark(i), self.sf(4.0));
             if let Some(drag)=self.bookmark_drag.filter(|drag|drag.moved){if self.hover==Hit::Bookmark(i){
-                if self.session.bookmarks[index].is_folder&&drag.point.x>=rect.x+rect.width/4&&drag.point.x<rect.right()-rect.width/4{
+                let (at,start,length)=if l.bookmarks_vertical{(drag.point.y,rect.y,rect.height)}else{(drag.point.x,rect.x,rect.width)};
+                if self.session.bookmarks[index].is_folder&&at>=start+length/4&&at<start+length-length/4{
                     cv.stroke_round(rf(*rect),self.sf(4.0),c(p.accent),self.sf(2.0));
-                }else{let x=if drag.point.x<rect.x+rect.width/2{rect.x}else{rect.right()}as f32;cv.line(x,rect.y as f32,x,rect.bottom()as f32,c(p.accent),self.sf(2.0));}
+                }else if l.bookmarks_vertical{let y=if at<start+length/2{rect.y}else{rect.bottom()}as f32;cv.line(rect.x as f32,y,rect.right()as f32,y,c(p.accent),self.sf(2.0));}
+                else{let x=if at<start+length/2{rect.x}else{rect.right()}as f32;cv.line(x,rect.y as f32,x,rect.bottom()as f32,c(p.accent),self.sf(2.0));}
             }}
             let r = rf(*rect);
             let icon = self.sf(ICON_DIP as f32);
@@ -325,7 +352,8 @@ impl WindowState {
         }
         if !l.bookmark_overflow.is_empty() {
             self.button_fill(cv, l.bookmark_overflow, Hit::BookmarkOverflow, self.sf(4.0));
-            cv.glyph("\u{E76C}", rf(l.bookmark_overflow), self.sf(10.0), c(p.text));
+            if l.bookmarks_vertical{cv.text(zsdesk_core::i18n::text("更多收藏…"),rf(l.bookmark_overflow),&self.ui_style(),c(p.text));}
+            else{cv.glyph("\u{E76C}", rf(l.bookmark_overflow), self.sf(10.0), c(p.text));}
         }
         if let Some(index)=self.renamed_bookmark_index(){if !self.bookmark_order.iter().take(l.bookmarks.len()).any(|i|*i==index){self.text_box(cv,rf(self.bookmark_rect(index)),true,false);}}
     }
@@ -359,6 +387,7 @@ impl WindowState {
                 cv.line(middle,split.y,middle,split.bottom(),c(p.divider),1.0);
             }
         }
+        if !l.bookmark_splitter.is_empty()&&(self.hover==Hit::BookmarkSplitter||self.bookmark_resize.is_some()){cv.fill(rf(l.bookmark_splitter),c(p.hover));}
         if !l.splitter.is_empty() && (self.hover == Hit::Splitter || self.splitter_drag.is_some()) {
             let x = l.splitter.x as f32 + l.splitter.width as f32 / 2.0;
             cv.line(x, l.splitter.y as f32, x, l.splitter.bottom() as f32, c(p.divider), 1.0);
@@ -368,31 +397,32 @@ impl WindowState {
     fn paint_status(&self, cv: &Canvas) {
         let p = &self.palette;
         let l = &self.layout;
+        let folder_progress=self.folder_sizes.progress();
         if l.status.is_empty() {
             // Transient messages sit at the right end of the command bar.
-            if self.status.is_empty() || l.command_row.is_empty() { return; }
+            if self.status.is_empty()&&folder_progress.is_none() || l.command_row.is_empty() { return; }
             let row = rf(l.command_row);
             let panes = [CommandId::PreviewPane, CommandId::DetailsPane];
             let left = l.commands.iter().filter(|(id, _)| !panes.contains(id)).map(|(_, r)| r.right()).max().unwrap_or(0) as f32 + self.sf(16.0);
             let right = l.commands.iter().filter(|(id, _)| panes.contains(id)).map(|(_, r)| r.x).min().map_or(row.right() - self.sf(12.0), |x| x as f32 - self.sf(12.0));
-            cv.text(&self.status, RectF::new(left, row.y, (right - left).max(0.0), row.h), &self.ui_style().align(Align::End),
+            cv.text(if self.status.is_empty(){folder_progress.as_deref().unwrap_or("")}else{&self.status}, RectF::new(left, row.y, (right - left).max(0.0), row.h), &self.ui_style().align(Align::End),
                 c(if status_is_error(&self.status) { p.danger } else { p.text_secondary }));
             return;
         }
         let r = rf(l.status);
         cv.fill(r, c(p.content));
-        let mut text = format!("{} 个项目", self.view_status.items);
+        let mut text = zsdesk_core::tr_format!("{} 个项目", self.view_status.items);
         if self.view_status.selected > 0 {
-            text.push_str(&format!("    选中 {} 个项目", self.view_status.selected));
+            text.push_str(&zsdesk_core::tr_format!("    选中 {} 个项目", self.view_status.selected));
             if let Some(bytes) = self.view_status.selected_bytes { text.push_str(&format!("  {}", format_size(bytes))); }
         }
         let style = TextStyle::ui(self.sf(UI_TEXT - 0.5));
         let left = r.x + self.sf(12.0);
         let (w, _) = cv.gfx().measure(&text, &style, r.w);
         cv.text(&text, RectF::new(left, r.y, w + 2.0, r.h), &style, c(p.text_secondary));
-        if !self.status.is_empty() || self.search_progress.is_some() {
+        if !self.status.is_empty() || self.search_progress.is_some() || folder_progress.is_some() {
             let x = left + w + self.sf(24.0);
-            let text=if self.status.is_empty(){self.search_progress.as_deref().unwrap_or("")}else{&self.status};
+            let text=if self.status.is_empty(){self.search_progress.as_deref().or(folder_progress.as_deref()).unwrap_or("")}else{&self.status};
             cv.text(text, RectF::new(x, r.y, (l.status_dual_pane.x as f32 - x - self.sf(8.0)).max(0.0), r.h), &style,
                 c(if status_is_error(&self.status) {p.danger} else {p.text_secondary}));
         }
@@ -484,10 +514,7 @@ fn resolve_icon(location: &ShellLocation, px: i32) -> Option<icons::OwnedIcon> {
 }
 
 fn clipboard_has_files() -> bool {
-    use windows::Win32::System::{DataExchange::{IsClipboardFormatAvailable, RegisterClipboardFormatW}, Ole::CF_HDROP};
-    if unsafe { IsClipboardFormatAvailable(CF_HDROP.0 as u32) }.is_ok() { return true; }
-    let shell = unsafe { RegisterClipboardFormatW(windows::core::w!("Shell IDList Array")) };
-    shell != 0 && unsafe { IsClipboardFormatAvailable(shell) }.is_ok()
+    zsdesk_windows::shell::file_transfer::has_paste_content()
 }
 
 #[cfg(test)]
@@ -519,7 +546,10 @@ mod icon_geometry_tests {
 /// Status text that reports a failure is drawn in the critical color; progress
 /// and confirmations ("已复制 3 个路径") stay neutral.
 fn status_is_error(text: &str) -> bool {
-    ["失败", "无法", "错误", "未找到", "不支持", "未保存", "未更新", "未启动", "异常", "超时", "需要修复"].iter().any(|word| text.contains(word))
+    let text=text.to_lowercase();
+    ["失败","无法","错误","未找到","不支持","未保存","未更新","未启动","异常","超时","需要修复",
+        "failed","cannot","error","not found","unsupported","not saved","not updated","not started","timed out","needs repair"]
+        .iter().any(|word|text.contains(word))
 }
 
 #[cfg(test)]

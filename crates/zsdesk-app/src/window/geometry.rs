@@ -25,6 +25,19 @@ pub(super) fn is_resize_hit(value: u32) -> bool {
     [HTLEFT,HTRIGHT,HTTOP,HTBOTTOM,HTTOPLEFT,HTTOPRIGHT,HTBOTTOMLEFT,HTBOTTOMRIGHT].contains(&value)
 }
 
+/// Preserve DWM's per-button identity. The screen-edge extension only fills
+/// pixels DWM did not identify as an actual caption button.
+pub(super) fn native_caption_hit(native:isize,edge_padding:Option<u32>)->isize{
+    use windows::Win32::UI::WindowsAndMessaging::{HTMINBUTTON,HTMAXBUTTON,HTCLOSE};
+    if [HTMINBUTTON,HTMAXBUTTON,HTCLOSE].contains(&(native as u32)){native}
+    else{edge_padding.map_or(native,|hit|hit as isize)}
+}
+
+pub(super) fn screen_edge_caption_buttons(mut buttons:[zsdesk_ui::chrome::Rect;3],width:i32)->[zsdesk_ui::chrome::Rect;3]{
+    for rect in &mut buttons{let bottom=rect.bottom();rect.y=0;rect.height=bottom.max(0);}
+    buttons[2].width=(width-buttons[2].x).max(0);buttons
+}
+
 pub(super) fn captionless_client(window: RECT, mut native_client: RECT, maximized: bool, frame_y: i32) -> RECT {
     native_client.top = window.top.saturating_add(if maximized { frame_y.max(0) } else { 0 }).min(native_client.bottom);
     native_client
@@ -39,6 +52,18 @@ pub(super) fn restore_maximized(show: u32, flags: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]fn native_button_identity_wins_over_an_inexact_aggregate_rectangle(){
+        use windows::Win32::UI::WindowsAndMessaging::{HTMINBUTTON,HTMAXBUTTON,HTCLOSE,HTCAPTION,HTCLIENT,HTBORDER};
+        for actual in [HTMINBUTTON,HTMAXBUTTON,HTCLOSE]{
+            for fallback in [None,Some(HTMINBUTTON),Some(HTMAXBUTTON),Some(HTCLOSE)]{
+                assert_eq!(native_caption_hit(actual as isize,fallback),actual as isize);
+            }
+        }
+        for empty in [HTCLIENT,HTCAPTION,HTBORDER,HTRIGHT]{
+            assert_eq!(native_caption_hit(empty as isize,None),empty as isize);
+            assert_eq!(native_caption_hit(empty as isize,Some(HTCLOSE)),HTCLOSE as isize);
+        }
+    }
     #[test]
     fn all_edges_and_corners_resize_at_each_dpi_and_negative_origin() {
         for dpi in [96, 120, 144, 192] {
@@ -73,5 +98,22 @@ mod tests {
         assert!(restore_maximized(SW_SHOWMINIMIZED.0 as u32, WPF_RESTORETOMAXIMIZED.0));
         assert!(!restore_maximized(SW_SHOWMINIMIZED.0 as u32, 0));
         assert!(!restore_maximized(1, WPF_RESTORETOMAXIMIZED.0));
+    }
+
+    #[test]
+    fn maximized_caption_targets_reach_the_top_and_right_without_overlap(){
+        use zsdesk_ui::chrome::{Rect,scale};
+        for dpi in [96,120,144,192]{
+            let width=scale(1200,dpi);let button=scale(46,dpi);let inset=scale(2,dpi);
+            let drawn=[0,1,2].map(|index|Rect::new(width-inset-button*(3-index),inset,button,scale(32,dpi)));
+            let hit=screen_edge_caption_buttons(drawn,width);
+            assert!(hit[2].contains(width-1,0));
+            assert!(!hit[2].contains(width,0));assert!(!hit[2].contains(width-1,-1));
+            for index in 0..3{
+                assert!(hit[index].contains(drawn[index].x,0));
+                assert_eq!(hit[index].bottom(),drawn[index].bottom());
+                if index<2{assert_eq!(hit[index].right(),hit[index+1].x);}
+            }
+        }
     }
 }

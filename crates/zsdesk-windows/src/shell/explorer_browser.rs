@@ -19,7 +19,7 @@ use windows::{
             Com::{
                 CoCreateInstance, IServiceProvider, IServiceProvider_Impl, CLSCTX_INPROC_SERVER,
             },
-            Ole::IObjectWithSite,
+            Ole::{IObjectWithSite,IOleWindow},
         },
         UI::{
             Shell::{
@@ -45,6 +45,8 @@ use super::{
 };
 #[path="view_background.rs"]
 mod view_background;
+#[cfg(test)]#[path="view_background_regression.rs"]mod view_background_regression;
+#[cfg(test)]#[path="native_theme_test_context.rs"]mod native_theme_test_context;
 
 const S_FALSE: HRESULT = HRESULT(1);
 const E_NOINTERFACE: HRESULT = HRESULT(0x8000_4002u32 as i32);
@@ -104,10 +106,12 @@ pub struct SearchMaterializationMetrics{
 }
 
 pub struct ExplorerBrowserHost {
+    picker: Rc<RefCell<Option<(String,bool,bool)>>>,
     panes: Rc<Cell<Panes>>,
     modern: Rc<Cell<bool>>,
     pub(crate) selection_revision: Rc<Cell<u64>>,
     pub(crate) selection_size: RefCell<super::commands::SelectionSizeCache>,
+    drop_registration:Rc<RefCell<Option<super::view_drop::Registration>>>,
     browser: Rc<IExplorerBrowser>,
     events: IExplorerBrowserEvents,
     site: IServiceProvider,
@@ -116,6 +120,10 @@ pub struct ExplorerBrowserHost {
     owner: isize,
     source: usize,
     background: Rc<Cell<view_background::Colors>>,
+    navigation_pending: Rc<Cell<bool>>,
+    theme_generation: Rc<Cell<u64>>,
+    theme_container: Option<HWND>,
+    container_theme: Cell<Option<(bool,bool)>>,
     streamed_results_used: Cell<bool>,
     results_active: Rc<Cell<bool>>,
     results_location: Rc<RefCell<Option<ShellLocation>>>,
@@ -125,6 +133,10 @@ pub struct ExplorerBrowserHost {
 }
 
 impl ExplorerBrowserHost {
+    pub fn set_picker(&self,pattern:&str,multiple:bool,folders_only:bool){
+        *self.picker.borrow_mut()=Some((pattern.to_owned(),multiple,folders_only));
+        if let Ok(view)=unsafe{self.browser.GetCurrentView::<IShellView>()}{apply_picker_flags(&view,&self.picker);}
+    }
     /// Names the application's per-folder Shell view preferences. Set this
     /// before the first navigation, and keep the name stable across launches.
     /// Transient hosts retain EBO_NOPERSISTVIEWSTATE and never write the bag.
@@ -180,12 +192,16 @@ impl ExplorerBrowserHost {
         let selection_revision = Rc::new(Cell::new(0u64));
         let results_active = Rc::new(Cell::new(false));
         let results_location = Rc::new(RefCell::new(None));
+        let navigation_pending=Rc::new(Cell::new(true));
+        let theme_generation=Rc::new(Cell::new(0u64));
         let this_pc = Rc::new(Cell::new(false));
-        let high_contrast=crate::theme::high_contrast();
-        let dark=crate::theme::system_dark_mode()&&!high_contrast;
+        let drop_registration=Rc::new(RefCell::new(None));
+        let picker=Rc::new(RefCell::new(None));
+        let dark=crate::theme::menus_dark();
         let background=Rc::new(Cell::new(view_background::Colors{
-            background:if dark{0x202020}else{0xffffff},dark,high_contrast}));
+            background:if dark{0x202020}else{0xffffff},high_contrast:crate::theme::high_contrast(),dark}));
         let site: IServiceProvider = BrowserSite {
+            picker:picker.clone(),
             hwnd: parent.0 as isize,
             source,
             browser: Rc::downgrade(&browser),
@@ -199,19 +215,25 @@ impl ExplorerBrowserHost {
         let object_with_site: IObjectWithSite = browser.cast()?;
         unsafe { object_with_site.SetSite(&site)? };
 
+        let existing_containers=browser_containers(parent);
         unsafe {
-            // The application supplies its own navigation, commands and status
-            // row. A wrapper frame would add another native status row to each
-            // pane. Retain frames only for an explicitly requested native pane.
-            let frames=if panes.get().details||panes.get().preview {EBO_SHOWFRAMES}else{windows::Win32::UI::Shell::EXPLORER_BROWSER_OPTIONS(0)};
-            browser.SetOptions(frames | EBO_ALWAYSNAVIGATE | EBO_NOBORDER)?;
+            // Keep the native browser frame responsible for view activation
+            // and OLE drop routing. Pane visibility hides the duplicate chrome.
+            browser.SetOptions(EBO_SHOWFRAMES | EBO_ALWAYSNAVIGATE | EBO_NOBORDER)?;
             browser.Initialize(parent, &rect, None)?;
         }
+        let theme_container=browser.cast::<IOleWindow>().ok().and_then(|window|unsafe{window.GetWindow()}.ok())
+            .filter(|window|owned_browser_container(parent,*window))
+            .or_else(||{let created=browser_containers(parent).into_iter().filter(|window|!existing_containers.contains(window)).collect::<Vec<_>>();(created.len()==1).then(||created[0])});
 
         let events: IExplorerBrowserEvents = BrowserEvents {
+            drop_registration:drop_registration.clone(),
+            picker:picker.clone(),
             hwnd: parent.0 as isize,
             source,
             background:background.clone(),
+            navigation_pending:navigation_pending.clone(),
+            theme_generation:theme_generation.clone(),
             browser: Rc::downgrade(&browser),
             modern: modern.clone(),
             selection_revision: selection_revision.clone(),
@@ -223,6 +245,8 @@ impl ExplorerBrowserHost {
         let advise_cookie = unsafe { browser.Advise(&events)? };
 
         let host = Self {
+            drop_registration,
+            picker,
             panes,
             modern,
             selection_revision,
@@ -235,6 +259,10 @@ impl ExplorerBrowserHost {
             owner: parent.0 as isize,
             source,
             background,
+            navigation_pending,
+            theme_generation,
+            theme_container,
+            container_theme:Cell::new(None),
             streamed_results_used: Cell::new(false),
             results_active,
             results_location,
@@ -242,7 +270,7 @@ impl ExplorerBrowserHost {
             search_metrics:Cell::new(SearchMaterializationMetrics::default()),
             bounds:Cell::new(rect),
         };
-        Ok(host)
+        host.prepare_container_theme();Ok(host)
     }
 
     /// Navigates the hosted Shell view without invoking an external Explorer.
@@ -270,7 +298,11 @@ impl ExplorerBrowserHost {
         }
         self.selection_revision.set(self.selection_revision.get().wrapping_add(1));
         let item = unsafe { shell_item(location)? };
-        unsafe { self.browser.BrowseToObject(&item, 0) }
+        self.navigation_pending.set(true);
+        self.theme_generation.set(self.theme_generation.get().wrapping_add(1));
+        self.prepare_container_theme();
+        let result=unsafe { self.browser.BrowseToObject(&item, 0) };
+        if result.is_err(){self.navigation_pending.set(false);}result
     }
 
     /// True after this browser has hosted a streamed ResultsFolder. Windows
@@ -290,7 +322,12 @@ impl ExplorerBrowserHost {
                 return Err(Error::from_hresult(HRESULT(0x8000FFFFu32 as i32)));
             }
             let results = self.results_folder()?;
+            let generation=self.theme_generation.get();
             self.remove_all_search_results(&results)?;
+            if generation==self.theme_generation.get()&&self.results_active.get(){
+                self.navigation_pending.set(false);
+                if let Ok(view)=unsafe{self.current_view()}{view_background::install(&view,self.background.clone(),view_background::ThemePermit::new(self.navigation_pending.clone(),self.theme_generation.clone()));}
+            }
             if let Some(location) = self.results_location.borrow().clone() {
                 post_location(self.owner, self.source, WM_SHELL_NAVIGATED, location);
             }
@@ -298,8 +335,11 @@ impl ExplorerBrowserHost {
         }
         self.streamed_results_used.set(true);
         self.results_active.set(true);
+        self.navigation_pending.set(true);
+        self.theme_generation.set(self.theme_generation.get().wrapping_add(1));
+        self.prepare_container_theme();
         let result = unsafe { self.browser.FillFromObject(None::<&IUnknown>, EBF_NODROPTARGET) };
-        if result.is_err() { self.results_active.set(false); }
+        if result.is_err() { self.results_active.set(false);self.navigation_pending.set(false); }
         result
     }
 
@@ -545,18 +585,25 @@ impl ExplorerBrowserHost {
     /// Must be called exactly once on the STA/UI thread that created this host,
     /// before its parent window or COM apartment is destroyed.
     pub unsafe fn destroy(&self) {
+        let registration=self.drop_registration.borrow_mut().take();drop(registration);
         if self.destroyed.replace(true) { return; }
+        let trace=|stage:&str|if std::env::var_os("ZSDESK_RUNTIME_TRACE").is_some(){eprintln!("Shell host {} teardown: {stage}",self.source);};
         // Block reentrant service queries while this particular browser is
         // being torn down; another/new browser may still enable its own mode.
         self.modern.set(false);
+        trace("menu");
         #[cfg(all(target_arch = "x86_64", target_env = "msvc"))]
         unsafe { zs_menu_shutdown(); }
         let _keep_callbacks_alive = (&self.events, &self.site);
+        trace("Unadvise");
         let _ = unsafe { self.browser.Unadvise(self.advise_cookie) };
+        trace("SetSite");
         if let Ok(object_with_site) = self.browser.cast::<IObjectWithSite>() {
             let _ = unsafe { object_with_site.SetSite(None::<&IUnknown>) };
         }
+        trace("Destroy");
         let _ = unsafe { self.browser.Destroy() };
+        trace("complete");
     }
 }
 
@@ -625,13 +672,22 @@ mod search_path_tests {
 }
 
 impl ExplorerBrowserHost {
+    fn prepare_container_theme(&self){
+        let colors=self.background.get();let wanted=(colors.dark,colors.high_contrast);
+        if self.container_theme.get()==Some(wanted){return;}
+        if let Some(window)=self.theme_container.filter(|window|owned_browser_container(HWND(self.owner as*mut _),*window)){
+            // Establish the host's scheme before its DefView/ItemsView exists.
+            // Retheming an already-created ItemsView can lose its native
+            // selection visuals and does not reliably change its colors.
+            crate::theme::allow_dark_for_window(window,colors.dark);self.container_theme.set(Some(wanted));
+        }
+    }
     pub fn panes(&self) -> Panes { self.panes.get() }
-    /// Sets only the erasure surface; the native Shell remains responsible for
-    /// item colors, selection backgrounds, accessibility and control painting.
+    /// Applies the current palette when a native renderer is created or reused.
+    /// The Shell keeps ownership of row rendering, selection and accessibility.
     pub fn set_content_background(&self,dark:bool,colorref:u32){
-        let high_contrast=crate::theme::high_contrast();
-        self.background.set(view_background::Colors{background:colorref,dark:dark&&!high_contrast,high_contrast});
-        if let Ok(view)=unsafe{self.current_view()}{view_background::install(&view,self.background.clone());}
+        self.background.set(view_background::Colors{background:colorref,high_contrast:crate::theme::high_contrast(),dark});
+        if !self.navigation_pending.get(){if let Ok(view)=unsafe{self.current_view()}{view_background::install(&view,self.background.clone(),view_background::ThemePermit::new(self.navigation_pending.clone(),self.theme_generation.clone()));}}
     }
     /// Changes presentation without rebuilding the file view or losing its
     /// selection. The native XAML runtime is retained once per UI thread.
@@ -685,6 +741,7 @@ pub(crate) unsafe fn is_archive(item: &windows::Win32::UI::Shell::IShellItem) ->
 
 #[implement(IServiceProvider, ICommDlgBrowser2, IExplorerPaneVisibility)]
 struct BrowserSite {
+    picker:Rc<RefCell<Option<(String,bool,bool)>>>,
     hwnd: isize,
     source: usize,
     browser: Weak<IExplorerBrowser>,
@@ -709,10 +766,8 @@ impl IServiceProvider_Impl for BrowserSite_Impl {
         }
         unsafe { *ppvobject = std::ptr::null_mut(); }
         if unsafe { *guidservice } != ICommDlgBrowser::IID && unsafe { *guidservice } != IExplorerPaneVisibility::IID {
-            #[cfg(all(target_arch = "x86_64", target_env = "msvc"))]
-            if let Some(browser) = self.browser.upgrade().filter(|_|self.modern.get() && !super::menu::view_menu_is_delegated()) {
-                return unsafe { zs_menu_query(browser.as_raw(), guidservice, riid, ppvobject) }.ok();
-            }
+            // Context-menu rendering is owned by the public menu adapter.
+            // Do not instantiate a version-specific private Shell presenter.
             return Err(Error::from_hresult(E_NOINTERFACE));
         }
         let result = unsafe { self.QueryInterface(riid, ppvobject) };
@@ -740,6 +795,11 @@ impl IExplorerPaneVisibility_Impl for BrowserSite_Impl {
 impl ICommDlgBrowser_Impl for BrowserSite_Impl {
     fn OnDefaultCommand(&self, view:Ref<IShellView>)->Result<()> {
         let Some(view)=view.as_ref() else{return Err(Error::from_hresult(E_NOINTERFACE));};
+        if self.picker.borrow().is_some(){
+            if unsafe{selected_shell_item(view)}.is_ok_and(|item|!unsafe{is_folder(&item)}||unsafe{is_archive(&item)}){
+                let _=unsafe{PostMessageW(Some(HWND(self.hwnd as*mut _)),super::events::WM_SHELL_PICKER_ACCEPT,WPARAM(self.source),LPARAM(0))};return Ok(());
+            }
+        }
         // A zip/cab is a folder that is also a file. With the user's choice, the
         // Shell runs its default program instead of browsing it here.
         if OPEN_ARCHIVES_EXTERNALLY.load(std::sync::atomic::Ordering::Relaxed)
@@ -775,12 +835,22 @@ impl ICommDlgBrowser_Impl for BrowserSite_Impl {
     fn IncludeObject(&self,view:Ref<IShellView>,child:*const windows::Win32::UI::Shell::Common::ITEMIDLIST)->Result<()>{
         // This PC shows drives, devices and network locations, like Windows 11;
         // the user's folders are in Quick access.
-        if !self.this_pc.get()||child.is_null(){return Ok(());}
+        if child.is_null(){return Ok(());}
         use windows::Win32::UI::Shell::{IFolderView,IShellFolder,IShellItem,SHCreateItemWithParent};
-        let hidden=view.as_ref().and_then(|view|view.cast::<IFolderView>().ok())
+        let item=view.as_ref().and_then(|view|view.cast::<IFolderView>().ok())
             .and_then(|folder|unsafe{folder.GetFolder::<IShellFolder>()}.ok())
-            .and_then(|folder|unsafe{SHCreateItemWithParent::<_,IShellItem>(None,&folder,child)}.ok())
-            .is_some_and(|item|super::shell_item::is_this_pc_known_folder(&item));
+            .and_then(|folder|unsafe{SHCreateItemWithParent::<_,IShellItem>(None,&folder,child)}.ok());
+        if let (Some((pattern,_,folders_only)),Some(item))=(self.picker.borrow().as_ref(),item.as_ref()){
+            if !unsafe{is_folder(item)}||unsafe{is_archive(item)}{
+                if *folders_only{return Err(Error::from_hresult(S_FALSE));}
+                let shown=unsafe{super::shell_item::location_from_shell_item(item)}.and_then(|location|location.as_path().map(|p|p.to_owned()))
+                    .and_then(|path|path.file_name().map(|name|name.to_string_lossy().into_owned()))
+                    .is_some_and(|name|{let name:Vec<u16>=name.encode_utf16().chain(Some(0)).collect();let pattern:Vec<u16>=pattern.encode_utf16().chain(Some(0)).collect();
+                        unsafe{windows::Win32::UI::Shell::PathMatchSpecW(windows::core::PCWSTR(name.as_ptr()),windows::core::PCWSTR(pattern.as_ptr()))}.as_bool()});
+                if !shown{return Err(Error::from_hresult(S_FALSE));}
+            }
+        }
+        let hidden=self.this_pc.get()&&item.is_some_and(|item|super::shell_item::is_this_pc_known_folder(&item));
         if hidden{Err(Error::from_hresult(S_FALSE))}else{Ok(())}
     }
 }
@@ -791,15 +861,19 @@ impl ICommDlgBrowser2_Impl for BrowserSite_Impl {
     fn GetViewFlags(&self)->Result<u32>{
         // Keep folder navigation interception without file-dialog "Select".
         // Per-item filtering is requested only for the small This PC view.
-        let include=if self.this_pc.get(){0}else{windows::Win32::UI::Shell::CDB2GVF_NOINCLUDEITEM};
+        let include=if self.this_pc.get()||self.picker.borrow().is_some(){0}else{windows::Win32::UI::Shell::CDB2GVF_NOINCLUDEITEM};
         Ok(include | windows::Win32::UI::Shell::CDB2GVF_NOSELECTVERB)
     }
 }
 #[implement(IExplorerBrowserEvents)]
 struct BrowserEvents {
+    drop_registration:Rc<RefCell<Option<super::view_drop::Registration>>>,
+    picker:Rc<RefCell<Option<(String,bool,bool)>>>,
     hwnd: isize,
     source: usize,
     background: Rc<Cell<view_background::Colors>>,
+    navigation_pending: Rc<Cell<bool>>,
+    theme_generation: Rc<Cell<u64>>,
     browser: Weak<IExplorerBrowser>,
     modern: Rc<Cell<bool>>,
     selection_revision: Rc<Cell<u64>>,
@@ -814,6 +888,13 @@ impl IExplorerBrowserEvents_Impl for BrowserEvents_Impl {
         &self,
         pidl_folder: *const windows::Win32::UI::Shell::Common::ITEMIDLIST,
     ) -> Result<()> {
+        let previous=self.drop_registration.borrow_mut().take();drop(previous);
+        self.navigation_pending.set(true);
+        self.theme_generation.set(self.theme_generation.get().wrapping_add(1));
+        let generation=self.theme_generation.get();
+        if let Some(browser)=self.browser.upgrade(){if let Ok(view)=unsafe{browser.GetCurrentView::<IShellView>()}{
+            if generation==self.theme_generation.get()&&self.navigation_pending.get(){view_background::install_pending(&view,self.background.clone());}
+        }}
         // Decided before the new view is created and asks for its view flags.
         let this_pc=!pidl_folder.is_null()&&unsafe{windows::Win32::UI::Shell::SHCreateItemFromIDList::<windows::Win32::UI::Shell::IShellItem>(pidl_folder)}
             .is_ok_and(|folder|super::shell_item::is_this_pc_item(&folder));
@@ -823,8 +904,12 @@ impl IExplorerBrowserEvents_Impl for BrowserEvents_Impl {
 
     fn OnViewCreated(&self, shell_view: Ref<IShellView>) -> Result<()> {
         self.selection_revision.set(self.selection_revision.get().wrapping_add(1));
+        self.navigation_pending.set(true);
+        self.theme_generation.set(self.theme_generation.get().wrapping_add(1));
+        let generation=self.theme_generation.get();
         if let Some(view) = shell_view.as_ref() {
-            view_background::install(view,self.background.clone());
+            apply_picker_flags(view,&self.picker);
+            if generation==self.theme_generation.get()&&self.navigation_pending.get(){view_background::install_pending(view,self.background.clone());}
             unsafe { super::menu::attach_view_menu(view, self.modern.clone()); }
             if self.results_active.get() { configure_results_columns(view); }
             if let Ok(folder)=view.cast::<IFolderView2>(){let _=super::view_state::sync_column_header(&folder);}
@@ -837,11 +922,22 @@ impl IExplorerBrowserEvents_Impl for BrowserEvents_Impl {
         pidl_folder: *const windows::Win32::UI::Shell::Common::ITEMIDLIST,
     ) -> Result<()> {
         self.selection_revision.set(self.selection_revision.get().wrapping_add(1));
+        let generation=self.theme_generation.get();
         if let Some(browser) = self.browser.upgrade() {
             if let Ok(view) = unsafe { browser.GetCurrentView::<IShellView>() } {
                 if self.results_active.get(){configure_results_columns(&view);}
                 if let Ok(folder)=view.cast::<IFolderView2>(){let _=super::view_state::sync_column_header(&folder);}
-                if self.results_active.get(){view_background::install(&view,self.background.clone());}
+                let matches=completed_view_matches(&view,pidl_folder,self.results_active.get());
+                let still_current=unsafe{browser.GetCurrentView::<IShellView>()}.ok().and_then(|current|current.cast::<IUnknown>().ok())
+                    .zip(view.cast::<IUnknown>().ok()).is_some_and(|(current,expected)|current==expected);
+                if matches&&still_current&&generation==self.theme_generation.get(){
+                    self.navigation_pending.set(false);
+                    {
+                        let registration=super::view_drop::Registration::ensure(&view,self.results_active.get()).ok().flatten();
+                        if generation==self.theme_generation.get(){*self.drop_registration.borrow_mut()=registration;}
+                    }
+                    view_background::install(&view,self.background.clone(),view_background::ThemePermit::new(self.navigation_pending.clone(),self.theme_generation.clone()));
+                }
             }
         }
         let logical = if self.results_active.get() { self.results_location.borrow().clone() } else { None };
@@ -856,27 +952,66 @@ impl IExplorerBrowserEvents_Impl for BrowserEvents_Impl {
         _pidl_folder: *const windows::Win32::UI::Shell::Common::ITEMIDLIST,
     ) -> Result<()> {
         self.results_active.set(false);
+        self.navigation_pending.set(false);
+        self.theme_generation.set(self.theme_generation.get().wrapping_add(1));
         let _ = unsafe { PostMessageW(Some(HWND(self.hwnd as *mut _)), WM_SHELL_NAVIGATION_FAILED, WPARAM(self.source), LPARAM(0)) };
         Ok(())
     }
 }
 
-fn configure_results_columns(view: &IShellView) {
+fn completed_view_matches(view:&IShellView,pidl:*const windows::Win32::UI::Shell::Common::ITEMIDLIST,results:bool)->bool{
+    let Ok(folder)=view.cast::<IFolderView2>()else{return false;};
+    if results{return unsafe{folder.GetFolder::<IResultsFolder>()}.is_ok();}
+    if pidl.is_null(){return false;}
+    let expected=unsafe{windows::Win32::UI::Shell::SHCreateItemFromIDList::<windows::Win32::UI::Shell::IShellItem>(pidl)};
+    let actual=unsafe{folder.GetFolder::<windows::Win32::UI::Shell::IShellItem>()};
+    match (actual,expected){(Ok(actual),Ok(expected))=>unsafe{actual.Compare(&expected,windows::Win32::UI::Shell::SICHINT_CANONICAL.0 as u32)}.is_ok_and(|order|order==0),_=>false}
+}
+
+fn apply_picker_flags(view:&IShellView,picker:&RefCell<Option<(String,bool,bool)>>){
+    if let (Some((_,multiple,_)),Ok(folder))=(picker.borrow().as_ref(),view.cast::<IFolderView2>()){
+        let flag=windows::Win32::UI::Shell::FWF_SINGLESEL.0 as u32;let _=unsafe{folder.SetCurrentFolderFlags(flag,if *multiple{0}else{flag})};
+    }
+}
+
+fn configure_results_columns(view: &IShellView)->bool {
     // Presentation capability varies by Windows release; none of these
     // preferences may prevent the results folder from being usable.
-    let Ok(folder) = view.cast::<IFolderView2>() else { return };
-    if unsafe { folder.GetFolder::<IResultsFolder>() }.is_err() { return; }
-    let _ = unsafe { folder.SetViewModeAndIconSize(FVM_DETAILS, 16) };
+    let Ok(folder) = view.cast::<IFolderView2>() else { return false };
+    if unsafe { folder.GetFolder::<IResultsFolder>() }.is_err() { return false; }
+    let mut changed=false;let mut mode=windows::Win32::UI::Shell::FOLDERVIEWMODE(0);let mut icon_size=0;
+    if unsafe{folder.GetViewModeAndIconSize(&mut mode,&mut icon_size)}.is_err()||mode!=FVM_DETAILS||icon_size!=16{
+        let _=unsafe{folder.SetViewModeAndIconSize(FVM_DETAILS,16)};changed=true;
+    }
     let _=super::view_state::sync_column_header(&folder);
-    let Ok(columns) = view.cast::<IColumnManager>() else { return };
+    let Ok(columns) = view.cast::<IColumnManager>() else { return changed };
     let mut keys = Vec::new();
     for name in ["System.ItemNameDisplay", "System.ItemFolderPathDisplay", "System.DateModified", "System.Size"] {
         let text: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
         let mut key = PROPERTYKEY::default();
-        if unsafe { windows::Win32::UI::Shell::PropertiesSystem::PSGetPropertyKeyFromName(windows::core::PCWSTR(text.as_ptr()), &mut key) }.is_err() { return; }
+        if unsafe { windows::Win32::UI::Shell::PropertiesSystem::PSGetPropertyKeyFromName(windows::core::PCWSTR(text.as_ptr()), &mut key) }.is_err() { return changed; }
         keys.push(key);
     }
-    let _ = unsafe { columns.SetColumns(&keys) };
+    let mut current=vec![PROPERTYKEY::default();keys.len()];
+    let same=unsafe{columns.GetColumnCount(windows::Win32::UI::Shell::CM_ENUM_VISIBLE)}.is_ok_and(|count|count as usize==keys.len())
+        &&unsafe{columns.GetColumns(windows::Win32::UI::Shell::CM_ENUM_VISIBLE,&mut current)}.is_ok()
+        &&current.iter().zip(&keys).all(|(a,b)|a.fmtid==b.fmtid&&a.pid==b.pid);
+    if !same{let _=unsafe{columns.SetColumns(&keys)};changed=true;}changed
+}
+
+fn owned_browser_container(parent:HWND,window:HWND)->bool{
+    use windows::Win32::{System::Threading::GetCurrentThreadId,UI::WindowsAndMessaging::{GetClassNameW,GetWindowThreadProcessId,IsChild,IsWindow}};
+    if window.0.is_null()||window==parent||!unsafe{IsWindow(Some(window))}.as_bool()||!unsafe{IsChild(parent,window)}.as_bool()
+        ||unsafe{GetWindowThreadProcessId(window,None)}!=unsafe{GetCurrentThreadId()}{return false;}
+    let mut name=[0u16;96];let length=unsafe{GetClassNameW(window,&mut name)}.max(0)as usize;
+    String::from_utf16_lossy(&name[..length])=="ExplorerBrowserControl"
+}
+fn browser_containers(parent:HWND)->Vec<HWND>{
+    use windows::{core::BOOL,Win32::UI::WindowsAndMessaging::EnumChildWindows};
+    unsafe extern "system" fn visit(window:HWND,lp:LPARAM)->BOOL{
+        let (parent,windows)=unsafe{&mut*(lp.0 as*mut (HWND,Vec<HWND>))};if owned_browser_container(*parent,window){windows.push(window);}true.into()
+    }
+    let mut state=(parent,Vec::new());let _=unsafe{EnumChildWindows(Some(parent),Some(visit),LPARAM((&mut state as*mut (HWND,Vec<HWND>))as isize))};state.1
 }
 
 fn post_location(hwnd: isize, source: usize, message: u32, location: ShellLocation) {

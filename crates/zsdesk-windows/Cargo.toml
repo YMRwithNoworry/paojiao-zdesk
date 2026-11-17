@@ -11,6 +11,7 @@ zsdesk-core = { path = "../zsdesk-core" }
 zsdesk-platform = { path = "../zsdesk-platform" }
 serde.workspace = true
 serde_json.workspace = true
+roxmltree = "0.20.0"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
@@ -24,6 +25,10 @@ windows-sys = { version = "0.59", features = [
   "Win32_Graphics_Gdi",
 ] }
 windows = { version = "0.62.2", features = [
+  "ApplicationModel",
+  "Management_Deployment",
+  "Storage_Search",
+  "Win32_System_WinRT",
   "Win32_Foundation",
   "Win32_Globalization",
   "Win32_Graphics_Direct2D",
@@ -38,6 +43,8 @@ windows = { version = "0.62.2", features = [
   "Win32_System_Com",
   "Win32_System_Com_StructuredStorage",
   "Win32_System_DataExchange",
+  "Win32_System_Environment",
+  "Win32_System_JobObjects",
   "Win32_System_LibraryLoader",
   "Win32_System_Memory",
   "Win32_System_Ole",

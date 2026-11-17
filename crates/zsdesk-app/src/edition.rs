@@ -30,13 +30,13 @@ pub const fn key() -> &'static str {
     }
 }
 
-pub const fn name() -> &'static str {
-    if DESKTOP_ONLY{return "桌面盒子独立版";}
-    if THEMED { return "主题版"; }
-    match (NETWORK, DESKTOP) {
+pub fn name() -> &'static str {
+    zsdesk_core::i18n::text(if DESKTOP_ONLY{"桌面盒子独立版"}
+    else if THEMED { "主题版" }
+    else {match (NETWORK, DESKTOP) {
         (true, true) => "全量版",
         (true, false) => "网络版",
         (false, true) => "桌面版",
         (false, false) => "标准版",
-    }
+    }})
 }

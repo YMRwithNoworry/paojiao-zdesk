@@ -22,18 +22,22 @@ mod wps_preview;
 mod preview_handlers;
 mod hover_preview;
 mod paint;
+pub(crate) mod picker;
 mod global_search;
 mod search_panel;
 mod integrated_search;
 mod startup_settings;
 mod context_menu;
+mod context_manager;
 #[cfg(test)]mod context_menu_regression;
+#[cfg(test)]mod session_regression;
 mod listary;
 mod mouse_navigation;
 mod dual_pane;
 mod pane_input;
 mod mouse_gestures;
 mod wheel_input;
+mod side_tabs;
 mod folder_sizes;
 mod view_memory;
 mod shell_registration;
@@ -95,8 +99,10 @@ const TIMER_MESSAGE: usize = 2;
 const TIMER_SEARCH: usize = 3;
 const TIMER_FAST_SEARCH:usize=4;
 const TIMER_PLACEMENT:usize=9;
+const TIMER_FOLDER_SIZES:usize=10;
 const WM_FAST_SEARCH:u32=WM_APP+43;
 const WM_DIAGNOSTIC:u32=WM_APP+44;
+pub(super) const WM_TAB_EMPHASIS_CHANGED:u32=WM_APP+182;
 type Slot = RefCell<Option<WindowState>>;
 #[derive(Clone,Copy,PartialEq,Eq)]
 enum BrowserRole{Fresh,Ordinary,Results}
@@ -140,17 +146,35 @@ fn release_window_properties(hwnd:HWND){
     for property in [windows::core::w!("ZSDesk.NativeCaption"),windows::core::w!("ZSDesk.CaptionVisual"),windows::core::w!("ZSDesk.CaptionPress")]{let _=unsafe{RemovePropW(hwnd,property)};}
 }
 
+pub(crate) fn shortcut_help_text()->&'static str{
+    let text=zsdesk_core::i18n::text(input::SHORTCUTS);
+    let desktop=zsdesk_core::i18n::text("桌面格子");
+    if crate::edition::DESKTOP_ONLY{text.find(desktop).map(|at|&text[at..]).unwrap_or(text)}
+    else if crate::edition::DESKTOP{text}else{text.split(desktop).next().unwrap_or(text).trim_end()}
+}
+
+#[cfg(test)]pub(crate) fn verify_builtin_preview_without_handlers(owner:HWND,path:&std::path::Path)->Result<()>{
+    let mut preview=quick_preview::QuickPreview::open_hidden_fallback(owner,path)?;
+    let state=preview.snapshot();anyhow::ensure!(state.kind=="text"&&state.notice.is_empty(),"built-in preview required an external handler: {state:?}");
+    let child=state.text_child.context("built-in text child")?;let mut text=[0u16;128];let count=unsafe{GetWindowTextW(child,&mut text)};
+    anyhow::ensure!(count>0,"built-in preview contained no text");preview.close();anyhow::ensure!(!preview.is_open(),"preview remained open");Ok(())
+}
+
 pub fn run(session: ExplorerSession, config_path: PathBuf, selection: Option<std::ffi::OsString>, modern: bool, secondary_window: bool,focus_search:Option<bool>) -> Result<()> {
     crate::runtime::trace("window-ole-init");
     unsafe { OleInitialize(None).context("OleInitialize failed")?; }
     let result = unsafe { run_inner(session, config_path, selection, modern, secondary_window,focus_search) };
     crate::runtime::trace("window-loop-return");
+    let clipboard=zsdesk_windows::shell::file_transfer::persist_thread_clipboard();
     unsafe { OleUninitialize(); }
     crate::runtime::trace("window-ole-uninit-return");
-    result
+    result.and(clipboard.map(|_|()).map_err(Into::into))
 }
 
 unsafe fn run_inner(session: ExplorerSession, config_path: PathBuf, selection: Option<std::ffi::OsString>, modern: bool, secondary_window: bool,focus_search:Option<bool>) -> Result<()> {
+    unsafe{run_window(session,config_path,selection,modern,secondary_window,focus_search,None)}
+}
+unsafe fn run_window(session: ExplorerSession, config_path: PathBuf, selection: Option<std::ffi::OsString>, modern: bool, secondary_window: bool,focus_search:Option<bool>,picker:Option<picker::State>) -> Result<()> {
     unsafe { InitCommonControlsEx(&INITCOMMONCONTROLSEX { dwSize: size_of::<INITCOMMONCONTROLSEX>() as u32, dwICC: ICC_BAR_CLASSES | ICC_STANDARD_CLASSES }) }.ok()?;
     let instance = HINSTANCE(unsafe { GetModuleHandleW(None)? }.0);
     let class = wide("ZSDesk.Native.Explorer");
@@ -166,6 +190,7 @@ unsafe fn run_inner(session: ExplorerSession, config_path: PathBuf, selection: O
     let relaunch = relaunch_command(&config_path);
     // The slot outlives the window and every callback that can reach it.
     let mut state = WindowState::new(session, config_path, selection, modern);
+    state.picker=picker;
     state.secondary_window = secondary_window;
     let slot = Box::new(RefCell::new(Some(state)));
     let (x, y, w, h) = initial_rect(placement);
@@ -175,19 +200,23 @@ unsafe fn run_inner(session: ExplorerSession, config_path: PathBuf, selection: O
     let _ = unsafe { SetWindowPos(hwnd, None, 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE) };
     let created = slot.borrow_mut().as_mut().map(|s| unsafe { s.create(hwnd) });
     if let Some(Err(error)) = created {
-        let text = wide(&format!("无法创建文件管理窗口：{error:#}"));
+        let text = wide(&zsdesk_core::tr_format!("无法创建文件管理窗口：{error:#}", error=error));
         unsafe { MessageBoxW(Some(hwnd), pcwstr(&text), PCWSTR(wide("ZSDesk").as_ptr()), MB_OK | MB_ICONERROR); }
         let _ = unsafe { DestroyWindow(hwnd) };
         return Err(error);
     }
     flush_deferred(hwnd,true);
     // Before the first show, so the taskbar button is created in the pin's group.
+    if !cfg!(test){if let Ok(exe)=std::env::current_exe(){let _=zsdesk_windows::taskbar::repair_taskbar_shortcuts(&exe,crate::edition::application_id());}}
     if let Some((command,icon))=&relaunch{
         let _=zsdesk_windows::taskbar::set_identity(hwnd,&zsdesk_windows::taskbar::Identity{app_id:crate::edition::application_id(),
             relaunch_command:command,display_name:"ZSDesk",icon});
     }
     let accelerators = unsafe { CreateAcceleratorTableW(&accelerator_table())? };
     let _ = unsafe { ShowWindow(hwnd, if placement.is_some_and(|p| p.maximized) { SW_SHOWMAXIMIZED } else { SW_SHOW }) };
+    if let Some(picker)=slot.borrow().as_ref().and_then(|state|state.picker.as_ref()){
+        let _=picker.options.events.send(picker::Event::Ready{token:picker.options.token,window:hwnd.0 as isize});
+    }
     if let Some(settings)=focus_search{post(hwnd,WM_ACTION,if settings{ACTION_SEARCH_SETTINGS}else{Command::FocusSearch.id()as usize},0);}
     let mut msg = MSG::default();
     let mut quick_preview:Option<preview_process::PreviewProcess>=None;
@@ -196,12 +225,20 @@ unsafe fn run_inner(session: ExplorerSession, config_path: PathBuf, selection: O
     let mut hover_preview=hover_preview::HoverPreview::new(hwnd);
     let mut middle_click=hover_preview::MiddleClick::new(hwnd);
     let mut gestures=mouse_gestures::MouseGestures::default();
+    let mut blank_clicks=pane_input::BlankClicks::default();
+    let mut last_space_preview=slot.borrow().as_ref().is_none_or(|state|state.session.ui.space_preview);
     loop {
         let result = unsafe { GetMessageW(&mut msg, None, 0, 0) }.0;
         if result <= 0 { break; }
+        if crate::utility_panel::dispatch_if_owned(&msg){continue;}
+        if matches!(msg.message,WM_KEYDOWN|WM_SYSKEYDOWN|WM_LBUTTONDOWN|WM_LBUTTONDBLCLK|WM_RBUTTONDOWN|WM_MBUTTONDOWN|WM_XBUTTONDOWN|WM_MOUSEWHEEL|WM_MOUSEHWHEEL|WM_POINTERDOWN){
+            zsdesk_windows::shell::file_transfer::note_user_input(msg.hwnd);
+        }
         if diagnostics::dispatch(&msg){continue;}
+        if picker::pre_translate(&slot,&msg){continue;}
         if address_input::pre_translate(&msg){continue;}
         dual_pane::activate_for_message(&slot,&msg);
+        if pane_input::blank_double_click(&slot,&msg,&mut blank_clicks){continue;}
         if gestures.process(hwnd,&msg,&slot) { hover_preview.dismiss(&mut quick_preview);continue; }
         if mouse_navigation::pre_translate(hwnd,&msg){continue;}
         if msg.hwnd==hwnd && msg.message==WM_TIMER && msg.wParam.0==preview_process::TIMER {
@@ -227,15 +264,20 @@ unsafe fn run_inner(session: ExplorerSession, config_path: PathBuf, selection: O
         }
         let plain_key=msg.message==WM_KEYDOWN && ![VK_CONTROL,VK_SHIFT,VK_MENU].iter().any(|k|unsafe{GetKeyState(k.0 as i32)}<0);
         let enabled=slot.try_borrow().ok().and_then(|s|s.as_ref().map(|s|s.session.ui.space_preview)).unwrap_or(false);
+        if enabled!=last_space_preview{
+            hover_preview.dismiss(&mut quick_preview);quick_preview=None;quicklook::close_requested();last_space_preview=enabled;
+        }
+        if !enabled&&plain_key&&msg.wParam.0==VK_SPACE.0 as usize&&quicklook::file_view_input(&msg,&slot){hover_preview.dismiss(&mut quick_preview);}
         let preview_open=quick_preview.as_ref().is_some_and(|p|p.is_open());
         if !enabled&&!preview_open&&quicklook::key(&msg,&slot){continue;}
-        if (enabled||preview_open)&&plain_key && !text_input_window(msg.hwnd) && (msg.wParam.0==VK_SPACE.0 as usize || (msg.wParam.0==VK_ESCAPE.0 as usize && preview_open)){
+        if plain_key && !text_input_window(msg.hwnd)&&!text_input_window(unsafe{GetFocus()}) &&
+            ((msg.wParam.0==VK_SPACE.0 as usize&&quicklook::file_view_input(&msg,&slot)) || (msg.wParam.0==VK_ESCAPE.0 as usize && preview_open)){
             if msg.lParam.0 as usize & (1usize<<30)!=0 { continue; }
             if quick_preview.as_ref().is_some_and(|p|p.is_open()){hover_preview.dismiss(&mut quick_preview);quick_preview=None;continue;}
-            if enabled && msg.wParam.0==VK_SPACE.0 as usize {
+            if msg.wParam.0==VK_SPACE.0 as usize {
                 let request=preview_process::selected_preview_request(&slot);
                 if let Some((path,provider,dark))=request {
-                    match preview_process::PreviewProcess::open_with_options(hwnd,&path,provider,dark,false){Ok(preview)=>quick_preview=Some(preview),Err(error)=>{if let Ok(mut s)=slot.try_borrow_mut(){if let Some(s)=s.as_mut(){s.show_message(format!("无法预览：{error}"));}}}}
+                    match preview_process::PreviewProcess::open_with_options(hwnd,&path,provider,dark,false){Ok(preview)=>quick_preview=Some(preview),Err(error)=>{if let Ok(mut s)=slot.try_borrow_mut(){if let Some(s)=s.as_mut(){s.show_message(zsdesk_core::tr_format!("无法预览：{error}", error=error));}}}}
                     continue;
                 }
             }
@@ -248,6 +290,8 @@ unsafe fn run_inner(session: ExplorerSession, config_path: PathBuf, selection: O
             shift: unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0, alt: unsafe { GetKeyState(VK_MENU.0 as i32) } < 0 };
         if msg.message == WM_KEYDOWN || msg.message == WM_SYSKEYDOWN {
             if let Some(action) = keyboard::resolve(msg.wParam.0 as u16, modifiers, true, editing) {
+                let loading=slot.try_borrow().ok().is_some_and(|s|s.as_ref().is_some_and(|state|state.file_input_loading(msg.hwnd)));
+                if loading{if let Ok(mut slot)=slot.try_borrow_mut(){if let Some(state)=slot.as_mut(){state.show_message(zsdesk_core::i18n::text("文件夹正在加载，请完成后再操作").into());}}continue;}
                 let view = slot.try_borrow().ok().and_then(|s| s.as_ref().and_then(|s| s.keyboard_view(&msg, true)));
                 if let Some(view) = view {
                     // Shell verbs can enter COM/modal loops: release the state borrow first.
@@ -276,9 +320,10 @@ unsafe fn run_inner(session: ExplorerSession, config_path: PathBuf, selection: O
             preview_process::sync_pane(hwnd,&slot,&mut pane_preview);
         }
         if msg.message==WM_SHELL_SELECTION_CHANGED {
+            if !enabled{quicklook::selection_changed(&msg,&slot);}
             if let Some(preview)=quick_preview.as_mut().filter(|p|p.is_open() && !p.is_hover()){
                 let path=preview_process::selected_preview_request(&slot).map(|(path,_,_)|path);
-                if let Some(path)=path{let _=preview.update(&path);}
+                let _=preview.update(path.as_deref().unwrap_or(std::path::Path::new("")));
             }
         }
     }
@@ -342,6 +387,7 @@ pub(super) struct BookmarkDrag { pub id:u64,pub start:POINT,pub point:POINT,pub 
 pub(super) struct DropZones { pub bookmarks: LayoutRect, pub strip: LayoutRect, pub tabs:LayoutRect, pub identity:Option<pane_input::Identity> }
 
 struct WindowState {
+    picker:Option<picker::State>,
     search_panel:search_panel::SearchPanel,
     hwnd: HWND,
     dpi: u32,
@@ -354,6 +400,7 @@ struct WindowState {
     shell_registration_warning: bool,
     modern: bool,
     browser: Option<ExplorerBrowserHost>,
+    destroyed:bool,
     browser_source: usize,
     folder_sizes: folder_sizes::FolderSizes,
     view_hwnd: HWND,
@@ -390,6 +437,11 @@ struct WindowState {
     tab_drag: Option<TabDrag>,
     bookmark_drag:Option<BookmarkDrag>,
     splitter_drag: Option<(i32, i32)>,
+    bookmark_resize: Option<(i32,i32)>,
+    side_tab_resize:Option<(i32,i32)>,
+    side_tab_scroll_drag:Option<(i32,usize)>,
+    side_tab_first:Option<usize>,
+    side_tab_wheel:i32,
     icons: HashMap<String, paint::IconEntry>,
     view_status: ViewStatus,
     view_mode: (i32, i32),
@@ -411,6 +463,7 @@ struct WindowState {
     search_scope: Option<ShellLocation>,
     search_result: Option<ShellLocation>,
     browser_role:BrowserRole,
+    native_theme_dark:Option<bool>,
     fast_search:Option<crate::fast_search::FastSearch>,
     fast_generation:u64,
     fast_submitted:Option<integrated_search::SubmittedSearch>,
@@ -424,6 +477,7 @@ struct WindowState {
     fullscreen_restore: Option<window_actions::FullscreenRestore>,
     wheel_remainder: i32,
     secondary_window: bool,
+    session_ownership: Option<crate::instance::Instance>,
     preview_rect: Option<LayoutRect>,
 }
 
@@ -431,25 +485,29 @@ impl WindowState {
     fn new(mut session: ExplorerSession, config_path: PathBuf, launch_selection: Option<std::ffi::OsString>, modern: bool) -> Self {
         if !modern{session.ui.context_menu.mode=zsdesk_core::model::explorer::ContextMenuMode::Original;}
         let modern=crate::context_preferences::modern(&session.ui.context_menu);
+        crate::context_preferences::register(&config_path,&session.ui.context_menu);
         Self {
+            picker:None,
             search_panel:search_panel::SearchPanel::default(),
             hwnd: HWND::default(), dpi: 96, search_saved_preferences:session.ui.search_preferences(),bookmarks_saved:session.bookmarks.clone(),session_ending:false,session, config_path, modern, browser: None, tree: None,
-            browser_source:0,folder_sizes:Default::default(),view_hwnd:HWND::default(),navigation_epoch:0,
+            browser_source:0,destroyed:false,folder_sizes:Default::default(),view_hwnd:HWND::default(),navigation_epoch:0,
             other_pane:Default::default(),active_pane_right:false,background_pane:false,routing_pane_message:false,pane_splitter_drag:None,
             address_edit: HWND::default(), search_edit: HWND::default(), rename_hwnd: HWND::default(), rename_id: None,
             tooltip: HWND::default(), tooltip_text: vec![0], font: HFONT::default(), gfx: None, surface: None,
             palette: Palette::light(), dark: false, mica: false, active: true, layout: ChromeLayout::default(),
             crumbs: Vec::new(), crumb_slots: Vec::new(), crumbs_for: None, address_editing: false, open_chevron: None,
-            hover: Hit::None, hover_crumb: None, pressed: None, tracking_mouse: false, tab_drag: None,bookmark_drag:None, splitter_drag: None,
+            hover: Hit::None, hover_crumb: None, pressed: None, tracking_mouse: false, tab_drag: None,bookmark_drag:None, splitter_drag: None,bookmark_resize:None,
+            side_tab_resize:None,side_tab_scroll_drag:None,side_tab_first:None,side_tab_wheel:0,
             icons: HashMap::new(), view_status: ViewStatus::default(), view_mode: (0, 0), bookmark_widths: Vec::new(),bookmark_order:Vec::new(),
             drop_registration: None, drop_zones: Rc::new(Cell::new(DropZones::default())), last_focus: HWND::default(),
             pending: None, queued: None, shown_tab: None, closed_tabs: Vec::new(), status: String::new(),
             launch_selection, launch_selections:Vec::new(), deferred_selection:None, open_requests: Default::default(), search_scope: None, search_result: None,
-            browser_role:BrowserRole::Fresh,fast_search:None,fast_generation:0,fast_submitted:None,fast_found:0,search_progress:None,fast_events:Default::default(),
+            browser_role:BrowserRole::Fresh,native_theme_dark:None,fast_search:None,fast_generation:0,fast_submitted:None,fast_found:0,search_progress:None,fast_events:Default::default(),
             fast_reset_pending:false,fast_clearing:None,fast_restore:None,
             search_settings_job:None,
             fullscreen_restore:None,wheel_remainder:0,
             secondary_window:false,
+            session_ownership:None,
             preview_rect:None,
             shell_registry:None,
             shell_registration_warning:false,
@@ -465,18 +523,19 @@ impl WindowState {
         context_menu::install();
         zsdesk_windows::shell::set_folder_open_capture(Some(pane_input::capture_folder_open));
         let key = crate::instance::property(&self.config_path);
-        unsafe { SetPropW(hwnd, PCWSTR(key.as_ptr()), Some(windows::Win32::Foundation::HANDLE(1usize as *mut _)))?; }
+        if self.picker.is_none(){unsafe { SetPropW(hwnd, PCWSTR(key.as_ptr()), Some(windows::Win32::Foundation::HANDLE(1usize as *mut _)))?; }}
         let route_key = crate::routing_control::profile_property(&self.config_path);
-        unsafe { SetPropW(hwnd, PCWSTR(route_key.as_ptr()), Some(windows::Win32::Foundation::HANDLE(1usize as *mut _)))?; }
+        if self.picker.is_none(){unsafe { SetPropW(hwnd, PCWSTR(route_key.as_ptr()), Some(windows::Win32::Foundation::HANDLE(1usize as *mut _)))?; }}
         unsafe { SetPropW(hwnd, windows::core::w!("ZSDesk.Activate.v1"), Some(windows::Win32::Foundation::HANDLE(1usize as *mut _)))?; }
         let preferred_show=if self.session.ui.window.is_some_and(|p|p.maximized){SW_SHOWMAXIMIZED.0}else{SW_SHOWNORMAL.0};
         unsafe{SetPropW(hwnd,windows::core::w!("ZSDesk.PreferredShow"),Some(windows::Win32::Foundation::HANDLE(preferred_show as usize as *mut _)))?;}
         let (family, _) = zsdesk_windows::gfx::system_ui_font(Some(hwnd));
-        self.gfx = Some(Gfx::new(&family).context("Direct2D 初始化失败")?);
+        self.gfx = Some(Gfx::new(&family).context(zsdesk_core::i18n::text("Direct2D 初始化失败"))?);
         // Menus are drawn, not created by Win32: prepare them before first use.
         zsdesk_windows::flyout::prepare();
         self.address_edit = unsafe { child(hwnd, "EDIT", "", ID_ADDRESS, ES_AUTOHSCROLL as u32, false)? };
         self.search_edit = unsafe { child(hwnd, "EDIT", "", ID_SEARCH, ES_AUTOHSCROLL as u32, true)? };
+        self.initialize_picker()?;
         for (edit, id) in [(self.address_edit, ID_ADDRESS), (self.search_edit, ID_SEARCH)] {
             unsafe { SetWindowSubclass(edit, Some(edit_proc), id, hwnd.0 as usize) }.ok()?;
         }
@@ -497,14 +556,15 @@ impl WindowState {
         unsafe { self.navigate_current(); }
         if self.session.ui.dual_pane { self.ensure_dual_pane(); }
         #[cfg(not(test))]
-        {
+        if self.picker.is_none(){
             self.check_integration();
             if let Err(error) = crate::routing_control::refresh_owned_target(&self.config_path, hwnd) {
-                self.show_message(format!("文件位置绑定检查失败：{error}"));
+                self.show_message(zsdesk_core::tr_format!("文件位置绑定检查失败：{error}", error=error));
             }
             if let Err(error) = crate::quick_search::start_if_enabled(&self.config_path) {
-                self.show_message(format!("后台搜索启动失败：{error:#}"));
+                self.show_message(zsdesk_core::tr_format!("后台搜索启动失败：{error:#}", error=error));
             }
+            crate::update_check::start_daily(&self.config_path,hwnd);
         }
         self.update_shell_registry();
         Ok(())
@@ -519,7 +579,7 @@ impl WindowState {
         if level==Integration::Default {
             if let Ok(exe)=std::env::current_exe(){
                 if let Err(error)=integration::upgrade_default(&exe,&self.config_path.with_file_name("takeover-backup.json")) {
-                    self.show_message(format!("系统打开接管尚未更新：{error}"));
+                    self.show_message(zsdesk_core::tr_format!("系统打开接管尚未更新：{error}", error=error));
                 }
             }
         }
@@ -528,7 +588,7 @@ impl WindowState {
         if std::path::Path::new(&registered).exists() { return; }
         if let Ok(exe) = std::env::current_exe() {
             let backup = self.config_path.with_file_name("takeover-backup.json");
-            if integration::apply(level, &exe, &backup).is_err() { self.show_message("系统集成需要修复：请在 ≡ → 系统集成 中重新选择".into()); }
+            if integration::apply(level, &exe, &backup).is_err() { self.show_message(zsdesk_core::i18n::text("系统集成需要修复：请在 ≡ → 系统集成 中重新选择").into()); }
         }
     }
 
@@ -543,6 +603,10 @@ impl WindowState {
     /// Caption buttons (minimize, maximize, close) in client coordinates.
     pub(super) fn caption_buttons(&self) -> Option<[LayoutRect; 3]> {
         caption_rects(self.hwnd)
+    }
+
+    pub(super) fn chrome_hit(&self,x:i32,y:i32)->Hit{
+        self.layout.hit_with_top_edge(x,y,screen_edge_window(self.hwnd))
     }
 
     /// Width covered by the DWM caption buttons, in client pixels.
@@ -562,17 +626,21 @@ impl WindowState {
 
     fn relayout(&mut self) {
         let (width, height) = self.client_size();
+        let height=(height-self.picker_height()).max(0);
         let input = ChromeInput {
             search_panel_open:self.search_panel.open,
             tab_placement:self.session.ui.tab_placement,
+            side_tabs_width:self.session.ui.side_tabs_width,side_tabs_compact:self.session.ui.side_tabs_compact,
             width, height, dpi: self.dpi, caption_width: self.caption_width(),
             caption_button: self.caption_buttons().map(|r|r[0]), command_bar: &self.session.ui.command_bar,
             tab_count: self.session.tabs.len(), active_tab: self.session.active_tab,
+            show_tab_list:self.session.ui.tab_count_button_visible(),
             show_tree: self.session.ui.show_tree && self.tree.is_some() && (!self.session.ui.show_preview || width>=self.s(if self.session.ui.tab_placement==zsdesk_core::model::explorer::TabPlacement::Top{900}else{1110})), tree_width: self.s(self.session.ui.tree_width),
-            show_bookmarks: self.session.ui.show_bookmarks, status_bar: true, bookmark_widths: &self.bookmark_widths,
+            show_bookmarks: self.session.ui.show_bookmarks,bookmarks_on_right:self.session.ui.bookmarks_on_right,bookmarks_width:self.s(self.session.ui.bookmarks_width), status_bar: true, bookmark_widths: &self.bookmark_widths,
         };
         let mut layout=ChromeLayout::new(&input);
         layout.retain_tab_viewport(&self.layout,self.session.tabs.len(),self.session.active_tab);
+        if layout.vertical_tabs{if let Some(first)=self.side_tab_first{layout.set_tab_viewport(self.session.tabs.len(),first);}}else{self.side_tab_first=None;}
         self.layout=layout;
         self.preview_rect=None;
         if self.session.ui.show_preview && self.layout.browser.width>self.s(240){
@@ -590,6 +658,7 @@ impl WindowState {
     }
 
     fn position_children(&mut self) {
+        self.position_picker();
         if let Some(browser) = &self.browser { unsafe { browser.resize(win_rect(self.layout.browser)); } }
         self.position_other_pane();
         if let Some(tree) = &self.tree {
@@ -647,6 +716,7 @@ impl WindowState {
             if !hwnd.0.is_null() { unsafe { SendMessageW(hwnd, WM_SETFONT, Some(WPARAM(self.font.0 as usize)), Some(LPARAM(1))); } }
         }
         if !old.0.is_null() { let _ = unsafe { DeleteObject(old.into()) }; }
+        self.picker_fonts();
     }
 
     /// Follows the system app mode for the chrome, DWM frame and Shell controls.
@@ -657,6 +727,7 @@ impl WindowState {
         zsdesk_windows::flyout::refresh_system();
         self.palette = Palette::for_mode(if self.dark { Mode::Dark } else { Mode::Light });
         if let Some(accent) = theme::system_accent(self.dark) { self.palette = self.palette.with_accent(accent); }
+        theme::allow_dark_for_window(self.hwnd,self.dark);
         theme::set_dark_frame(self.hwnd, self.dark);
         theme::round_corners(self.hwnd, false);
         theme::round_corners(self.tooltip, true);
@@ -667,15 +738,21 @@ impl WindowState {
         }
         let (normal, focused, text) = (colorref(self.palette.input), colorref(self.palette.input_focused), colorref(self.palette.text));
         let _=replace_edit_colors(self.hwnd,normal,focused,text);
-        let cue = wide(&format!("搜索 {}", self.current_location().title()));
+        let cue = wide(&zsdesk_core::tr_format!("搜索 {}", self.current_location().title()));
         unsafe { SendMessageW(self.search_edit, EM_SETCUEBANNER, Some(WPARAM(1)), Some(LPARAM(cue.as_ptr() as isize))); }
-        for edit in [self.address_edit, self.search_edit] { theme::theme_control(edit, self.dark); }
+        // Chrome owns the edit surface and border. An Explorer-themed native
+        // edit paints another theme-dependent layer over this explicit palette.
+        for edit in [self.address_edit, self.search_edit] {
+            let _=unsafe{windows::Win32::UI::Controls::SetWindowTheme(edit,windows::core::w!(""),windows::core::w!(""))};
+            let _=unsafe{InvalidateRect(Some(edit),None,true)};
+        }
     }
 
     fn refresh_system_theme(&mut self){
         // A changed caption/frame mode invalidates an in-progress press.
         unsafe{SendMessageW(self.hwnd,WM_CANCELMODE,None,None);}
-        self.apply_theme();self.theme_children();
+        let previous=self.dark;self.apply_theme();self.theme_children();
+        if previous!=self.dark{self.rebuild_color_scheme_views();}
         self.relayout();self.position_children();self.invalidate();
     }
 
@@ -732,6 +809,16 @@ impl WindowState {
     }
 
     fn save(&mut self) {
+        if self.picker.is_some(){return;}
+        if self.secondary_window{
+            match crate::instance::try_own_session(&self.config_path){
+                Ok(Some(owner))=>{self.session_ownership=Some(owner);self.secondary_window=false;},
+                Ok(None)=>{},
+                Err(error)=>{diagnostics::record("session","ownership-check-failed",None);crate::runtime::trace(&format!("session ownership: {error:#}"));},
+            }
+        }
+        if let Ok(saved)=storage::load(&self.config_path){self.session.ui.file_dialog_takeover=saved.ui.file_dialog_takeover;}
+        if let Some(options)=crate::context_preferences::current(&self.config_path){self.session.ui.context_menu=options;}
         match storage::save_window_with_shared_preferences(&self.config_path,&self.canonical_session(),self.secondary_window,&self.search_saved_preferences,&self.bookmarks_saved){
             Ok((preferences,bookmarks))=>{
                 self.session.ui.apply_search_preferences(&preferences);self.search_saved_preferences=preferences;
@@ -743,8 +830,13 @@ impl WindowState {
                 }
                 self.bookmarks_saved=bookmarks;
             },
-            Err(e)=>self.show_message(format!("保存会话失败：{e}")),
+            Err(e)=>self.show_message(zsdesk_core::tr_format!("保存会话失败：{e}", e=e)),
         }
+    }
+
+    fn toggle_file_dialog_takeover(&mut self){
+        let value=!storage::load(&self.config_path).map_or(self.session.ui.file_dialog_takeover,|saved|saved.ui.file_dialog_takeover);
+        match storage::save_file_dialog_takeover(&self.config_path,value){Ok(())=>{self.session.ui.file_dialog_takeover=value;let _=crate::quick_search::start_if_enabled(&self.config_path);},Err(error)=>self.show_message(zsdesk_core::tr_format!("无法保存文件选择设置：{error}", error=error))}
     }
 
     fn remember_placement(&mut self) {
@@ -761,20 +853,34 @@ impl WindowState {
     }
 
     unsafe fn destroy(&mut self) {
+        if std::mem::replace(&mut self.destroyed,true){return;}
+        if let Some(picker)=&self.picker{
+            // Return while the UI is closing, before Shell COM teardown can
+            // delay completion and cause the original caller to reappear.
+            let _=picker.options.events.send(picker::Event::Finished{token:picker.options.token,result:Ok(picker.result.borrow().clone())});
+            unsafe{let _=ShowWindow(self.hwnd,SW_HIDE);}
+        }
+        #[cfg(test)]println!("window teardown: registry");
         if let Some(mut registry)=self.shell_registry.take(){registry.stop();}
         pane_input::discard(self.hwnd);
         diagnostics::record("window","close",None);diagnostics::close(self.hwnd);
         context_menu::destroy(self.hwnd);
         self.folder_sizes.cancel();
         self.cancel_fast_search();self.fast_search=None;
+        #[cfg(test)]println!("window teardown: capture");
         unsafe { self.capture_active(); self.commit_bookmark_rename(); }
+        #[cfg(test)]println!("window teardown: other pane");
         self.destroy_other_pane();
         self.remember_placement();
         self.drop_registration = None;
+        #[cfg(test)]println!("window teardown: tree");
         self.tree = None;
+        #[cfg(test)]println!("window teardown: browser");
         self.browser = None;
+        #[cfg(test)]println!("window teardown: save");
         self.save();
         if !self.font.0.is_null() { let _ = unsafe { DeleteObject(self.font.into()) }; self.font = HFONT::default(); }
+        #[cfg(test)]println!("window teardown: complete");
     }
 }
 
@@ -824,23 +930,77 @@ fn caption_rects(hwnd:HWND)->Option<[LayoutRect;3]>{
     }
     let width=scale(46,dpi);Some([0,1,2].map(|i|LayoutRect::new(client.right-width*(3-i),0,width,scale(STRIP_H,dpi))))
 }
-fn caption_hit(hwnd:HWND,mut point:POINT)->Option<u32>{
+fn painted_caption_hit(hwnd:HWND,mut point:POINT)->Option<u32>{
     unsafe{ScreenToClient(hwnd,&mut point)}.ok().ok()?;
-    caption_rects(hwnd)?.iter().zip([HTMINBUTTON,HTMAXBUTTON,HTCLOSE]).find_map(|(rect,hit)|rect.contains(point.x,point.y).then_some(hit))
+    let mut buttons=caption_rects(hwnd)?;
+    if screen_edge_window(hwnd){
+        let mut client=RECT::default();unsafe{GetClientRect(hwnd,&mut client)}.ok()?;
+        buttons=geometry::screen_edge_caption_buttons(buttons,client.right);
+    }
+    buttons.iter().zip([HTMINBUTTON,HTMAXBUTTON,HTCLOSE]).find_map(|(rect,hit)|rect.contains(point.x,point.y).then_some(hit))
+}
+fn caption_hit(hwnd:HWND,point:POINT)->Option<u32>{
+    let fallback=painted_caption_hit(hwnd,point);
+    if native_caption(hwnd){
+        let position=LPARAM(((point.x as u16 as u32)|((point.y as u16 as u32)<<16))as isize);
+        let mut result=LRESULT(0);
+        if unsafe{DwmDefWindowProc(hwnd,WM_NCHITTEST,WPARAM(0),position,&mut result)}.as_bool(){
+            let padding=if caption_padding_hit(hwnd,point){fallback}else{None};
+            let hit=geometry::native_caption_hit(result.0,padding)as u32;
+            return [HTMINBUTTON,HTMAXBUTTON,HTCLOSE].contains(&hit).then_some(hit);
+        }
+    }
+    fallback
+}
+fn screen_edge_window(hwnd:HWND)->bool{
+    window_actions::fullscreen(hwnd)||unsafe{IsZoomed(hwnd)}.as_bool()
+}
+fn caption_padding_hit(hwnd:HWND,mut point:POINT)->bool{
+    if !screen_edge_window(hwnd)||painted_caption_hit(hwnd,point).is_none(){return false;}
+    if !unsafe{ScreenToClient(hwnd,&mut point)}.as_bool(){return false;}
+    caption_rects(hwnd).is_some_and(|buttons|buttons.iter().all(|rect|!rect.contains(point.x,point.y)))
 }
 fn native_caption(hwnd:HWND)->bool{
     !window_actions::fullscreen(hwnd)&&!unsafe{GetPropW(hwnd,windows::core::w!("ZSDesk.NativeCaption"))}.0.is_null()
 }
 
 unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    if (msg==WM_ACTIVATE&&(wp.0&0xffff)==0)||(msg==WM_ACTIVATEAPP&&wp.0==0){pane_input::invalidate_blank_clicks(hwnd);}
     if msg==WM_NCDESTROY{release_window_properties(hwnd);}
     let native_caption = native_caption(hwnd);
     let caption_message = matches!(msg, WM_NCHITTEST | WM_NCMOUSEMOVE | WM_NCMOUSELEAVE | WM_NCLBUTTONDOWN | WM_NCLBUTTONUP | WM_NCLBUTTONDBLCLK);
-    if native_caption && caption_message {
+    let owns_caption_press=!unsafe{GetPropW(hwnd,windows::core::w!("ZSDesk.CaptionPress"))}.0.is_null();
+    let padding_press=msg==WM_NCLBUTTONDOWN&&caption_padding_hit(hwnd,POINT{x:x_lparam(lp.0),y:y_lparam(lp.0)});
+    // Native buttons must share DWM's exact hit map with DWM's own drawing.
+    // An aggregate caption rectangle split into thirds is only a fallback for
+    // painted buttons; it must not override native button widths or hover.
+    if native_caption && caption_message && (!owns_caption_press||msg==WM_NCMOUSELEAVE) && !padding_press {
         let mut result = LRESULT(0);
         if unsafe { DwmDefWindowProc(hwnd, msg, wp, lp, &mut result) }.as_bool() {
-            if msg==WM_NCHITTEST&&unsafe{IsZoomed(hwnd)}.as_bool()&&geometry::is_resize_hit(result.0 as u32){return unsafe{hit_test(hwnd,lp)};}
+            if msg==WM_NCHITTEST{
+                let point=POINT{x:x_lparam(lp.0),y:y_lparam(lp.0)};
+                let padding=caption_padding_hit(hwnd,point).then(||painted_caption_hit(hwnd,point)).flatten();
+                result=LRESULT(geometry::native_caption_hit(result.0,padding));
+                if unsafe{IsZoomed(hwnd)}.as_bool()&&geometry::is_resize_hit(result.0 as u32){return unsafe{hit_test(hwnd,lp)};}
+            }
             return result;
+        }
+    }
+    // Keep the native pressed/hover tracking loop outside the WindowState
+    // borrow. Only painted buttons and extra screen-edge pixels need capture.
+    if native_caption&&!owns_caption_press&&!padding_press
+        &&matches!(msg,WM_NCLBUTTONDOWN|WM_NCLBUTTONUP|WM_NCLBUTTONDBLCLK)
+        &&[HTMINBUTTON,HTMAXBUTTON,HTCLOSE].contains(&(wp.0 as u32)){
+        return unsafe{DefWindowProcW(hwnd,msg,wp,lp)};
+    }
+    if msg==WM_NCHITTEST&&screen_edge_window(hwnd){
+        let mut point=POINT{x:x_lparam(lp.0),y:y_lparam(lp.0)};
+        if let Some(hit)=caption_hit(hwnd,point){return LRESULT(hit as isize);}
+        if unsafe{ScreenToClient(hwnd,&mut point)}.as_bool(){
+            let pointer=unsafe{GetWindowLongPtrW(hwnd,GWLP_USERDATA)}as*const Slot;
+            if !pointer.is_null(){if let Ok(slot)=unsafe{&*pointer}.try_borrow(){
+                if slot.as_ref().is_some_and(|state|matches!(state.chrome_hit(point.x,point.y),Hit::Tab(_)|Hit::TabClose(_))){return LRESULT(HTCLIENT as isize);}
+            }}
         }
     }
     if msg==WM_APPCOMMAND&&mouse_navigation::app_command(hwnd,wp,lp){return LRESULT(1);}
@@ -888,7 +1048,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
     // DwmDefWindowProc has already had first refusal for a native caption.
     // When it declines button input, keep the same explicit fallback used by
     // the painted caption instead of entering DefWindowProc's tracking loop.
-    if msg==WM_NCLBUTTONDOWN&&[HTMINBUTTON,HTMAXBUTTON,HTCLOSE].contains(&(wp.0 as u32)){
+    if matches!(msg,WM_NCLBUTTONDOWN|WM_NCLBUTTONDBLCLK)&&[HTMINBUTTON,HTMAXBUTTON,HTCLOSE].contains(&(wp.0 as u32)){
         unsafe{SetPropW(hwnd,windows::core::w!("ZSDesk.CaptionPress"),Some(windows::Win32::Foundation::HANDLE(wp.0 as*mut _))).ok();SetCapture(hwnd);}
         track_caption_buttons(hwnd,msg,wp);return LRESULT(0);
     }
@@ -1038,6 +1198,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
     if msg==WM_SYSCOMMAND&&window_actions::fullscreen(hwnd)&&matches!((wp.0 as u32)&0xfff0,SC_RESTORE|SC_MAXIMIZE){
         post(hwnd,WM_ACTION,Command::ToggleFullscreen.id()as usize,0);return LRESULT(0);
     }
+    if msg==pane_input::MESSAGE&&pane_input::dispatch_context_menu(hwnd,wp.0){return LRESULT(0);}
     // Calls into Shell and native controls may synchronously re-enter this procedure.
     let Ok(mut slot) = (unsafe { &*pointer }).try_borrow_mut() else {
         return unsafe { reentrant(hwnd, msg, wp, lp) };
@@ -1048,9 +1209,9 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
         return unsafe { DefWindowProcW(hwnd, msg, wp, lp) };
     }
     let result = unsafe { state.handle(msg, wp, lp) };
-    if msg != WM_DESTROY { state.publish_shell_windows(); }
+    if msg != WM_DESTROY&&!state.destroyed { state.publish_shell_windows(); }
     if msg == WM_DESTROY { *slot = None; }
-    let live=slot.is_some();
+    let live=slot.as_ref().is_some_and(|state|!state.destroyed);
     drop(slot);
     flush_deferred(hwnd,live);
     if take_deferred_paint(hwnd)&&live { let _ = unsafe { InvalidateRect(Some(hwnd), None, false) }; }
@@ -1073,7 +1234,7 @@ fn track_caption_buttons(hwnd: HWND, msg: u32, wp: WPARAM) {
             let _ = unsafe { TrackMouseEvent(&mut track) };
             (if is_button { code } else { 0 }, pressed && is_button && code == old)
         }
-        WM_NCLBUTTONDOWN => (if is_button { code } else { 0 }, is_button),
+        WM_NCLBUTTONDOWN | WM_NCLBUTTONDBLCLK => (if is_button { code } else { 0 }, is_button),
         WM_NCLBUTTONUP => (if is_button { code } else { 0 }, false),
         WM_NCMOUSELEAVE | WM_MOUSEMOVE | WM_CANCELMODE | WM_CAPTURECHANGED | WM_KILLFOCUS => (0, false),
         _ => return,
@@ -1106,7 +1267,7 @@ unsafe fn reentrant(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
             let _=unsafe{SetPropW(hwnd,DEFERRED_PAINT_PROPERTY,Some(windows::Win32::Foundation::HANDLE(1usize as*mut _)))};
             LRESULT(0)
         }
-        WM_CLOSE | WM_LAYOUT | WM_ACTION | WM_SHELL_NAVIGATED | WM_SHELL_FOLDER_INVOKED | WM_SHELL_NAVIGATION_FAILED | WM_BOOKMARK_PATH_DROPPED
+        WM_CLOSE | picker::WM_NATIVE_REPLY | WM_LAYOUT | WM_ACTION | WM_SHELL_NAVIGATED | WM_SHELL_FOLDER_INVOKED | WM_SHELL_NAVIGATION_FAILED | WM_BOOKMARK_PATH_DROPPED
         | WM_OPEN_REQUEST | WM_TREE_NAVIGATE | WM_SHELL_SELECTION_CHANGED | crate::routing_control::WM_RESULT | WM_FAST_SEARCH | WM_DIAGNOSTIC
         | WM_CANCELMODE | WM_CAPTURECHANGED | WM_THEMECHANGED | WM_DWMCOMPOSITIONCHANGED | WM_SYSCOLORCHANGE | pane_input::MESSAGE | crate::shell_window_registry::WM_SELECT => {
             defer_message(hwnd,msg,wp,lp);
@@ -1215,11 +1376,15 @@ impl WindowState {
         if dual_pane::browser_message(msg) && !self.routing_pane_message { return self.route_browser_message(msg,wp,lp); }
         let point = || POINT { x: x_lparam(lp.0), y: y_lparam(lp.0) };
         match msg {
+            picker::WM_NATIVE_REPLY=>{self.picker_native_reply(wp.0 as u64,lp.0);return Some(LRESULT(0));},
             WM_QUERYENDSESSION=>return Some(LRESULT(1)),
             WM_ENDSESSION=>{self.session_ending=wp.0!=0;if self.session_ending{self.save();}return None;},
-            WM_CLOSE if !self.session_ending&&self.session.has_locked_tabs()=>{
-                self.show_message(if !self.session.ui.dual_pane&&self.session.secondary_pane.tabs.iter().any(|t|t.locked){"隐藏窗格中有已锁定的标签页，请开启双栏并解锁后再关闭窗口"}else{"有已锁定的标签页，请先在标签右键菜单中解锁后再关闭窗口"}.into());return Some(LRESULT(0));
+            WM_CLOSE if self.picker.is_none()&&!self.session_ending&&!crate::runtime::exiting()&&self.session.has_locked_tabs()=>{
+                self.show_message(if !self.session.ui.dual_pane&&self.session.secondary_pane.tabs.iter().any(|t|t.locked){zsdesk_core::i18n::text("隐藏窗格中有已锁定的标签页，请开启双栏并解锁后再关闭窗口")}else{zsdesk_core::i18n::text("有已锁定的标签页，请先在标签右键菜单中解锁后再关闭窗口")}.into());return Some(LRESULT(0));
             },
+            // Release Shell hosts while the owner is still a live window.
+            // WM_DESTROY is the fallback for direct/native destruction.
+            WM_CLOSE=>{if !self.session_ending&&self.picker_close_pending(){return Some(LRESULT(0));}unsafe{self.destroy();}return None;},
             WM_PAINT => {
                 let mut ps = PAINTSTRUCT::default();
                 let dc = unsafe { BeginPaint(self.hwnd, &mut ps) };
@@ -1257,10 +1422,12 @@ impl WindowState {
                 if area == "ShellState" || area.is_empty() { self.invalidate(); }
             }
             WM_THEMECHANGED | WM_DWMCOMPOSITIONCHANGED | WM_SYSCOLORCHANGE => self.refresh_system_theme(),
+            folder_sizes::WM_CHANGED=>{let change=zsdesk_windows::shell::notify::read_change(wp,lp);if change.event!=0{self.folder_sizes_changed();}}
             WM_TIMER => {
                 if wp.0==deferred_selection::TIMER{self.poll_pane_selections();}
                 if wp.0==TIMER_PLACEMENT{let _=unsafe{KillTimer(Some(self.hwnd),TIMER_PLACEMENT)};self.remember_placement();self.save();}
                 if wp.0 == TIMER_STATUS { self.update_shell_registry();self.refresh_status();self.poll_search_settings();self.poll_pane_searches();self.poll_folder_sizes(); }
+                if wp.0 == TIMER_FOLDER_SIZES{self.poll_folder_sizes_inner();}
                 if wp.0 == TIMER_SEARCH { let _ = unsafe { KillTimer(Some(self.hwnd), TIMER_SEARCH) }; unsafe { self.live_search(); } }
                 if wp.0 == TIMER_FAST_SEARCH { let _=unsafe{KillTimer(Some(self.hwnd),TIMER_FAST_SEARCH)};self.poll_pane_searches(); }
                 if wp.0 == TIMER_MESSAGE {
@@ -1272,9 +1439,10 @@ impl WindowState {
                 }
             }
             WM_MOUSEMOVE => self.mouse_move(point(), wp.0),
+            WM_MOUSEWHEEL=>{let message=MSG{hwnd:self.hwnd,message:msg,wParam:wp,lParam:lp,..Default::default()};if self.side_tabs_wheel(&message){return Some(LRESULT(0));}},
             WM_MOUSELEAVE => {
                 self.tracking_mouse = false;
-                if self.tab_drag.is_none() && self.splitter_drag.is_none() { self.set_hover(Hit::None, None); }
+                if self.tab_drag.is_none() && self.splitter_drag.is_none()&&self.bookmark_resize.is_none()&&self.side_tab_resize.is_none()&&self.side_tab_scroll_drag.is_none() { self.set_hover(Hit::None, None); }
             }
             WM_LBUTTONDOWN => self.mouse_down(point()),
             WM_LBUTTONUP => self.mouse_up(point()),
@@ -1282,22 +1450,22 @@ impl WindowState {
             WM_MBUTTONUP => self.middle_click(point()),
             WM_RBUTTONUP => self.right_click(point()),
             WM_CANCELMODE => {
-                self.tab_drag = None;self.bookmark_drag=None; self.splitter_drag = None; self.pane_splitter_drag=None; self.pressed = None;
+                self.tab_drag = None;self.bookmark_drag=None; self.splitter_drag = None; self.bookmark_resize=None;self.pane_splitter_drag=None;self.side_tab_resize=None;self.side_tab_scroll_drag=None; self.pressed = None;
                 if unsafe { GetCapture() } == self.hwnd { let _ = unsafe { ReleaseCapture() }; }
                 self.set_hover(Hit::None, None); self.invalidate();
             }
-            WM_CAPTURECHANGED => { self.tab_drag = None;self.bookmark_drag=None; self.splitter_drag = None; self.pane_splitter_drag=None; self.pressed = None; self.invalidate(); }
+            WM_CAPTURECHANGED => { self.tab_drag = None;self.bookmark_drag=None; self.splitter_drag = None; self.bookmark_resize=None;self.pane_splitter_drag=None;self.side_tab_resize=None;self.side_tab_scroll_drag=None; self.pressed = None; self.invalidate(); }
             WM_SETCURSOR => {
                 if (lp.0 & 0xFFFF) as u32 == HTCLIENT {
                     let mut p = POINT::default();
                     let _ = unsafe { GetCursorPos(&mut p) };
                     let _ = unsafe { ScreenToClient(self.hwnd, &mut p) };
-                    let cursor = match self.layout.hit(p.x, p.y) {
-                        Hit::Splitter | Hit::PaneSplitter => Some(IDC_SIZEWE),
+                    let cursor = match self.chrome_hit(p.x, p.y) {
+                        Hit::Splitter | Hit::PaneSplitter | Hit::TabSplitter | Hit::BookmarkSplitter => Some(IDC_SIZEWE),
                         Hit::Address if !self.address_editing && self.crumb_at(p.x, p.y).is_none() => Some(IDC_IBEAM),
                         _ => None,
                     };
-                    let cursor = cursor.or(self.splitter_drag.or(self.pane_splitter_drag.map(|(x,w)|(x,i32::from(w)))).map(|_| IDC_SIZEWE)).unwrap_or(IDC_ARROW);
+                    let cursor = cursor.or(self.side_tab_resize.or(self.splitter_drag).or(self.bookmark_resize).or(self.pane_splitter_drag.map(|(x,w)|(x,i32::from(w)))).map(|_| IDC_SIZEWE)).unwrap_or(IDC_ARROW);
                     if let Ok(c) = unsafe { LoadCursorW(None, cursor) } { unsafe { SetCursor(Some(c)); } }
                     return Some(LRESULT(1));
                 }
@@ -1309,6 +1477,7 @@ impl WindowState {
             WM_COMMAND => {
                 let id = wp.0 & 0xFFFF;
                 let code = (wp.0 >> 16) as u32;
+                if self.picker_command(id,code){return Some(LRESULT(0));}
                 if lp.0 != 0 {
                     // Notifications from native EDIT children.
                     if (id == ID_ADDRESS || id == ID_SEARCH) && (code == EN_SETFOCUS || code == EN_KILLFOCUS) {
@@ -1333,7 +1502,8 @@ impl WindowState {
             WM_SHELL_NAVIGATED => if lp.0 != 0 { unsafe { self.navigation_completed(*Box::from_raw(lp.0 as *mut ShellLocation)); } },
             WM_SHELL_FOLDER_INVOKED => if lp.0 != 0 { unsafe { self.navigate_from_contents(*Box::from_raw(lp.0 as *mut ShellLocation)); } },
             WM_SHELL_NAVIGATION_FAILED => unsafe { self.navigation_failed() },
-            WM_SHELL_SELECTION_CHANGED => { unsafe { acknowledge_selection_changed(lp.0); } self.refresh_status(); }
+            WM_SHELL_SELECTION_CHANGED => { unsafe { acknowledge_selection_changed(lp.0); } self.refresh_status();self.picker_selection_changed(); }
+            zsdesk_windows::shell::WM_SHELL_PICKER_ACCEPT=>self.picker_accept_view(),
             WM_TREE_NAVIGATE => if lp.0 != 0 {
                 let location = unsafe { *Box::from_raw(lp.0 as *mut ShellLocation) };
                 if wp.0 != 0 { unsafe { self.new_tab(location); } } else { unsafe { self.navigate_from_tree(location); } }
@@ -1342,15 +1512,24 @@ impl WindowState {
             WM_OPEN_REQUEST => if lp.0 != 0 { unsafe { self.open_requested(*Box::from_raw(lp.0 as *mut crate::instance::OpenRequest)); } },
             WM_FAST_SEARCH => self.poll_pane_searches(),
             WM_DIAGNOSTIC=>if lp.0!=0{let request=unsafe{Box::from_raw(lp.0 as *mut crate::instance::DiagnosticRequest)};let _=self.write_diagnostics(&request);},
+            WM_TAB_EMPHASIS_CHANGED=>if let Ok(saved)=storage::load(&self.config_path){
+                if self.session.ui.tab_selection_emphasis!=saved.ui.tab_selection_emphasis{
+                    self.session.ui.tab_selection_emphasis=saved.ui.tab_selection_emphasis;self.invalidate();
+                }
+            },
+            crate::update_check::NOTICE=>if let Some(release)=crate::update_check::take_notice(&self.config_path){
+                if let Err(error)=crate::utility_panel::offer_update(self.hwnd,&self.config_path,release){self.show_message(zsdesk_core::tr_format!("无法显示更新信息：{error:#}", error=error));}
+            },
             crate::routing_control::WM_RESULT => if lp.0!=0{self.show_message(unsafe{*Box::from_raw(lp.0 as *mut String)});},
             message if message>=0xC000&&message==zsdesk_windows::shell::file_transfer::result_message()=>{
                 let code=wp.0 as u32;
-                if code==0{
-                    while let Some(path)=zsdesk_windows::shell::file_transfer::take_created_folder(self.hwnd){self.select_created_folder(path);}
-                }else if code!=0x800704c7{self.show_message(format!("文件操作未完成：{}",windows::core::Error::from_hresult(windows::core::HRESULT(code as i32))));}
+                let completion=zsdesk_windows::shell::file_transfer::take_completion(self.hwnd,lp.0 as usize);
+                if let Some(completion)=completion{self.show_message(completion.message());self.receive_transfer_completion(&completion);}
+                else if zsdesk_windows::shell::file_transfer::is_cancelled(windows::core::HRESULT(code as i32)){self.show_message(zsdesk_core::i18n::text("文件操作已取消").into());}
+                else if code!=0{self.show_message(zsdesk_core::tr_format!("文件操作未完成：{}", zsdesk_windows::shell::file_transfer::error_message(&windows::core::Error::from_hresult(windows::core::HRESULT(code as i32)))));}
             },
-            message if message >= 0xC000 && message == zsdesk_windows::shell::menu::failure_message() => {
-                self.show_message(format!("右键菜单加载失败（0x{:08X}），隐藏设置仍保留。", wp.0 as u32));
+        message if message >= 0xC000 && (message == zsdesk_windows::shell::menu::failure_message()||message==zsdesk_windows::shell::file_transfer::result_message()) => {
+                self.show_message(zsdesk_core::tr_format!("系统右键操作未完成（0x{:08X}），请查看诊断日志。", wp.0 as u32));
             }
             WM_DESTROY => { crate::runtime::trace("window-destroy");zsdesk_windows::taskbar::clear_identity(self.hwnd);unsafe { self.destroy(); PostQuitMessage(0); }crate::runtime::trace("window-quit-posted"); }
             _ => return None,
@@ -1445,6 +1624,7 @@ fn accelerator_table() -> Vec<ACCEL> {
         (FALT | FVIRTKEY, VK_P, Command::TogglePreview), (FALT | FSHIFT | FVIRTKEY, VK_P, Command::ToggleDetails),
         (FCONTROL | FVIRTKEY, VK_N, Command::NewWindow),
         (FVIRTKEY, VK_F11, Command::ToggleFullscreen),
+        (FCONTROL | FVIRTKEY, VK_F1, Command::ToggleCommandBar),
         (FVIRTKEY, VK_F6, Command::FocusNext), (FSHIFT | FVIRTKEY, VK_F6, Command::FocusPrevious),
         (FCONTROL | FVIRTKEY, VK_R, Command::Refresh),
         (FCONTROL | FVIRTKEY, VK_OEM_PLUS, Command::ZoomIn),

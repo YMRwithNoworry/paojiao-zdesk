@@ -10,6 +10,9 @@ const ROOT_CLASS:PCWSTR=w!("ZSDesk.Native.Runtime");
 const DEFAULT_SERVICE_PIPE:&str=r"\\.\PIPE\Everything Service";
 const OWN_SERVICE_PIPE:&str=r"\\.\PIPE\ZSdesk Everything Service";
 const SERVICE_INSTANCE:&str="ZSdesk";
+#[path="everything_status.rs"]
+mod status;
+pub(super) fn status_report(profile:&Path)->String{status::report(profile)}
 #[link(name="kernel32")]
 unsafe extern "system"{
     fn WaitNamedPipeW(name:*const u16,timeout:u32)->i32;
@@ -97,8 +100,10 @@ fn registry_text(root:HKEY,key:&str,value:Option<&str>)->Option<String>{
 fn registry_path(root:HKEY,key:&str,value:Option<&str>)->Option<PathBuf>{
     registry_text(root,key,value).map(|value|PathBuf::from(value.trim_matches('"')))
 }
-pub(super) fn executable(configured:Option<&Path>)->Option<PathBuf>{
-    if let Some(path)=configured.filter(|p|p.is_absolute()&&p.is_file()){return Some(path.into());}
+fn installed_executable(configured:Option<&Path>)->Option<PathBuf>{
+    if let Some(path)=configured{return ensure_executable(path).ok().map(|_|path.into());}
+    // An explicitly named private instance must not launch an unrelated user's installation.
+    if std::env::var_os("ZSDESK_EVERYTHING_INSTANCE").is_some(){return None;}
     for hive in [HKEY_CURRENT_USER,HKEY_LOCAL_MACHINE]{
         if let Some(path)=registry_path(hive,r"Software\Microsoft\Windows\CurrentVersion\App Paths\Everything.exe",None).filter(|p|p.is_file()){return Some(path);}
         for key in [r"Software\Microsoft\Windows\CurrentVersion\Uninstall\Everything",r"Software\Microsoft\Windows\CurrentVersion\Uninstall\Everything 1.5a"]{
@@ -106,7 +111,17 @@ pub(super) fn executable(configured:Option<&Path>)->Option<PathBuf>{
         }
     }
     for variable in ["ProgramFiles","ProgramFiles(x86)"]{if let Some(dir)=std::env::var_os(variable){let path=PathBuf::from(dir).join("Everything/Everything.exe");if path.is_file(){return Some(path);}}}
-    bundle().ok()
+    None
+}
+pub(super) fn executable(configured:Option<&Path>)->Option<PathBuf>{
+    if configured.is_some(){installed_executable(configured)}else{installed_executable(None).or_else(||bundle().ok())}
+}
+/// Read-only availability check; never starts or installs an external engine.
+pub(super) fn available(configured:Option<&Path>)->bool{
+    external(configured).is_some()||match configured{
+        Some(path)=>ensure_executable(path).is_ok(),
+        None=>executable(None).is_some(),
+    }
 }
 pub(super) fn ensure_executable(path:&Path)->Result<()>{ensure!(path.is_absolute()&&path.is_file()&&ordinary_everything(path),"请选择 Everything.exe 程序文件");Ok(())}
 fn expected_hash()->Result<String>{let value:serde_json::Value=serde_json::from_str(MANIFEST)?;value["executable_sha256"].as_str().map(str::to_owned).context("Everything 发布清单缺少内容标识")}
@@ -247,7 +262,8 @@ pub(super) fn ensure_running(configured:Option<&Path>,cancel:&impl Fn()->bool,al
     let root=root()?;let _lock=lock(&root,cancel)?;
     if let Some(connection)=external(configured){return Ok(connection);}
     if let Some(connection)=managed_connection(&root).filter(|connection|configured.is_none_or(|path|same_path(path,&connection.executable))){return Ok(connection);}
-    if let Some(path)=configured{
+    let installed=if configured.is_none(){installed_executable(None)}else{None};
+    if let Some(path)=configured.or(installed.as_deref()){
         ensure_executable(path)?;
         let mut launch=command(path);if let Ok(instance)=std::env::var("ZSDESK_EVERYTHING_INSTANCE"){launch.arg("-instance").arg(instance);}
         launch.arg("-startup").spawn()?;
@@ -296,12 +312,24 @@ pub(super) fn ipc(window:HWND,code:usize,value:isize)->Result<usize>{
     let mut result=0;let sent=unsafe{SendMessageTimeoutW(window,WM_USER,WPARAM(code),LPARAM(value),SMTO_ABORTIFHUNG,1000,Some(&mut result))};
     ensure!(sent.0!=0,"Everything 暂时没有响应");Ok(result)
 }
+fn require_managed_index_source(admin:Result<bool>,compatible_service:impl FnOnce()->bool,folders:impl FnOnce()->bool)->Result<()>{
+    let admin=admin.context("无法确认 Everything 实例的权限状态（IPC 403 查询失败）")?;
+    ensure!(admin||compatible_service()||folders(),
+        "未发现兼容的 Everything 1.4 索引服务，且未配置目录索引；请在“≡ → 搜索 → 启用 Everything 索引服务…”中启用 ZSDesk 专用服务。版本不明或 1.5 的服务不会复用");
+    Ok(())
+}
+/// Shared read-only prerequisite for both queries and the status display. A
+/// managed instance can report DB-loaded for an empty, unusable index.
+fn check_index_source(connection:&Connection)->Result<()>{
+    if !connection.managed{return Ok(());}
+    require_managed_index_source(ipc(connection.hwnd,403,0).map(|value|value!=0),
+        ||service_pipe().is_some(),||root().is_ok_and(|root|explicit_folders(&root.join("Everything.ini"))))
+}
 pub(super) fn wait_ready(connection:&Connection,cancel:&impl Fn()->bool,pending:&mut dyn FnMut())->Result<()>{
     if cancel(){bail!("搜索已取消");}
     // Check once per query before accepting an already-loaded empty database.
     // Resource/version checks must not repeat in the 50 ms readiness loop.
-    if connection.managed&&ipc(connection.hwnd,403,0).unwrap_or(0)==0&&service_pipe().is_none()
-        &&!root().is_ok_and(|root|explicit_folders(&root.join("Everything.ini"))){bail!("未发现兼容的 Everything 1.4 索引服务，请在“≡ → 搜索 → 启用快速索引服务…”中启用 ZSdesk 专用服务；版本不明或 1.5 的服务不会复用");}
+    check_index_source(connection)?;
     wait_for_ready(||Ok(ipc(connection.hwnd,401,0)?!=0),cancel,pending,Duration::from_secs(120))
 }
 fn wait_for_ready(mut loaded:impl FnMut()->Result<bool>,cancel:&impl Fn()->bool,pending:&mut dyn FnMut(),budget:Duration)->Result<()>{
@@ -367,6 +395,14 @@ fn other_hosts()->bool{
 
 #[cfg(test)]mod service_tests{
     use super::*;
+    #[test]fn managed_index_requires_known_permissions_or_an_accessible_index_source(){
+        require_managed_index_source(Ok(true),||panic!("admin does not need service lookup"),||panic!("admin does not need folder lookup")).unwrap();
+        require_managed_index_source(Ok(false),||true,||panic!("compatible service already available")).unwrap();
+        require_managed_index_source(Ok(false),||false,||true).unwrap();
+        let missing=require_managed_index_source(Ok(false),||false,||false).unwrap_err().to_string();assert!(missing.contains("兼容")&&missing.contains("目录索引"));
+        let unknown=require_managed_index_source(Err(anyhow::anyhow!("IPC unavailable")),||panic!("SCM availability cannot substitute for an IPC result"),||panic!("unknown permission state must remain unknown")).unwrap_err();
+        assert!(format!("{unknown:#}").contains("IPC unavailable"));
+    }
     #[test]fn unread_database_never_becomes_a_successful_empty_snapshot(){
         use std::cell::Cell;
         let notifications=Cell::new(0);

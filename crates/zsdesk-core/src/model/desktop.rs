@@ -23,11 +23,11 @@ pub enum Category { Apps, Folders, Documents, Images, Media, Archives, Others }
 
 impl Category {
     pub const ALL: [Category; 7] = [Self::Apps, Self::Folders, Self::Documents, Self::Images, Self::Media, Self::Archives, Self::Others];
-    pub const fn title(self) -> &'static str {
-        match self {
+    pub fn title(self) -> &'static str {
+        crate::i18n::text(match self {
             Self::Apps => "应用与快捷方式", Self::Folders => "文件夹", Self::Documents => "文档",
             Self::Images => "图片", Self::Media => "视频与音乐", Self::Archives => "压缩包", Self::Others => "其他",
-        }
+        })
     }
 }
 
@@ -105,6 +105,9 @@ pub struct Fence {
     #[serde(default)] pub rule: Option<Category>,
     /// 规则未命中的桌面项目进入此格子。
     #[serde(default)] pub catch_all: bool,
+    /// Loose item created only because no automatic rule currently accepts it.
+    /// Explicitly released items remain independent when rules are re-enabled.
+    #[serde(default)] pub auto_released: bool,
     /// 文件夹格子当前浏览的子目录（None 表示根目录）。
     #[serde(default)] pub browse: Option<PathBuf>,
     /// 标签组：同组格子共用一个位置，作为标签显示在同一个标题栏。0 表示独立格子。
@@ -118,7 +121,7 @@ impl Fence {
     pub fn new(id: u64, title: impl Into<String>, source: FenceSource, placement: Placement) -> Self {
         let sort = if source == FenceSource::Desktop { FenceSort::Manual } else { FenceSort::Name };
         Self { id, title: title.into(), source, placement, collapsed: false, locked: false, view: FenceView::Icons,
-            icon_size: IconSize::Medium, sort, descending: false, members: Vec::new(), rule: None, catch_all: false, browse: None,
+            icon_size: IconSize::Medium, sort, descending: false, members: Vec::new(), rule: None, catch_all: false, auto_released:false, browse: None,
             group: 0, tab_active: false }
     }
     /// An inactive tab: its window stays hidden behind the group's active tab.
@@ -203,7 +206,7 @@ impl DesktopConfig {
         normalize_groups(&mut self.stash);
         self.released_items.retain(|item| item.members.len() == 1 && item.is_desktop());
         let mut released_keys=std::collections::HashSet::new();
-        self.released_items.retain(|item|released_keys.insert(item.members[0].to_lowercase()));
+        self.released_items.retain(|item|released_keys.insert(item.members[0].clone()));
         for item in &mut self.released_items {
             item.title.clear(); item.group = 0; item.tab_active = false;
             item.collapsed = false; item.locked = true; item.rule = None; item.catch_all = false;
@@ -219,18 +222,34 @@ impl DesktopConfig {
     pub fn is_released_key(&self, key: &str) -> bool {
         self.released_items.iter().any(|item| item.members.iter().any(|member| member.eq_ignore_ascii_case(key)))
     }
+    /// Explicit groups and manual loose icons may be restored by parsing name.
+    /// Automatic loose icons must be proved by the fresh desktop inventory.
+    pub fn restorable_desktop_members(&self)->impl Iterator<Item=&String>{
+        self.fences.iter().chain(self.released_items.iter().filter(|item|!item.auto_released))
+            .filter(|item|item.is_desktop()).flat_map(|item|item.members.iter())
+    }
     pub fn distributed_items(&self,items:&[ItemInfo])->Vec<Vec<usize>> {
         let mut groups=distribute(&self.fences,items);
-        for group in &mut groups { group.retain(|index|!self.is_released_key(&items[*index].key)); }
+        for group in &mut groups { group.retain(|index|!self.released_identity(items,&items[*index].key)); }
         groups
+    }
+    fn released_identity(&self,items:&[ItemInfo],key:&str)->bool{
+        self.released_items.iter().any(|item|item.members.iter().any(|member|member==key))
+            ||unique_alias(items,key)&&self.is_released_key(key)
     }
     /// A visual move only: the file itself and its path are never changed here.
     pub fn release_item(&mut self, key: String, placement: Placement) -> u64 {
+        self.release_identity(key,placement,false)
+    }
+    pub fn release_item_exact(&mut self,key:String,placement:Placement)->u64{self.release_identity(key,placement,true)}
+    fn release_identity(&mut self,key:String,placement:Placement,exact:bool)->u64{
+        let matches=|member:&str|member==key||(!exact&&member.eq_ignore_ascii_case(&key));
         for fence in self.fences.iter_mut().chain(&mut self.stash) {
-            fence.members.retain(|member| !member.eq_ignore_ascii_case(&key));
+            fence.members.retain(|member| !matches(member));
         }
-        if let Some(item) = self.released_items.iter_mut().find(|item| item.members.first().is_some_and(|member| member.eq_ignore_ascii_case(&key))) {
+        if let Some(item) = self.released_items.iter_mut().find(|item| item.members.first().is_some_and(|member| matches(member))) {
             item.placement = placement;
+            item.auto_released = false;
             return item.id;
         }
         let id = self.take_id();
@@ -238,6 +257,28 @@ impl DesktopConfig {
         item.members.push(key); item.locked = true;
         self.released_items.push(item);
         id
+    }
+
+    /// Uncollected items stay visible without silently enabling a catch-all.
+    /// A later explicit rule change may collect only automatically loose items.
+    pub fn reconcile_uncollected(&mut self,items:&[ItemInfo],mut placement:impl FnMut(&str)->Placement)->bool {
+        self.try_reconcile_uncollected(items,|key|Ok::<_,std::convert::Infallible>(placement(key))).unwrap()
+    }
+    /// Fallible placement planning. Call on a clone when the result must be atomic.
+    pub fn try_reconcile_uncollected<E>(&mut self,items:&[ItemInfo],mut placement:impl FnMut(&str)->Result<Placement,E>)->Result<bool,E> {
+        let assigned:std::collections::HashSet<_>=distribute(&self.fences,items).into_iter().flatten().map(|index|items[index].key.clone()).collect();
+        let live:std::collections::HashSet<_>=items.iter().map(|item|item.key.clone()).collect();
+        let before=self.released_items.len();
+        self.released_items.retain(|item|!item.auto_released||item.members.first().is_some_and(|key|live.contains(key)&&!assigned.contains(key)));
+        let mut changed=before!=self.released_items.len();
+        for item in items {
+            if assigned.contains(&item.key)||self.released_identity(items,&item.key){continue;}
+            let position=placement(&item.key)?;
+            let id=self.release_item_exact(item.key.clone(),position);
+            if let Some(item)=self.released_items.iter_mut().find(|item|item.id==id){item.auto_released=true;}
+            changed=true;
+        }
+        Ok(changed)
     }
 
     // ---- tab groups ----------------------------------------------------------
@@ -372,21 +413,34 @@ impl DesktopConfig {
     /// Puts `keys` into fence `target` (manual membership), removing them from other desktop fences.
     /// `before` inserts ahead of an existing member to support manual reordering.
     pub fn assign(&mut self, target: u64, keys: &[String], before: Option<&str>) {
+        self.assign_identities(target,keys,before,false);
+    }
+    pub fn assign_exact(&mut self,target:u64,keys:&[String],before:Option<&str>){self.assign_identities(target,keys,before,true);}
+    fn assign_identities(&mut self,target:u64,keys:&[String],before:Option<&str>,exact:bool){
+        let matches=|member:&str|keys.iter().any(|key|member==key||(!exact&&member.eq_ignore_ascii_case(key)));
         if !self.fences.iter().any(|f| f.id == target && f.is_desktop()) { return; }
-        self.released_items.retain(|item| !item.members.iter().any(|member| keys.iter().any(|key| member.eq_ignore_ascii_case(key))));
+        self.released_items.retain(|item| !item.members.iter().any(|member|matches(member)));
         for fence in self.fences.iter_mut().filter(|f| f.is_desktop()) {
-            fence.members.retain(|member| !keys.iter().any(|key|member.eq_ignore_ascii_case(key)));
+            fence.members.retain(|member| !matches(member));
         }
         let Some(fence) = self.fence_mut(target).filter(|f| f.is_desktop()) else { return };
-        let at = before.and_then(|b| fence.members.iter().position(|m| m == b)).unwrap_or(fence.members.len());
-        for (offset, key) in keys.iter().enumerate() { fence.members.insert(at + offset, key.clone()); }
+        let at = before.and_then(|b|fence.members.iter().position(|m|m==b).or_else(||{
+            let mut candidates=fence.members.iter().enumerate().filter(|(_,m)|m.eq_ignore_ascii_case(b));let first=candidates.next().map(|(index,_)|index);if candidates.next().is_none(){first}else{None}
+        })).unwrap_or(fence.members.len());
+        let mut inserted=std::collections::HashSet::new();let mut offset=0;
+        for key in keys {if inserted.insert(key.clone()){fence.members.insert(at+offset,key.clone());offset+=1;}}
     }
 
     /// Updates manual memberships after a rename.
     pub fn rename_member(&mut self, old: &str, new: &str) -> bool {
+        let members:Vec<_>=self.fences.iter().chain(&self.released_items).flat_map(|fence|&fence.members).collect();
+        let exact=members.iter().any(|member|member.as_str()==old);
+        let aliases:std::collections::HashSet<_>=members.iter().filter(|member|member.eq_ignore_ascii_case(old)).map(|member|member.as_str()).collect();
+        let matching=if exact{Some(old.to_owned())}else if aliases.len()==1{aliases.into_iter().next().map(str::to_owned)}else{None};
+        let Some(matching)=matching else{return false;};
         let mut changed = false;
         for fence in self.fences.iter_mut().chain(&mut self.released_items) {
-            for member in fence.members.iter_mut().filter(|m| m.eq_ignore_ascii_case(old)) { *member = new.to_string(); changed = true; }
+            for member in fence.members.iter_mut().filter(|m| m.as_str()==matching) { *member = new.to_string(); changed = true; }
         }
         changed
     }
@@ -434,7 +488,8 @@ pub struct ItemInfo {
 pub fn distribute(fences: &[Fence], items: &[ItemInfo]) -> Vec<Vec<usize>> {
     let mut result = vec![Vec::new(); fences.len()];
     for (item_index, item) in items.iter().enumerate() {
-        let manual = fences.iter().position(|f| f.is_desktop() && f.members.iter().any(|m| m.eq_ignore_ascii_case(&item.key)));
+        let manual = fences.iter().position(|f| f.is_desktop() && f.members.iter().any(|m| m==&item.key))
+            .or_else(||unique_alias(items,&item.key).then(||fences.iter().position(|f|f.is_desktop()&&f.members.iter().any(|m|m.eq_ignore_ascii_case(&item.key)))).flatten());
         let ruled = || fences.iter().position(|f| f.is_desktop() && f.rule == Some(item.category));
         let fallback = || fences.iter().position(|f| f.is_desktop() && f.catch_all);
         if let Some(fence) = manual.or_else(ruled).or_else(fallback) { result[fence].push(item_index); }
@@ -442,10 +497,12 @@ pub fn distribute(fences: &[Fence], items: &[ItemInfo]) -> Vec<Vec<usize>> {
     for (fence, indices) in fences.iter().zip(result.iter_mut()) { sort_items(fence, items, indices); }
     result
 }
+fn unique_alias(items:&[ItemInfo],key:&str)->bool{items.iter().filter(|item|item.key.eq_ignore_ascii_case(key)).take(2).count()==1}
 
 /// Orders `indices` according to the fence sort mode (folders first except in manual mode).
 pub fn sort_items(fence: &Fence, items: &[ItemInfo], indices: &mut [usize]) {
-    let member_rank = |key: &str| fence.members.iter().position(|m| m.eq_ignore_ascii_case(key)).unwrap_or(usize::MAX);
+    let member_rank = |key: &str| fence.members.iter().position(|m|m==key)
+        .or_else(||unique_alias(items,key).then(||fence.members.iter().position(|m|m.eq_ignore_ascii_case(key))).flatten()).unwrap_or(usize::MAX);
     let ext = |name: &str| name.rsplit_once('.').map(|(_, e)| e.to_lowercase()).unwrap_or_default();
     indices.sort_by(|&a, &b| {
         let (x, y) = (&items[a], &items[b]);
@@ -547,6 +604,68 @@ pub fn auto_layout(count: usize, area_w: i32, area_h: i32) -> Vec<Bounds> {
 mod tests {
     use super::*;
     #[test]
+    fn automatic_aliases_need_live_evidence_and_manual_items_keep_their_exact_state(){
+        let mut config=DesktopConfig::default();
+        for id in 1..=7{let mut group=Fence::new(id,format!("Saved {id}"),FenceSource::Desktop,Placement::default());group.members.push(format!("group-{id}"));config.fences.push(group);}
+        config.next_id=8;
+        // Explicitly released items remain user-owned even when their paths
+        // are absent from the desktop snapshot or refer outside the desktop.
+        for index in 0..6{config.release_item_exact(format!(r"C:\Saved\manual-{index}.txt"),Placement{x:index*100,y:70,..Default::default()});}
+        let manual=config.released_items.clone();let groups=config.fences.clone();
+        let system="::{645FF040-5081-101B-9F08-00AA002F954E}";
+        let id=config.release_item_exact(system.into(),Placement::default());config.fence_mut(id).unwrap().auto_released=true;
+        let visible_system=config.fence(id).unwrap().clone();
+        for key in [r"C:\Users\Test\Desktop",r"C:\Users\Test",r"C:\Users\Test\Music",r"C:\Users\Test\Downloads",r"C:\Users\Test\Pictures",r"C:\Users\Test\Videos",r"C:\Users\Test\Documents",r"E:\Cloud\Provider"]{
+            let id=config.release_item_exact(key.into(),Placement::default());config.fence_mut(id).unwrap().auto_released=true;
+        }
+        let mut config:DesktopConfig=serde_json::from_slice(&serde_json::to_vec(&config).unwrap()).unwrap();
+        let restored=config.restorable_desktop_members().cloned().collect::<Vec<_>>();assert_eq!(restored.len(),13);
+        assert!(manual.iter().all(|item|restored.contains(&item.members[0])));assert!(!restored.contains(&system.to_owned()));
+        assert!(!restored.contains(&r"C:\Users\Test\Documents".to_owned()));
+        let next_id=config.next_id;
+        assert!(config.reconcile_uncollected(&[info(system,false)],|_|panic!("existing visible icon must not allocate another ID")));
+        assert_eq!(config.fences,groups);assert_eq!(&config.released_items[..6],manual.as_slice());
+        assert_eq!(config.released_items.len(),7);assert_eq!(config.released_items[6],visible_system);assert_eq!(config.next_id,next_id);
+        assert!(!config.reconcile_uncollected(&[info(system,false)],|_|Placement::default()));
+        assert!(config.reconcile_uncollected(&[],|_|Placement::default()));assert_eq!(config.released_items,manual);assert_eq!(config.fences,groups);assert_eq!(config.next_id,next_id);
+    }
+    #[test]
+    fn disabled_collection_stays_off_and_uncollected_files_remain_visible(){
+        let mut config=DesktopConfig::default();let mut group=fence(1,None,false);group.members.push("kept.txt".into());config.fences.push(group);config.next_id=2;
+        let items=vec![info("kept.txt",false),info("new.txt",false)];
+        assert!(config.reconcile_uncollected(&items,|_|Placement::default()));
+        assert_eq!(config.distributed_items(&items),vec![vec![0]]);
+        assert_eq!(config.released_items.len(),1);assert!(config.released_items[0].auto_released);
+        assert_eq!(config.released_items[0].members,vec!["new.txt"]);
+        let mut saved:DesktopConfig=serde_json::from_slice(&serde_json::to_vec(&config).unwrap()).unwrap();saved.normalize();
+        assert!(saved.fences[0].rule.is_none()&&!saved.fences[0].catch_all);
+        assert!(!saved.reconcile_uncollected(&items,|_|panic!("existing loose position must be preserved")));
+        saved.fences[0].catch_all=true;assert!(saved.reconcile_uncollected(&items,|_|Placement::default()));
+        assert!(saved.released_items.is_empty());assert_eq!(saved.distributed_items(&items),vec![vec![0,1]]);
+        saved.release_item("new.txt".into(),Placement::default());assert!(!saved.released_items[0].auto_released);
+        assert!(!saved.reconcile_uncollected(&items,|_|Placement::default()));assert_eq!(saved.distributed_items(&items),vec![vec![0]]);
+        saved.fences.clear();assert!(saved.reconcile_uncollected(&items,|_|Placement::default()));
+        assert_eq!(saved.released_items.len(),2);assert!(saved.fences.is_empty(),"deleting groups cannot re-enable collection");
+    }
+    #[test]
+    fn assigning_members_deduplicates_and_matches_insertion_case(){
+        let mut config=DesktopConfig::default();let mut group=fence(1,None,false);group.members=vec!["a.txt".into(),"B.txt".into()];config.fences.push(group);
+        config.assign(1,&["new.txt".into(),"new.txt".into()],Some("b.TXT"));
+        assert_eq!(config.fences[0].members,vec!["a.txt","new.txt","B.txt"]);
+    }
+    #[test]
+    fn case_distinct_items_keep_exact_membership_release_and_manual_order(){
+        let items=vec![info("A.txt",false),info("a.txt",false)];
+        let mut config=DesktopConfig::default();let mut a=fence(1,None,false);a.members.push("A.txt".into());let mut b=fence(2,None,false);b.members.push("a.txt".into());config.fences=vec![a,b];config.next_id=3;
+        assert_eq!(config.distributed_items(&items),vec![vec![0],vec![1]]);
+        config.assign_exact(2,&["A.txt".into()],None);assert_eq!(config.fences[1].members,vec!["a.txt","A.txt"]);
+        assert_eq!(config.distributed_items(&items),vec![vec![],vec![1,0]]);
+        config.release_item_exact("A.txt".into(),Placement::default());config.release_item_exact("a.txt".into(),Placement::default());config.normalize();
+        assert_eq!(config.released_items.len(),2);assert_eq!(config.distributed_items(&items),vec![Vec::<usize>::new(),Vec::new()]);
+        config.assign_exact(1,&["A.txt".into()],None);assert_eq!(config.released_items.len(),1);assert_eq!(config.released_items[0].members,vec!["a.txt"]);
+        assert_eq!(config.distributed_items(&items),vec![vec![0],vec![]]);
+    }
+    #[test]
     fn released_desktop_items_survive_rules_restart_and_explicit_reassignment() {
         let key=r"C:\Users\Test\Desktop\报告.txt";
         let mut config=DesktopConfig{fences:vec![fence(1,Some(Category::Documents),true)],next_id:2,..Default::default()};
@@ -564,6 +683,16 @@ mod tests {
         restored.assign(1,&[key.into()],None);
         assert!(restored.released_items.is_empty());
         assert_eq!(restored.distributed_items(&[info(key,false)]),vec![vec![0]]);
+    }
+    #[test]
+    fn rename_members_prefers_exact_identity_and_rejects_ambiguous_aliases(){
+        let mut config=DesktopConfig{fences:vec![fence(1,None,false),fence(2,None,false)],..Default::default()};
+        config.fences[0].members.push("A.txt".into());config.fences[1].members.push("a.txt".into());
+        assert!(!config.rename_member("a.TXT","wrong.txt"));
+        assert!(config.rename_member("A.txt","renamed.txt"));
+        assert_eq!(config.fences[0].members,vec!["renamed.txt"]);assert_eq!(config.fences[1].members,vec!["a.txt"]);
+        assert!(config.rename_member("A.TXT","unique.txt"));
+        assert_eq!(config.fences[1].members,vec!["unique.txt"]);
     }
     #[test]
     fn old_desktop_profiles_default_to_no_released_items() {

@@ -19,10 +19,12 @@ fn exercise(root:&PathBuf)->Result<serde_json::Value>{
     unsafe{OleInitialize(None)?;}
     struct Apartment;impl Drop for Apartment{fn drop(&mut self){unsafe{OleUninitialize();}}}let _apartment=Apartment;
     let instance=HINSTANCE(unsafe{GetModuleHandleW(None)?}.0);let mut windows=Windows(Vec::new());
-    for class in [w!("WorkerW"),w!("ZSDesk.Layer.Normal"),w!("ZSDesk.Layer.Fence"),w!("ZSDesk.Layer.Overlay")] {
+    for class in [w!("WorkerW"),w!("SHELLDLL_DefView"),w!("ZSDesk.Layer.Normal"),w!("ZSDesk.Layer.Fence"),w!("ZSDesk.Layer.Overlay")] {
         unsafe{RegisterClassW(&WNDCLASSW{lpfnWndProc:Some(proc),hInstance:instance,lpszClassName:class,..Default::default()});}
     }
     let desktop=show(None,w!("WorkerW"),WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE,instance,&mut windows)?;
+    let view=unsafe{CreateWindowExW(WINDOW_EX_STYLE::default(),w!("SHELLDLL_DefView"),w!("Owned desktop view"),WS_CHILD|WS_VISIBLE,0,0,400,300,Some(desktop),None,Some(instance),None)}?;
+    windows.0.push(view);
     let first=show(None,w!("ZSDesk.Layer.Normal"),WS_EX_NOACTIVATE,instance,&mut windows)?;
     let second=show(None,w!("ZSDesk.Layer.Normal"),WS_EX_NOACTIVATE,instance,&mut windows)?;
     let fence=show(Some(desktop),w!("ZSDesk.Layer.Fence"),WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE,instance,&mut windows)?;
@@ -61,10 +63,34 @@ fn exercise(root:&PathBuf)->Result<serde_json::Value>{
     ensure!(!host.desktop_exposed&&window_precedes(first,fence)&&window_precedes(second,fence),"a non-covering desktop helper raised fences over an application");
     host.raise_above(desktop);
     ensure!(window_precedes(first,fence)&&window_precedes(second,fence)&&window_precedes(fence,desktop),"a retained non-covering anchor raised fences over an application");
+    // A full-size helper passes geometric coverage, but is still not the
+    // desktop. Esc/menu dismissal may leave such a WorkerW activated.
+    let _=unsafe{SetWindowPos(helper,None,20,20,400,300,SWP_NOZORDER|SWP_NOACTIVATE)};
+    crate::desktop::set_z(helper,HWND_TOP);
+    ensure!(host.covers_applications_below(helper),"full-size helper fixture must pass the former geometry check");
+    host.raise_above(helper);
+    ensure!(!host.desktop_exposed&&window_precedes(first,fence)&&window_precedes(second,fence),"full-size WorkerW helper was mistaken for exposed desktop");
+    // When Explorer reparents the desktop view, the old HWND remains valid
+    // and full-screen. It must no longer be eligible as a retained anchor.
+    crate::desktop::set_z(desktop,HWND_TOP);host.raise_above(desktop);
+    let old=host.desktop_anchor.context("old desktop anchor")?;
+    let _=unsafe{SetParent(view,Some(helper))}?;
+    ensure!(!old.valid(),"reparented desktop view retained its obsolete anchor");
+    crate::desktop::set_z(helper,HWND_BOTTOM);host.lower_all(HWND::default());
+    ensure!(window_precedes(first,fence)&&window_precedes(second,fence),"obsolete desktop anchor covered applications after cancellation");
+    let restored=show(None,w!("ZSDesk.Layer.Normal"),WS_EX_NOACTIVATE,instance,&mut windows)?;
+    crate::desktop::set_z(helper,HWND_TOP);host.raise_above(helper);crate::desktop::set_z(restored,fence);
+    host.reconcile_layer_event(restored);
+    ensure!(window_precedes(restored,fence)&&!host.desktop_exposed,"a shown application without foreground activation remained under fences");
+    let offscreen=show(None,w!("ZSDesk.Layer.Normal"),WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE,instance,&mut windows)?;
+    unsafe{SetWindowPos(offscreen,None,-32000,-32000,20,20,SWP_NOZORDER|SWP_NOACTIVATE)?;}
+    ensure!(host.application_window(offscreen).is_none(),"off-screen helper defined the visible application band");
     host.fences.clear();host.loader.shutdown();host.gfx.release_device_resources();
     Ok(serde_json::json!({"topmost_overlay_cannot_raise_background_fences":true,"cancel_without_foreground_is_safe":true,
         "all_normal_apps_remain_above_fences":true,"show_desktop_preserved":true,"capture_on_exposed_desktop_preserved":true,
-        "own_app_switch_restores_application_priority":true,"specific_hotkey_not_required":true,"real_desktop_modified":false}))
+        "own_app_switch_restores_application_priority":true,"full_size_helper_rejected":true,"reparented_anchor_rejected":true,
+        "shown_application_reconciled_without_foreground":true,"offscreen_helpers_excluded":true,
+        "specific_hotkey_not_required":true,"real_desktop_modified":false}))
 }
 
 #[test]

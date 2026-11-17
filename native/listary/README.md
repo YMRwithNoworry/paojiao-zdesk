@@ -55,6 +55,18 @@ This configuration supports Listary-to-ZSDesk folder opening and file selection.
 Those features require Listary to recognize ZSDesk as an integrated file manager. The old DLL is not loaded by 7.1;
 this adapter does not impersonate another application's window class or install a global hook.
 
+### HTTP API and Quick Switch
+
+Listary 7.1.0.47's built-in **HTTP API Documentation** describes `POST /api/v1/search` for querying its file index.
+The optional service listens only on `127.0.0.1`; its port is configured in Listary. Search requests accept
+`query`, pagination and file filters, and return matching file paths. The documented API has no operation
+for registering a file manager, publishing its active folder, or switching an Open/Save dialog.
+
+Enabling that search API does not enable ZSDesk Quick Switch integration. The folder-opening and file-selection
+configuration above remains available independently. A Listary 7.1 Quick Switch provider needs a supported
+file-manager integration contract; the [7.1 release notes](https://www.listary.com/v7) describe a future
+integration system separately from the HTTP search API.
+
 Configuration references: [General settings](https://help.listary.com/options-general),
 [Commands](https://help.listary.com/options-commands), [7.1 release notes](https://www.listary.com/v7).
 

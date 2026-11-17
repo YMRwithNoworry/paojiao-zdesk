@@ -34,7 +34,7 @@ pub(super) fn same_location(left:&ShellLocation,right:&ShellLocation)->bool {
 
 impl WindowState {
     pub(super) fn update_shell_registry(&mut self) {
-        if cfg!(test){return;}
+        if cfg!(test)||self.picker.is_some(){return;}
         let default_profile=std::path::absolute(&self.config_path).ok().zip(std::path::absolute(storage::config_path()).ok())
             .is_some_and(|(actual,default)|crate::explorer_forwarder::same_path(&actual,&default));
         let executable=std::env::current_exe().ok();
@@ -43,7 +43,7 @@ impl WindowState {
             if let Some(mut registry)=self.shell_registry.take(){registry.stop();}
             let changed=default_profile&&executable.as_ref().is_some_and(|exe|zsdesk_windows::integration::folder_integration_needs_attention(exe));
             if changed&&!self.shell_registration_warning {
-                self.show_message("文件夹接管的处理程序或隐藏标志已被修改；可在“系统集成”中恢复后重新启用。".into());
+                self.show_message(zsdesk_core::i18n::text("文件夹接管的处理程序或隐藏标志已被修改；可在“系统集成”中恢复后重新启用。").into());
             }
             self.shell_registration_warning=changed;
             return;

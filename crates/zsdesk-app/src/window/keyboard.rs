@@ -36,7 +36,7 @@ pub(super) fn resolve(key: u16, modifiers: Modifiers, file_context: bool, text_e
 /// Native views own their undo/redo routing. Give them the original message
 /// before considering a currently available background-menu command.
 pub(super) fn execute_message(view: &IShellView, owner: HWND, action: FileShortcut, message: &MSG) -> Result<()> {
-    if matches!(action, FileShortcut::Undo | FileShortcut::Redo) {
+    if matches!(action, FileShortcut::Undo | FileShortcut::Redo | FileShortcut::SelectAll) {
         return translate_history_then_invoke(|| unsafe { view.TranslateAccelerator(message) },
             || execute(view, owner, action));
     }
@@ -59,14 +59,17 @@ pub(super) fn execute(view: &IShellView, owner: HWND, action: FileShortcut) -> R
     // (or another virtual folder), a zip as paste target and a clipboard that
     // holds only virtual file contents have none: the folder's own Shell verb
     // handles those, exactly as the toolbar buttons already do.
-    let direct=match action{
-        FileShortcut::Copy=>Some(file_transfer::copy_view(view,owner,false)),
-        FileShortcut::Cut=>Some(file_transfer::copy_view(view,owner,true)),
-        FileShortcut::Paste=>Some(file_transfer::paste_view(view,owner)),
-        FileShortcut::Delete{permanent}=>Some(file_transfer::delete_view(view,owner,permanent)),
-        _=>None,
-    };
-    if direct.is_some_and(|result|result.is_ok()){return Ok(());}
+    if matches!(action,FileShortcut::Copy|FileShortcut::Cut|FileShortcut::Delete{..})&&file_transfer::filesystem_selection(view)?{
+        return match action{
+            FileShortcut::Copy=>file_transfer::copy_view(view,owner,false),
+            FileShortcut::Cut=>file_transfer::copy_view(view,owner,true),
+            FileShortcut::Delete{permanent}=>file_transfer::delete_view(view,unsafe{view.GetWindow()?},permanent),
+            _=>unreachable!(),
+        };
+    }
+    if action==FileShortcut::Paste&&file_transfer::has_filesystem_clipboard(){
+        if let Some(path)=file_transfer::filesystem_folder_path(view)?{return file_transfer::paste(unsafe{view.GetWindow()?},&path);}
+    }
     if action == FileShortcut::InvertSelection { return zsdesk_windows::shell::commands::invert_view_selection(view); }
     if matches!(action, FileShortcut::Undo | FileShortcut::Redo) {
         let menu = ShellMenu::for_view(view, false)?;

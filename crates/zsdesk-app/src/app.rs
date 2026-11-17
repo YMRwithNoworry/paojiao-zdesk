@@ -85,7 +85,7 @@ fn parse(args: impl IntoIterator<Item=OsString>) -> Result<Options> {
         }
         if arg == "--apply-import" { opts.apply_import = true; continue; }
         if arg == "--classic-menu" { opts.classic = true; continue; }
-        if arg == "--profile-dir" { opts.profile = Some(PathBuf::from(iter.next().context("缺少配置目录")?)); continue; }
+        if arg == "--profile-dir" { opts.profile = Some(PathBuf::from(iter.next().context(zsdesk_core::i18n::text("缺少配置目录"))?)); continue; }
         if arg == "--select" { opts.select = true; continue; }
         // Registered by system integration: behaves like a plain path argument.
         if arg == "--shell-open" {opts.shell_open=true; continue; }
@@ -276,6 +276,7 @@ pub(crate) fn run_arguments(args: Vec<OsString>, in_host: bool) -> Result<()> {
     let _ = unsafe { windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID(windows::core::PCWSTR(app_id.as_ptr())) };
     let opts = parse(args.iter().cloned())?;
     let config = std::path::absolute(opts.profile.as_ref().map(|p| p.join("explorer-session.json")).unwrap_or_else(storage::config_path))?;
+    if !in_host{crate::language::initialize_profile(&config);}
     if !in_host&&managed(&opts){return crate::runtime::run(config,args);}
     let desktop_config = config.with_file_name("desktop-fences.json");
     if opts.integration_enable{
@@ -308,7 +309,10 @@ pub(crate) fn run_arguments(args: Vec<OsString>, in_host: bool) -> Result<()> {
         Mode::Desktop(_) | Mode::Guard(..) | Mode::ImportTencent if !crate::edition::DESKTOP => {
             bail!("ZSDesk {} 不包含桌面格子，请使用桌面版或全量版", crate::edition::name())
         }
-        Mode::Desktop(command) => return desktop::run(desktop_config, config, command),
+        Mode::Desktop(command) => {
+            if !matches!(command,DesktopCommand::Quit|DesktopCommand::Diagnostics(_)){let _=crate::quick_search::start_if_enabled(&config);}
+            return desktop::run(desktop_config, config, command);
+        },
         Mode::Guard(pid,thread) => return desktop::guard(desktop_config, pid,thread),
         Mode::ImportTencent => return desktop::migration::run(
             opts.import_source.as_deref().context("缺少腾讯布局路径")?, &desktop_config,
@@ -338,12 +342,22 @@ pub(crate) fn run_arguments(args: Vec<OsString>, in_host: bool) -> Result<()> {
         let Some(instance)=crate::instance::enter(&config, requested.as_ref(), selection.as_deref())? else {return Ok(());}; Some(instance)
     };
     let loaded = if config.try_exists()? { Some(storage::load(&config)?) } else { None };
-    let fresh = loaded.is_none() || opts.new_window;
-    let mut session = loaded.unwrap_or_else(storage::default_session);
-    session.normalize();
-    if let Some(location) = requested { activate(&mut session, location, fresh); }
-    else {session.apply_startup_location();}
+    let session=prepare_window_session(loaded,requested,opts.new_window);
     window::run(session, config, selection, !opts.classic,opts.new_window,opts.focus_search.then_some(opts.search_settings))
+}
+
+fn prepare_window_session(saved:Option<ExplorerSession>,requested:Option<ShellLocation>,independent:bool)->ExplorerSession{
+    let has_saved=saved.is_some();let mut session=saved.unwrap_or_else(storage::default_session);
+    session.normalize();
+    if let Some(location)=requested{
+        // Restoring the primary window must preserve its saved tabs even when
+        // a folder open/reveal supplies the active location. Independent
+        // windows and non-restoring startup modes still start at that target.
+        let fresh=independent||!has_saved||session.ui.startup_location!=zsdesk_core::model::explorer::StartupLocation::RestoreSession;
+        if fresh{session.secondary_pane=Default::default();}
+        activate(&mut session,location,fresh);
+    }else{session.apply_startup_location();}
+    session
 }
 
 fn activate(session: &mut ExplorerSession, target: ShellLocation, fresh: bool) {
@@ -419,6 +433,37 @@ mod tests {
         activate(&mut s, a, false);
         assert_eq!(s.tabs.len(), 2);
         assert_eq!(s.active_tab, 0);
+    }
+    #[test]
+    fn explicit_launch_respects_restore_preference_and_independent_windows(){
+        use zsdesk_core::model::explorer::StartupLocation;
+        for start in [StartupLocation::RestoreSession,StartupLocation::ThisPc,StartupLocation::Folder(r"C:\startup".into())]{
+            let restored=start==StartupLocation::RestoreSession;
+            let mut session=ExplorerSession::default();session.ui.startup_location=start;
+            activate(&mut session,ShellLocation::Path(r"C:\old".into()),true);
+            session.secondary_pane=Default::default();
+            for independent in [false,true]{
+                let actual=prepare_window_session(Some(session.clone()),Some(ShellLocation::Path(r"C:\requested".into())),independent);
+                assert_eq!(actual.tabs.len(),if restored&&!independent{2}else{1});
+                assert_eq!(actual.current_location(),&ShellLocation::Path(r"C:\requested".into()));
+            }
+        }
+    }
+    #[test]
+    fn restored_launch_reuses_saved_target_without_losing_other_tabs(){
+        let mut session=ExplorerSession::default();
+        activate(&mut session,ShellLocation::Path(r"C:\first".into()),true);
+        activate(&mut session,ShellLocation::Path(r"C:\second".into()),false);
+        let actual=prepare_window_session(Some(session.clone()),Some(ShellLocation::Path(r"C:\first".into())),false);
+        assert_eq!(actual.tabs,session.tabs);assert_eq!(actual.active_tab,0);
+        let reopened=prepare_window_session(Some(actual.clone()),None,false);
+        assert_eq!(reopened.tabs,actual.tabs);assert_eq!(reopened.active_tab,actual.active_tab);
+    }
+    #[test]
+    fn first_explicit_launch_has_no_synthetic_restored_tab(){
+        let target=ShellLocation::Path(r"C:\first-launch".into());
+        let session=prepare_window_session(None,Some(target.clone()),false);
+        assert_eq!(session.tabs.len(),1);assert_eq!(session.current_location(),&target);
     }
     #[test]
     fn selection_requires_target_and_keeps_unicode_names() {

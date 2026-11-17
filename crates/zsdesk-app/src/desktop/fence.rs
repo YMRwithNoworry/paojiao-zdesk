@@ -76,7 +76,7 @@ pub struct Edges { pub left: bool, pub top: bool, pub right: bool, pub bottom: b
 pub enum Interaction {
     Move { cursor: POINT, rect: RECT },
     Resize { edges: Edges, cursor: POINT, rect: RECT },
-    Press { index: usize, cursor: POINT },
+    Press { key: String, cursor: POINT },
     /// Rubber-band selection; `start` is in content coordinates (client y +
     /// scroll at the press), `current` in client coordinates.
     Rubber { start: POINT, current: POINT, base: HashSet<String> },
@@ -110,6 +110,7 @@ pub struct Geometry {
     pub add_hidden: bool,
     pub tab_list: Rect,
     pub hidden_tabs: usize,
+    pub list_view: bool,
 }
 
 impl Geometry {
@@ -128,7 +129,7 @@ impl Geometry {
     pub fn new(width: i32, height: i32, dpi: u32, fence: &Fence, count: usize, scroll: i32, browsing: bool) -> Self {
         let s = |v: i32| scale(v, dpi);
         let title_h = s(TITLE_H);
-        let mut g = Geometry { width, height, ..Default::default() };
+        let mut g = Geometry { width, height, list_view:fence.view==FenceView::List, ..Default::default() };
         g.title = Rect::new(0, 0, width, title_h.min(height));
         g.more = Rect::new(width - s(32), s(3), s(28), title_h - s(6));
         g.back = if browsing { Rect::new(s(4), s(3), s(28), title_h - s(6)) } else { Rect::default() };
@@ -160,6 +161,7 @@ impl Geometry {
             FenceView::List => {
                 let row_h = s(26);
                 let icon = s(20);
+                g.icon_px=icon;
                 for i in 0..count {
                     let y = g.content.y + pad + i as i32 * row_h - scroll;
                     let cell = Rect::new(g.content.x + pad, y, inner_w, row_h - s(2));
@@ -262,6 +264,7 @@ impl Geometry {
 
     /// Insertion index for a drop at `(x, y)` (manual ordering).
     pub fn insertion(&self, x: i32, y: i32) -> usize {
+        if self.list_view{return self.cells.iter().position(|c|y<c.cell.y+c.cell.height/2).unwrap_or(self.cells.len());}
         self.cells.iter().position(|c| y < c.cell.y || (y < c.cell.bottom() && x < c.cell.x + c.cell.width / 2)).unwrap_or(self.cells.len())
     }
 
@@ -295,6 +298,10 @@ pub struct FenceWin {
     pub drop_hover: Option<usize>,
     pub rename: Option<(HWND, RenameTarget)>,
     pub message: Option<String>,
+    pub notice:Option<(String,std::time::Instant)>,
+    pub cut_keys:HashSet<String>,
+    pub pending_selection:Option<(Vec<std::path::PathBuf>,bool,std::time::Instant,u64)>,
+    pub operation_epoch:u64,
     pub tracking: bool,
     /// A collapsed fence temporarily rolled down under the pointer.
     pub peek: bool,
@@ -314,11 +321,16 @@ pub struct FenceWin {
 pub enum RenameTarget { Item(String), Title }
 
 impl FenceWin {
+    pub fn advance_operation_epoch(&mut self){
+        static NEXT:std::sync::atomic::AtomicU64=std::sync::atomic::AtomicU64::new(1);
+        self.operation_epoch=NEXT.fetch_add(1,std::sync::atomic::Ordering::Relaxed);self.pending_selection=None;
+    }
     pub fn new(id: u64) -> Self {
-        Self { id, hwnd: HWND::default(), dpi: 96, entries: Vec::new(), selection: HashSet::new(), anchor: None, focus: None,
+        let mut value=Self { id, hwnd: HWND::default(), dpi: 96, entries: Vec::new(), selection: HashSet::new(), anchor: None, focus: None,
             hover: FenceHit::None, scroll: 0, zoom_remainder: 0, standalone: false, interaction: None, surface: None, notify: None, notify_path: None, drop: None,
-            drop_hover: None, rename: None, message: None, tracking: false, peek: false, peek_blocked: false,
-            tabs: Vec::new(), ghost: false, merge_hover: None, drop_tab: None }
+            drop_hover: None, rename: None, message: None,notice:None,cut_keys:HashSet::new(),pending_selection:None,operation_epoch:0, tracking: false, peek: false, peek_blocked: false,
+            tabs: Vec::new(), ghost: false, merge_hover: None, drop_tab: None };
+        value.advance_operation_epoch();value
     }
 
     /// More than one tab: the title bar shows the tab strip.
@@ -491,7 +503,7 @@ impl FenceWin {
                 let content = rf(g.content);
                 cv.push_clip(content);
                 if self.entries.is_empty() && !self.standalone {
-                    let hint = self.message.clone().unwrap_or_else(|| if fence.is_desktop() { "将桌面图标拖到这里".into() } else { "此文件夹为空".into() });
+                    let hint = self.message.clone().unwrap_or_else(|| if fence.is_desktop() { zsdesk_core::i18n::text("将桌面图标拖到这里").into() } else { zsdesk_core::i18n::text("此文件夹为空").into() });
                     cv.text(&hint, content, &TextStyle::ui(sf(12.0)).align(Align::Center), col(palette.text_secondary));
                 }
                 let label_style = if fence.view == FenceView::List { TextStyle::ui(sf(12.0)) } else { TextStyle::ui(sf(12.0)).align(Align::Center).top().wrapped() };
@@ -514,19 +526,19 @@ impl FenceWin {
                     }
                     if self.focus == Some(i) && selected { cv.stroke_round(r, sf(4.0), col(palette.selected_border), 1.0); }
                     let icon_rect = rf(cell.icon);
-                    let opacity = if entry.ghosted { 0.5 } else { 1.0 };
+                    let opacity = if entry.ghosted || self.cut_keys.contains(&entry.key) { 0.5 } else { 1.0 };
                     match &bitmaps[i] {
                         Some(bitmap) => {
                             let (bw, bh) = bitmap_size(bitmap);
                             cv.image(bitmap, fit(icon_rect, bw, bh), opacity);
                         }
-                        None => cv.glyph(if entry.is_container() { glyph::FOLDER } else { "\u{E8A5}" }, icon_rect, icon_rect.h * 0.7, col(palette.text_secondary)),
+                        None => cv.glyph(if entry.is_container() { glyph::FOLDER } else { "\u{E8A5}" }, icon_rect, icon_rect.h * 0.7, col(palette.text_secondary).with_alpha(opacity)),
                     }
                     if entry.is_link && fence.view == FenceView::Icons {
                         // Shortcut overlay arrow, like the desktop.
                         let a = RectF::new(icon_rect.x, icon_rect.bottom() - sf(14.0), sf(14.0), sf(14.0));
-                        cv.round(a, sf(2.0), Color::rgba8(0xFF, 0xFF, 0xFF, 0xF0));
-                        cv.glyph("\u{E8A7}", a, sf(9.0), Color::rgba8(0x00, 0x5F, 0xB8, 0xFF));
+                        cv.round(a, sf(2.0), Color::rgba8(0xFF, 0xFF, 0xFF, 0xF0).with_alpha(opacity));
+                        cv.glyph("\u{E8A7}", a, sf(9.0), Color::rgba8(0x00, 0x5F, 0xB8, 0xFF).with_alpha(opacity));
                     }
                     if let Some((_, RenameTarget::Item(key))) = &self.rename { if *key == entry.key { continue; } }
                     let label = rf(cell.label);
@@ -543,6 +555,11 @@ impl FenceWin {
                     cv.fill(band, col(palette.selected));
                     cv.stroke_round(band, 0.0, col(palette.selected_border), 1.0);
                 }
+                if !self.standalone{if let Some((text,until))=&self.notice{if std::time::Instant::now()<*until{
+                    let height=sf(28.0).min(content.h);let area=RectF::new(content.x+sf(6.0),content.bottom()-height-sf(4.0),(content.w-sf(12.0)).max(0.0),height);
+                    cv.round(area,sf(5.0),col(palette.title).with_alpha(0.96));
+                    cv.text(text,RectF::new(area.x+sf(8.0),area.y,(area.w-sf(16.0)).max(0.0),area.h),&TextStyle::ui(sf(11.0)),col(palette.text));
+                }}}
                 cv.pop_clip();
                 if !g.thumb.is_empty() && (hovered || matches!(self.interaction, Some(Interaction::Thumb { .. }))) {
                     cv.round(rf(g.thumb), sf(2.0), col(palette.text_secondary).with_alpha(0.6));
@@ -702,6 +719,17 @@ mod tests {
         assert_eq!(g.insertion(c.x + 2, c.y + 5), 1);
         assert_eq!(g.insertion(c.right() - 2, c.y + 5), 2);
         assert_eq!(g.insertion(5, 399), 6);
+    }
+    #[test]fn list_insertion_depends_on_vertical_half_not_pointer_column(){
+        for dpi in [96,144,192]{
+            let mut model=fence();model.view=FenceView::List;
+            let g=Geometry::new(scale(340,dpi),scale(400,dpi),dpi,&model,6,scale(20,dpi),false);
+            assert_eq!(g.icon_px,scale(20,dpi));
+            let row=g.cells[2].cell;
+            for x in [row.x+1,row.x+row.width/2,row.right()-1]{
+                assert_eq!(g.insertion(x,row.y+1),2);assert_eq!(g.insertion(x,row.bottom()-1),3);
+            }
+        }
     }
 
     #[test]

@@ -6,9 +6,9 @@ thread_local! {
     static NEXT_INPUT_WATCH: Cell<u64> = const { Cell::new(1) };
 }
 
-struct InputWatch { id:u64, hook:HHOOK, cancelled:Rc<Cell<bool>> }
+pub(super) struct InputWatch { id:u64, hook:HHOOK, cancelled:Rc<Cell<bool>> }
 impl InputWatch {
-    fn new()->Option<Self>{
+    pub(super) fn new()->Option<Self>{
         let hook=unsafe{SetWindowsHookExW(WH_GETMESSAGE,Some(search_input_hook),None,
             windows::Win32::System::Threading::GetCurrentThreadId())}.ok()?;
         let id=NEXT_INPUT_WATCH.with(|next|{let value=next.get();next.set(value.wrapping_add(1).max(1));value});
@@ -19,6 +19,7 @@ impl InputWatch {
         if !installed {let _=unsafe{UnhookWindowsHookEx(hook)};return None;}
         Some(Self{id,hook,cancelled})
     }
+    pub(super) fn changed(&self)->bool{self.cancelled.get()}
 }
 impl Drop for InputWatch {
     fn drop(&mut self){
@@ -98,7 +99,7 @@ impl WindowState{
     pub(super) fn write_diagnostics(&self,request:&crate::instance::DiagnosticRequest)->anyhow::Result<()>{
         if request.output.exists(){
             let existing:serde_json::Value=serde_json::from_slice(&std::fs::read(&request.output)?)?;
-            anyhow::ensure!(existing["schema"]=="ZSDesk.Diagnostics.v1","输出文件不是既有诊断报告");
+            anyhow::ensure!(existing["schema"]=="ZSDesk.Diagnostics.v1", "{}", zsdesk_core::tr_format!("输出文件不是既有诊断报告"));
         }
         let paths=self.browser.as_ref().map(|b|b.item_paths_limit(128)).unwrap_or_default();
         let selected=self.browser.as_ref().map(|b|b.selection_paths_limit(128)).unwrap_or_default();
@@ -111,7 +112,7 @@ impl WindowState{
             "search_maintenance_role":self.fast_search.as_ref().map(|engine|engine.maintenance_role()),
             "search_progress":self.search_progress,"message":self.status,"icon_cache_items":self.icons.len(),
             "search_materialization":self.browser.as_ref().map(|browser|browser.search_materialization_metrics()),
-            "search_panel_open":self.search_panel.open,"address_editing":self.address_editing,
+            "search_memory":crate::fast_search::memory_diagnostics(),"search_panel_open":self.search_panel.open,"address_editing":self.address_editing,
             "search_page":{"offset":self.search_controls().offset,"total":self.search_controls().total,"shown":self.search_controls().shown,"busy":self.search_controls().busy},
             "surface_bytes":self.surface.as_ref().map(|s|u64::from(s.width.max(0)as u32)*u64::from(s.height.max(0)as u32)*4).unwrap_or(0),
             "ui":self.session.ui,"menu":zsdesk_windows::shell::menu_diagnostics()});
@@ -120,7 +121,7 @@ impl WindowState{
         std::fs::write(&temp,serde_json::to_vec_pretty(&value)?)?;std::fs::rename(temp,&request.output)?;Ok(())
     }
     pub(super) fn cancel_fast_search(&mut self){
-        if let Some(engine)=&self.fast_search{engine.cancel();}
+        if let Some(engine)=&self.fast_search{engine.cancel_query();}
         self.fast_generation=0;self.fast_submitted=None;self.fast_events.clear();self.search_progress=None;
         self.discard_fast_restore("query cancelled");self.fast_reset_pending=false;self.fast_clearing=None;
         let _=unsafe{KillTimer(Some(self.hwnd),TIMER_FAST_SEARCH)};
@@ -139,17 +140,17 @@ impl WindowState{
         let options=crate::fast_search::SearchOptions::from_ui(&self.session.ui);
         if self.fast_search.is_none(){
             match crate::fast_search::FastSearch::for_profile(&self.config_path,self.hwnd,WM_FAST_SEARCH,options){
-                Ok(engine)=>self.fast_search=Some(engine),Err(error)=>{self.show_message(format!("无法启动搜索：{error}"));return;}
+                Ok(engine)=>self.fast_search=Some(engine),Err(error)=>{self.show_message(zsdesk_core::tr_format!("无法启动搜索：{error}", error=error));return;}
             }
         }
-        let preferred=self.search_scope.as_ref().and_then(|s|s.as_path().map(PathBuf::from));
+        let preferred=self.search_controls().scope;
         self.fast_found=0;self.fast_events.clear();self.discard_fast_restore("query started");self.fast_reset_pending=true;self.fast_clearing=None;
         let controls=self.search_controls();let expression=self.search_expression(query);
         self.fast_generation=self.fast_search.as_ref().unwrap().start_page(&expression,preferred,controls.offset,super::search_panel::SEARCH_PAGE_SIZE,controls.sort);
         self.fast_submitted=Some(submitted);
         let controls=self.search_controls_mut();controls.busy=true;controls.error=None;controls.shown=0;
         self.apply_search_sort();
-        self.search_progress=Some("正在搜索…".into());
+        self.search_progress=Some(zsdesk_core::i18n::text("正在搜索…").into());
         self.relayout();self.position_children();self.invalidate();
     }
     pub(super) fn search_backend_changed(&mut self){
@@ -157,7 +158,7 @@ impl WindowState{
         self.cancel_all_search_backends();
         self.save();
         if let Err(error)=crate::quick_search::control::signal(&self.config_path,"reload"){
-            self.show_message(format!("后台搜索设置重载失败：{error}"));
+            self.show_message(zsdesk_core::tr_format!("后台搜索设置重载失败：{error}", error=error));
         }
         if let Some(query)=query{self.start_fast_search(&query);}
     }
@@ -167,8 +168,8 @@ impl WindowState{
         let query=match self.current_location(){ShellLocation::Search{query,..}=>Some(query.clone()),_=>None};
         self.cancel_all_search_backends();
         match crate::fast_search::FastSearch::for_profile(&self.config_path,self.hwnd,WM_FAST_SEARCH,crate::fast_search::SearchOptions::from_ui(&self.session.ui)){
-            Ok(engine)=>{engine.rebuild();self.fast_search=Some(engine);self.show_message("正在后台重建自带索引，搜索时可查看进度".into());},
-            Err(error)=>self.show_message(format!("无法重建索引：{error}")),
+            Ok(engine)=>{engine.rebuild();self.fast_search=Some(engine);self.show_message(zsdesk_core::i18n::text("正在后台重建自带索引，搜索时可查看进度").into());},
+            Err(error)=>self.show_message(zsdesk_core::tr_format!("无法重建索引：{error}", error=error)),
         }
         if let Some(query)=query{self.start_fast_search(&query);}
     }
@@ -186,7 +187,7 @@ impl WindowState{
                 else if preferences.folder_sizes!=self.search_saved_preferences.folder_sizes{self.cancel_folder_sizes();}
                 self.session.ui.apply_search_preferences(&preferences);self.search_saved_preferences=preferences;true
             },
-            Err(error)=>{self.session.ui.apply_search_preferences(&self.search_saved_preferences);self.show_message(format!("搜索设置未保存：{error}"));false},
+            Err(error)=>{self.session.ui.apply_search_preferences(&self.search_saved_preferences);self.show_message(zsdesk_core::tr_format!("搜索设置未保存：{error}", error=error));false},
         }
     }
     fn pending_selection_valid(&mut self)->bool{
@@ -266,7 +267,7 @@ impl WindowState{
             Err(error) if error.code().0 as u32==0x8000000A=>{},
             Err(error)=>return Err(error),
         }
-        if std::time::Instant::now()>=deadline{return Err(windows::core::Error::new(windows::core::HRESULT(0x800705B4u32 as i32),"搜索结果视图尚未完成清除"));}
+        if std::time::Instant::now()>=deadline{return Err(windows::core::Error::new(windows::core::HRESULT(0x800705B4u32 as i32),zsdesk_core::i18n::text("搜索结果视图尚未完成清除")));}
         Ok(false)
     }
     fn restore_fast_selection(&mut self){
@@ -321,8 +322,9 @@ impl WindowState{
         if self.fast_generation==0 || !matches!(self.current_location(),ShellLocation::Search{..}){
             let events=self.fast_search.as_ref().map(|engine|engine.poll()).unwrap_or_default();
             if let Some(event)=events.last(){
-                if event.finished{self.show_message(event.error.as_ref().map_or_else(||"自带索引已就绪".to_owned(),|error|format!("索引未完成：{error}")));}
-                else if event.scanning{self.show_message(format!("正在建立自带索引，已处理 {} 项",event.scanned));}
+                if event.finished{self.show_message(event.error.as_ref().map_or_else(||zsdesk_core::i18n::text("自带索引已就绪").to_owned(),|error|zsdesk_core::tr_format!("索引未完成：{error}", error=error)));}
+                else if event.phase==crate::fast_search::IndexPhase::Snapshot{self.show_message(zsdesk_core::i18n::text("正在读取已有索引…").into());}
+                else if event.scanning{self.show_message(zsdesk_core::tr_format!("正在更新自带索引，已处理 {} 项", event.scanned));}
             }return;
         }
         if self.fast_events.is_empty(){if let Some(engine)=&self.fast_search{self.fast_events.extend(engine.poll());}}
@@ -332,7 +334,7 @@ impl WindowState{
                 match self.finish_fast_clear(){
                     Ok(true)=>{},
                     Ok(false)=>{self.fast_events.push_front(event);unsafe{SetTimer(Some(self.hwnd),TIMER_FAST_SEARCH,30,None);}return;},
-                    Err(error)=>{self.cancel_fast_search();self.show_message(format!("无法刷新搜索结果：{error}"));return;},
+                    Err(error)=>{self.cancel_fast_search();self.show_message(zsdesk_core::tr_format!("无法刷新搜索结果：{error}", error=error));return;},
                 }
             }
             if event.reset || self.fast_reset_pending{
@@ -344,7 +346,7 @@ impl WindowState{
                     Err(error) if error.code().0 as u32==0x8000000A=>{
                         self.fast_events.push_front(event);unsafe{SetTimer(Some(self.hwnd),TIMER_FAST_SEARCH,30,None);}return;
                     },
-                    Err(error)=>{self.cancel_fast_search();self.show_message(format!("无法刷新搜索结果：{error}"));return;},
+                    Err(error)=>{self.cancel_fast_search();self.show_message(zsdesk_core::tr_format!("无法刷新搜索结果：{error}", error=error));return;},
                 }
             }
             self.pending_selection_valid();
@@ -354,7 +356,7 @@ impl WindowState{
                     Err(error) if error.code().0 as u32==0x8000000A=>{
                         self.fast_events.push_front(event);unsafe{SetTimer(Some(self.hwnd),TIMER_FAST_SEARCH,30,None);}return;
                     },
-                    Err(error)=>{self.show_message(format!("无法显示搜索结果：{error}"));}
+                    Err(error)=>{self.show_message(zsdesk_core::tr_format!("无法显示搜索结果：{error}", error=error));}
                 }}
             }
             // Appending must not turn an external/user selection into our own
@@ -380,41 +382,41 @@ impl WindowState{
 fn progress_text(event:&crate::fast_search::SearchEvent,found:usize)->String{
     use crate::fast_search::BackendKind;
     if event.backend==BackendKind::Everything{
-        if event.scanning&&!event.finished&&event.error.is_none(){return "Everything 正在准备文件名索引，完成后自动显示结果…".into();}
-        return event.error.as_ref().map_or_else(||format!("共 {} 项 · 当前页 {found} 项 · Everything",event.indexed),|error|format!("搜索未完成：{error}"));
+        if event.scanning&&!event.finished&&event.error.is_none(){return zsdesk_core::i18n::text("Everything 正在准备文件名索引，完成后自动显示结果…").into();}
+        return event.error.as_ref().map_or_else(||zsdesk_core::tr_format!("共 {} 项 · 当前页 {found} 项 · Everything", event.indexed, found=found),|error|zsdesk_core::tr_format!("搜索未完成：{error}", error=error));
     }
     if !event.scanning&&event.error.is_none(){
-        let mut text=format!("共 {} 项 · 当前页 {found} 项 · 自带搜索",event.indexed);
+        let mut text=zsdesk_core::tr_format!("共 {} 项 · 当前页 {found} 项 · 自带搜索", event.indexed, found=found);
         if let Some(warning)=event.volumes.iter().find_map(|v|v.warning.as_ref()){text.push_str(" · ");text.extend(warning.chars().take(72));}return text;
     }
-    let backend=match event.backend{BackendKind::NativeNtfs=>"NTFS 元数据",BackendKind::DirectoryScan=>"目录索引",BackendKind::Mixed=>"NTFS + 目录补全",BackendKind::Everything=>"Everything"};
-    let mut text=if let Some(error)=&event.error{format!("搜索未完成：{error}")}
-        else if event.truncated{format!("已显示前 {found} 条结果，请补充关键字")}
-        else{format!("找到 {found} 条")};
-    text.push_str(&format!(" · {backend} · {} · {} 条索引记录",phase_text(event.phase),event.indexed));
-    if event.scanning{text.push_str(&format!("（已处理 {} 条）",event.scanned));}
-    if event.read_only{text.push_str(" · 共享索引，只读查询");}
+    let backend=match event.backend{BackendKind::NativeNtfs=>zsdesk_core::i18n::text("NTFS 元数据"),BackendKind::DirectoryScan=>zsdesk_core::i18n::text("目录索引"),BackendKind::Mixed=>zsdesk_core::i18n::text("NTFS + 目录补全"),BackendKind::Everything=>"Everything"};
+    let mut text=if let Some(error)=&event.error{zsdesk_core::tr_format!("搜索未完成：{error}", error=error)}
+        else if event.truncated{zsdesk_core::tr_format!("已显示前 {found} 条结果，请补充关键字", found=found)}
+        else{zsdesk_core::tr_format!("找到 {found} 条", found=found)};
+    text.push_str(&zsdesk_core::tr_format!(" · {backend} · {} · {} 条索引记录", phase_text(event.phase), event.indexed, backend=backend));
+    if event.scanning{text.push_str(&zsdesk_core::tr_format!("（已处理 {} 条）", event.scanned));}
+    if event.read_only{text.push_str(zsdesk_core::i18n::text(" · 共享索引，只读查询"));}
     if !event.volumes.is_empty(){
         let volumes=event.volumes.iter().take(8).map(|volume|{
             let root=volume.root.to_string_lossy();let root=root.trim_end_matches(['\\','/']);
-            let mode=if volume.backend==BackendKind::DirectoryScan{"目录"}else{"NTFS"};
+            let mode=if volume.backend==BackendKind::DirectoryScan{zsdesk_core::i18n::text("目录")}else{"NTFS"};
             format!("{root} {mode}/{}",phase_text(volume.phase))
         }).collect::<Vec<_>>().join("、");
         text.push_str(&format!(" · {volumes}"));
-        if event.volumes.len()>8{text.push_str(&format!(" 等 {} 卷",event.volumes.len()));}
+        if event.volumes.len()>8{text.push_str(&zsdesk_core::tr_format!(" 等 {} 卷", event.volumes.len()));}
         if let Some(warning)=event.volumes.iter().find_map(|volume|volume.warning.as_ref()){
             let short:String=warning.chars().take(72).collect();text.push_str(&format!(" · {short}"));
             if warning.chars().count()>72{text.push('…');}
         }
     }
-    if event.denied>0{text.push_str(&format!(" · 跳过 {} 处受限位置",event.denied));}
-    if event.skipped_reparse>0{text.push_str(&format!(" · {} 处目录链接未跟随",event.skipped_reparse));}
+    if event.denied>0{text.push_str(&zsdesk_core::tr_format!(" · 跳过 {} 处受限位置", event.denied));}
+    if event.skipped_reparse>0{text.push_str(&zsdesk_core::tr_format!(" · {} 处目录链接未跟随", event.skipped_reparse));}
     text
 }
 fn phase_text(phase:crate::fast_search::IndexPhase)->&'static str{
     use crate::fast_search::IndexPhase;
-    match phase{IndexPhase::Starting=>"准备中",IndexPhase::Snapshot=>"建立快照",IndexPhase::CatchingUp=>"同步 USN",
-        IndexPhase::Scanning=>"目录补全",IndexPhase::Attributes=>"读取匹配项属性",IndexPhase::Ready=>"就绪",IndexPhase::Paused=>"已暂停"}
+    match phase{IndexPhase::Starting=>zsdesk_core::i18n::text("准备中"),IndexPhase::Snapshot=>zsdesk_core::i18n::text("读取已有索引"),IndexPhase::CatchingUp=>zsdesk_core::i18n::text("同步文件变更"),
+        IndexPhase::Scanning=>zsdesk_core::i18n::text("目录补全"),IndexPhase::Attributes=>zsdesk_core::i18n::text("读取匹配项属性"),IndexPhase::Ready=>zsdesk_core::i18n::text("就绪"),IndexPhase::Paused=>zsdesk_core::i18n::text("已暂停")}
 }
 
 #[cfg(test)]mod tests{
@@ -462,7 +464,7 @@ fn phase_text(phase:crate::fast_search::IndexPhase)->&'static str{
             scanning:true,finished:false,truncated:false,error:None,reset:true,backend:BackendKind::Mixed,
             phase:IndexPhase::CatchingUp,volumes:vec![VolumeStatus{root:PathBuf::from(r"C:\"),backend:BackendKind::NativeNtfs,
                 phase:IndexPhase::Ready,indexed:20,checkpoint:Some(10),warning:None}],read_only:true};
-        let text=progress_text(&event,2);for part in ["NTFS","USN","只读","索引记录","C:"]{assert!(text.contains(part));}
+        let text=progress_text(&event,2);for part in ["NTFS","同步文件变更","只读","索引记录","C:"]{assert!(text.contains(part));}
         assert!(!text.contains("唯一文件"));
     }
 }

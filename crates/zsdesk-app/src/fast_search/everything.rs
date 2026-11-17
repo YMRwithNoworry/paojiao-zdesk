@@ -34,7 +34,11 @@ pub struct SearchItem{
 pub struct SearchPage{pub items:Vec<SearchItem>,pub total:u64,pub offset:u32}
 
 pub fn running()->Option<HWND>{runtime::running()}
+pub fn available(configured:Option<&Path>)->bool{runtime::available(configured)}
 pub fn executable(configured:Option<&Path>)->Option<PathBuf>{runtime::executable(configured)}
+/// Observes configured/running sources without launching an indexer or service.
+/// Run on a background worker because bounded IPC and file checks may wait.
+pub fn status_report(profile:&Path)->String{runtime::status_report(profile)}
 pub fn open_settings(profile:&Path)->Result<()>{let _activity=super::everything_activity();super::require_everything(profile)?;runtime::open_settings(profile)}
 /// Must be invoked only by the explicit “启用全盘索引” user action.
 pub fn enable_service(profile:&Path)->Result<()>{let _activity=super::everything_activity();super::require_everything(profile)?;runtime::enable_service(profile)}

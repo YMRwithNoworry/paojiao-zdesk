@@ -22,6 +22,7 @@ pub enum Command {
     SwitchPane,
     NewWindow,
     ToggleFullscreen,
+    ToggleCommandBar,
     FocusNext,
     FocusPrevious,
     ZoomIn,
@@ -66,6 +67,7 @@ impl Command {
             Self::ZoomOut => 2035,
             Self::ResetZoom => 2036,
             Self::CloseOtherTabs => 2037,
+            Self::ToggleCommandBar => 2038,
             Self::ViewPreset(n) => 2040 + n as u16,
             Self::SelectTab(n) => 2020 + n as u16,
         }
@@ -99,6 +101,7 @@ impl Command {
             2035 => Some(Self::ZoomOut),
             2036 => Some(Self::ResetZoom),
             2037 => Some(Self::CloseOtherTabs),
+            2038 => Some(Self::ToggleCommandBar),
             2041..=2048 => Some(Self::ViewPreset((id - 2040) as u8)),
             2021..=2029 => Some(Self::SelectTab((id - 2020) as u8)),
             _ => None,
@@ -111,7 +114,7 @@ mod tests {
     use super::Command;
     #[test]
     fn ids_round_trip() {
-        for c in [Command::NewTab, Command::CloseOtherTabs, Command::NewFolder, Command::ToggleDetails,Command::ToggleDualPane,Command::SwitchPane, Command::SelectTab(1), Command::SelectTab(9)] {
+        for c in [Command::NewTab, Command::CloseOtherTabs, Command::NewFolder, Command::ToggleDetails,Command::ToggleDualPane,Command::SwitchPane,Command::ToggleCommandBar, Command::SelectTab(1), Command::SelectTab(9)] {
             assert_eq!(Command::from_id(c.id()), Some(c));
         }
         assert_eq!(Command::from_id(2020), None);

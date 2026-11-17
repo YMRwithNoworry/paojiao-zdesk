@@ -20,7 +20,7 @@ fn request_path(workspace:&Path,id:u128)->PathBuf{workspace.join(format!("wps-re
 fn result_path(workspace:&Path,id:u128)->PathBuf{workspace.join(format!("wps-result-{id}.json"))}
 fn cancel_path(workspace:&Path,id:u128)->PathBuf{workspace.join(format!("wps-cancel-{id}"))}
 fn read<T:serde::de::DeserializeOwned>(path:&Path)->Result<T>{
-    if fs::metadata(path)?.len()>65536{bail!("文档预览状态过长");}
+    if fs::metadata(path)?.len()>65536{bail!("{}", zsdesk_core::tr_format!("文档预览状态过长"));}
     Ok(serde_json::from_slice(&fs::read(path)?)?)
 }
 fn write(path:&Path,value:&impl Serialize)->Result<()>{
@@ -53,9 +53,9 @@ pub(super) fn cancelled(workspace:&Path)->bool{ACTIVE.with(|active|active.get().
 pub(super) fn guarded()->bool{ACTIVE.with(|active|active.get().is_some())}
 
 pub(super) fn render(source:&Path,workspace:&Path)->Result<RenderedDocument>{
-    if workspace.join("wps-active.lock").exists(){bail!("WPS 正在完成上一次文档预览，请稍后重试");}
+    if workspace.join("wps-active.lock").exists(){bail!("{}", zsdesk_core::tr_format!("WPS 正在完成上一次文档预览，请稍后重试"));}
     let preview:serde_json::Value=read(&workspace.join("request.json"))?;
-    let generation=preview["generation"].as_u64().context("文档预览请求无效")?;
+    let generation=preview["generation"].as_u64().context(zsdesk_core::i18n::text("文档预览请求无效"))?;
     let id=SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
     let request=Request{id,source:source.into(),preview_generation:generation};
     let input=request_path(workspace,id);write(&input,&request)?;
@@ -64,7 +64,7 @@ pub(super) fn render(source:&Path,workspace:&Path)->Result<RenderedDocument>{
     let mut child=Command::new(std::env::current_exe()?).arg("--wps-render-worker").arg(&input)
         .creation_flags(CREATE_NO_WINDOW.0|CREATE_BREAKAWAY_FROM_JOB.0)
         .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn()
-        .context("无法启动文档预览清理进程")?;
+        .context(zsdesk_core::i18n::text("无法启动文档预览清理进程"))?;
     let started=Instant::now();let output=result_path(workspace,id);
     loop{
         if let Ok(outcome)=read::<Outcome>(&output){
@@ -72,9 +72,9 @@ pub(super) fn render(source:&Path,workspace:&Path)->Result<RenderedDocument>{
                 let _=fs::remove_file(&output);let _=fs::remove_file(&input);
                 std::thread::spawn(move||{let _=child.wait();});
                 if let Some(error)=outcome.error{bail!("{error}");}
-                let pdf=outcome.pdf.context("文档预览未返回内容")?;
+                let pdf=outcome.pdf.context(zsdesk_core::i18n::text("文档预览未返回内容"))?;
                 if pdf.parent()!=Some(workspace)||pdf.file_name().is_none_or(|name|!name.to_string_lossy().starts_with("wps-")){
-                    bail!("文档预览路径无效");
+                    bail!("{}", zsdesk_core::tr_format!("文档预览路径无效"));
                 }
                 // Result publication happens only after the owned document has
                 // closed. Reap the short-lived process away from the UI helper.
@@ -86,13 +86,13 @@ pub(super) fn render(source:&Path,workspace:&Path)->Result<RenderedDocument>{
             // Never kill the process holding WPS's only cleanup guard. One
             // cross-window mutex bounds pending WPS work to one document.
             std::thread::spawn(move||{let _=child.wait();});
-            bail!("文档预览已取消，正在关闭本次预览文档");
+            bail!("{}", zsdesk_core::tr_format!("文档预览已取消，正在关闭本次预览文档"));
         }
         if let Some(exit)=child.try_wait()?{
             // A successful writer publishes before exiting; re-read once to
             // avoid racing the exit notification with the final file rename.
             if output.exists(){continue;}
-            bail!("文档预览进程已退出（{exit}）");
+            bail!("{}", zsdesk_core::tr_format!("文档预览进程已退出（{exit}）" , exit=exit));
         }
         std::thread::sleep(Duration::from_millis(25));
     }
@@ -102,19 +102,19 @@ struct MutexOwner(HANDLE);
 impl Drop for MutexOwner{fn drop(&mut self){let _=unsafe{ReleaseMutex(self.0)};let _=unsafe{CloseHandle(self.0)};}}
 fn single_renderer()->Result<MutexOwner>{
     let mutex=unsafe{CreateMutexW(None,true,w!("Local\\ZSDesk.WpsPreview.DocumentCleanup"))}?;
-    if unsafe{GetLastError()}==ERROR_ALREADY_EXISTS{let _=unsafe{CloseHandle(mutex)};bail!("WPS 正在完成另一个文档预览，请稍后重试");}
+    if unsafe{GetLastError()}==ERROR_ALREADY_EXISTS{let _=unsafe{CloseHandle(mutex)};bail!("{}", zsdesk_core::tr_format!("WPS 正在完成另一个文档预览，请稍后重试"));}
     Ok(MutexOwner(mutex))
 }
 
 pub(in super::super) fn run_worker_if_requested()->Option<Result<()>>{
     if std::env::args_os().nth(1).as_deref()!=Some(std::ffi::OsStr::new("--wps-render-worker")){return None;}
     Some((||{
-        let input=PathBuf::from(std::env::args_os().nth(2).context("缺少文档预览请求")?);
-        if std::env::args_os().count()!=3||!input.is_absolute(){bail!("文档预览请求无效");}
-        let workspace=input.parent().context("缺少文档预览目录")?;
-        if workspace.file_name().is_none_or(|name|!name.to_string_lossy().starts_with("preview-")){bail!("文档预览目录无效");}
+        let input=PathBuf::from(std::env::args_os().nth(2).context(zsdesk_core::i18n::text("缺少文档预览请求"))?);
+        if std::env::args_os().count()!=3||!input.is_absolute(){bail!("{}", zsdesk_core::tr_format!("文档预览请求无效"));}
+        let workspace=input.parent().context(zsdesk_core::i18n::text("缺少文档预览目录"))?;
+        if workspace.file_name().is_none_or(|name|!name.to_string_lossy().starts_with("preview-")){bail!("{}", zsdesk_core::tr_format!("文档预览目录无效"));}
         let request:Request=read(&input)?;
-        if input!=request_path(workspace,request.id)||!request.source.is_absolute(){bail!("文档预览请求路径无效");}
+        if input!=request_path(workspace,request.id)||!request.source.is_absolute(){bail!("{}", zsdesk_core::tr_format!("文档预览请求路径无效"));}
         let _mutex=match single_renderer(){Ok(mutex)=>mutex,Err(error)=>{
             write(&result_path(workspace,request.id),&Outcome{id:request.id,pdf:None,error:Some(error.to_string())})?;return Ok(());
         }};
@@ -127,13 +127,13 @@ pub(in super::super) fn run_worker_if_requested()->Option<Result<()>>{
         ACTIVE.with(|active|active.set(Some(request.id)));
         unsafe{OleInitialize(None)}?;
         struct Apartment;impl Drop for Apartment{fn drop(&mut self){unsafe{OleUninitialize();}}}let apartment=Apartment;
-        let outcome=if cancelled_id(workspace,request.id){Err(anyhow::anyhow!("文档预览已取消"))}else{render_owned(&request.source,workspace)};
+        let outcome=if cancelled_id(workspace,request.id){Err(anyhow::anyhow!("{}", zsdesk_core::tr_format!("文档预览已取消")))}else{render_owned(&request.source,workspace)};
         drop(apartment);
         let cancelled=cancelled_id(workspace,request.id);
         let mut retained=None;
         let result=match outcome{
             Ok(rendered) if !cancelled=>{let pdf=rendered.pdf.clone();retained=Some(rendered);Outcome{id:request.id,pdf:Some(pdf),error:None}},
-            Ok(rendered)=>{drop(rendered);Outcome{id:request.id,pdf:None,error:Some("文档预览已取消".into())}},
+            Ok(rendered)=>{drop(rendered);Outcome{id:request.id,pdf:None,error:Some(zsdesk_core::i18n::text("文档预览已取消").into())}},
             Err(error)=>{let _=fs::remove_file(workspace.join(format!("wps-{}.pdf",std::process::id())));Outcome{id:request.id,pdf:None,error:Some(format!("{error:#}"))}},
         };
         if !cancelled{

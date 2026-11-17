@@ -4,7 +4,7 @@ use super::*;
 #[derive(Default)]
 pub(super) struct MouseGestures { drag:Option<Drag> }
 struct Drag {
-    target:HWND, down:LPARAM, keys:WPARAM, start:POINT, last:POINT,
+    target:HWND, view:HWND, start:POINT, last:POINT,
     directions:Vec<u8>, threshold:i32, identity:pane_input::Identity,
 }
 
@@ -25,21 +25,32 @@ impl MouseGestures {
         if unsafe{GetCapture()}==hwnd {let _=unsafe{ReleaseCapture()};}
     }
     pub(super) fn process(&mut self,hwnd:HWND,msg:&MSG,slot:&Slot)->bool {
+        if self.drag.is_some()&&unsafe{GetCapture()}!=hwnd{self.drag=None;}
         if self.drag.is_some() && (msg.message==WM_CANCELMODE || (msg.message==WM_CAPTURECHANGED && msg.lParam.0!=hwnd.0 as isize)
             || (msg.message==WM_KEYDOWN && msg.wParam.0==VK_ESCAPE.0 as usize)) {
             let consume=msg.message==WM_KEYDOWN;self.cancel(hwnd);return consume;
         }
         if msg.message==WM_RBUTTONDOWN && self.drag.is_none() {
             let context=slot.try_borrow().ok().and_then(|slot|slot.as_ref().and_then(|state|{
-                let view=state.view_hwnd;
-                (state.session.ui.mouse_gestures && state.pending.is_none() && !view.0.is_null()
-                    && (msg.hwnd==view || unsafe{IsChild(view,msg.hwnd)}.as_bool()) && !text_input_window(msg.hwnd))
-                    .then(||state.identity_for_source(state.browser_source).map(|identity|(identity,state.s(24)))).flatten()
+                let(view,source)=state.file_view_for_input(msg.hwnd)?;
+                (state.session.ui.mouse_gestures&&!text_input_window(msg.hwnd)
+                    &&!zsdesk_windows::shell::menu::control_owns_context_menu(view,msg.hwnd))
+                    .then(||state.identity_for_source(source).map(|identity|(view,identity,state.s(24)))).flatten()
             }));
-            let Some((identity,threshold))=context else{return false;};
-            self.drag=Some(Drag{target:msg.hwnd,down:msg.lParam,keys:msg.wParam,start:msg.pt,last:msg.pt,
+            let Some((view,identity,threshold))=context else{return false;};
+            let point=LPARAM(((msg.pt.x as u16 as u32)|((msg.pt.y as u16 as u32)<<16))as isize);
+            // File rows own native left/right OLE drags. A gesture may only
+            // capture blank space; consuming a row's right-down loses the
+            // Shell's drag source and its Copy/Move/Link drop menu.
+            if zsdesk_windows::shell::menu::classify_view_menu_point(view,msg.hwnd,point)
+                !=zsdesk_windows::shell::menu::ViewMenuTarget::Background{return false;}
+            let current=slot.try_borrow().ok().is_some_and(|slot|slot.as_ref().is_some_and(|state|
+                state.file_view_for_input(msg.hwnd)==Some((view,identity.source))&&state.identity_for_source(identity.source)==Some(identity)));
+            if !current{return false;}
+            self.drag=Some(Drag{target:msg.hwnd,view,start:msg.pt,last:msg.pt,
                 directions:Vec::new(),threshold,identity});
             unsafe{SetCapture(hwnd);}
+            if unsafe{GetCapture()}!=hwnd{self.drag=None;return false;}
             return true;
         }
         if msg.message==WM_MOUSEMOVE {
@@ -57,20 +68,17 @@ impl MouseGestures {
             let Some(drag)=self.drag.take() else{return false;};
             if unsafe{GetCapture()}==hwnd {let _=unsafe{ReleaseCapture()};}
             let current=slot.try_borrow().ok().and_then(|slot|slot.as_ref().map(|state|
-                state.identity_for_source(drag.identity.source)==Some(drag.identity) && state.session.ui.mouse_gestures)).unwrap_or(false);
+                state.identity_for_source(drag.identity.source)==Some(drag.identity)&&state.file_view_for_input(drag.target)==Some((drag.view,drag.identity.source))
+                    &&state.session.ui.mouse_gestures)).unwrap_or(false);
             if !current || !unsafe{IsWindow(Some(drag.target))}.as_bool(){return true;}
             if let Some(action)=command(&drag.directions) {
                 pane_input::post(hwnd,drag.identity,pane_input::Intent::Action(action.id()as usize));
             } else if drag.directions.is_empty()
                 && (msg.pt.x-drag.start.x).abs().max((msg.pt.y-drag.start.y).abs())<drag.threshold {
-                // Replay only a click, without reentering this queue filter.
-                // The native view retains its normal selection/context menu.
-                let mut up=msg.pt;let _=unsafe{ScreenToClient(drag.target,&mut up)};
-                let packed=LPARAM(((up.x as u16 as u32)|((up.y as u16 as u32)<<16))as isize);
-                unsafe {
-                    SendMessageW(drag.target,WM_RBUTTONDOWN,Some(drag.keys),Some(drag.down));
-                    SendMessageW(drag.target,WM_RBUTTONUP,Some(WPARAM(msg.wParam.0 & !2)),Some(packed));
-                }
+                // DirectUI versions differ in whether replayed button messages
+                // synthesize WM_CONTEXTMENU. Dispatch one owned request instead;
+                // the menu target resolver selects the clicked item itself.
+                pane_input::post(hwnd,drag.identity,pane_input::Intent::ContextMenu(drag.start));
             }
             return true;
         }

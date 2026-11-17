@@ -67,7 +67,7 @@ pub fn for_view(view:&IShellView)->Result<ShellMenu>{
     let result=(||{
         let menu:IContextMenu=unsafe{CoCreateInstance(&GUID::from_u128(0xd969a300_e7ff_11d0_a93b_00a0c90f2719),None,CLSCTX_INPROC_SERVER)}?;
         unsafe{menu.cast::<IShellExtInit>()?.Initialize(Some(pidl),None,None)?;}
-        ShellMenu::new(menu)
+        ShellMenu::new_background(menu)
     })();
     unsafe{windows::Win32::System::Com::CoTaskMemFree(Some(pidl.cast()));}result
 }

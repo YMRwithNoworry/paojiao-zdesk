@@ -1172,9 +1172,10 @@ checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 
 [[package]]
 name = "zsdesk-app"
-version = "0.3.13"
+version = "0.3.17"
 dependencies = [
  "anyhow",
+ "cc",
  "dirs",
  "embed-resource",
  "pinyin",
@@ -1195,7 +1196,7 @@ dependencies = [
 
 [[package]]
 name = "zsdesk-core"
-version = "0.3.13"
+version = "0.3.17"
 dependencies = [
  "serde",
  "serde_json",
@@ -1203,14 +1204,14 @@ dependencies = [
 
 [[package]]
 name = "zsdesk-platform"
-version = "0.3.13"
+version = "0.3.17"
 dependencies = [
  "zsdesk-core",
 ]
 
 [[package]]
 name = "zsdesk-plugin"
-version = "0.3.13"
+version = "0.3.17"
 dependencies = [
  "serde",
  "serde_json",
@@ -1220,7 +1221,7 @@ dependencies = [
 
 [[package]]
 name = "zsdesk-ui"
-version = "0.3.13"
+version = "0.3.17"
 dependencies = [
  "zsdesk-core",
  "zsui",
@@ -1228,10 +1229,11 @@ dependencies = [
 
 [[package]]
 name = "zsdesk-windows"
-version = "0.3.13"
+version = "0.3.17"
 dependencies = [
  "anyhow",
  "cc",
+ "roxmltree 0.20.0",
  "serde",
  "serde_json",
  "sha2",

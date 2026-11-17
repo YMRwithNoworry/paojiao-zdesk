@@ -6,10 +6,12 @@
 #include <cstring>
 #include "MinHook.h"
 #include "CommandAgility.h"
+#include "NativeCommandGuard.h"
+#include "MenuSubmenuLifetime.h"
 
 namespace menu_command_bridge {
 using InsertFunction = void(__fastcall*)(IUnknown*, HMENU, IExplorerCommand*, UINT, void*, const void*);
-using OwnerProbe = bool(*)(IUnknown*, DWORD*, ULONGLONG*) noexcept;
+using OwnerProbe = bool(*)(IUnknown*, DWORD*, ULONGLONG*, std::shared_ptr<native_command_guard::Gate>*) noexcept;
 inline InsertFunction originalInsert = nullptr;
 inline OwnerProbe ownerProbe = nullptr;
 inline SRWLOCK setupLock = SRWLOCK_INIT;
@@ -26,39 +28,74 @@ struct Scope {
     IUnknown* native;
     DWORD owner;
     ULONGLONG generation;
+    std::shared_ptr<native_command_guard::Gate> gate;
 };
 inline bool IsCurrent(void* context) noexcept {
     const auto scope = static_cast<Scope*>(context);
     DWORD owner = 0;
     ULONGLONG generation = 0;
+    std::shared_ptr<native_command_guard::Gate> gate;
     return enabled.load() && ownerProbe &&
-        ownerProbe(scope->native, &owner, &generation) &&
-        owner == scope->owner && generation == scope->generation && owner != GetCurrentThreadId();
+        ownerProbe(scope->native, &owner, &generation,&gate) &&gate&&scope->gate&&gate->Token()==scope->gate->Token()&&
+        owner == scope->owner && generation == scope->generation&&gate->Current(generation);
 }
 inline void __fastcall Insert(IUnknown* native, HMENU menu, IExplorerCommand* command,
         UINT index, void* storage, const void* packageName) {
     ++active;
     struct ActiveScope { ~ActiveScope() { --active; } } activeScope;
-    Scope scope{native, 0, 0};
+    Scope scope{native, 0, 0,{}};
     const bool ours = enabled.load() && ownerProbe &&
-        ownerProbe(native, &scope.owner, &scope.generation) && scope.owner != GetCurrentThreadId();
+        ownerProbe(native, &scope.owner, &scope.generation,&scope.gate)&&scope.gate;
     Microsoft::WRL::ComPtr<IUnknown> keepNative;
     Microsoft::WRL::ComPtr<IExplorerCommand> keepCommand;
     if (ours) { keepNative = native; keepCommand = command; }
-    menu_command_agility::VectorRange before{};
-    size_t first = 0;
-    const bool valid = ours && command && menu_command_agility::ReadRange(storage, before, first);
-    // Preserve the native operation and its exception semantics exactly once.
-    originalInsert(native, menu, command, index, storage, packageName);
-    if (!valid || !IsCurrent(&scope)) return;
-    unsigned changed = 0;
-    HRESULT result = E_UNEXPECTED;
-    try {
-        result = menu_command_agility::ConvertInsertedCommand(
-            storage, first, command, &IsCurrent, &scope, &changed);
-    } catch (...) { result = E_UNEXPECTED; }
-    converted.fetch_add(changed);
-    if (FAILED(result)) ++failures;
+    if(!ours){originalInsert(native,menu,command,index,storage,packageName);return;}
+    if(!IsCurrent(&scope))return;
+    Microsoft::WRL::ComPtr<IExplorerCommand> guarded;HRESULT result=E_UNEXPECTED;
+    try{result=native_command_guard::WrapCommand(command,scope.gate,scope.generation,{},&guarded);}
+    catch(const std::bad_alloc&){result=E_OUTOFMEMORY;}catch(...){result=E_UNEXPECTED;}
+    if(FAILED(result)||!guarded){++failures;scope.gate->Failure(FAILED(result)?result:E_UNEXPECTED,"insert-wrap-command",&IID_IExplorerCommand,scope.generation);return;}
+    if(!IsCurrent(&scope))return;
+    menu_command_agility::VectorRange range{};size_t first=0;
+    const bool hadRange=menu_command_agility::ReadRange(storage,range,first);
+    // Both owner-STA and asynchronous insertions receive the public-interface
+    // proxy before native storage retains it. No private vector fields change.
+    {
+        menu_submenu_lifetime::Insertion ownership(menu,index);
+        originalInsert(native,menu,guarded.Get(),index,storage,packageName);
+    }
+    ++converted;
+    // Read only the already-verified vector layout to associate a public command
+    // ID. The proxy is safe before this read; an unbound bypass cannot trigger
+    // a parent-intercepted action because the gate requires an identity.
+    if(hadRange&&IsCurrent(&scope)){
+        size_t count=0;if(!menu_command_agility::ReadRange(storage,range,count)||count<first){scope.gate->Failure(E_UNEXPECTED,"insert-vector-range",nullptr,scope.generation);++failures;return;}
+        Microsoft::WRL::ComPtr<IUnknown> guardedIdentity;guarded.As(&guardedIdentity);
+        for(size_t row=first;row<count;++row){
+            if(!IsCurrent(&scope))return;
+            if(!menu_command_agility::ReadRange(storage,range,count)||row>=count){scope.gate->Failure(E_UNEXPECTED,"insert-vector-generation",nullptr,scope.generation);++failures;return;}
+            BYTE* entry=range.begin+row*menu_command_agility::kVerbBytes;
+            const UINT id=*reinterpret_cast<UINT*>(entry);
+            auto raw=*reinterpret_cast<IExplorerCommand**>(entry+0x18);
+            auto agile=*reinterpret_cast<IAgileReference**>(entry+0x20);
+            bool match=raw==guarded.Get();
+            Microsoft::WRL::ComPtr<IAgileReference> keepAgile(agile);
+            if(!match&&keepAgile){Microsoft::WRL::ComPtr<IUnknown> identity;if(SUCCEEDED(keepAgile->Resolve(IID_PPV_ARGS(&identity))))match=identity==guardedIdentity;}
+            if(match){
+                // Resolve can pump metadata updates. Never bind an ID from a
+                // record that was replaced or moved during that COM call.
+                if(!IsCurrent(&scope))return;
+                if(!menu_command_agility::ReadRange(storage,range,count)||row>=count){scope.gate->Failure(E_UNEXPECTED,"bind-vector-generation",nullptr,scope.generation);++failures;return;}
+                entry=range.begin+row*menu_command_agility::kVerbBytes;
+                if(*reinterpret_cast<UINT*>(entry)!=id||*reinterpret_cast<IExplorerCommand**>(entry+0x18)!=raw
+                    ||*reinterpret_cast<IAgileReference**>(entry+0x20)!=agile){scope.gate->Failure(HRESULT_FROM_WIN32(ERROR_RETRY),"bind-command-replaced",nullptr,scope.generation);++failures;return;}
+                Microsoft::WRL::ComPtr<native_command_guard::ProxyIdentity> identity;
+                HRESULT bound=guarded->QueryInterface(native_command_guard::kProxyIdentity,reinterpret_cast<void**>(identity.GetAddressOf()));
+                if(SUCCEEDED(bound))bound=identity->BindCommand(id);
+                if(FAILED(bound)){scope.gate->Failure(bound,"bind-command-id",nullptr,scope.generation);++failures;return;}
+            }
+        }
+    }
 }
 
 // The caller first verifies the full Windows.UI.FileExplorer image hash and
@@ -98,6 +135,9 @@ inline HRESULT InstallVerified(HMODULE module, OwnerProbe probe) noexcept {
                 // Publish once before the first hook activation. Old callbacks
                 // can remain in flight across a disable/re-enable cycle.
                 if (!ownerProbe) ownerProbe = probe;
+                result=menu_submenu_lifetime::InstallVerified(module);
+            }
+            if (SUCCEEDED(result)) {
                 const MH_STATUS status = MH_EnableHook(target);
                 if (status == MH_OK) enabled.store(true);
                 else result = E_FAIL;
@@ -110,6 +150,7 @@ inline HRESULT InstallVerified(HMODULE module, OwnerProbe probe) noexcept {
 
 inline HRESULT Disable() noexcept {
     AcquireSRWLockExclusive(&setupLock);
+    if(active.load()) {ReleaseSRWLockExclusive(&setupLock);return HRESULT_FROM_WIN32(ERROR_BUSY);}
     HRESULT result = S_OK;
     if (enabled.load()) {
         const MH_STATUS status = MH_DisableHook(target);
@@ -119,6 +160,7 @@ inline HRESULT Disable() noexcept {
                 std::memcmp(bytes, originalEntry, sizeof(bytes)))) result = HRESULT_FROM_WIN32(ERROR_REVISION_MISMATCH);
         if (SUCCEEDED(result)) enabled.store(false);
     }
+    if(SUCCEEDED(result))result=menu_submenu_lifetime::Disable();
     // Do not remove the trampoline or unload either module while native tasks
     // may still hold references. Rollback disables behavior and restores bytes.
     ReleaseSRWLockExclusive(&setupLock);

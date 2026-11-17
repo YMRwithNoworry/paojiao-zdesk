@@ -26,6 +26,8 @@ fn reserve_column<T>(column:&mut Vec<T>,additional:usize)->Result<()>{
 pub struct VolumeIndex {
     pub root:PathBuf,pub serial:u32,pub journal_id:u64,pub checkpoint:i64,pub has_journal:bool,
     pub mft:bool,pub denied:u64,pub index:Index,
+    /// Directory identities still needing enumeration; identities survive compaction.
+    pub pending_dirs:Vec<u64>,
 }
 
 #[derive(Default)]

@@ -1,5 +1,6 @@
 //! Full native Shell/window interaction regression on an unswitched desktop.
 use super::*;
+use windows::Win32::Graphics::Gdi::{GetDC,ReleaseDC,GetTextColor,GetBkColor};
 use anyhow::ensure;
 use std::{ffi::c_void,fs,ptr,sync::{Arc,atomic::{AtomicBool,Ordering}},thread,time::{Duration,Instant}};
 use windows::Win32::Graphics::Gdi::{GetMonitorInfoW,MonitorFromWindow,MONITORINFO,MONITOR_DEFAULTTONEAREST};
@@ -111,13 +112,17 @@ unsafe extern "system" fn trace_caption(hwnd:HWND,msg:u32,wp:WPARAM,lp:LPARAM,_i
 struct CaptionTrace(HWND);
 impl Drop for CaptionTrace{fn drop(&mut self){if unsafe{IsWindow(Some(self.0))}.as_bool(){let _=unsafe{RemoveWindowSubclass(self.0,Some(trace_caption),0x5a54)};}}}
 fn caption_click(hwnd:HWND,index:usize)->Result<()>{
+    caption_click_at(hwnd,index,None)
+}
+pub(super) fn caption_click_at(hwnd:HWND,index:usize,client_point:Option<POINT>)->Result<()>{
     CAPTION_TRACE.with(|trace|trace.borrow_mut().clear());
     unsafe{SetWindowSubclass(hwnd,Some(trace_caption),0x5a54,0)}.ok()?;let _trace=CaptionTrace(hwnd);
     let rect=caption_rects(hwnd).context("caption rectangles")?[index];
-    let mut point=POINT{x:rect.x+rect.width/2,y:rect.y+rect.height/2};
+    let mut point=client_point.unwrap_or(POINT{x:rect.x+rect.width/2,y:rect.y+rect.height/2});
     unsafe{ClientToScreen(hwnd,&mut point)}.ok()?;
     let packed=LPARAM((((point.x as u32)&0xffff)|(((point.y as u32)&0xffff)<<16))as isize);
     let hit=unsafe{SendMessageW(hwnd,WM_NCHITTEST,None,Some(packed))}.0 as u32;
+    if index==2{println!("interaction close: hit={hit} native={}",native_caption(hwnd));}
     ensure!(hit==[HTMINBUTTON,HTMAXBUTTON,HTCLOSE][index],"painted caption is not clickable: {index} returned {hit}");
     let mut client=point;unsafe{ScreenToClient(hwnd,&mut client)}.ok()?;
     let client_packed=LPARAM((((client.x as u32)&0xffff)|(((client.y as u32)&0xffff)<<16))as isize);
@@ -144,6 +149,7 @@ fn caption_click(hwnd:HWND,index:usize)->Result<()>{
     let queued=unsafe{PostMessageW(Some(hwnd),WM_NCLBUTTONDOWN,WPARAM(hit as usize),packed)
         .and_then(|_|PostMessageW(Some(hwnd),WM_LBUTTONUP,WPARAM(0),client_packed))};
     if let Err(error)=queued{done.store(true,Ordering::Release);let _=watchdog.join();return Err(error.into());}
+    if index==2{println!("interaction close: input queued");}
     pump(150);done.store(true,Ordering::Release);let _=watchdog.join();
     let trace=CAPTION_TRACE.with(|trace|std::mem::take(&mut*trace.borrow_mut()));
     println!("{}",serde_json::json!({"caption_index":index,"hit":hit,"watchdog_expired":expired.load(Ordering::Acquire),"events":trace}));
@@ -181,14 +187,49 @@ fn key(hwnd:HWND,acc:HACCEL,key:VIRTUAL_KEY,ctrl:bool,shift:bool)->Result<()>{
     unsafe{SetKeyboardState(&original)?;}
     ensure!(handled,"key {} was not bound",key.0);pump(100);Ok(())
 }
+fn side_tab_controls(slot:&Slot,hwnd:HWND)->Result<()>{
+    use zsdesk_core::model::explorer::TabPlacement;
+    let original=slot.borrow().as_ref().unwrap().session.clone();
+    {let mut guard=slot.borrow_mut();let state=guard.as_mut().unwrap();let native_view=state.browser.as_ref().unwrap().view_window();
+        state.session.ui.show_tab_count=true;state.session.ui.show_tab_list=true;state.relayout();ensure!(!state.layout.tab_list.is_empty(),"tab count button missing when enabled");
+        state.apply_interface_choice("show-tab-count");ensure!(state.layout.tab_list.is_empty()&&!state.session.ui.tab_count_button_visible(),"disabled count left a replacement button");
+        state.apply_interface_choice("show-tab-count");ensure!(!state.layout.tab_list.is_empty()&&state.session.ui.tab_count_button_visible(),"tab count did not return");
+        ensure!(state.browser.as_ref().unwrap().view_window()==native_view,"count visibility recreated the file view");}
+    let point_message=|message:u32,p:POINT|{let packed=LPARAM(((p.x as u16 as u32)|((p.y as u16 as u32)<<16))as isize);unsafe{SendMessageW(hwnd,message,Some(WPARAM(0)),Some(packed));}};
+    for placement in [TabPlacement::Left,TabPlacement::Right]{
+        {let mut guard=slot.borrow_mut();let state=guard.as_mut().unwrap();let location=state.current_location().clone();
+            let first=state.session.next_id;state.session.tabs=(0..80).map(|offset|ExplorerTab::new(first+offset,location.clone())).collect();state.session.next_id=first+80;state.session.active_tab=0;
+            state.session.ui.tab_placement=placement;state.session.ui.side_tabs_width=210;state.session.ui.side_tabs_compact=true;unsafe{state.rebuild_tabs();state.resize();}}
+        pump(30);
+        let (view,location,panel,divider,scale)={let guard=slot.borrow();let state=guard.as_ref().unwrap();(state.browser.as_ref().unwrap().view_window(),state.current_location().clone(),state.layout.tab_panel,state.layout.tab_splitter,state.s(60))};
+        let mut wheel_point=POINT{x:panel.x+panel.width/2,y:panel.y+50};unsafe{ClientToScreen(hwnd,&mut wheel_point)}.ok()?;
+        let packed=LPARAM(((wheel_point.x as u16 as u32)|((wheel_point.y as u16 as u32)<<16))as isize);
+        unsafe{SendMessageW(hwnd,WM_MOUSEWHEEL,Some(WPARAM((-120i16 as u16 as usize)<<16)),Some(packed));}pump(20);
+        {let guard=slot.borrow();let state=guard.as_ref().unwrap();ensure!(state.layout.tabs[0].index==3&&state.session.active_tab==0&&state.current_location()==&location&&state.browser.as_ref().unwrap().view_window()==view,"wheel scrolled the folder or selected a tab");}
+        let start=POINT{x:divider.x+divider.width/2,y:divider.y+40};let end=POINT{x:start.x+if placement==TabPlacement::Left{scale}else{-scale},y:start.y};
+        point_message(WM_LBUTTONDOWN,start);point_message(WM_MOUSEMOVE,end);point_message(WM_LBUTTONUP,end);pump(20);
+        {let guard=slot.borrow();let state=guard.as_ref().unwrap();ensure!((state.session.ui.side_tabs_width-270).abs()<=1,"side width did not follow drag direction/DPI");ensure!(storage::load(&state.config_path)?.ui.side_tabs_width==state.session.ui.side_tabs_width,"side width not persisted");}
+        let (track,thumb)={let guard=slot.borrow();let state=guard.as_ref().unwrap();(state.layout.tab_scroll_track,state.layout.tab_scroll_thumb)};
+        let start=POINT{x:thumb.x+thumb.width/2,y:thumb.y+thumb.height/2};let end=POINT{x:start.x,y:track.bottom()+30};
+        point_message(WM_LBUTTONDOWN,start);point_message(WM_MOUSEMOVE,end);point_message(WM_LBUTTONUP,end);pump(20);
+        {let mut guard=slot.borrow_mut();let state=guard.as_mut().unwrap();ensure!(state.layout.tabs.last().unwrap().index==79&&state.session.active_tab==0,"scroll thumb did not reach final tab independently");
+            unsafe{state.select_tab(0);}ensure!(state.layout.tabs.first().unwrap().index==0,"selecting the active tab did not reveal it");
+            let compact=state.layout.tabs.len();state.apply_interface_choice("side-tabs-compact");ensure!(state.layout.tabs.len()<compact,"compact density did not change visible capacity");
+            ensure!(state.current_location()==&location&&state.browser.as_ref().unwrap().view_window()==view,"sidebar control rebuilt or navigated native view");}
+    }
+    {let mut guard=slot.borrow_mut();let state=guard.as_mut().unwrap();state.session=original;unsafe{state.rebuild_tabs();state.resize();}state.save();}
+    pump(30);Ok(())
+}
+
 fn run(output:&std::path::Path)->Result<serde_json::Value>{
     unsafe{OleInitialize(None)?;}let _apartment=Apartment;
     unsafe{InitCommonControlsEx(&INITCOMMONCONTROLSEX{dwSize:size_of::<INITCOMMONCONTROLSEX>()as u32,dwICC:ICC_STANDARD_CLASSES|ICC_BAR_CLASSES})}.ok()?;
     let files=output.join("files");fs::create_dir_all(&files)?;
     for name in ["中文 文件.txt","second.txt","third.txt"]{fs::write(files.join(name),b"Native regression fixture")?;}
     let mut session=storage::default_session();session.tabs=vec![ExplorerTab::new(1,ShellLocation::Path(files))];session.next_id=2;
-    session.ui.show_tree=true;session.ui.show_preview=false;
+    session.ui.show_tree=true;session.ui.show_preview=false;session.ui.everything_folder_sizes=true;
     let config=output.join("profile/explorer-session.json");
+    storage::save(&config,&session)?;
     let slot=Box::new(RefCell::new(Some(WindowState::new(session,config.clone(),None,false))));
     let instance=HINSTANCE(unsafe{GetModuleHandleW(None)?}.0);let class=wide("ZSDesk.Native.InteractionRegression");
     unsafe{RegisterClassW(&WNDCLASSW{hInstance:instance,lpfnWndProc:Some(window_proc),lpszClassName:pcwstr(&class),..Default::default()});}
@@ -198,9 +239,20 @@ fn run(output:&std::path::Path)->Result<serde_json::Value>{
     unsafe{SetWindowPos(hwnd,None,0,0,0,0,SWP_FRAMECHANGED|SWP_NOMOVE|SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE)?;slot.borrow_mut().as_mut().unwrap().create(hwnd)?;let _=ShowWindow(hwnd,SW_SHOWNOACTIVATE);}
     let deadline=Instant::now()+Duration::from_secs(12);
     loop{pump(40);if slot.borrow().as_ref().is_some_and(|s|s.pending.is_none()&&s.shown_tab.is_some()){break;}ensure!(Instant::now()<deadline,"Shell navigation timed out");}
+    slot.borrow().as_ref().unwrap().browser.as_ref().unwrap().set_view_mode(4,16)?;
+    let deadline=Instant::now()+Duration::from_secs(6);loop{pump(50);
+        if slot.borrow().as_ref().is_some_and(|state|state.folder_sizes.active()&&matches!(state.folder_sizes.status(),folder_sizes::Status::Ready{known:3,unknown:0,..})){break;}
+        ensure!(Instant::now()<deadline,"main-window total-size integration did not complete");}
     edit_palette_isolation(output)?;
     last_tab_close_policy(output)?;
     let acc=Accelerators(unsafe{CreateAcceleratorTableW(&accelerator_table())?});
+    let browser_source=slot.borrow().as_ref().unwrap().browser_source;
+    let command_height=slot.borrow().as_ref().unwrap().layout.command_row.height;
+    key(hwnd,acc.0,VK_F1,true,false)?;
+    {let state=slot.borrow();let state=state.as_ref().unwrap();ensure!(!state.session.ui.command_bar.visible&&state.layout.command_row.is_empty()&&!state.layout.command_toggle.is_empty(),"Ctrl+F1 did not retain an expand button");}
+    let toggle=slot.borrow().as_ref().unwrap().layout.command_toggle;
+    {let mut state=slot.borrow_mut();let state=state.as_mut().unwrap();let point=POINT{x:toggle.x+toggle.width/2,y:toggle.y+toggle.height/2};state.mouse_down(point);state.mouse_up(point);}
+    pump(60);{let state=slot.borrow();let state=state.as_ref().unwrap();ensure!(state.session.ui.command_bar.visible&&state.layout.command_row.height==command_height&&state.browser_source==browser_source,"command bar toggle rebuilt or changed the folder view");}
     let mode=||slot.borrow().as_ref().unwrap().browser.as_ref().unwrap().view_mode().unwrap();
     let normal=rectangle(hwnd)?;let mut frames=Vec::new();
     // Exercise notifications without modifying the user's Windows theme or
@@ -252,6 +304,7 @@ fn run(output:&std::path::Path)->Result<serde_json::Value>{
     let mut monitor=MONITORINFO{cbSize:size_of::<MONITORINFO>()as u32,..Default::default()};
     unsafe{GetMonitorInfoW(MonitorFromWindow(hwnd,MONITOR_DEFAULTTONEAREST),&mut monitor)}.ok()?;
     for maximized in [false,true]{
+        println!("interaction stage: fullscreen maximized={maximized}");
         if maximized{unsafe{let _=ShowWindow(hwnd,SW_SHOWMAXIMIZED);}pump(80);}
         key(hwnd,acc.0,VK_F11,false,false)?;
         ensure!(window_actions::fullscreen(hwnd)&&rectangle(hwnd)?==monitor.rcMonitor,"F11 did not fill the monitor");
@@ -261,12 +314,15 @@ fn run(output:&std::path::Path)->Result<serde_json::Value>{
         ensure!(rectangle(hwnd)?==normal,"fullscreen restore changed normal bounds");
     }
     for placement in [zsdesk_core::model::explorer::TabPlacement::Left,zsdesk_core::model::explorer::TabPlacement::Right,zsdesk_core::model::explorer::TabPlacement::Top]{
+        println!("interaction stage: tab placement {placement:?}");
         {let mut state=slot.borrow_mut();let state=state.as_mut().unwrap();state.session.ui.tab_placement=placement;unsafe{state.resize();}}
         pump(100);let state=slot.borrow();let state=state.as_ref().unwrap();let actual=rectangle(state.browser.as_ref().unwrap().view_window().unwrap())?;
         ensure!(actual.right-actual.left>100&&actual.bottom-actual.top>100,"side tabs collapsed the native view");
         ensure!(rectangle(hwnd)?==normal,"tab placement moved the main window");
     }
+    if let Err(error)=side_tab_controls(&slot,hwnd){eprintln!("side-tab regression failed: {error:#}");return Err(error);}
     key(hwnd,acc.0,VK_0,true,false)?;ensure!(mode().1==48,"reset zoom");
+    println!("interaction stage: wheel and shortcuts");
     let view=slot.borrow().as_ref().unwrap().browser.as_ref().unwrap().view_window().unwrap();let bounds=rectangle(view)?;
     let packed=LPARAM((((bounds.left+30)as u32&0xffff)|(((bounds.top+60)as u32&0xffff)<<16))as isize);
     let wheel=|delta:i16,target:HWND|MSG{hwnd:target,message:WM_MOUSEWHEEL,wParam:WPARAM(((delta as u16 as usize)<<16)|8),lParam:packed,..Default::default()};
@@ -285,6 +341,7 @@ fn run(output:&std::path::Path)->Result<serde_json::Value>{
     key(hwnd,acc.0,VK_T,true,true)?;pump(200);ensure!(slot.borrow().as_ref().unwrap().session.tabs.len()==2,"Ctrl+Shift+T reopen");
     let mut materials=Vec::new();
     if crate::edition::THEMED{
+        println!("interaction stage: materials");
         use zsdesk_core::model::explorer::{BackdropStyle,ColorScheme};
         for (backdrop,scheme) in [(BackdropStyle::Solid,ColorScheme::Light),(BackdropStyle::Solid,ColorScheme::Dark),(BackdropStyle::Mica,ColorScheme::System),(BackdropStyle::Acrylic,ColorScheme::System)]{
             {let mut state=slot.borrow_mut();let state=state.as_mut().unwrap();state.session.ui.appearance.backdrop=backdrop;state.session.ui.appearance.color_scheme=scheme;state.apply_theme();state.theme_children();unsafe{state.resize();}}
@@ -297,11 +354,26 @@ fn run(output:&std::path::Path)->Result<serde_json::Value>{
             materials.push(serde_json::json!({"backdrop":backdrop,"color":scheme,"dwm_supported":available,"dwm_value":actual}));
         }
     }
+    println!("interaction stage: dual pane");
     let dual=dual_pane::native_exercise(&slot,output,pump)?;
+    if crate::edition::THEMED{
+        for (choice,dark) in [("appearance-dark",true),("appearance-light",false)]{
+            println!("interaction stage: explicit {choice}");
+            {let mut guard=slot.borrow_mut();guard.as_mut().unwrap().apply_appearance_choice(choice);}
+            let deadline=Instant::now()+Duration::from_secs(12);
+            loop{pump(30);let guard=slot.borrow();let state=guard.as_ref().unwrap();
+                if state.dark==dark&&state.pending.is_none()&&state.queued.is_none()&&state.native_theme_dark==Some(dark){break;}
+                ensure!(Instant::now()<deadline,"explicit color scheme did not reach native view: {choice}");}
+            let guard=slot.borrow();let state=guard.as_ref().unwrap();let dc=unsafe{GetDC(Some(state.search_edit))};
+            let brush=unsafe{SendMessageW(hwnd,WM_CTLCOLOREDIT,Some(WPARAM(dc.0 as usize)),Some(LPARAM(state.search_edit.0 as isize)))};
+            ensure!(brush.0!=0&&unsafe{GetTextColor(dc)}!=unsafe{GetBkColor(dc)},"search edit has invisible text after {choice}");unsafe{ReleaseDC(Some(state.search_edit),dc);}
+        }
+    }
+    println!("interaction stage: close");
     caption_click(hwnd,2)?;ensure!(!unsafe{IsWindow(Some(hwnd))}.as_bool(),"caption close failed");
     ensure!(storage::load(&config)?.ui.window==Some(saved),"closing changed saved normal geometry");
     let report=serde_json::json!({"dual_pane":dual,"caption_button_clicks":true,"all_resize_cursor_handles":true,"tab_cursor":"arrow","saved_geometry_reopens":true,"manual_resize":frames,"saved_size":[saved.width,saved.height],"maximize_restore_cycles":3,"fullscreen_normal_and_maximized":true,"materials":materials,
-        "ctrl_wheel_high_resolution_and_direction":true,"wheel_text_edit_preserved":true,"view_presets":presets,"focus_cycle":true,"tab_shortcuts":true,"native_shell_loaded":true,"tab_positions":["left","right","top"],
+        "ctrl_wheel_high_resolution_and_direction":true,"wheel_text_edit_preserved":true,"side_tabs_resize_scroll_and_persistence":true,"tab_count_toggle_hides_entire_button":true,"view_presets":presets,"focus_cycle":true,"tab_shortcuts":true,"native_shell_loaded":true,"tab_positions":["left","right","top"],
         "caption_input":"queued down/up with bounded tracking watchdog","caption_cancel_releases_capture":true,"caption_drag_out_and_back":true,"caption_visual_per_hwnd":true,
         "theme_composition_systemcolor_notifications":true,"high_contrast_notification_reentrant":true,"windows_theme_preferences_changed":false,
         "edit_palette_per_hwnd":true,"owned_brush_teardown":true,"deferred_paint_per_hwnd":true,"last_tab_close_setting":true});
@@ -311,7 +383,8 @@ fn run(output:&std::path::Path)->Result<serde_json::Value>{
 #[test]
 #[ignore="Full native window/Shell test on a private desktop; requires ZSDESK_NATIVE_TEST_OUTPUT"]
 fn native_full_window_resize_zoom_and_shortcuts()->Result<()>{
-    let output=PathBuf::from(std::env::var_os("ZSDESK_NATIVE_TEST_OUTPUT").context("set isolated output")?).join("interaction");
+    let output=PathBuf::from(std::env::var_os("ZSDESK_NATIVE_TEST_OUTPUT").context("set isolated output")?)
+        .join(format!("interaction-{}",std::process::id()));
     ensure!(output.is_absolute(),"output must be absolute");fs::create_dir_all(&output)?;
     let foreground=unsafe{GetForegroundWindow()};let name=wide(&format!("ZSDesk.Interaction.{}",std::process::id()));
     let desktop=unsafe{CreateDesktopW(name.as_ptr(),ptr::null(),ptr::null(),0,0x000f00ff,ptr::null())};ensure!(!desktop.is_null(),"private desktop creation failed");
@@ -366,13 +439,22 @@ fn locked_tabs_and_bookmark_drag(output:&std::path::Path)->Result<serde_json::Va
             SendMessageW(runner.hwnd,WM_LBUTTONUP,None,Some(pack(to)));
         }pump(30);
     };
+    for vertical in [false,true]{
+    {let mut guard=runner.slot.borrow_mut();let state=guard.as_mut().unwrap();
+        let native=state.browser.as_ref().unwrap().view_window();
+        state.session.bookmarks=vec![Bookmark::folder(20,"分类".into(),None),Bookmark::link(21,"甲".into(),ShellLocation::ThisPc,None),Bookmark::link(22,"乙".into(),ShellLocation::Path(output.into()),None)];
+        state.apply_interface_choice(if vertical{"bookmarks-placement-right"}else{"bookmarks-placement-top"});
+        ensure!(state.layout.bookmarks_vertical==vertical,"bookmark layout did not switch");
+        ensure!(state.browser.as_ref().unwrap().view_window()==native,"bookmark layout recreated the file view");
+        ensure!(storage::load(&state.config_path)?.ui.bookmarks_on_right==vertical,"bookmark placement did not persist");}
     let folder=rect(20)?;drag(rect(21)?,POINT{x:folder.x+folder.width/2,y:folder.y+folder.height/2});
     ensure!(runner.slot.borrow().as_ref().unwrap().session.bookmarks.iter().find(|b|b.id==21).unwrap().parent_id==Some(20),"drag into category failed");
-    let root={let slot=runner.slot.borrow();let row=slot.as_ref().unwrap().layout.bookmarks_row;POINT{x:row.right()-10,y:row.y+row.height/2}};
+    let root={let slot=runner.slot.borrow();let row=slot.as_ref().unwrap().layout.bookmarks_row;if vertical{POINT{x:row.x+row.width/2,y:row.bottom()-10}}else{POINT{x:row.right()-10,y:row.y+row.height/2}}};
     drag(rect(21)?,root);
     ensure!(runner.slot.borrow().as_ref().unwrap().session.bookmarks.iter().find(|b|b.id==21).unwrap().parent_id.is_none(),"drag out to root failed");
-    let folder=rect(20)?;drag(rect(22)?,POINT{x:folder.x+1,y:folder.y+folder.height/2});
+    let folder=rect(20)?;drag(rect(22)?,if vertical{POINT{x:folder.x+folder.width/2,y:folder.y+1}}else{POINT{x:folder.x+1,y:folder.y+folder.height/2}});
     ensure!(runner.slot.borrow().as_ref().unwrap().session.bookmarks[0].id==22,"sibling drag ordering failed");
+    }
     {
         let mut slot=runner.slot.borrow_mut();let state=slot.as_mut().unwrap();state.save();
         let saved=storage::load(&state.config_path)?;ensure!(saved.bookmarks==state.session.bookmarks,"category order did not persist");ensure!(saved.secondary_pane.tabs[0].locked,"hidden lock did not persist");
@@ -381,7 +463,7 @@ fn locked_tabs_and_bookmark_drag(output:&std::path::Path)->Result<serde_json::Va
     unsafe{SendMessageW(runner.hwnd,WM_ENDSESSION,Some(WPARAM(1)),None);SendMessageW(runner.hwnd,WM_CLOSE,None,None);}
     ensure!(!unsafe{IsWindow(Some(runner.hwnd))}.as_bool(),"OS session completion was blocked by a lock");
     Ok(serde_json::json!({"locked_shortcuts_middle_double":true,"locked_close_groups":true,"locked_window_and_system_close":true,"hidden_pane_lock":true,
-        "os_session_shutdown_allowed":true,"bookmark_drag_into_category":true,"bookmark_drag_to_root":true,"bookmark_sibling_order":true,"persisted_categories_and_locks":true}))
+        "os_session_shutdown_allowed":true,"bookmark_drag_into_category":true,"bookmark_drag_to_root":true,"bookmark_sibling_order":true,"bookmark_top_and_right_layouts":true,"persisted_categories_and_locks":true}))
 }
 
 #[test]

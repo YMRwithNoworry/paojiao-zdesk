@@ -13,6 +13,10 @@ pub(super) struct NavigationRequest {
 }
 impl NavigationRequest { pub(super) fn new(tab:ExplorerTab)->Self {Self{tab,from_tree:false,from_quick_access:false}} }
 
+fn leaves_results(role:BrowserRole,pending_search:bool,target:&ShellLocation)->bool{
+    !matches!(target,ShellLocation::Search{..})&&(role==BrowserRole::Results||pending_search)
+}
+
 impl WindowState {
     pub(super) fn navigation_tree_options(&self)->zsdesk_windows::shell::NamespaceTreeOptions {
         zsdesk_windows::shell::NamespaceTreeOptions{show_recycle_bin:self.session.ui.navigation_show_recycle_bin,
@@ -22,7 +26,7 @@ impl WindowState {
         self.tree=None;
         match unsafe{NamespaceTreeHost::create_with_options(self.hwnd,win_rect(self.layout.tree),self.current_location(),self.navigation_tree_options())} {
             Ok(tree)=>{self.tree=Some(tree);self.theme_children();self.relayout();self.position_children();},
-            Err(error)=>self.show_message(format!("无法更新导航窗格：{error}")),
+            Err(error)=>self.show_message(zsdesk_core::tr_format!("无法更新导航窗格：{error}", error=error)),
         }
     }
     pub(super) fn navigation_auto_expand(&self)->bool {
@@ -54,9 +58,19 @@ impl WindowState {
     pub(super) unsafe fn request_navigation(&mut self,request:NavigationRequest) {
         self.deferred_selection=None;
         self.navigation_epoch=self.navigation_epoch.wrapping_add(1);
+        zsdesk_windows::shell::file_transfer::clear_origin(self.view_hwnd);
         self.folder_sizes.cancel();
         if !self.background_pane {self.end_address_edit();}
-        if self.pending.is_some() {self.queued=Some(request);return;}
+        let leaving_results=leaves_results(self.browser_role,self.pending.as_ref().is_some_and(|p|matches!(p.tab.current(),ShellLocation::Search{..})),request.tab.current());
+        if self.pending.is_some()&&!leaving_results {self.queued=Some(request);return;}
+        if leaving_results {
+            // ResultsFolder can retain NAVIGATEONCE and a pending FillFromObject
+            // completion. Retire its event source instead of waiting for it.
+            self.pending=None;self.queued=None;
+            self.cancel_fast_search();
+            let _=unsafe{KillTimer(Some(self.hwnd),TIMER_SEARCH)};
+            if let Err(error)=self.reset_browser_host(){self.show_message(zsdesk_core::tr_format!("无法打开文件夹：{error}", error=error));return;}
+        }
         if !self.session.tabs.iter().any(|t|t.id==request.tab.id) {return;}
         let target=request.tab.current().clone();
         self.pending=Some(request);
@@ -65,7 +79,7 @@ impl WindowState {
         self.cancel_fast_search();
         let global=matches!(&target,ShellLocation::Search{..});
         if global && self.browser_role==BrowserRole::Ordinary{
-            if let Err(error)=self.reset_browser_host(){self.show_message(format!("无法创建搜索结果视图：{error}"));unsafe{self.navigation_failed();}return;}
+            if let Err(error)=self.reset_browser_host(){self.show_message(zsdesk_core::tr_format!("无法创建搜索结果视图：{error}", error=error));unsafe{self.navigation_failed();}return;}
         }
         self.browser_role=if global{BrowserRole::Results}else{BrowserRole::Ordinary};
         let result=self.browser.as_ref().map(|b|unsafe {b.navigate(&target)});
@@ -92,12 +106,14 @@ impl WindowState {
     unsafe fn navigate_active(&mut self,location:ShellLocation,from_tree:bool,from_quick_access:bool) {
         unsafe {self.capture_active();}
         let mut tab=self.session.active_tab().clone();
-        if tab.navigate(location) {unsafe {self.request_navigation(NavigationRequest{tab,from_tree,from_quick_access});}}
+        let replacing_pending_search=self.pending.as_ref().is_some_and(|p|matches!(p.tab.current(),ShellLocation::Search{..}));
+        if tab.navigate(location)||replacing_pending_search {unsafe {self.request_navigation(NavigationRequest{tab,from_tree,from_quick_access});}}
     }
     pub(super) unsafe fn navigation_completed(&mut self,location:ShellLocation) {
         self.navigation_epoch=self.navigation_epoch.wrapping_add(1);
         self.view_hwnd=self.browser.as_ref().and_then(|b|b.view_window()).unwrap_or_default();
-        if let Some(identity)=self.identity_for_source(self.browser_source){wheel_input::install(self.view_hwnd,self.hwnd,identity);}
+        if let Some(identity)=self.identity_for_source(self.browser_source){wheel_input::install(self.view_hwnd,self.hwnd,identity);
+            let _=zsdesk_windows::shell::file_transfer::bind_origin(self.view_hwnd,identity.source,identity.tab,identity.epoch);}
         let completed_request=self.pending.is_some();
         let completed_tab = self.pending.as_ref().map(|request| request.tab.id).or(self.shown_tab);
         let active_completion = completed_tab == Some(self.session.active_tab().id);
@@ -134,6 +150,8 @@ impl WindowState {
             // Leaving the results: forget the scope and clear the box (unless typing).
             self.search_scope=None; self.search_result=None;
             self.search_controls_mut().origin = None;
+            let scope=if self.session.ui.search_all_files&&!location.as_path().is_some_and(crate::fast_search::network::is_remote){None}else{super::integrated_search::font_scope::folder_scope(&location)};
+            self.search_controls_mut().scope=scope;
             if !self.background_pane && unsafe {GetFocus()}!=self.search_edit {
                 self.search_controls_mut().draft = Some(String::new());
                 let _=unsafe {SetWindowTextW(self.search_edit,PCWSTR::null())};
@@ -193,11 +211,12 @@ impl WindowState {
         self.launch_selection=None;
         self.launch_selections.clear();
         let failed=self.pending.take().map(|p|p.tab.current().address()).unwrap_or_default();
-        self.show_message(format!("无法打开：{failed}"));
+        self.show_message(zsdesk_core::tr_format!("无法打开：{failed}", failed=failed));
         if self.queued.is_none() {
             if let Some(index)=self.session.tabs.iter().position(|t|Some(t.id)==self.shown_tab) {self.session.active_tab=index;}
         }
         unsafe {self.rebuild_tabs();}
+        if self.queued.is_none(){if let Some(identity)=self.identity_for_source(self.browser_source){let _=zsdesk_windows::shell::file_transfer::bind_origin(self.view_hwnd,identity.source,identity.tab,identity.epoch);}}
         if let Some(request)=self.queued.take() {unsafe {self.request_navigation(request);}}
         else if let Some(request)=self.open_requests.pop_front(){unsafe {self.open_requested(request);}}
     }
@@ -209,7 +228,11 @@ impl WindowState {
         unsafe {self.rebuild_tabs();self.navigate_current();}
     }
     pub(super) unsafe fn select_tab(&mut self,index:usize) {
-        if index>=self.session.tabs.len() || index==self.session.active_tab {return;}
+        if index>=self.session.tabs.len(){return;}
+        if index==self.session.active_tab{
+            if self.side_tab_first.take().is_some(){self.side_tab_wheel=0;self.relayout();self.invalidate_rect(self.layout.tab_panel);}
+            return;
+        }
         self.end_address_edit();
         unsafe {self.capture_active();}
         self.session.active_tab=index;
@@ -217,7 +240,7 @@ impl WindowState {
     }
     pub(super) unsafe fn close_tab(&mut self,index:usize) {
         if index>=self.session.tabs.len() {return;}
-        if self.session.tabs[index].locked{self.show_message("此标签页已锁定，请先在右键菜单中解锁".into());return;}
+        if self.session.tabs[index].locked{self.show_message(zsdesk_core::i18n::text("此标签页已锁定，请先在右键菜单中解锁").into());return;}
         if self.session.tabs.len()==1 && self.session.ui.close_window_on_last_tab {
             if self.close_last_pane_tab() {return;}
             post(self.hwnd,WM_CLOSE,0,0);return;
@@ -271,14 +294,14 @@ impl WindowState {
         let target=self.pending.as_ref().filter(|p|p.tab.id==self.session.active_tab().id).map(|p|p.tab.current().clone()).unwrap_or_else(||self.current_location().clone());
         if self.crumbs_for.as_ref()!=Some(&target) {
             self.crumbs=if let ShellLocation::Search{query,scope}=&target{
-                vec![Crumb{title:scope.as_ref().map(|p|zsdesk_core::model::explorer::path_title(p)).unwrap_or_else(||"全部本地磁盘".into()),
+                vec![Crumb{title:scope.as_ref().map(|p|zsdesk_core::model::explorer::path_title(p)).unwrap_or_else(||zsdesk_core::i18n::text("全部本地磁盘").into()),
                     location:scope.clone().map(ShellLocation::Path).unwrap_or(ShellLocation::ThisPc)},
-                    Crumb{title:format!("搜索：{query}"),location:target.clone()}]
+                    Crumb{title:zsdesk_core::tr_format!("搜索：{query}", query=query),location:target.clone()}]
             }else{unsafe {zsdesk_windows::shell::breadcrumb(&target)}};
             if self.crumbs.is_empty() {self.crumbs.push(zsdesk_windows::shell::Crumb{title:target.title(),location:target.clone()});}
             self.crumbs_for=Some(target.clone());
             self.layout_crumbs();
-            let cue=wide(&if self.session.ui.search_all_files {"快速搜索全部本地磁盘".to_string()} else {format!("搜索 {}",target.title())});
+            let cue=wide(&if self.session.ui.search_all_files {zsdesk_core::i18n::text("快速搜索全部本地磁盘").to_string()} else {zsdesk_core::tr_format!("搜索 {}", target.title())});
             unsafe {SendMessageW(self.search_edit,EM_SETCUEBANNER,Some(WPARAM(1)),Some(LPARAM(cue.as_ptr() as isize)));}
         }
         // Switching tabs restores that tab's query; live typing owns the EDIT
@@ -295,14 +318,15 @@ impl WindowState {
             self.end_address_edit();
             let _=unsafe {SetWindowTextW(self.address_edit,PCWSTR(wide(&target.address()).as_ptr()))};
         }
-        let _=unsafe {SetWindowTextW(self.hwnd,PCWSTR(wide(&format!("{} - ZSDesk",target.title())).as_ptr()))};
+        let title=if let Some(picker)=&self.picker{format!("{} — {} - ZSDesk",picker.options.title,target.title())}else{format!("{} - ZSDesk",target.title())};
+        let _=unsafe {SetWindowTextW(self.hwnd,PCWSTR(wide(&title).as_ptr()))};
         self.invalidate();
     }
     pub(super) unsafe fn focus_address(&mut self) {
         self.address_editing=true;
         if let Some(identity)=self.identity_for_source(self.browser_source) {address_input::begin(self.address_edit,self.hwnd,identity);}
         self.hover_crumb=None;
-        let text=match self.current_location() {ShellLocation::ThisPc=>"此电脑".to_string(),l=>l.address()};
+        let text=match self.current_location() {ShellLocation::ThisPc=>zsdesk_core::i18n::text("此电脑").to_string(),l=>l.address()};
         let _=unsafe {SetWindowTextW(self.address_edit,PCWSTR(wide(&text).as_ptr()))};
         self.position_children();
         let _=unsafe {SetFocus(Some(self.address_edit))};
@@ -321,26 +345,24 @@ impl WindowState {
         unsafe{self.commit_address_text(&text);}
     }
     pub(super) unsafe fn commit_address_text(&mut self,text:&str) {
+        if text.encode_utf16().count()>32767||text.contains('\0'){self.show_message(zsdesk_core::i18n::text("路径过长或包含无效字符").into());return;}
         if matches!(self.current_location(),ShellLocation::Shell{parsing_name,pidl:Some(_),..} if parsing_name.trim().is_empty())
             &&text.trim()==self.current_location().address(){
             // A provider label is display-only. Preserve its PIDL when the
             // user accepts an unchanged address instead of parsing the label.
             self.end_address_edit();self.focus_view();return;
         }
-        if let Some(request)=super::terminal::parse(&text) {
-            match request {
-                Ok(request)=>if self.launch_terminal(&request) { self.end_address_edit(); },
-                Err(message)=>self.show_message(message.into()),
-            }
+        if let Some(Ok(request))=super::terminal::parse(&text) {
+            if self.launch_terminal(&request) { self.end_address_edit(); }
             return;
         }
         let lower=text.trim().to_ascii_lowercase();
         if !crate::edition::NETWORK && ["ftp://","sftp://","ssh://","smb://"].iter().any(|s|lower.starts_with(s)) {
-            self.show_message(format!("ZSDesk {} 不支持 FTP/SSH 地址，请使用网络版或全量版",crate::edition::name()));
+            self.show_message(zsdesk_core::tr_format!("ZSDesk {} 不支持 FTP/SSH 地址，请使用网络版或全量版", crate::edition::name()));
             return;
         }
         if sftp_to_unc(text.trim()).is_some() && !sshfs_installed() {
-            self.show_message("SFTP/SSH 访问需要先安装 SSHFS-Win（WinFsp），安装后可直接输入 sftp:// 地址".into());
+            self.show_message(zsdesk_core::i18n::text("SFTP/SSH 访问需要先安装 SSHFS-Win（WinFsp），安装后可直接输入 sftp:// 地址").into());
             return;
         }
         let working_directory = match self.current_location() {
@@ -348,6 +370,11 @@ impl WindowState {
             ShellLocation::Search { scope: Some(path), .. } => Some(path.as_path()),
             _ => None,
         };
+        if working_directory.is_some_and(|path|path.to_string_lossy().starts_with(r"\\"))
+            && address_is_command_prompt(&text) {
+            self.show_message(zsdesk_core::i18n::text("CMD 不支持网络路径作为工作目录，请使用 PowerShell 或 pwsh").into());
+            return;
+        }
         if let Some(mut command) = address_command(&text, working_directory) {
             // ZSDesk is a GUI-subsystem process; explicitly give console shells
             // their own console so interactive shells such as Nushell can attach.
@@ -358,15 +385,23 @@ impl WindowState {
                 return;
             }
         }
-        match parse_address(&text) {
-            Some(location) => {
+        match parse_address(text) {
+            Some(location)=>{
+                let location=match resolve_relative_address(location,self.current_location()){
+                    Ok(location)=>location,Err(message)=>{self.show_message(message);return;},
+                };
                 self.end_address_edit();
-                unsafe { self.navigate_to(location); }
-                if let Some(browser) = &self.browser { unsafe { browser.focus(); } }
-            }
-            None => self.show_message("请输入文件夹路径或可执行命令".into()),
+                unsafe {self.navigate_to(location);}
+                if let Some(browser)=&self.browser {unsafe {browser.focus();}}
+            },
+            None=>{self.show_message(zsdesk_core::i18n::text("请输入文件夹路径").into());}
         }
     }
+}
+fn address_is_command_prompt(text:&str)->bool {
+    address_command_args(text).and_then(|args|args.into_iter().next())
+        .and_then(|exe|Path::new(&exe).file_name().map(|name|name.to_string_lossy().into_owned()))
+        .is_some_and(|name|name.eq_ignore_ascii_case("cmd")||name.eq_ignore_ascii_case("cmd.exe"))
 }
 /// Parses and prepares any Windows executable command, not a list of known shells.
 fn address_command(text: &str, working_directory: Option<&Path>) -> Option<Command> {
@@ -400,6 +435,13 @@ fn address_command_args(text: &str) -> Option<Vec<OsString>> {
     } else { None };
     unsafe { let _ = LocalFree(Some(HLOCAL(arguments.cast()))); }
     result
+}
+fn resolve_relative_address(location:ShellLocation,current:&ShellLocation)->Result<ShellLocation,String>{
+    let ShellLocation::Path(path)=&location else{return Ok(location);};
+    if path.is_absolute(){return Ok(location);}
+    if matches!(path.components().next(),Some(std::path::Component::Prefix(_))){return Err(zsdesk_core::i18n::text("请输入包含盘符和反斜杠的完整路径").into());}
+    let base=current.as_path().filter(|path|path.is_absolute()).ok_or_else(||zsdesk_core::i18n::text("当前位置不是文件系统目录，请输入完整路径").to_string())?;
+    std::path::absolute(base.join(path)).map(ShellLocation::Path).map_err(|error|zsdesk_core::tr_format!("路径无效：{error}", error=error))
 }
 pub(super) fn parse_address(text:&str)->Option<ShellLocation> {
     parse_address_with(text,|name|std::env::var(name).ok())
@@ -474,7 +516,7 @@ pub(super) fn sftp_to_unc(text:&str)->Option<PathBuf> {
 }
 
 fn strip_scheme<'a>(text:&'a str,schemes:&[&str])->Option<&'a str> {
-    schemes.iter().find_map(|s| (text.len()>=s.len() && text[..s.len()].eq_ignore_ascii_case(s)).then(||&text[s.len()..]))
+    schemes.iter().find_map(|s| text.get(..s.len()).filter(|head|head.eq_ignore_ascii_case(s)).and_then(|_|text.get(s.len()..)))
 }
 
 /// SSHFS-Win (WinFsp) provides the `\\sshfs*` network provider used for SFTP.
@@ -489,6 +531,24 @@ pub(super) fn window_text(hwnd:HWND)->String {
 }
 #[cfg(test)] mod tests {
     use super::*;
+    #[test]fn relative_addresses_use_the_visible_folder_not_the_program_directory(){
+        let current=ShellLocation::Path(r"D:\工程\资料".into());
+        assert_eq!(resolve_relative_address(ShellLocation::Path("中文目录".into()),&current).unwrap(),ShellLocation::Path(r"D:\工程\资料\中文目录".into()));
+        assert_eq!(resolve_relative_address(ShellLocation::Path(r"..\图纸".into()),&current).unwrap(),ShellLocation::Path(r"D:\工程\图纸".into()));
+        assert_eq!(resolve_relative_address(ShellLocation::Path(r"\根目录".into()),&current).unwrap(),ShellLocation::Path(r"D:\根目录".into()));
+        assert!(resolve_relative_address(ShellLocation::Path("相对目录".into()),&ShellLocation::ThisPc).is_err());
+        assert!(resolve_relative_address(ShellLocation::Path("C:目录".into()),&current).is_err());
+    }
+    #[test] fn unicode_addresses_never_slice_through_a_character() {
+        for text in [r"D:\中文目录",r"C:\施工日志",r"E:\资料\图纸",r"\\服务器\共享\工程","中文目录","😀文件夹",r"C:\é中\文件"] {
+            assert_eq!(parse_address(text),Some(ShellLocation::Path(text.into())),"{text}");
+            assert_eq!(sftp_to_unc(text),None);assert_eq!(smb_to_unc(text),None);
+        }
+        for prefix in ["", "C:", "C:\\", "\\\\"] {for character in ['中','é','😀','한'] {
+            for count in 1..=10 {let text=format!("{prefix}{}",character.to_string().repeat(count));
+                assert!(parse_address(&text).is_some());assert!(sftp_to_unc(&text).is_none());}
+        }}
+    }
     #[test] fn address_accepts_shell_unc_and_quoted_paths_without_io() {
         assert_eq!(parse_address("  此电脑 "),Some(ShellLocation::ThisPc));
         assert_eq!(parse_address("\"D:\\not-yet-mounted\\folder\""),Some(ShellLocation::Path(PathBuf::from("D:\\not-yet-mounted\\folder"))));
@@ -530,10 +590,33 @@ pub(super) fn window_text(hwnd:HWND)->String {
     }
 
     #[test]
+    fn command_prompt_is_identified_even_with_an_absolute_quoted_path() {
+        assert!(address_is_command_prompt("cmd /C cd"));
+        assert!(address_is_command_prompt(r#""C:\Windows\System32\cmd.exe" /C cd"#));
+        assert!(!address_is_command_prompt("pwsh -Command Get-Location"));
+        // Parameterized commands fall back to general executable handling.
+        assert!(super::super::terminal::parse("cmd /C cd").unwrap().is_err());
+        assert!(address_command("cmd /C cd", Some(Path::new(r"\\server\share"))).is_some());
+    }
+
+    #[test]
     fn address_command_starts_an_executable_in_the_current_folder() {
         let directory = std::env::current_dir().unwrap();
         let output = address_command("cmd.exe /C cd", Some(&directory)).unwrap().output().unwrap();
         assert!(output.status.success());
         assert_eq!(String::from_utf8_lossy(&output.stdout).trim().to_ascii_lowercase(), directory.to_string_lossy().to_ascii_lowercase());
+    }
+}
+
+#[cfg(test)]mod results_exit_tests{
+    use super::*;
+    #[test]fn folder_navigation_retires_results_drop_and_navigation_restrictions(){
+        for target in [ShellLocation::ThisPc,ShellLocation::Path(PathBuf::from(r"E:\资料"))]{
+            assert!(leaves_results(BrowserRole::Results,false,&target));
+            assert!(leaves_results(BrowserRole::Fresh,true,&target));
+            assert!(!leaves_results(BrowserRole::Ordinary,false,&target));
+        }
+        let search=ShellLocation::Search{query:"文件".into(),scope:None};
+        assert!(!leaves_results(BrowserRole::Results,true,&search));
     }
 }

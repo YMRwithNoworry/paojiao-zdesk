@@ -19,7 +19,8 @@ impl WindowState {
     }
     pub(super) fn bookmark_rect(&self,index:usize)->LayoutRect{
         self.bookmark_order.iter().position(|&i|i==index).and_then(|slot|self.layout.bookmarks.get(slot).copied())
-            .unwrap_or_else(||{let row=self.layout.bookmarks_row;LayoutRect::new(row.x+self.s(8),row.y+self.s(2),self.s(220).min(row.width-self.s(16)),row.height-self.s(4))})
+            .unwrap_or_else(||{if self.layout.bookmarks_vertical&&!self.layout.bookmark_overflow.is_empty(){return self.layout.bookmark_overflow;}
+                let row=self.layout.bookmarks_row;LayoutRect::new(row.x+self.s(8),row.y+self.s(2),self.s(220).min((row.width-self.s(16)).max(0)),self.s(28).min((row.height-self.s(4)).max(0)))})
     }
     pub(super) fn add_current_bookmark(&mut self) {
         let target = self.current_location().clone();
@@ -31,7 +32,7 @@ impl WindowState {
     }
     fn add_bookmark_to(&mut self,name:String,target:ShellLocation,parent:Option<u64>){
         if self.session.bookmarks.iter().any(|b| !b.is_folder&&b.target == target&&b.parent_id==parent) {
-            self.show_message(format!("“{name}”已在收藏栏中"));
+            self.show_message(zsdesk_core::tr_format!("“{name}”已在收藏栏中", name=name));
             return;
         }
         let id = self.session.take_id();
@@ -62,7 +63,7 @@ impl WindowState {
         let Some(bookmark)=self.session.bookmarks.get(index).cloned().filter(|b|b.is_folder)else{return;};
         let targets:Vec<_>=self.session.bookmark_folder_links(bookmark.id).into_iter()
             .filter(|target|target.as_path().is_none_or(|path|!path.is_file())).collect();
-        if targets.is_empty(){self.show_message(format!("“{}”中没有可打开的文件夹",bookmark.display_name));return;}
+        if targets.is_empty(){self.show_message(zsdesk_core::tr_format!("“{}”中没有可打开的文件夹", bookmark.display_name));return;}
         let first=self.session.tabs.len();
         for target in targets{unsafe{self.new_tab(target);}}
         if first<self.session.tabs.len(){unsafe{self.select_tab(first);}}
@@ -71,11 +72,11 @@ impl WindowState {
     pub(super) unsafe fn save_tabs_to_category(&mut self,folder:Option<u64>){
         unsafe{self.capture_active();}
         let tabs:Vec<_>=self.session.tabs.iter().map(|tab|tab.current().clone()).collect();
-        let name=format!("标签页 {}",chrono_like_now());
+        let name=zsdesk_core::tr_format!("标签页 {}", chrono_like_now());
         let id=self.session.save_tabs_to_bookmarks(folder,&name,None,&tabs);
         self.session.ui.show_bookmarks=true;self.save();unsafe{self.rebuild_bookmarks();}
         if folder.is_none(){if let Some(index)=self.session.bookmarks.iter().position(|b|b.id==id){unsafe{self.start_bookmark_rename(index);}}}
-        else{self.show_message(format!("已将 {} 个标签页保存到分类",tabs.len()));}
+        else{self.show_message(zsdesk_core::tr_format!("已将 {} 个标签页保存到分类", tabs.len()));}
     }
     pub(super) unsafe fn bookmark_double_click(&mut self,slot:usize)->bool{
         let Some(index)=self.bookmark_index(slot)else{return false;};
@@ -91,23 +92,23 @@ impl WindowState {
         let Some(bookmark)=self.session.bookmarks.get(index).cloned()else{return;};
         let siblings:Vec<_>=self.session.bookmarks.iter().filter(|b|b.parent_id==bookmark.parent_id).map(|b|b.id).collect();
         let position=siblings.iter().position(|id|*id==bookmark.id).unwrap_or(0);
-        let mut destinations=vec![entry("收藏栏根目录","move-root",bookmark.parent_id.is_some(),false)];
+        let mut destinations=vec![entry(zsdesk_core::i18n::text("收藏栏根目录"),"move-root",bookmark.parent_id.is_some(),false)];
         destinations.extend(self.session.bookmarks.iter().filter(|b|b.is_folder&&b.id!=bookmark.id).map(|b|
             entry(&b.display_name.replace('&',"&&"),&format!("move-{}",b.id),bookmark.parent_id!=Some(b.id)&&self.session.can_move_bookmark_to(bookmark.id,Some(b.id)),false)));
         let spec = menu(vec![
-            entry(if bookmark.is_folder{if bookmark.collapsed{"展开分类"}else{"折叠分类"}}else{"打开"}, "open", true, false),
-            entry(if bookmark.is_folder{"打开分类中的全部文件夹\t双击"}else{"在新标签页中打开"}, "open-tab", true, false),
-            entry("收藏当前文件夹到此分类","add-here",bookmark.is_folder,false),
-            entry("将所有标签页保存到此分类","save-tabs-here",bookmark.is_folder,false),
-            entry("新建分类目录","new-folder",true,false),
+            entry(if bookmark.is_folder{if bookmark.collapsed{zsdesk_core::i18n::text("展开分类")}else{zsdesk_core::i18n::text("折叠分类")}}else{zsdesk_core::i18n::text("打开")}, "open", true, false),
+            entry(if bookmark.is_folder{zsdesk_core::i18n::text("打开分类中的全部文件夹\t双击")}else{zsdesk_core::i18n::text("在新标签页中打开")}, "open-tab", true, false),
+            entry(zsdesk_core::i18n::text("收藏当前文件夹到此分类"),"add-here",bookmark.is_folder,false),
+            entry(zsdesk_core::i18n::text("将所有标签页保存到此分类"),"save-tabs-here",bookmark.is_folder,false),
+            entry(zsdesk_core::i18n::text("新建分类目录"),"new-folder",true,false),
             MenuItemSpec::Separator,
-            entry("重命名", "rename", true, false),
-            entry("向左移动", "left", position > 0, false),
-            entry("向右移动", "right", position+1<siblings.len(), false),
-            submenu("移动到分类",destinations),
+            entry(zsdesk_core::i18n::text("重命名"), "rename", true, false),
+            entry(zsdesk_core::i18n::text("向左移动"), "left", position > 0, false),
+            entry(zsdesk_core::i18n::text("向右移动"), "right", position+1<siblings.len(), false),
+            submenu(zsdesk_core::i18n::text("移动到分类"),destinations),
             MenuItemSpec::Separator,
-            entry(if bookmark.is_folder{"移除分类并保留其中收藏"}else{"从收藏栏移除"}, "remove", true, false),
-            entry("删除分类及其中的收藏…", "remove-subtree", bookmark.is_folder, false),
+            entry(if bookmark.is_folder{zsdesk_core::i18n::text("移除分类并保留其中收藏")}else{zsdesk_core::i18n::text("从收藏栏移除")}, "remove", true, false),
+            entry(zsdesk_core::i18n::text("删除分类及其中的收藏…"), "remove-subtree", bookmark.is_folder, false),
         ]);
         match input::popup(self.hwnd, &spec, None).as_deref() {
             Some("open") => unsafe { self.open_bookmark_index(index, false) },
@@ -122,8 +123,8 @@ impl WindowState {
             Some("move-root")=>self.move_bookmark_to(bookmark.id,None,None),
             Some("remove") => { self.session.remove_bookmark(bookmark.id); self.save(); unsafe { self.rebuild_bookmarks(); } },
             Some("remove-subtree") if bookmark.is_folder => {
-                let text=wide(&format!("删除分类“{}”及其中的收藏和子分类？\n\n实际文件和文件夹不会被删除。",bookmark.display_name));
-                if unsafe{MessageBoxW(Some(self.hwnd),PCWSTR(text.as_ptr()),windows::core::w!("删除收藏分类"),MB_OKCANCEL|MB_ICONQUESTION)}==IDOK {
+                let text=wide(&zsdesk_core::tr_format!("删除分类“{}”及其中的收藏和子分类？\n\n实际文件和文件夹不会被删除。", bookmark.display_name));
+                if unsafe{MessageBoxW(Some(self.hwnd),PCWSTR(text.as_ptr()),windows::core::PCWSTR(zsdesk_core::i18n::wide("删除收藏分类").as_ptr()),MB_OKCANCEL|MB_ICONQUESTION)}==IDOK {
                     self.session.remove_bookmark_subtree(bookmark.id);self.save();unsafe{self.rebuild_bookmarks();}
                 }
             },
@@ -135,10 +136,10 @@ impl WindowState {
         let hidden = self.layout.bookmarks.len();
         let mut items: Vec<MenuItemSpec> = self.bookmark_order.iter().copied().skip(hidden)
             .map(|i| submenu(&self.bookmark_label(i).replace('&',"&&"),vec![
-                entry("打开 / 展开",&format!("bm-{i}"),true,false),entry("管理收藏",&format!("edit-{i}"),true,false)])).collect();
-        items.push(entry("收藏当前文件夹\tCtrl+D", "add", true, false));
-        items.push(entry("新建分类目录","new-folder",true,false));
-        items.push(entry("将所有标签页保存为新分类","save-tabs",true,false));
+                entry(zsdesk_core::i18n::text("打开 / 展开"),&format!("bm-{i}"),true,false),entry(zsdesk_core::i18n::text("管理收藏"),&format!("edit-{i}"),true,false)])).collect();
+        items.push(entry(zsdesk_core::i18n::text("收藏当前文件夹\tCtrl+D"), "add", true, false));
+        items.push(entry(zsdesk_core::i18n::text("新建分类目录"),"new-folder",true,false));
+        items.push(entry(zsdesk_core::i18n::text("将所有标签页保存为新分类"),"save-tabs",true,false));
         match input::popup(self.hwnd, &menu(items), Some(self.layout.bookmark_overflow)).as_deref() {
             Some("add") => self.add_current_bookmark(),
             Some("new-folder")=>unsafe{self.new_bookmark_folder(None);},
@@ -150,11 +151,11 @@ impl WindowState {
     }
     pub(super) unsafe fn bookmarks_bar_menu(&mut self) {
         let spec = menu(vec![
-            entry("收藏当前文件夹\tCtrl+D", "add", true, false),
-            entry("新建分类目录","new-folder",true,false),
-            entry("将所有标签页保存为新分类","save-tabs",true,false),
+            entry(zsdesk_core::i18n::text("收藏当前文件夹\tCtrl+D"), "add", true, false),
+            entry(zsdesk_core::i18n::text("新建分类目录"),"new-folder",true,false),
+            entry(zsdesk_core::i18n::text("将所有标签页保存为新分类"),"save-tabs",true,false),
             MenuItemSpec::Separator,
-            entry("显示收藏栏", "toggle", true, self.session.ui.show_bookmarks),
+            entry(zsdesk_core::i18n::text("显示收藏栏"), "toggle", true, self.session.ui.show_bookmarks),
         ]);
         match input::popup(self.hwnd, &spec, None).as_deref() {
             Some("add") => self.add_current_bookmark(),
@@ -166,8 +167,8 @@ impl WindowState {
     }
     unsafe fn new_bookmark_folder(&mut self,parent:Option<u64>){
         unsafe{self.commit_bookmark_rename();}
-        let id=self.session.take_id();let mut name="新建分类".to_string();let mut number=2;
-        while self.session.bookmarks.iter().any(|b|b.parent_id==parent&&b.display_name==name){name=format!("新建分类 {number}");number+=1;}
+        let id=self.session.take_id();let mut name=zsdesk_core::i18n::text("新建分类").to_string();let mut number=2;
+        while self.session.bookmarks.iter().any(|b|b.parent_id==parent&&b.display_name==name){name=zsdesk_core::tr_format!("新建分类 {number}", number=number);number+=1;}
         self.session.bookmarks.push(Bookmark::folder(id,name,parent));self.session.ui.show_bookmarks=true;
         if let Some(parent)=parent{if let Some(folder)=self.session.bookmarks.iter_mut().find(|b|b.id==parent){folder.collapsed=false;}}
         self.save();unsafe{self.rebuild_bookmarks();self.start_bookmark_rename(self.session.bookmarks.len()-1);}
@@ -181,7 +182,8 @@ impl WindowState {
         // Borderless EDIT inside the rounded text box painted by the chrome.
         let line = self.edit_line_height();
         let pad = self.s(8);
-        let r = LayoutRect::new(rect.x + pad, rect.y + (rect.height - line) / 2, rect.width.max(self.s(140)) - pad * 2, line);
+        let width=if self.layout.bookmarks_vertical{rect.width}else{rect.width.max(self.s(140))};
+        let r = LayoutRect::new(rect.x + pad, rect.y + (rect.height - line) / 2, (width - pad * 2).max(1), line);
         unsafe {
             move_control(self.rename_hwnd, r);
             SendMessageW(self.rename_hwnd, WM_SETFONT, Some(WPARAM(self.font.0 as usize)), Some(LPARAM(1)));
@@ -218,10 +220,11 @@ impl WindowState {
                 let Some(index)=self.bookmark_index(slot)else{return;};let item=self.session.bookmarks[index].clone();
                 if item.id==id{return;}
                 let rect=self.layout.bookmarks[slot];
-                if item.is_folder&&point.x>=rect.x+rect.width/4&&point.x<rect.right()-rect.width/4{
+                let (at,start,length)=if self.layout.bookmarks_vertical{(point.y,rect.y,rect.height)}else{(point.x,rect.x,rect.width)};
+                if item.is_folder&&at>=start+length/4&&at<start+length-length/4{
                     self.move_bookmark_to(id,Some(item.id),None);
                 }else{
-                    let before=if point.x<rect.x+rect.width/2{Some(item.id)}else{
+                    let before=if at<start+length/2{Some(item.id)}else{
                         self.session.bookmarks.iter().skip(index+1).find(|b|b.parent_id==item.parent_id&&b.id!=id).map(|b|b.id)
                     };self.move_bookmark_to(id,item.parent_id,before);
                 }

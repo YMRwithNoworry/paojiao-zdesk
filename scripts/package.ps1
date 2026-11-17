@@ -157,6 +157,9 @@ try {
         if ($identity.product -ne 'ZSDesk' -or $identity.version -ne $version -or $identity.edition -ne $edition -or $identity.network -ne $definition.Network -or $identity.desktop -ne $definition.Desktop -or $identity.themed -ne $definition.Themed -or [bool]$identity.desktop_only -ne [bool]$definition.DesktopOnly) { throw "Executable edition/version mismatch: $edition" }
         [IO.Directory]::CreateDirectory($stage) | Out-Null
         Copy-Item -LiteralPath $exe -Destination (Join-Path $stage 'ZSDesk.exe')
+        $windowHook=(Get-Content -LiteralPath (Join-Path $TargetDir 'release\ZSDeskWindowHook.name') -Raw).Trim()
+        if($windowHook -notmatch '^ZSDeskWindowHook-[0-9a-f]{16}\.dll$'){throw 'Invalid window hook identity'}
+        Copy-Item -LiteralPath (Join-Path $TargetDir "release\$windowHook") -Destination (Join-Path $stage $windowHook)
         foreach ($runtime in $runtimeFiles) {
             Copy-Item -LiteralPath (Join-Path $RuntimeDir $runtime) -Destination (Join-Path $stage $runtime)
         }
@@ -195,16 +198,31 @@ try {
         if($definition.Themed){$readme+=@('','主题版支持亚克力、Mica 和纯色深浅主题；配置独立存放在 AppData\Roaming\ZSDesk-Theme。')}
         elseif(-not $definition.DesktopOnly){$readme+=@('','配置默认保存在用户 AppData\Roaming\ZSDesk。')}
         if(-not $definition.DesktopOnly){
-        $readme += @('','≡ → 搜索：选择自带搜索或 Everything 搜索；新配置默认使用自带搜索，已有配置保留原来的选择。',
+        $readme += @('','≡ → 搜索：选择自带搜索或 Everything 搜索；新配置默认使用 Everything 搜索，已有配置保留原来的选择。',
             '自带搜索使用共享的内存索引和本地快照；普通权限下遍历目录，管理员权限下使用只读 MFT 枚举。',
             '可用的 USN 日志用于增量更新；默认空闲 5 分钟保存快照并释放内存，再次搜索时恢复并补齐变更。',
             '开发和缓存目录内容默认不收录，可在搜索设置中开启；文件大小、修改时间索引和拼音首字母匹配默认关闭。',
-            ('随附的 Everything '+$enginePin.version+' 是可选搜索后端，也可复用已运行的 Everything；只有选中此后端才会按需连接或启动。'),
+            ('随附的 Everything '+$enginePin.version+' 是默认搜索后端，也可复用已运行的 Everything；选择此后端后按需连接或启动。'),
             'Everything 快速全盘索引需要兼容服务或管理员权限；未配置可用索引时会显示设置提示。',
             'Everything 版权与完整许可位于 engines\everything\License.txt。')
         }
-        $readme+=@('portable.flag 使用程序旁 data 目录；--profile-dir 指定独立配置。','安装包与便携包不包含用户路径、桌面布局、搜索索引或系统接管记录。','源码与许可证：https://github.com/qiu7824/zsdesk')
+        $readme+=@('portable.flag 使用程序旁 data 目录；--profile-dir 指定独立配置。','安装包与便携包不包含用户路径、桌面布局、搜索索引或系统接管记录。','源码与许可证：https://github.com/YMRwithNoworry/paojiao-zdesk')
         $readme -join "`r`n" | Set-Content -LiteralPath (Join-Path $stage '说明.txt') -Encoding utf8BOM
+        $english=@("ZSDesk $version ($edition) — Windows x64",'',
+            'Language: non-Chinese Windows systems use English by default.',
+            'File manager: menu → Interface settings → Language. Restart ZSDesk after changing the language.',
+            'File names and Windows Shell labels retain their original language.',
+            'Run ZSDesk.exe. Ctrl+F searches files; Alt+P toggles the preview pane; Space opens quick preview.',
+            'Network share searches stay within the selected UNC folder or existing mapped network folder.',
+            'Settings are preserved during updates. Exit ZSDesk before replacing portable files.',
+            'Use portable.flag for a data folder beside the program, or --profile-dir for a separate configuration.',
+            'Source and licenses: https://github.com/YMRwithNoworry/paojiao-zdesk')
+        if($definition.DesktopOnly){$english=@("ZSDesk $version Desktop Box — Windows x64",'',
+            'Run ZSDesk.exe to start desktop fences. This edition does not include the file manager or search.',
+            'The interface follows the Windows display language, using English on non-Chinese systems.',
+            'Settings: %APPDATA%\ZSDesk-DesktopBox. Files and folders remain in their original locations.',
+            'Source and licenses: https://github.com/YMRwithNoworry/paojiao-zdesk')}
+        $english -join "`r`n" | Set-Content -LiteralPath (Join-Path $stage 'README.en.txt') -Encoding utf8BOM
         $files=[ordered]@{}
         foreach ($file in (Get-ChildItem -LiteralPath $stage -File -Recurse | Sort-Object FullName)) {
             if ($file.LastWriteTimeUtc.Year -lt 1980) { $file.LastWriteTimeUtc=[datetime]'1980-01-01T00:00:00Z' }
@@ -212,7 +230,7 @@ try {
             $files[$relative]=[ordered]@{bytes=$file.Length;sha256=(Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()}
         }
         $searchEngine=if($definition.DesktopOnly){$null}else{[ordered]@{product='Everything';version=$enginePin.version;manifest='engines/everything/manifest.json';manifest_sha256=(Get-FileHash -LiteralPath $enginePinPath).Hash.ToLowerInvariant()}}
-        $defaultSearchBackend=if($definition.DesktopOnly){$null}else{'native_ntfs'}
+        $defaultSearchBackend=if($definition.DesktopOnly){$null}else{'everything'}
         $searchBackends=@();if(-not $definition.DesktopOnly){$searchBackends=@('native_ntfs','everything')}
         $manifest=[ordered]@{product='ZSDesk';version=$version;edition=$edition;edition_name=$definition.Name;platform='windows-x64';features=$definition.Features;desktop_only=[bool]$definition.DesktopOnly;
             search_engine=$searchEngine;search_default_backend=$defaultSearchBackend;search_backends=@($searchBackends);files=$files}

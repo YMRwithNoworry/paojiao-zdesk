@@ -75,9 +75,7 @@ fn profile() -> Rc<Profile> {
 
 /// Prepares this UI thread's menus ahead of the first opening: window class,
 /// Direct2D/DirectWrite factories and render target, the menu text formats at
-/// the primary monitor's DPI and the theme profile. Detection that reads
-/// system files (whether the Windows 11 Shell menu presenter can run) starts
-/// on a background thread so neither startup nor the first menu waits for it.
+/// the primary monitor's DPI and the theme profile.
 pub fn prepare() {
     register_class();
     let _ = profile();
@@ -88,11 +86,6 @@ pub fn prepare() {
         let _ = gfx.measure(CHECK, &TextStyle::icon(metrics.px(12.0)), 4096.0);
         if let Some(surface) = Surface::new(1, 1) { let _ = gfx.draw(&surface, |_| {}); }
     }
-    static DETECTION: std::sync::Once = std::sync::Once::new();
-    DETECTION.call_once(|| {
-        let _ = std::thread::Builder::new().name("zsdesk-menu-detection".into())
-            .spawn(|| { let _ = crate::shell::menu::modern_presenter_supported(); });
-    });
 }
 
 /// Re-reads the theme profile (dark mode, accent color, high contrast) after

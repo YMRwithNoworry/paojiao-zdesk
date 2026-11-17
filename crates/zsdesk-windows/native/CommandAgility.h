@@ -29,6 +29,8 @@ inline bool ReadRange(void* storage,VectorRange& range,size_t& count) noexcept {
     return true;
 }
 
+// Legacy vector-layout helper retained for compatibility probes. Production
+// guarded commands use an FTM proxy and do not modify these private slots.
 // Call on the worker that constructed the command, immediately after the
 // original Insert returns and before its coroutine publishes the vector to UI.
 // Only a newly inserted record containing this call's exact command is changed.

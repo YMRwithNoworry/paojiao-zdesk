@@ -3,11 +3,15 @@ use super::*;
 use anyhow::ensure;
 use std::{ffi::c_void,fs,path::Path,thread,time::{Duration,Instant}};
 use zsdesk_core::model::desktop::{DesktopConfig,Fence,FenceSource,FenceView,Placement};
-use windows::Win32::UI::{Input::KeyboardAndMouse::{GetCapture,SetCapture,ReleaseCapture},Shell::{NIN_SELECT,NINF_KEY}};
+use windows::Win32::UI::{Input::KeyboardAndMouse::{GetCapture,SetCapture,ReleaseCapture,VK_HOME,VK_DOWN},Shell::{NIN_SELECT,NINF_KEY}};
 #[link(name="user32")]unsafe extern "system"{
     fn CreateDesktopW(name:*const u16,device:*const u16,mode:*const c_void,flags:u32,access:u32,attributes:*const c_void)->*mut c_void;
     fn SetThreadDesktop(desktop:*mut c_void)->i32;
     fn CloseDesktop(desktop:*mut c_void)->i32;
+    fn CreateWindowStationW(name:*const u16,flags:u32,access:u32,security:*const c_void)->*mut c_void;
+    fn GetProcessWindowStation()->*mut c_void;
+    fn SetProcessWindowStation(station:*mut c_void)->i32;
+    fn CloseWindowStation(station:*mut c_void)->i32;
 }
 thread_local!{static TRAY_ACTIONS:RefCell<Option<Vec<TrayAction>>>=const{RefCell::new(None)};}
 pub(super) fn capture_tray_action(action:TrayAction)->bool{
@@ -62,6 +66,31 @@ fn captures(host:&OwnedHost)->Result<serde_json::Value>{
     let _=unsafe{ReleaseCapture()};unsafe{SendMessageW(first,WM_LBUTTONUP,None,Some(LPARAM(0)));}verify_selection()?;
     Ok(serde_json::json!({"cancel_mode_releases_owned_capture":true,"reentrant_cancel_deferred":true,"capture_change_preserves_new_owner":true,"selection_preserved":true,"mouse_up_after_cancel_preserves_selection":true}))
 }
+fn placement(host:&OwnedHost)->Result<serde_json::Value>{
+    let hwnd=host.windows[0];
+    let point=POINT{x:80,y:16};
+    with_host(|state|{
+        let fence=state.config.fence_mut(1).unwrap();fence.collapsed=true;fence.placement.height=460;
+        state.peek(1,true);
+    });
+    ensure!(with_host(|state|state.fences[0].peek)==Some(true),"hover fixture not expanded");
+    with_host(|state|state.mouse_down(1,point,false));
+    ensure!(with_host(|state|!state.fences[0].peek&&matches!(state.fences[0].interaction,Some(fence::Interaction::Move{..})))==Some(true),"dragging collapsed title retained expanded preview");
+    let before=with_host(|state|state.fences[0].window_rect()).unwrap();
+    with_host(|state|state.mouse_move(1,POINT{x:point.x+180,y:point.y+90}));
+    let moved=with_host(|state|state.fences[0].window_rect()).unwrap();
+    ensure!(moved.left-before.left==180&&moved.top-before.top==90,"title drag lost pointer offset");
+    unsafe{SendMessageW(hwnd,WM_CANCELMODE,None,None);}
+    with_host(|state|state.place_all());
+    let restored=with_host(|state|state.fences[0].window_rect()).unwrap();
+    ensure!((restored.left-moved.left).abs()<=1&&(restored.top-moved.top).abs()<=1,"capture cancellation lost moved position");
+    ensure!(with_host(|state|state.config.fence(1).unwrap().placement.height)==Some(460),"collapsed drag changed expanded height");
+    with_host(|state|state.save_now());
+    let config=host::load_config(&with_host(|state|state.config_path.clone()).unwrap());
+    let saved=host::to_screen(&config.fence(1).unwrap().placement,true);
+    ensure!((saved.left-moved.left).abs()<=1&&(saved.top-moved.top).abs()<=1,"saved position differs after restart");
+    Ok(serde_json::json!({"collapsed_drag_uses_title_height":true,"pointer_offset_preserved":true,"capture_cancel_keeps_position":true,"saved_position_matches":true,"expanded_height_preserved":true}))
+}
 fn tray(host:&OwnedHost)->Result<serde_json::Value>{
     TRAY_ACTIONS.with(|slot|*slot.borrow_mut()=Some(Vec::new()));let _capture=CaptureActions;
     with_host(|state|state.tray_version4=true);
@@ -82,25 +111,21 @@ fn tray(host:&OwnedHost)->Result<serde_json::Value>{
 const MANAGEMENT_SUBCLASS:usize=0x5a534d47;
 const MANAGEMENT_TIMER:usize=0x5a534d48;
 const MANAGEMENT_WATCHDOG:usize=0x5a534d49;
-thread_local!{static MANAGEMENT_INDEX:Cell<Option<u32>>=const{Cell::new(None)};static MANAGEMENT_ENTERED:Cell<bool>=const{Cell::new(false)};}
+thread_local!{static MANAGEMENT_STEPS:Cell<Option<usize>>=const{Cell::new(None)};static MANAGEMENT_ENTERED:Cell<bool>=const{Cell::new(false)};}
 unsafe extern "system" fn management_probe(hwnd:HWND,msg:u32,wp:WPARAM,lp:LPARAM,_id:usize,_data:usize)->LRESULT{
     if msg==WM_ENTERMENULOOP{
         MANAGEMENT_ENTERED.with(|value|value.set(true));
         unsafe{SetTimer(Some(hwnd),MANAGEMENT_TIMER,80,None);SetTimer(Some(hwnd),MANAGEMENT_WATCHDOG,3000,None);}
     }
-    if msg==WM_INITMENUPOPUP{
-        let menu=HMENU(wp.0 as*mut _);let count=unsafe{GetMenuItemCount(Some(menu))};
-        for index in 0..count{
-            let mut label=[0u16;256];let count=unsafe{GetMenuStringW(menu,index as u32,Some(&mut label),MF_BYPOSITION)};
-            if String::from_utf16_lossy(&label[..count.max(0)as usize])=="锁定格子"{MANAGEMENT_INDEX.with(|value|value.set(Some(index as u32)));}
-        }
-    }
     if msg==WM_TIMER&&wp.0==MANAGEMENT_TIMER{
         let _=unsafe{KillTimer(Some(hwnd),MANAGEMENT_TIMER)};
-        let _=unsafe{PostMessageW(Some(hwnd),WM_CHAR,WPARAM(b'z' as usize),LPARAM(1))};return LRESULT(0);
-    }
-    if msg==WM_MENUCHAR{
-        if let Some(index)=MANAGEMENT_INDEX.with(Cell::get){return LRESULT((index|(MNC_EXECUTE<<16))as isize);}
+        // Both the drawn flyout and the high-contrast Win32 menu consume
+        // keyboard navigation. The drawn menu has no HMENU/WM_MENUCHAR path.
+        if let Some(steps)=MANAGEMENT_STEPS.with(Cell::get){
+            for key in std::iter::once(VK_HOME).chain(std::iter::repeat_n(VK_DOWN,steps)).chain(std::iter::once(VK_RETURN)){
+                let _=unsafe{PostMessageW(Some(hwnd),WM_KEYDOWN,WPARAM(key.0 as usize),LPARAM(1))};
+            }
+        }return LRESULT(0);
     }
     if msg==WM_TIMER&&wp.0==MANAGEMENT_WATCHDOG{zsdesk_windows::flyout::cancel();let _=unsafe{EndMenu()};return LRESULT(0);}
     unsafe{windows::Win32::UI::Shell::DefSubclassProc(hwnd,msg,wp,lp)}
@@ -121,7 +146,9 @@ fn management(host:&OwnedHost)->Result<serde_json::Value>{
     ensure!(matches!(deferred,After::FolderSystemMenu{fence:1,..}),"folder system menu did not use its explicit route");
     let pasted=with_host(|state|state.menu_command(Some(1),"paste",point)).context("paste command routing")?;
     ensure!(matches!(pasted,After::Verb{fence:1,verb:"paste",background:true}),"fence paste did not use the background paste route");
-    MANAGEMENT_INDEX.with(|value|value.set(None));MANAGEMENT_ENTERED.with(|value|value.set(false));
+    let steps=spec.items.iter().filter(|item|matches!(item,MenuItemSpec::Command{enabled:true,..}|MenuItemSpec::Submenu{enabled:true,..}))
+        .position(|item|matches!(item,MenuItemSpec::Command{command:UiCommand::Custom{id,..},..}if id=="lock")).context("enabled root lock command")?;
+    MANAGEMENT_STEPS.with(|value|value.set(Some(steps)));MANAGEMENT_ENTERED.with(|value|value.set(false));
     let before=zsdesk_windows::shell::menu_diagnostics();
     unsafe{windows::Win32::UI::Shell::SetWindowSubclass(owner,Some(management_probe),MANAGEMENT_SUBCLASS,0)}.ok()?;
     fence_menu(1,point);
@@ -132,13 +159,13 @@ fn management(host:&OwnedHost)->Result<serde_json::Value>{
     ensure!(MENU_WORKER.with(|worker|worker.borrow().is_none()),"management popup started a Shell worker");
     let after=zsdesk_windows::shell::menu_diagnostics();
     ensure!(before.presenter_creations==after.presenter_creations,"management popup activated the Shell presenter");
-    Ok(serde_json::json!({"real_management_popup":true,"string_command_dispatched":"lock","selected_item_submenu":true,
+    Ok(serde_json::json!({"real_management_popup":true,"string_command_dispatched":"lock","keyboard_steps_from_first":steps,"selected_item_submenu":true,
         "folder_system_menu_explicit":true,"shell_worker_started":false,"production_profile_modified":false}))
 }
 fn exercise(root:&Path)->Result<serde_json::Value>{
     unsafe{OleInitialize(None)?;}let _apartment=Apartment;let host=owned_host(root)?;
-    let pointer=captures(&host)?;let tray=tray(&host)?;let management=management(&host)?;drop(host);pump(30);
-    Ok(serde_json::json!({"pointer":pointer,"tray":tray,"management":management,"desktop_start_called":false,"notification_area_modified":false}))
+    let pointer=captures(&host)?;let placement=placement(&host)?;let tray=tray(&host)?;let management=management(&host)?;drop(host);pump(30);
+    Ok(serde_json::json!({"pointer":pointer,"placement":placement,"tray":tray,"management":management,"desktop_start_called":false,"notification_area_modified":false}))
 }
 #[test]
 #[ignore="Owned-window tray/capture message regression on a private desktop; requires ZSDESK_NATIVE_TEST_OUTPUT"]
@@ -149,4 +176,55 @@ fn native_fence_capture_and_tray_message_protocol()->Result<()>{
     let closed=unsafe{CloseDesktop(desktop)}!=0;let current=unsafe{GetForegroundWindow()};let mut process=0;unsafe{GetWindowThreadProcessId(current,Some(&mut process));}let isolated=process!=std::process::id();
     let report=serde_json::json!({"state":if result.is_ok()&&closed&&isolated{"passed"}else{"failed"},"checks":result.as_ref().map_err(|error|format!("{error:#}")),"desktop_closed":closed,"foreground_unchanged":before==current,"test_did_not_activate":isolated});
     fs::write(root.join("verification.current.json"),serde_json::to_vec_pretty(&report)?)?;println!("{report}");result?;ensure!(closed&&isolated,"desktop cleanup/focus failed");Ok(())
+}
+
+fn clipboard_exercise(root:&Path)->Result<serde_json::Value>{
+    use zsdesk_windows::shell::file_transfer;
+    unsafe{OleInitialize(None)?;}let _apartment=Apartment;
+    let source=root.join("source");let destination=root.join("destination");fs::create_dir_all(&source)?;fs::create_dir_all(&destination)?;
+    let path=source.join("剪切 文件.txt");fs::write(&path,b"clipboard-owned-content")?;
+    let host=owned_host(&source)?;
+    with_host(|state|{
+        state.config.fence_mut(2).unwrap().source=FenceSource::Folder{root:destination.clone()};
+        state.refresh_folder(1);state.refresh_folder(2);
+    });
+    let listener=clipboard::Listener::new(host.hwnd)?;
+    let cut=||with_host(|state|state.fences[0].cut_keys.iter().any(|key|key.ends_with("剪切 文件.txt")))==Some(true);
+    file_transfer::copy_paths(host.windows[0],&[path.clone()],true)?;pump(100);
+    ensure!(cut(),"cut did not dim the source icon through WM_CLIPBOARDUPDATE");
+    file_transfer::copy_paths(host.windows[0],&[path.clone()],false)?;pump(100);
+    ensure!(!cut(),"copy retained previous cut dimming");
+    file_transfer::copy_paths(host.windows[0],&[path.clone()],true)?;pump(100);ensure!(cut(),"second cut did not dim");
+    file_transfer::set_text(host.windows[0],"unrelated private clipboard")?;pump(100);
+    ensure!(!cut(),"replacing clipboard text retained stale cut appearance");
+    file_transfer::copy_paths(host.windows[0],&[path.clone()],true)?;pump(100);
+    run_verb(2,"paste",true);
+    let target=destination.join("剪切 文件.txt");let deadline=Instant::now()+Duration::from_secs(10);
+    loop{
+        pump(20);
+        let selected=with_host(|state|state.fences[1].selected_entries().iter().any(|entry|entry.path.as_ref()==Some(&target)))==Some(true);
+        if selected&&target.exists()&&!path.exists(){break;}
+        ensure!(Instant::now()<deadline,"asynchronous paste did not move and select the exact output");
+    }
+    ensure!(fs::read(&target)?==b"clipboard-owned-content","paste changed file bytes");
+    ensure!(with_host(|state|state.fences.iter().all(|window|window.notice.is_none()))==Some(true),"paste displayed a text banner");
+    ensure!(!cut(),"completed move retained cut appearance");
+    drop(listener);drop(host);pump(20);fs::remove_file(target)?;
+    Ok(serde_json::json!({"cut_dimmed":true,"copy_clears_cut":true,"unrelated_clipboard_clears_cut":true,"real_paste_move":true,"exact_output_selected":true,"no_success_banner":true,"user_clipboard_accessed":false}))
+}
+
+#[test]
+#[ignore="Private window-station clipboard and actual fence paste regression"]
+fn native_fence_cut_appearance_and_paste_selection()->Result<()>{
+    let root=PathBuf::from(std::env::var_os("ZSDESK_NATIVE_TEST_OUTPUT").context("output")?).join("fence-clipboard");ensure!(root.is_absolute(),"absolute output required");fs::create_dir_all(&root)?;
+    let original=unsafe{GetProcessWindowStation()};let name=wide(&format!("ZSDesk.FenceClipboard.{}",std::process::id()));
+    let station=unsafe{CreateWindowStationW(name.as_ptr(),0,0x000f037f,std::ptr::null())};ensure!(!station.is_null(),"private station creation failed");
+    if unsafe{SetProcessWindowStation(station)}==0{let _=unsafe{CloseWindowStation(station)};anyhow::bail!("private station attach failed");}
+    let desktop=unsafe{CreateDesktopW(wide("Default").as_ptr(),std::ptr::null(),std::ptr::null(),0,0x000f00ff,std::ptr::null())};
+    if desktop.is_null(){let _=unsafe{SetProcessWindowStation(original)};let _=unsafe{CloseWindowStation(station)};anyhow::bail!("private desktop creation failed");}
+    let raw=desktop as usize;let output=root.clone();
+    let result=thread::spawn(move||->Result<serde_json::Value>{ensure!(unsafe{SetThreadDesktop(raw as*mut c_void)}!=0,"private desktop attach failed");clipboard_exercise(&output)}).join().map_err(|_|anyhow::anyhow!("clipboard test panicked")).and_then(|value|value);
+    let restored=unsafe{SetProcessWindowStation(original)}!=0;let desktop_closed=unsafe{CloseDesktop(desktop)}!=0;let station_closed=unsafe{CloseWindowStation(station)}!=0;
+    let report=serde_json::json!({"state":if result.is_ok()&&restored&&desktop_closed&&station_closed{"passed"}else{"failed"},"checks":result.as_ref().map_err(|error|format!("{error:#}")),"station_restored":restored,"desktop_closed":desktop_closed,"station_closed":station_closed});
+    fs::write(root.join("verification.current.json"),serde_json::to_vec_pretty(&report)?)?;println!("{report}");result?;ensure!(restored&&desktop_closed&&station_closed,"clipboard fixture cleanup failed");Ok(())
 }

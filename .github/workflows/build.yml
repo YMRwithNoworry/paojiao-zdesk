@@ -211,6 +211,10 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & .\scripts\package.ps1 -WorkDir $work -TargetDir $env:CARGO_TARGET_DIR -OutputDir $output -RoutingDir $routing -EverythingDir (Join-Path $env:RUNNER_TEMP 'ZSDesk-everything') -InnoCompiler $innoCompiler
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $artifacts = @(Get-ChildItem -LiteralPath $output -File | Where-Object { $_.Name -match '^ZSDesk-\d+\.\d+\.\d+-(standard|network|desktop|full|themed|desktop-box)-x64(\.zip|-setup\.exe)$' } | Sort-Object Name)
+          if ($artifacts.Count -ne 12) { throw 'Expected a ZIP and installer for each of the six editions' }
+          $checksums = @($artifacts | ForEach-Object { ((Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant() + '  ' + $_.Name) })
+          [IO.File]::WriteAllLines((Join-Path $output 'SHA256SUMS.txt'), [string[]]$checksums, [Text.UTF8Encoding]::new($false))
       - name: Commit release version
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         id: version_commit
@@ -288,4 +292,5 @@ jobs:
           files: |
             ${{ runner.temp }}/ZSDesk-release/*.zip
             ${{ runner.temp }}/ZSDesk-release/*-setup.exe
+            ${{ runner.temp }}/ZSDesk-release/SHA256SUMS.txt
 

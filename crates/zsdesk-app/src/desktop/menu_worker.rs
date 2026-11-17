@@ -7,14 +7,15 @@ use zsdesk_ui::menus::{MenuItemSpec,MenuSpec};
 use zsdesk_windows::shell::menu::{forward_menu_message,MenuInterceptions,MenuOutcome,ShellMenu};
 
 const CLASS:PCWSTR=w!("ZSDesk.Desktop.MenuOwner");
-const CANCEL_TIMER:usize=1;
-const CANCEL_REQUEST:u32=WM_APP+25;
+pub(super) const CANCEL_TIMER:usize=super::protocol::MenuTimer::Cancel as usize;
+#[cfg(test)]pub(super) const PROBE_TIMER:usize=super::protocol::MenuTimer::Probe as usize;
+pub(super) const CANCEL_REQUEST:u32=super::protocol::Message::MenuCancel as u32;
 static RETIRING:Mutex<Vec<JoinHandle<()>>>=Mutex::new(Vec::new());
 pub(super) fn retiring_count()->usize{
     let mut threads=RETIRING.lock().unwrap_or_else(|e|e.into_inner());
     let mut index=0;while index<threads.len(){if threads[index].is_finished(){let _=threads.swap_remove(index).join();}else{index+=1;}}threads.len()
 }
-pub(super) const READY:u32=WM_APP+24;
+pub(super) const READY:u32=super::protocol::Message::MenuReady as u32;
 #[derive(Clone)]
 pub(super) enum Target{Items{pidls:Vec<Vec<u8>>,key:Option<String>},Background{folder:Option<PathBuf>}}
 #[derive(Clone)]
@@ -22,11 +23,12 @@ pub(super) struct Request{
     pub fence:u64,pub owner:isize,pub point:POINT,pub profile:PathBuf,pub items:Vec<MenuItemSpec>,pub target:Target,pub extended:bool,
     pub generation:u64,pub queued:Instant,pub input_started:Instant,pub ui_thread:u32,pub foreground:isize,
     pub mode:crate::context_menu_process::Mode,
+    pub layout:Option<zsdesk_core::model::explorer::ShellViewState>,
     #[cfg(test)] pub probe:Option<Probe>,
 }
 impl Request{
     pub fn new(fence:u64,owner:HWND,point:POINT,profile:PathBuf,items:Vec<MenuItemSpec>,target:Target,extended:bool)->Self{
-        let now=Instant::now();Self{fence,owner:owner.0 as isize,point,profile,items,target,extended,generation:0,queued:now,input_started:now,ui_thread:unsafe{GetCurrentThreadId()},foreground:unsafe{GetForegroundWindow()}.0 as isize,mode:crate::context_menu_process::Mode::More,#[cfg(test)]probe:None}
+        let now=Instant::now();Self{fence,owner:owner.0 as isize,point,profile,items,target,extended,generation:0,queued:now,input_started:now,ui_thread:unsafe{GetCurrentThreadId()},foreground:unsafe{GetForegroundWindow()}.0 as isize,mode:crate::context_menu_process::Mode::More,layout:None,#[cfg(test)]probe:None}
     }
 }
 #[derive(Clone,Debug,Default,serde::Serialize)]
@@ -50,8 +52,9 @@ impl ValidationAnswer{
 impl Drop for ValidationAnswer{fn drop(&mut self){self.wake();}}
 pub(super) enum Event{
     Validate{request:Request,before_invoke:bool,answer:ValidationAnswer},
-    Finished{request:Request,ids:Vec<String>,outcome:Result<MenuOutcome,(i32,String)>,timing:Timing},
+    Finished{request:Request,ids:Vec<String>,outcome:Result<MenuOutcome,(i32,String)>,timing:Timing,effects:MenuEffects},
 }
+#[derive(Default)]pub(super) struct MenuEffects{pub created:Vec<zsdesk_windows::shell::new_menu::CreatedItem>,pub layout:Option<zsdesk_core::model::explorer::ShellViewState>,pub sort_changed:bool}
 struct Shared{
     pending:Mutex<Option<Request>>,events:Mutex<VecDeque<Event>>,stop:AtomicBool,generation:AtomicU64,window:AtomicIsize,
     destination:isize,failure:Mutex<Option<(i32,String)>>,
@@ -87,17 +90,19 @@ impl Worker{
             })();
             if let Err(error)=result{
                 *worker.failure.lock().unwrap_or_else(|e|e.into_inner())=Some((error.code().0,error.message()));
-                if let Some(request)=worker.pending.lock().unwrap_or_else(|e|e.into_inner()).take(){worker.push(Event::Finished{request,ids:Vec::new(),outcome:Err((error.code().0,error.message())),timing:Timing::default()});}
+                if let Some(request)=worker.pending.lock().unwrap_or_else(|e|e.into_inner()).take(){worker.push(Event::Finished{request,ids:Vec::new(),outcome:Err((error.code().0,error.message())),timing:Timing::default(),effects:MenuEffects::default()});}
             }
         })?;
         Ok(Self{shared,thread:Some(thread),recent:VecDeque::new()})
     }
-    pub fn submit(&self,mut request:Request){
+    pub fn submit(&self,mut request:Request)->u64{
         request.generation=self.shared.generation.fetch_add(1,Ordering::AcqRel).wrapping_add(1);
+        let generation=request.generation;
         request.queued=Instant::now();
         let mut pending=self.shared.pending.lock().unwrap_or_else(|e|e.into_inner());
-        if let Some(error)=self.shared.failure.lock().unwrap_or_else(|e|e.into_inner()).clone(){drop(pending);self.shared.push(Event::Finished{request,ids:Vec::new(),outcome:Err(error),timing:Timing::default()});return;}
+        if let Some(error)=self.shared.failure.lock().unwrap_or_else(|e|e.into_inner()).clone(){drop(pending);self.shared.push(Event::Finished{request,ids:Vec::new(),outcome:Err(error),timing:Timing::default(),effects:MenuEffects::default()});return generation;}
         *pending=Some(request);drop(pending);self.shared.wake(true);
+        generation
     }
     pub fn drain(&mut self)->Vec<Event>{
         let events:Vec<_>=self.shared.events.lock().unwrap_or_else(|e|e.into_inner()).drain(..).collect();
@@ -174,9 +179,9 @@ unsafe extern "system" fn procedure(hwnd:HWND,message:u32,wp:WPARAM,lp:LPARAM)->
     if message==WM_NCCREATE{let create=unsafe{&*(lp.0 as*const CREATESTRUCTW)};unsafe{SetWindowLongPtrW(hwnd,GWLP_USERDATA,create.lpCreateParams as isize);}return LRESULT(1);}
     let state=unsafe{GetWindowLongPtrW(hwnd,GWLP_USERDATA)}as*const WindowState;
     if !state.is_null(){let state=unsafe{&*state};
-        if message==WM_ENTERMENULOOP{state.entered.set(Some(Instant::now()));#[cfg(test)]if state.probe.get().is_some(){unsafe{SetTimer(Some(hwnd),2,40,None);}}}
+        if message==WM_ENTERMENULOOP{state.entered.set(Some(Instant::now()));#[cfg(test)]if state.probe.get().is_some(){unsafe{SetTimer(Some(hwnd),PROBE_TIMER,40,None);}}}
         if message==WM_CANCELMODE||((message==CANCEL_REQUEST||(message==WM_TIMER&&wp.0==CANCEL_TIMER))&&(!state.shared.current(state.generation.get())||!unsafe{IsWindow(Some(HWND(state.source.get()as*mut _)))}.as_bool())){let _=unsafe{EndMenu()};return LRESULT(0);}
-        #[cfg(test)]if message==WM_TIMER&&wp.0==2{let _=unsafe{KillTimer(Some(hwnd),2)};if let Some(probe)=state.probe.get(){let _=unsafe{PostMessageW(Some(hwnd),WM_CHAR,WPARAM((if probe.copy{b'c'}else{b'z'})as usize),LPARAM(1))};}return LRESULT(0);}
+        #[cfg(test)]if message==WM_TIMER&&wp.0==PROBE_TIMER{let _=unsafe{KillTimer(Some(hwnd),PROBE_TIMER)};if let Some(probe)=state.probe.get(){let _=unsafe{PostMessageW(Some(hwnd),WM_CHAR,WPARAM((if probe.copy{b'c'}else{b'z'})as usize),LPARAM(1))};}return LRESULT(0);}
     }
     if let Some(result)=forward_menu_message(message,wp,lp){return result;}
     unsafe{DefWindowProcW(hwnd,message,wp,lp)}
@@ -226,7 +231,7 @@ fn legacy_probe(shared:&Shared,state:&WindowState,owner:HWND,request:&Request,ti
     if !isolated&&!foreground_allowed(request.foreground){return Err(error_abort());}
     unsafe{let _=SetWindowPos(owner,None,request.point.x,request.point.y,0,0,SWP_NOZORDER|SWP_NOACTIVATE);let _=ShowWindow(owner,SW_SHOWNOACTIVATE);let _=SetForegroundWindow(owner);let _=SetActiveWindow(owner);let _=SetFocus(Some(owner));SetTimer(Some(owner),CANCEL_TIMER,100,None);}
     let result=match (&shell,&request.target){
-        (Some(menu),Target::Items{pidls,key})=>menu.track_selected_before(owner,request.point,pidls,ids.len(),MenuInterceptions{rename:key.is_some(),open:pidls.len()==1&&key.is_some()},&mut||validate(shared,request,true)),
+        (Some(menu),Target::Items{pidls,key})=>menu.track_selected_before(owner,request.point,pidls,ids.len(),MenuInterceptions{rename:key.is_some(),open:pidls.len()==1&&key.is_some(),..Default::default()},&mut||validate(shared,request,true)),
         (Some(menu),Target::Background{folder:Some(path)})=>menu.track_folder_background(owner,request.point,path,ids.len(),&mut||validate(shared,request,true)),
         _=>{let spec=MenuSpec{items:request.items.clone(),..Default::default()};let selected=super::popup(owner,&spec,request.point);*ids=selected.clone().into_iter().collect();Ok(selected.map_or(MenuOutcome::Dismissed,|_|MenuOutcome::Application(zsdesk_windows::shell::menu::APP_FIRST)))},
     };
@@ -237,7 +242,7 @@ fn legacy_probe(shared:&Shared,state:&WindowState,owner:HWND,request:&Request,ti
     if unsafe{GetForegroundWindow()}==owner&&unsafe{IsWindow(Some(source))}.as_bool(){let _=unsafe{SetForegroundWindow(source)};}
     result
 }
-fn perform(shared:&Shared,state:&WindowState,owner:HWND,request:&Request,timing:&mut Timing,ids:&mut Vec<String>)->windows::core::Result<MenuOutcome>{
+fn perform(shared:&Shared,state:&WindowState,owner:HWND,request:&Request,timing:&mut Timing,ids:&mut Vec<String>,effects:&mut MenuEffects)->windows::core::Result<MenuOutcome>{
     // The old same-STA probe is retained only to exercise public menu message
     // forwarding. Production extension code is always in a child process.
     #[cfg(test)]if request.probe.is_some(){return legacy_probe(shared,state,owner,request,timing,ids);}
@@ -245,27 +250,38 @@ fn perform(shared:&Shared,state:&WindowState,owner:HWND,request:&Request,timing:
     let stage=Instant::now();
     validate(shared,request,false)?;
     timing.initial_validation_microseconds=micros(stage.elapsed());
-    if !foreground_allowed(request.foreground){return Err(windows::core::Error::new(windows::core::HRESULT(0x80004004u32 as i32),"菜单打开前前台窗口已改变"));}
+    if !foreground_allowed(request.foreground){return Err(windows::core::Error::new(windows::core::HRESULT(0x80004004u32 as i32),zsdesk_core::i18n::text("菜单打开前前台窗口已改变")));}
     let stage=Instant::now();
     let (options,cache_hit)=state.policy.borrow_mut().options(&request.profile);
     timing.settings_cache_hit=cache_hit;
     timing.settings_microseconds=micros(stage.elapsed());let stage=Instant::now();
-    let(pidls,folder,intercept)=match &request.target{
-        Target::Items{pidls,key}=>(pidls.clone(),None,MenuInterceptions{rename:key.is_some(),open:pidls.len()==1&&key.is_some()}),
-        Target::Background{folder}=>(Vec::new(),folder.clone(),MenuInterceptions::default()),
+    let(pidls,folder,intercept,mode)=match &request.target{
+        Target::Items{pidls,key}=>(pidls.clone(),None,MenuInterceptions{rename:key.is_some(),open:pidls.len()==1&&key.is_some(),file_actions:pidls.iter().all(|pidl|
+            zsdesk_windows::shell::pidl::item_from_pidl(pidl).is_ok_and(|item|unsafe{item.GetAttributes(windows::Win32::System::SystemServices::SFGAO_FILESYSTEM)}.is_ok_and(|value|value.0&windows::Win32::System::SystemServices::SFGAO_FILESYSTEM.0!=0)))},request.mode),
+        Target::Background{folder:Some(folder)} if request.mode==crate::context_menu_process::Mode::Paste=>(Vec::new(),Some(folder.clone()),MenuInterceptions::default(),request.mode),
+        Target::Background{folder:Some(folder)}=>{
+            let identity=zsdesk_windows::shell::pidl::location_pidl(&zsdesk_core::model::explorer::ShellLocation::Path(folder.clone())).ok_or_else(error_abort)?;
+            let file_actions=zsdesk_windows::shell::pidl::item_from_pidl(&identity).is_ok_and(|item|{
+                use windows::Win32::System::SystemServices::{SFGAO_FILESYSTEM,SFGAO_FOLDER,SFGAO_STREAM};
+                unsafe{item.GetAttributes(SFGAO_FILESYSTEM|SFGAO_FOLDER|SFGAO_STREAM)}.is_ok_and(|value|value.0&(SFGAO_FILESYSTEM.0|SFGAO_FOLDER.0)==(SFGAO_FILESYSTEM.0|SFGAO_FOLDER.0)&&value.0&SFGAO_STREAM.0==0)
+            });
+            (vec![identity],Some(folder.clone()),MenuInterceptions{file_actions,..Default::default()},crate::context_menu_process::Mode::Background)
+        },
+        Target::Background{folder:None}=>(Vec::new(),None,MenuInterceptions::default(),request.mode),
     };
     timing.request_snapshot_microseconds=micros(stage.elapsed());
     let input_to_client=micros(request.input_started.elapsed());
-    let mut client=crate::context_menu_process::Client::spawn_extended(HWND(request.owner as*mut _),request.point,pidls,folder,options,intercept,request.mode,request.extended)
-        .map_err(|error|windows::core::Error::new(windows::core::HRESULT(0x80004005u32 as i32),error.to_string()))?;
+    let mut client=crate::context_menu_process::Client::spawn_with_layout(HWND(request.owner as*mut _),request.point,pidls,folder,options,intercept,mode,request.extended,request.layout.clone())
+        .map_err(|error|windows::core::Error::new(crate::context_menu_process::failure_code(&error),crate::context_menu_process::failure_message(&error)))?;
     timing.extension_process=client.pid();
     loop{
         if !shared.current(request.generation){client.cancel();return Err(error_abort());}
         if let Some(result)=client.poll(&mut|before|validate(shared,request,before).is_ok()&&(before||foreground_allowed(request.foreground))){
+            effects.created=client.created_items();effects.layout=client.result_layout();effects.sort_changed=client.result_sort_changed();
             if let Some((bind,populate))=client.timings(){timing.bind_microseconds=bind;timing.populate_microseconds=populate;}
             timing.isolation=client.detailed_timings();
             timing.input_to_menu_microseconds=timing.isolation.parent_to_menu_microseconds.map(|time|time.saturating_add(input_to_client));
-            return result.map_err(|error|windows::core::Error::new(windows::core::HRESULT(0x80004005u32 as i32),error.to_string()));
+            return result.map_err(|error|windows::core::Error::new(crate::context_menu_process::failure_code(&error),crate::context_menu_process::failure_message(&error)));
         }
         let mut message=MSG::default();for _ in 0..32{if !unsafe{PeekMessageW(&mut message,None,0,0,PM_REMOVE)}.as_bool(){break;}
             if message.message==WM_QUIT{client.cancel();return Err(error_abort());}unsafe{let _=TranslateMessage(&message);DispatchMessageW(&message);}}
@@ -283,9 +299,9 @@ fn run(shared:Arc<Shared>)->windows::core::Result<()>{
         let next=shared.pending.lock().unwrap_or_else(|e|e.into_inner()).take();
         if let Some(request)=next{
             let mut timing=Timing{generation:request.generation,ui_thread:request.ui_thread,menu_thread:unsafe{GetCurrentThreadId()},owner_thread:unsafe{GetWindowThreadProcessId(owner.0,None)},queue_microseconds:micros(request.queued.elapsed()),..Default::default()};let mut ids=Vec::new();
-            let outcome=perform(&shared,&state,owner.0,&request,&mut timing,&mut ids);
+            let mut effects=MenuEffects::default();let outcome=perform(&shared,&state,owner.0,&request,&mut timing,&mut ids,&mut effects);
             timing.result=match &outcome{Ok(value)=>format!("{value:?}"),Err(error)=>format!("0x{:08x}: {}",error.code().0 as u32,error.message())};
-            shared.push(Event::Finished{request,ids,outcome:outcome.map_err(|error|(error.code().0,error.message())),timing});continue;
+            shared.push(Event::Finished{request,ids,outcome:outcome.map_err(|error|(error.code().0,error.message())),timing,effects});continue;
         }
         let mut message=MSG::default();let status=unsafe{GetMessageW(&mut message,None,0,0)}.0;if status<=0{break;}unsafe{let _=TranslateMessage(&message);DispatchMessageW(&message);}
     }
@@ -318,7 +334,7 @@ fn run(shared:Arc<Shared>)->windows::core::Result<()>{
         crate::storage::save(&first,&session)?;
         let (options,hit)=cache.options(&first);ensure!(options.show_wps&&!hit,"external preference edit was hidden by the cache");
         std::fs::write(&first,b"invalid session")?;
-        let (options,hit)=cache.options(&first);ensure!(!options.show_wps&&!hit&&cache.entry.is_none(),"invalid configuration retained stale policy");
+        let (options,hit)=cache.options(&first);ensure!(options.show_wps==zsdesk_windows::shell::menu::ContextMenuOptions::default().show_wps&&!hit&&cache.entry.is_none(),"invalid configuration retained stale policy");
         crate::storage::save(&first,&session)?;
         let (options,hit)=cache.options(&first);ensure!(options.show_wps&&!hit,"restored configuration was not reloaded");
         Ok(())

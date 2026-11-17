@@ -14,7 +14,8 @@ use windows::{core::{BOOL,PWSTR},Win32::{Foundation::{CloseHandle,COLORREF,FILET
     UI::{Accessibility::{SetWinEventHook,UnhookWinEvent,HWINEVENTHOOK},
         Input::KeyboardAndMouse::{GetAsyncKeyState,IsWindowEnabled,VK_SHIFT},WindowsAndMessaging::*}}};
 
-pub(super) const LEASE_MS:u64=800;
+pub(super) const LEASE_MS:u64=8000;
+pub(super) const PREPARE_MS:u64=8000;
 const MAX_LEASES:usize=16;
 const PROPERTY:windows::core::PCWSTR=windows::core::w!("ZSDesk.ExplorerVisibilityLease.v1");
 const CHANGED_STYLE:u32=WS_EX_LAYERED.0|WS_EX_TOOLWINDOW.0|WS_EX_APPWINDOW.0;
@@ -131,7 +132,8 @@ impl Connection {
         let mut child=Command::new(std::env::current_exe()?).args(["--explorer-visibility-guard",&parent.to_string(),&created.to_string()])
             .creation_flags(0x08000000).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn()?;
         let input=Arc::new(Mutex::new(child.stdin.take()));let stdout=child.stdout.take().context("guard output")?;
-        let leases=Arc::new(Mutex::new(HashMap::<u64,Lease>::new()));let recovery=leases.clone();let writer=input.clone();
+        let leases=Arc::new(Mutex::new(HashMap::<u64,Lease>::new()));let recovery=leases.clone();
+        let reader_input=input.clone();
         let(tx,events)=mpsc::channel();
         let reader=thread::Builder::new().name("zsdesk-explorer-lease-recovery".into()).stack_size(256*1024).spawn(move||{
             for line in BufReader::new(stdout).lines(){
@@ -140,10 +142,9 @@ impl Connection {
                 match &event {
                     Event::Prepared(lease)=>{
                         if let Ok(mut known)=recovery.lock(){known.insert(lease.id,lease.clone());}
-                        // Recovery has the original style before the child is
-                        // allowed to make any window invisible.
-                        if send(&writer,&Control::Hide(lease.id)).is_err(){break;}
-                        continue;
+                        // The recovery reader does not wait for Shell COM or
+                        // navigation. Mask a new window before its first paint.
+                        let _=send(&reader_input,&Control::Hide(lease.id));
                     },
                     Event::Hidden(lease)=>{if let Ok(mut known)=recovery.lock(){known.insert(lease.id,lease.clone());}},
                     Event::Restored{lease,..}|Event::Closed{lease}=>{if let Ok(mut known)=recovery.lock(){known.remove(lease);}},
@@ -185,9 +186,31 @@ impl Drop for Connection {
     }
 }
 
+fn preparation_live(lease:&Lease,stamp:u64)->bool{stamp>=lease.started&&stamp-lease.started<PREPARE_MS}
 struct Entry{lease:Lease,hidden:bool,closing:bool}
 struct Watcher{enabled:bool,heartbeat:u64,known:HashSet<(isize,u32,u32)>,entries:HashMap<u64,Entry>,serial:u64,output:SyncSender<Event>}
-thread_local!{static WATCHER:RefCell<Option<Watcher>>=const{RefCell::new(None)};}
+thread_local!{
+    static WATCHER:RefCell<Option<Watcher>>=const{RefCell::new(None)};
+    static COMMANDS:RefCell<Option<Receiver<Control>>>=const{RefCell::new(None)};
+}
+fn process_commands()->bool{
+    let values=COMMANDS.with(|slot|slot.borrow().as_ref().map(|rx|rx.try_iter().collect::<Vec<_>>()).unwrap_or_default());
+    for value in values{let running=WATCHER.with(|slot|slot.borrow_mut().as_mut().is_some_and(|watcher|watcher.command(value)));if !running{return false;}}true
+}
+unsafe extern "system" fn early_message(window:HWND,message:u32,wp:WPARAM,lp:LPARAM)->windows::Win32::Foundation::LRESULT{
+    if message!=crate::early_window_hook::MESSAGE{return unsafe{DefWindowProcW(window,message,wp,lp)};}
+    let source=HWND(wp.0 as*mut _);
+    let accepted=WATCHER.with(|slot|{let Ok(mut slot)=slot.try_borrow_mut()else{return false;};
+        if let Some(watcher)=slot.as_mut(){watcher.observe(EVENT_OBJECT_SHOW,source);true}else{false}});
+    if !accepted{return windows::Win32::Foundation::LRESULT(0);}
+    let until=Instant::now()+Duration::from_millis(50);
+    loop{
+        if !process_commands(){break;}
+        let state=WATCHER.with(|slot|slot.borrow().as_ref().and_then(|watcher|watcher.entries.values().find(|entry|entry.lease.identity.window==source.0 as isize).map(|entry|entry.hidden)));
+        if state!=Some(false)||Instant::now()>=until{break;}thread::sleep(Duration::from_millis(1));
+    }
+    windows::Win32::Foundation::LRESULT(0)
+}
 impl Watcher {
     fn emit(&self,event:Event)->bool{self.output.try_send(event).is_ok()}
     fn enable(&mut self,enabled:bool){
@@ -211,7 +234,7 @@ impl Watcher {
         if !self.enabled||!root_browser(window){return;}
         if let Some((id,lease,hidden))=self.entries.iter().find_map(|(id,entry)|(entry.lease.identity.window==key)
             .then_some((*id,entry.lease.clone(),entry.hidden))){
-            if !lease.live_at(now())||shift_down()||modal(window)||native_tab_count(window)>1{self.remove(id,"source-changed");}
+            if !(if hidden{lease.live_at(now())}else{preparation_live(&lease,now())})||shift_down()||modal(window)||native_tab_count(window)>1{self.remove(id,"source-changed");}
             else if hidden&&event==EVENT_OBJECT_SHOW&&marked(&lease){
                 let current=unsafe{GetWindowLongPtrW(window,GWL_EXSTYLE)}as u32;
                 unsafe{SetWindowLongPtrW(window,GWL_EXSTYLE,hidden_style(current)as isize);}
@@ -237,12 +260,19 @@ impl Watcher {
             Control::Heartbeat=>self.heartbeat=now(),
             Control::Hide(id)=>{
                 let Some(entry)=self.entries.get_mut(&id)else{return true;};
-                if entry.hidden||!entry.lease.live_at(now())||!self.enabled{return true;}
+                if entry.hidden||!self.enabled{return true;}
+                if !preparation_live(&entry.lease,now()){self.remove(id,"preparation-expired");return true;}
                 // The one and only clock start for an actual hidden window.
                 entry.lease.started=now();entry.lease.deadline=entry.lease.started.saturating_add(LEASE_MS);
                 if hide(&entry.lease){entry.hidden=true;let event=Event::Hidden(entry.lease.clone());
                     if !self.emit(event){self.remove(id,"event-channel-full");}}
-                else{self.remove(id,"ineligible");}
+                else{
+                    // Initialization may change the owner/enabled/style bits
+                    // between activation and show. Retry on the next show.
+                    let identity=entry.lease.identity.clone();
+                    self.known.remove(&(identity.window,identity.pid,identity.thread));
+                    self.remove(id,"ineligible");
+                }
             },
             Control::Restore(id)=>self.remove(id,"forwarding-cancelled"),
             Control::Commit(id)=>{
@@ -254,7 +284,7 @@ impl Watcher {
                 // Do not enqueue a posted close which could survive a restored
                 // lease. A synchronous attempt consumes only its remaining
                 // budget and is made after the UI confirmed the latest selection.
-                let budget=entry.lease.deadline.saturating_sub(now()).min(20)as u32;
+                let budget=entry.lease.deadline.saturating_sub(now()).min(200)as u32;
                 if budget==0{self.remove(id,"close-expired");return true;}
                 let accepted=unsafe{SendMessageTimeoutW(window,WM_CLOSE,WPARAM(0),LPARAM(0),SMTO_ABORTIFHUNG|SMTO_BLOCK,budget,None)}.0!=0;
                 if !basic_identity_matches(&entry.lease.identity){self.entries.remove(&id);let _=self.emit(Event::Closed{lease:id});}
@@ -268,7 +298,7 @@ impl Watcher {
     fn restore_all(&mut self,reason:&str){let ids:Vec<_>=self.entries.keys().copied().collect();for id in ids{self.remove(id,reason);}}
     fn expire(&mut self){
         let stamp=now();let ids:Vec<_>=self.entries.iter().filter_map(|(id,entry)|
-            (!entry.lease.live_at(stamp)||!basic_identity_matches(&entry.lease.identity)||shift_down()
+            (!(if entry.hidden{entry.lease.live_at(stamp)}else{preparation_live(&entry.lease,stamp)})||!basic_identity_matches(&entry.lease.identity)||shift_down()
                 ||modal(entry.lease.identity.hwnd())||native_tab_count(entry.lease.identity.hwnd())>1).then_some(*id)).collect();
         for id in ids{self.remove(id,"lease-expired-or-interrupted");}
         self.known.retain(|(handle,pid,tid)|{
@@ -304,23 +334,23 @@ fn run_guard()->Result<()>{
             ||stream.write_all(b"\n").is_err()||stream.flush().is_err(){break;}}output_dead.store(true,Ordering::Release);
     })?;
     WATCHER.with(|slot|*slot.borrow_mut()=Some(Watcher{enabled:false,heartbeat:now(),known:HashSet::new(),entries:HashMap::new(),serial:1,output}));
+    COMMANDS.with(|slot|*slot.borrow_mut()=Some(commands));
     struct Hooks(Vec<HWINEVENTHOOK>);impl Drop for Hooks{fn drop(&mut self){for hook in self.0.drain(..){unsafe{UnhookWinEvent(hook);}}}}
     struct Recovery;impl Drop for Recovery{fn drop(&mut self){WATCHER.with(|slot|{if let Some(mut watcher)=slot.borrow_mut().take(){watcher.restore_all("guard-exit");}});}}
     let _recovery=Recovery;let mut hooks=Hooks(Vec::new());
+    let _early=crate::early_window_hook::Hook::install(windows::core::w!("ZSDesk.EarlyExplorer.Guard"),Some(early_message),true)?;
     for event in [EVENT_SYSTEM_FOREGROUND,EVENT_OBJECT_SHOW,EVENT_OBJECT_DESTROY]{
         let hook=unsafe{SetWinEventHook(event,event,None,Some(event_hook),0,0,WINEVENT_OUTOFCONTEXT|WINEVENT_SKIPOWNPROCESS)};
         ensure!(!hook.0.is_null(),"Explorer event hook unavailable");hooks.0.push(hook);
     }
     while !disconnected.load(Ordering::Acquire)&&unsafe{WaitForSingleObject(parent.0,0)}==windows::Win32::Foundation::WAIT_TIMEOUT{
-        let mut running=true;
-        for command in commands.try_iter(){WATCHER.with(|slot|{if let Some(watcher)=slot.borrow_mut().as_mut(){running=watcher.command(command);}});if !running{break;}}
-        if !running{break;}
+        if !process_commands(){break;}
         let mut message=MSG::default();while unsafe{PeekMessageW(&mut message,None,0,0,PM_REMOVE)}.as_bool(){unsafe{let _=TranslateMessage(&message);DispatchMessageW(&message);}}
         let healthy=WATCHER.with(|slot|{if let Some(watcher)=slot.borrow_mut().as_mut(){watcher.expire();
-            !watcher.enabled||now().saturating_sub(watcher.heartbeat)<2000}else{false}});
+            !watcher.enabled||now().saturating_sub(watcher.heartbeat)<PREPARE_MS+1000}else{false}});
         // A live host can still have a stuck coordinator. Stop intercepting
         // new windows until that coordinator returns and establishes a new
-        // guarded connection; already-hidden windows still expire at 800 ms.
+        // guarded connection; already-hidden windows have a fixed deadline.
         if !healthy{break;}
         thread::sleep(Duration::from_millis(5));
     }
@@ -332,7 +362,7 @@ fn run_guard()->Result<()>{
     #[test]fn absolute_lease_deadline_cannot_be_extended_by_late_results(){
         let lease=Lease{id:1,identity:Identity{window:1,pid:1,thread:1,created:1},original_style:0,started:100,deadline:900,foreground:false};
         assert!(lease.live_at(100));assert!(lease.live_at(899));assert!(!lease.live_at(900));assert!(!lease.live_at(99));
-        let invalid=Lease{deadline:901,..lease};assert!(!invalid.live_at(100));
+        let invalid=Lease{deadline:100+LEASE_MS+1,..lease};assert!(!invalid.live_at(100));
     }
     #[test]fn restoring_visibility_preserves_unrelated_shell_style_changes(){
         let original=WS_EX_APPWINDOW.0|WS_EX_WINDOWEDGE.0;

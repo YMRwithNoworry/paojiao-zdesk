@@ -1,13 +1,13 @@
-//! Local QuickLook bridge for users who disable the built-in Space preview.
+//! Optional QuickLook bridge selected explicitly in preview settings.
 use super::*;
 use std::{fs::OpenOptions,os::windows::{fs::OpenOptionsExt,io::AsRawHandle},path::Path,sync::OnceLock};
 use windows::Win32::{Foundation::{CloseHandle,HANDLE,ERROR_IO_PENDING},
     Security::{GetLengthSid,GetTokenInformation,TokenUser,TOKEN_QUERY,TOKEN_USER},
     Storage::FileSystem::{FILE_FLAG_OVERLAPPED,SECURITY_IDENTIFICATION,SECURITY_SQOS_PRESENT,WriteFile},
     System::{IO::{CancelIoEx,GetOverlappedResult,GetOverlappedResultEx,OVERLAPPED},
-        Threading::{CreateEventW,GetCurrentProcess,OpenProcessToken}}};
+        Threading::{CreateEventW,GetCurrentProcess,OpenProcessToken},Pipes::WaitNamedPipeW}};
 
-thread_local!{static SPACE:Cell<bool>=const{Cell::new(false)};}
+thread_local!{static SPACE:Cell<bool>=const{Cell::new(false)};static LAST_REQUEST:RefCell<Option<PathBuf>>=const{RefCell::new(None)};}
 struct Handle(HANDLE);
 impl Drop for Handle{fn drop(&mut self){let _=unsafe{CloseHandle(self.0)};}}
 
@@ -33,12 +33,22 @@ fn pipe_name()->Option<&'static str>{
     }).as_deref()
 }
 fn toggle_message(path:&Path)->Option<Vec<u8>>{
+    path_message("Toggle",path)
+}
+fn path_message(verb:&str,path:&Path)->Option<Vec<u8>>{
     let path=path.to_str()?;
     if !Path::new(path).is_absolute()||path.contains(['\0','\r','\n','|'])||path.len()>32768{return None;}
-    Some(format!("QuickLook.App.PipeMessages.Toggle|{path}\n").into_bytes())
+    if !matches!(verb,"Toggle"|"Switch"){return None;}
+    Some(format!("QuickLook.App.PipeMessages.{verb}|{path}\n").into_bytes())
 }
 fn send(pipe:&str,bytes:&[u8])->bool{
-    let Ok(file)=OpenOptions::new().write(true).custom_flags(FILE_FLAG_OVERLAPPED.0|SECURITY_SQOS_PRESENT.0|SECURITY_IDENTIFICATION.0).open(pipe)else{return false;};
+    let open=||OpenOptions::new().write(true).custom_flags(FILE_FLAG_OVERLAPPED.0|SECURITY_SQOS_PRESENT.0|SECURITY_IDENTIFICATION.0).open(pipe);
+    let file=match open(){Ok(file)=>file,Err(error)if error.raw_os_error()==Some(231)=>{
+        // QuickLook serves one connection at a time. A short reconnect window
+        // handles its disconnect/re-arm interval without an unbounded UI wait.
+        if !unsafe{WaitNamedPipeW(PCWSTR(wide(pipe).as_ptr()),60)}.as_bool(){return false;}
+        let Ok(file)=open()else{return false;};file
+    },Err(_)=>return false};
     send_file(&file,bytes)
 }
 fn send_file(file:&std::fs::File,bytes:&[u8])->bool{
@@ -57,15 +67,55 @@ fn send_file(file:&std::fs::File,bytes:&[u8])->bool{
 }
 
 #[cfg(test)]#[path="quicklook_process_tests.rs"]mod process_tests;
+/// Only the active file view may provide the selection for a Space action.
+/// Text edits, side bars, menus and window chrome retain their own keystrokes.
+pub(super) fn file_view_input(message:&MSG,slot:&Slot)->bool{
+    let focus=unsafe{GetFocus()};
+    if text_input_window(message.hwnd)||text_input_window(focus){return false;}
+    slot.try_borrow().ok().is_some_and(|slot|slot.as_ref().is_some_and(|state|{
+        let view=state.view_hwnd;
+        !view.0.is_null()&&state.pending.is_none()&&state.queued.is_none()&&
+            (focus==view||unsafe{IsChild(view,focus)}.as_bool())&&
+            (message.hwnd==view||unsafe{IsChild(view,message.hwnd)}.as_bool()||message.hwnd==state.hwnd)
+    }))
+}
 pub(super) fn key(message:&MSG,slot:&Slot)->bool{
+    if message.message==WM_KEYDOWN&&message.wParam.0==VK_ESCAPE.0 as usize&&file_view_input(message,slot)
+        &&![VK_CONTROL,VK_SHIFT,VK_MENU].iter().any(|key|unsafe{GetKeyState(key.0 as i32)}<0)
+        &&LAST_REQUEST.with(|last|last.borrow().is_some()){
+        let delivered=pipe_name().is_some_and(|name|send(name,b"QuickLook.App.PipeMessages.Close|\n"));
+        LAST_REQUEST.with(|last|*last.borrow_mut()=None);return delivered;
+    }
     if message.wParam.0!=VK_SPACE.0 as usize{return false;}
     if message.message==WM_KEYUP{return SPACE.with(|space|space.replace(false));}
-    if message.message!=WM_KEYDOWN||text_input_window(message.hwnd)||text_input_window(unsafe{GetFocus()})
+    if message.message!=WM_KEYDOWN||!file_view_input(message,slot)
         ||[VK_CONTROL,VK_SHIFT,VK_MENU].iter().any(|key|unsafe{GetKeyState(key.0 as i32)}<0){return false;}
     if message.lParam.0 as usize&(1usize<<30)!=0{return SPACE.with(Cell::get);}
-    let handled=preview_process::selected_preview_request(slot).and_then(|(path,_,_)|toggle_message(&path))
-        .zip(pipe_name()).is_some_and(|(bytes,name)|send(name,&bytes));
+    let Some((path,_,_))=preview_process::selected_preview_request(slot)else{return false;};
+    let handled=toggle_message(&path).zip(pipe_name()).is_some_and(|(bytes,name)|send(name,&bytes));
+    if handled{LAST_REQUEST.with(|last|*last.borrow_mut()=Some(path));}
+    if !handled{
+        LAST_REQUEST.with(|last|*last.borrow_mut()=None);
+        if let Ok(mut slot)=slot.try_borrow_mut(){if let Some(state)=slot.as_mut(){state.show_message(zsdesk_core::i18n::text("QuickLook 未运行或不可用，已使用内置预览。").into());}}
+    }
+    // The caller opens its built-in preview when the optional bridge is absent.
     SPACE.with(|space|space.set(handled));handled
+}
+pub(super) fn close_requested(){
+    if LAST_REQUEST.with(|last|last.borrow_mut().take().is_some()){
+        let _=pipe_name().is_some_and(|name|send(name,b"QuickLook.App.PipeMessages.Close|\n"));
+    }
+    SPACE.with(|space|space.set(false));
+}
+/// QuickLook's documented-in-source Switch message updates only an already
+/// visible preview; it does not open a new window on normal selection changes.
+pub(super) fn selection_changed(message:&MSG,slot:&Slot){
+    if !file_view_input(message,slot)||LAST_REQUEST.with(|last|last.borrow().is_none()){return;}
+    let Some((path,_,_))=preview_process::selected_preview_request(slot)else{return;};
+    if LAST_REQUEST.with(|last|last.borrow().as_ref()==Some(&path)){return;}
+    if path_message("Switch",&path).zip(pipe_name()).is_some_and(|(bytes,name)|send(name,&bytes)){
+        LAST_REQUEST.with(|last|*last.borrow_mut()=Some(path));
+    }
 }
 
 #[cfg(test)]mod tests{
@@ -104,5 +154,7 @@ pub(super) fn key(message:&MSG,slot:&Slot)->bool{
         for invalid in ["relative.txt","C:\\a\nQuit","C:\\a|b","C:\\a\0b"]{assert!(toggle_message(Path::new(invalid)).is_none());}
         assert_eq!(sid_text(&[1,2,0,0,0,0,0,5,21,0,0,0,42,0,0,0]).as_deref(),Some("S-1-5-21-42"));
         assert!(sid_text(&[1,2,0,0,0,0,0,5]).is_none());
+        assert_eq!(path_message("Switch",Path::new(r"C:\中文 文件\图纸.pdf")).unwrap(),"QuickLook.App.PipeMessages.Switch|C:\\中文 文件\\图纸.pdf\n".as_bytes());
+        assert!(path_message("Execute",Path::new(r"C:\a.txt")).is_none());
     }
 }

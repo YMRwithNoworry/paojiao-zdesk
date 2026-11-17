@@ -15,21 +15,21 @@ impl QuickMenu{
         let result=Self{menu:unsafe{CreatePopupMenu()}?};
         let visible=|verbs:&[&str]|!options.hidden_verbs.iter().any(|hidden|verbs.iter().any(|verb|hidden.eq_ignore_ascii_case(verb)));
         if selected>0{
-            result.item("打开",QuickAction::Open,true)?;
+            result.item(zsdesk_core::i18n::text("打开"),QuickAction::Open,true)?;
             result.separator()?;
             if visible(&["cut"]){result.item("剪切\tCtrl+X",QuickAction::Cut,true)?;}
             if visible(&["copy"]){result.item("复制\tCtrl+C",QuickAction::Copy,true)?;}
-            if visible(&["copyaspath","copypath"]){result.item("复制路径",QuickAction::CopyPath,true)?;}
+            if visible(&["copyaspath","copypath"]){result.item(zsdesk_core::i18n::text("复制路径"),QuickAction::CopyPath,true)?;}
             if visible(&["rename"]){result.item("重命名\tF2",QuickAction::Rename,selected==1)?;}
             if visible(&["delete"]){result.item("删除\tDel",QuickAction::Delete,true)?;}
         }else{
-            if visible(&["paste"]){result.item("粘贴\tCtrl+V",QuickAction::Paste,folder)?;}
+            if visible(&["paste"]){result.item(zsdesk_core::i18n::text("粘贴\tCtrl+V"),QuickAction::Paste,folder)?;}
             if visible(&["new"]){result.item("新建文件夹\tCtrl+Shift+N",QuickAction::NewFolder,folder)?;}
             result.item("刷新\tF5",QuickAction::Refresh,true)?;
         }
         // Virtual namespace folders have properties too. Only filesystem-only
         // actions above depend on the writable-folder hint.
-        if visible(&["properties"]){result.item("属性\tAlt+Enter",QuickAction::Properties,true)?;}
+        if visible(&["properties"]){result.item(zsdesk_core::i18n::text("属性\tAlt+Enter"),QuickAction::Properties,true)?;}
         result.separator()?;
         result.item("更多系统/扩展命令(&M)…",QuickAction::More,true)?;
         Ok(result)

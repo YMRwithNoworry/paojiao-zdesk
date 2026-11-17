@@ -1,4 +1,137 @@
 use super::*;
+#[test]fn native_file_data_preserves_shell_formats_and_move_intent_without_changing_clipboard(){
+    use windows::Win32::System::{Com::{DVASPECT_CONTENT,FORMATETC,TYMED_HGLOBAL},Ole::ReleaseStgMedium};
+    unsafe{OleInitialize(None)}.unwrap();
+    struct Apartment;impl Drop for Apartment{fn drop(&mut self){unsafe{OleUninitialize();}}}let _apartment=Apartment;
+    let root=std::env::temp_dir().join(format!("zsdesk-data-object-{}-{}",std::process::id(),unsafe{GetCurrentThreadId()}));
+    std::fs::create_dir_all(root.join("另一目录")).unwrap();
+    struct Fixture(PathBuf);impl Drop for Fixture{fn drop(&mut self){let _=std::fs::remove_dir_all(&self.0);}}let _fixture=Fixture(root.clone());
+    let paths=vec![root.join("文件一.txt"),root.join("另一目录").join("文件二.txt")];
+    for path in &paths{std::fs::write(path,b"clipboard-format-fixture").unwrap();}
+    let sequence=unsafe{GetClipboardSequenceNumber()};
+    for cut in [false,true]{
+        let data=file_data_object(HWND::default(),&paths,cut).unwrap();
+        for name in [CFSTR_SHELLIDLIST,CFSTR_PREFERREDDROPEFFECT]{
+            let format=unsafe{RegisterClipboardFormatW(name)};
+            let request=FORMATETC{cfFormat:format as u16,ptd:std::ptr::null_mut(),dwAspect:DVASPECT_CONTENT.0,lindex:-1,tymed:TYMED_HGLOBAL.0 as u32};
+            unsafe{data.QueryGetData(&request)}.unwrap();
+            let mut medium=unsafe{data.GetData(&request)}.unwrap();
+            if name==CFSTR_PREFERREDDROPEFFECT{
+                let memory=unsafe{medium.u.hGlobal};let pointer=unsafe{GlobalLock(memory)};assert!(!pointer.is_null());
+                assert_eq!(unsafe{pointer.cast::<u32>().read_unaligned()},if cut{2}else{1});let _=unsafe{GlobalUnlock(memory)};
+            }
+            unsafe{ReleaseStgMedium(&mut medium)};
+        }
+        // Shell expands 8.3 parent paths (for example a runner's TEMP path).
+        // Verify the same files in the same order, independent of that spelling.
+        let actual=crate::ole::hdrop_paths(&data).iter().map(std::fs::canonicalize).collect::<std::io::Result<Vec<_>>>().unwrap();
+        let expected=paths.iter().map(std::fs::canonicalize).collect::<std::io::Result<Vec<_>>>().unwrap();
+        assert_eq!(actual,expected);
+    }
+    assert_eq!(unsafe{GetClipboardSequenceNumber()},sequence);
+}
+#[test]fn shell_cancellation_and_production_collision_policy(){
+    for code in [0x80270000u32,0x80270001,0x800704c7,0x80004004]{assert!(is_cancelled(HRESULT(code as i32)));}
+    for code in [0u32,1,0x80070005,0x80070020,0x80270003]{assert!(!is_cancelled(HRESULT(code as i32)));}
+    for action in [Operation::Copy,Operation::Move,Operation::Delete{permanent:false},Operation::NewFolder]{
+        let flags=operation_flags(action,false);
+        assert_eq!((flags&(FOF_SILENT|FOF_NOCONFIRMATION|FOF_NOERRORUI|FOFX_KEEPNEWERFILE|FOF_RENAMEONCOLLISION)).0,0);
+    }
+    assert!(!Completion{operation:Operation::Copy,requested:4,completed:2,aborted:true,cancelled:true,skipped:false,outputs:Vec::new(),outputs_truncated:false,origin:None,error:None,error_detail:None}.message().contains("失败"));
+    assert!(Completion{operation:Operation::Copy,requested:4,completed:4,aborted:false,cancelled:false,skipped:false,outputs:Vec::new(),outputs_truncated:false,origin:None,error:None,error_detail:None}.message().contains("完成"));
+}
+#[test]fn completion_matches_shell_extended_paths_without_folding_unicode(){
+    assert_eq!(completion_key(Path::new(r"\\?\C:\资料\甲")),completion_key(Path::new("c:/资料/甲/")));
+    assert_eq!(completion_key(Path::new(r"\\?\UNC\server\share\目录")),completion_key(Path::new(r"\\server\share\目录")));
+    assert_ne!(completion_key(Path::new(r"C:\Ä")),completion_key(Path::new(r"C:\ä")));
+}
+#[test]fn transfer_dependencies_serialize_only_overlapping_files(){
+    let a=Access::new(&[r"E:\source\a.txt".into()],Some(Path::new(r"E:\destination")),Operation::Copy);
+    let b=Access::new(&[r"D:\other\b.txt".into()],Some(Path::new(r"E:\destination")),Operation::Copy);
+    let dependent=Access::new(&[r"E:\destination\a.txt".into()],Some(Path::new(r"E:\final")),Operation::Move);
+    assert!(!a.conflicts(&b));assert!(a.conflicts(&dependent));
+    let deletion=Access::new(&[r"E:\destination".into()],None,Operation::Delete{permanent:false});assert!(a.conflicts(&deletion));
+    let sibling=Access::new(&[r"E:\destination-other".into()],None,Operation::Delete{permanent:false});assert!(!a.conflicts(&sibling));
+    let root=Access::new(&[r"E:\".into()],None,Operation::Delete{permanent:false});assert!(a.conflicts(&root));
+}
+#[test]fn delayed_failure_cannot_consume_another_operations_completion(){
+    let owner=window().unwrap();let thread=unsafe{GetCurrentThreadId()};
+    let failed=NEXT_OPERATION.fetch_add(1,Ordering::Relaxed);let succeeded=NEXT_OPERATION.fetch_add(1,Ordering::Relaxed);
+    COMPLETIONS.lock().unwrap().push_back((succeeded,owner.0.0 as isize,thread,Completion{operation:Operation::Copy,requested:2,completed:2,aborted:false,cancelled:false,skipped:false,outputs:Vec::new(),outputs_truncated:false,origin:None,error:None,error_detail:None}));
+    assert!(take_completion(owner.0,failed).is_none());
+    assert_eq!(take_completion(owner.0,succeeded).unwrap().completed,2);
+    assert!(take_completion(owner.0,succeeded).is_none());
+}
+#[test]fn pending_callback_followed_by_success_is_not_a_skipped_operation(){
+    let state=Arc::new(Mutex::new(ProgressState::default()));let progress=Progress{state:state.clone(),cancel_before:false};
+    for code in [COPYENGINE_S_PENDING,COPYENGINE_S_PENDING_DELETE,HRESULT(0)]{
+        progress.after(windows::core::Ref::default(),code,windows::core::Ref::default(),false).unwrap();
+    }
+    let state=state.lock().unwrap();assert!(!state.skipped);assert!(state.failure.is_none());
+}
+#[test]fn outputs_are_top_level_deduplicated_and_bound_to_the_original_view(){
+    let owner=window().unwrap();
+    let view=Window(unsafe{CreateWindowExW(WINDOW_EX_STYLE::default(),w!("STATIC"),None,WS_CHILD,0,0,1,1,Some(owner.0),None,None,None)}.unwrap());
+    bind_origin(view.0,17,u64::MAX-1,u64::MAX-2).unwrap();
+    let origin=capture_origin(view.0).unwrap();assert_eq!(origin.tab,u64::MAX-1);assert_eq!(origin.epoch,u64::MAX-2);
+    let root=PathBuf::from(r"E:\source\folder");let another=PathBuf::from(r"E:\source\other.txt");
+    let request=request(view.0,vec![root.clone(),another.clone()],Some(r"E:\destination".into()),Operation::Copy,None);
+    assert_eq!(request.owner,owner.0.0 as isize);assert_eq!(request.origin,Some(origin));
+    bind_origin(view.0,18,2,3).unwrap();assert_ne!(capture_origin(view.0),request.origin);
+    let mut state=ProgressState::for_request(&request);
+    state.success(Some(&root.join("child.txt")),Some(Path::new(r"E:\destination\folder\child.txt")),false);
+    assert!(state.outputs.is_empty()&&state.completed.is_empty());
+    for _ in 0..3{state.success(Some(&root),Some(Path::new(r"E:\destination\folder")),false);}
+    state.success(Some(&another),Some(Path::new(r"E:\destination\other (2).txt")),false);
+    state.finished=Some(HRESULT(0));let outcome=finish_outcome(&mut state,Ok(()),Ok(false));
+    let completion=completion_for(&request,Ok(outcome));
+    assert_eq!(completion.origin,Some(origin));assert_eq!(completion.completed,2);assert!(!completion.aborted);
+    assert_eq!(completion.outputs,vec![PathBuf::from(r"E:\destination\folder"),PathBuf::from(r"E:\destination\other (2).txt")]);
+    let handle=view.0.0 as isize;
+    assert!(thread::spawn(move||capture_origin(HWND(handle as*mut _))).join().unwrap().is_none());
+    clear_origin(view.0);assert!(capture_origin(view.0).is_none());
+}
+#[test]fn output_limits_preserve_completion_and_case_sensitive_names(){
+    let owner=window().unwrap();
+    let request=request(owner.0,vec![r"E:\source\A.txt".into(),r"E:\source\a.txt".into()],Some(r"E:\destination".into()),Operation::Copy,None);
+    let mut state=ProgressState::for_request(&request);
+    state.success(Some(Path::new(r"E:\source\A.txt")),Some(Path::new(r"E:\destination\A.txt")),false);
+    state.success(Some(Path::new(r"E:\source\a.txt")),Some(Path::new(r"E:\destination\a.txt")),false);
+    assert_eq!(state.completed.len(),2);assert_eq!(state.outputs.len(),2);
+    state.output_bytes=MAX_PATH_BYTES;state.output(Path::new(r"E:\destination\another.txt"));
+    assert!(state.outputs_truncated);assert_eq!(state.outputs.len(),2);assert_eq!(state.completed.len(),2);
+    let mut count=ProgressState{track_outputs:true,..Default::default()};
+    for index in 0..=MAX_ITEMS{count.output(Path::new(&format!(r"E:\destination\item-{index}")));}
+    assert_eq!(count.outputs.len(),MAX_ITEMS);assert!(count.outputs_truncated);
+}
+#[test]fn partial_failure_keeps_successful_outputs_and_original_hresult(){
+    let owner=window().unwrap();let first=PathBuf::from(r"E:\source\first.txt");let second=PathBuf::from(r"E:\source\second.txt");
+    let request=request(owner.0,vec![first.clone(),second],Some(r"E:\destination".into()),Operation::Copy,None);
+    let mut state=ProgressState::for_request(&request);
+    state.success(Some(&first),Some(Path::new(r"E:\destination\first.txt")),false);
+    state.fail(COPYENGINE_E_USER_CANCELLED);let failure=HRESULT(0x80070005u32 as i32);state.fail(failure);state.finished=Some(COPYENGINE_E_USER_CANCELLED);
+    let completion=completion_for(&request,Ok(finish_outcome(&mut state,Err(Error::from_hresult(COPYENGINE_E_USER_CANCELLED)),Ok(true))));
+    assert!(completion.aborted&&completion.cancelled);assert_eq!(completion.error,Some(failure));assert_eq!(completion.result_code(),failure.0 as u32);
+    assert_eq!(completion.completed,1);assert_eq!(completion.outputs,[PathBuf::from(r"E:\destination\first.txt")]);
+    assert!(completion.message().contains("未完成")&&completion.message().contains("1 / 2"));
+}
+#[test]fn user_input_changes_only_the_bound_views_completion_activity(){
+    let owner=window().unwrap();
+    let child=|parent|Window(unsafe{CreateWindowExW(WINDOW_EX_STYLE::default(),w!("STATIC"),None,WS_CHILD,0,0,1,1,Some(parent),None,None,None)}.unwrap());
+    let view=child(owner.0);let editor=child(view.0);let other=child(owner.0);
+    bind_origin(view.0,17,33,5).unwrap();bind_origin(other.0,18,34,5).unwrap();
+    let submitted=request(view.0,vec![r"E:\source\file.txt".into()],Some(r"E:\destination".into()),Operation::Copy,None);
+    let original=submitted.origin.unwrap();assert!(origin_current(&original));
+    bind_origin(view.0,17,33,5).unwrap();assert_eq!(capture_origin(view.0),Some(original));
+    note_user_input(other.0);assert!(origin_current(&original),"another pane cancelled this pane's automatic selection");
+    note_user_input(editor.0);let changed=capture_origin(view.0).unwrap();
+    assert_eq!((changed.view,changed.pane,changed.tab,changed.epoch),(original.view,original.pane,original.tab,original.epoch));
+    assert!(changed.activity>original.activity);assert!(!origin_current(&original));assert!(origin_current(&changed));
+    bind_origin(view.0,17,33,5).unwrap();assert_eq!(capture_origin(view.0),Some(changed));
+    assert_eq!(submitted.origin,Some(original),"authorized operation snapshot was mutated by later input");
+    clear_origin(view.0);assert!(!origin_current(&changed));
+    bind_origin(view.0,17,33,5).unwrap();assert_ne!(capture_origin(view.0),Some(changed));
+}
 use anyhow::{Context,ensure};
 use sha2::{Digest,Sha256};
 use std::{fs,io::{Read,Write},time::{Duration,Instant}};
@@ -79,8 +212,15 @@ unsafe extern "system"{
 }
 struct Apartment;impl Drop for Apartment{fn drop(&mut self){unsafe{OleUninitialize();}}}
 struct Window(HWND);impl Drop for Window{fn drop(&mut self){let _=unsafe{DestroyWindow(self.0)};}}
-thread_local!{static RESULTS:std::cell::RefCell<Vec<u32>>=const{std::cell::RefCell::new(Vec::new())};}
+const PUMP_DROP:u32=WM_APP+319;
+thread_local!{
+    static RESULTS:std::cell::RefCell<Vec<u32>>=const{std::cell::RefCell::new(Vec::new())};
+    static PUMP_SIGNAL:std::cell::RefCell<Option<Arc<ReplySignal>>>=const{std::cell::RefCell::new(None)};
+    static PUMP_COUNT:std::cell::Cell<usize>=const{std::cell::Cell::new(0)};
+}
 unsafe extern "system" fn proc(hwnd:HWND,msg:u32,wp:WPARAM,lp:LPARAM)->LRESULT{
+    if msg==PUMP_DROP{PUMP_COUNT.with(|count|count.set(count.get()+1));note_user_input(hwnd);
+        PUMP_SIGNAL.with(|signal|{if let Some(signal)=signal.borrow().as_ref(){let _=unsafe{SetEvent(HANDLE(signal.0 as*mut _))};}});return LRESULT(0);}
     if msg==result_message(){RESULTS.with(|result|result.borrow_mut().push(wp.0 as u32));return LRESULT(0);}
     unsafe{DefWindowProcW(hwnd,msg,wp,lp)}
 }
@@ -94,7 +234,9 @@ fn window()->anyhow::Result<Window>{
     Ok(Window(unsafe{CreateWindowExW(WS_EX_NOACTIVATE,class,w!("File transfer regression"),WS_POPUP,0,0,1,1,None,None,Some(instance),None)}?))
 }
 fn request(owner:HWND,paths:Vec<PathBuf>,destination:Option<PathBuf>,operation:Operation,clipboard:Option<u32>)->Request{
-    Request{owner:owner.0 as isize,thread:unsafe{GetCurrentThreadId()},paths,destination,operation,clipboard}
+    let origin=capture_origin(owner);let root=unsafe{GetAncestor(owner,GA_ROOT)};let owner=if root.0.is_null(){owner}else{root};
+    let access=Access::new(&paths,destination.as_deref(),operation);
+    Request{token:NEXT_OPERATION.fetch_add(1,Ordering::Relaxed),owner:owner.0 as isize,thread:unsafe{GetCurrentThreadId()},origin,paths,destination,operation,clipboard,reply:None,test_gate:None,access}
 }
 fn digest(path:&Path)->anyhow::Result<String>{
     let mut hash=Sha256::new();let mut file=fs::File::open(path)?;let mut buffer=[0u8;65536];
@@ -120,6 +262,19 @@ fn exercise(root:&Path)->anyhow::Result<serde_json::Value>{
     // WinSta0. No saved user IDataObject or delayed stream is ever requested.
     set_text(owner.0,"隔离剪贴板")?;
     ensure!(!persist_owned_file_clipboard(owner.0)?&&text_clipboard()?=="隔离剪贴板","non-file clipboard was changed");
+    ensure!(!has_paste_content(),"plain text was treated as a file paste");
+    {
+        let _clipboard=Clipboard::open(Some(owner.0))?;unsafe{EmptyClipboard()?;}
+        let format=unsafe{RegisterClipboardFormatW(CFSTR_FILEDESCRIPTORW)};ensure!(format!=0,"virtual descriptor format");
+        let mut descriptor=FILEGROUPDESCRIPTORW::default();descriptor.cItems=1;
+        descriptor.fgd[0].dwFlags=FD_FILESIZE.0 as u32;
+        let name:Vec<u16>="virtual-fixture.txt".encode_utf16().collect();let mut filename=[0u16;260];filename[..name.len()].copy_from_slice(&name);descriptor.fgd[0].cFileName=filename;
+        let bytes=unsafe{std::slice::from_raw_parts((&descriptor as*const FILEGROUPDESCRIPTORW).cast::<u8>(),std::mem::size_of::<FILEGROUPDESCRIPTORW>())};
+        Memory::new(bytes)?.publish(format)?;
+    }
+    ensure!(has_paste_content()&&!has_filesystem_clipboard(),"virtual-file paste did not retain its native route");
+    ensure!(!persist_owned_file_clipboard(owner.0)?,"virtual provider was converted to a path snapshot");
+    set_text(owner.0,"隔离剪贴板")?;
     let source=root.join("source");let destination=root.join("copied");let moved=root.join("moved");let cancelled=root.join("cancelled");
     for folder in [&source,&destination,&moved,&cancelled]{fs::create_dir_all(folder)?;}
     let a=source.join("中文 文件甲.bin");let b=source.join("多文件乙.bin");
@@ -133,11 +288,14 @@ fn exercise(root:&Path)->anyhow::Result<serde_json::Value>{
     drop(locks);
     let copied=request(owner.0,paths.clone(),Some(destination.clone()),Operation::Copy,None);
     let started=Instant::now();let outcome=perform(&copied,true)?;ensure!(!outcome.aborted,"copy was cancelled");let elapsed=started.elapsed();
+    let expected_outputs=paths.iter().map(|path|exact_completion_key(&destination.join(path.file_name().unwrap()))).collect::<HashSet<_>>();
+    ensure!(outcome.outputs.iter().map(|path|exact_completion_key(path)).collect::<HashSet<_>>()==expected_outputs&&!outcome.outputs_truncated,"copy did not report exact successful targets");
     for(index,path)in paths.iter().enumerate(){ensure!(digest(&destination.join(path.file_name().unwrap()))?==expected[index],"copy SHA256 mismatch");}
     // A user's newer text must survive completion of an earlier cut request.
     set_text(owner.0,"later clipboard survives move")?;
     let outcome=perform(&request(owner.0,paths.clone(),Some(moved.clone()),Operation::Move,Some(sequence)),true)?;
     ensure!(!outcome.aborted&&text_clipboard()?=="later clipboard survives move","move cleared a newer clipboard");
+    ensure!(outcome.outputs.len()==2&&outcome.outputs.iter().all(|path|path.parent()==Some(moved.as_path())),"move targets were lost after source deletion");
     for(index,path)in paths.iter().enumerate(){ensure!(!path.exists()&&digest(&moved.join(path.file_name().unwrap()))?==expected[index],"move result/source mismatch");}
     let moved_paths=paths.iter().map(|path|moved.join(path.file_name().unwrap())).collect::<Vec<_>>();
     let aborted=perform_inner(&request(owner.0,moved_paths.clone(),Some(cancelled.clone()),Operation::Copy,None),true,true);
@@ -154,6 +312,37 @@ fn exercise(root:&Path)->anyhow::Result<serde_json::Value>{
     let created2=perform(&request(owner.0,Vec::new(),Some(folders.clone()),Operation::NewFolder,None),true)?;
     ensure!(!created1.aborted&&!created2.aborted&&created1.created!=created2.created,"new folder did not get a unique name");
     ensure!(created1.created.as_ref().is_some_and(|path|path.is_dir())&&created2.created.as_ref().is_some_and(|path|path.is_dir()),"new folder callback returned no directory");
+    ensure!(created1.outputs==created1.created.clone().into_iter().collect::<Vec<_>>()&&created2.outputs==created2.created.clone().into_iter().collect::<Vec<_>>(),"new-folder outputs do not match actual unique names");
+
+    // Quiet mode is confined to isolated fixtures. A same-name replacement
+    // must report the actual destination and retain its new content hash.
+    let collision_source=root.join("collision-source");let collision_target=root.join("collision-target");
+    for folder in [&collision_source,&collision_target]{fs::create_dir_all(folder)?;}
+    let collision=collision_source.join("replace.txt");let replacement=collision_target.join("replace.txt");
+    fs::write(&collision,b"replacement fixture")?;fs::write(&replacement,b"previous fixture")?;
+    let collision_result=perform(&request(owner.0,vec![collision],Some(collision_target.clone()),Operation::Copy,None),true)?;
+    ensure!(!collision_result.aborted&&collision_result.outputs.len()==1&&exact_completion_key(&collision_result.outputs[0])==exact_completion_key(&replacement)
+        &&fs::read(&replacement)?==b"replacement fixture","replacement result and output path differ");
+
+    let recursive_source=root.join("recursive-source").join("package");let recursive_target=root.join("recursive-target");
+    fs::create_dir_all(recursive_source.join("nested"))?;fs::create_dir_all(&recursive_target)?;
+    fs::write(recursive_source.join("top.txt"),b"top")?;fs::write(recursive_source.join("nested/child.txt"),b"child")?;
+    let recursive=perform(&request(owner.0,vec![recursive_source],Some(recursive_target.clone()),Operation::Copy,None),true)?;
+    ensure!(!recursive.aborted&&recursive.completed==1&&recursive.outputs.len()==1&&exact_completion_key(&recursive.outputs[0])==exact_completion_key(&recursive_target.join("package")),"recursive children escaped the top-level output contract: {recursive:?}");
+    ensure!(fs::read(recursive_target.join("package/nested/child.txt"))?==b"child","recursive directory content mismatch");
+
+    let partial_source=root.join("partial-source");let partial_target=root.join("partial-target");
+    for folder in [&partial_source,&partial_target]{fs::create_dir_all(folder)?;}
+    let partial_paths=[partial_source.join(format!("first-{}.txt",std::process::id())),partial_source.join(format!("second-{}.txt",std::process::id()))];
+    for path in &partial_paths{fs::write(path,b"partial transfer fixture")?;}
+    struct Injection;impl Drop for Injection{fn drop(&mut self){FAIL_AFTER_SUCCESS.with(|flag|flag.set(false));}}
+    let partial={FAIL_AFTER_SUCCESS.with(|flag|flag.set(true));let _injection=Injection;
+        perform(&request(owner.0,partial_paths.to_vec(),Some(partial_target.clone()),Operation::Copy,None),true)?};
+    ensure!(partial.aborted&&partial.error==Some(HRESULT(0x80070005u32 as i32))&&partial.completed==1,"injected partial failure lost its actual result: {partial:?}");
+    ensure!(partial.outputs.len()==1&&partial.outputs[0].is_file()&&partial.outputs[0].parent()==Some(partial_target.as_path()),"partial success output was lost");
+    ensure!(fs::read(&partial.outputs[0])?==b"partial transfer fixture","partial output content changed");
+    let actual=partial_paths.iter().filter(|path|partial_target.join(path.file_name().unwrap()).exists()).count();
+    ensure!(actual==1,"partial failure was reported before/after the wrong number of copies");
     let remove=root.join("delete-fixture.bin");fixture(&remove,38,65536)?;
     ensure!(!perform(&request(owner.0,vec![remove.clone()],None,Operation::Delete{permanent:true},None),true)?.aborted&&!remove.exists(),"permanent fixture deletion failed");
 
@@ -167,6 +356,49 @@ fn exercise(root:&Path)->anyhow::Result<serde_json::Value>{
     loop{pump();heartbeats+=1;if pending_operations()==0{break;}ensure!(Instant::now()<deadline,"FIFO operation queue did not retire");thread::sleep(Duration::from_millis(5));}
     pump();let results=RESULTS.with(|results|results.borrow().clone());ensure!(results==[0,0],"FIFO operation errors: {results:?}");
     ensure!(!fifo_mid.join(fifo.file_name().unwrap()).exists()&&digest(&fifo_final.join(fifo.file_name().unwrap()))?==fifo_hash,"FIFO copy-then-move ordering failed");
+    let parallel_source=root.join("parallel-source");let parallel_target=root.join("parallel-target");
+    fs::create_dir_all(&parallel_source)?;fs::create_dir_all(&parallel_target)?;
+    let first_path=parallel_source.join(format!("blocked-{}.bin",std::process::id()));let second_path=parallel_source.join(format!("independent-{}.bin",std::process::id()));
+    let first_hash=fixture(&first_path,83,65536)?;let second_hash=fixture(&second_path,91,65536)?;
+    let gate=Arc::new(ReplySignal(unsafe{CreateEventW(None,true,false,PCWSTR::null())}?.0 as usize));
+    struct OpenGate(Arc<ReplySignal>);impl Drop for OpenGate{fn drop(&mut self){let _=unsafe{SetEvent(HANDLE(self.0.0 as*mut _))};}}let release=OpenGate(gate.clone());
+    let mut first=request(owner.0,vec![first_path.clone()],Some(parallel_target.clone()),Operation::Copy,Some(777));first.test_gate=Some(gate);
+    let mut duplicate=first.clone();duplicate.token=NEXT_OPERATION.fetch_add(1,Ordering::Relaxed);
+    RESULTS.with(|values|values.borrow_mut().clear());enqueue(first)?;enqueue(duplicate)?;
+    enqueue(request(owner.0,vec![second_path.clone()],Some(parallel_target.clone()),Operation::Copy,Some(778)))?;
+    let until=Instant::now()+Duration::from_secs(3);
+    while !parallel_target.join(second_path.file_name().unwrap()).exists(){pump();ensure!(Instant::now()<until,"independent paste waited behind an unrelated operation");thread::sleep(Duration::from_millis(5));}
+    ensure!(!parallel_target.join(first_path.file_name().unwrap()).exists(),"first operation was not blocked by the test gate");
+    {let queue=QUEUE.lock().unwrap();ensure!(queue.active.iter().chain(queue.waiting.iter()).filter(|request|request.clipboard==Some(777)).count()==1,"repeated paste queued a second identical operation");ensure!(queue.workers<=MAX_WORKERS,"worker bound exceeded");}
+    drop(release);let until=Instant::now()+Duration::from_secs(8);
+    while pending_operations()!=0{pump();ensure!(Instant::now()<until,"parallel workers did not retire");thread::sleep(Duration::from_millis(5));}
+    pump();ensure!(RESULTS.with(|values|values.borrow().clone())==[0,0],"parallel or duplicate paste completion mismatch");
+    ensure!(digest(&parallel_target.join(first_path.file_name().unwrap()))?==first_hash&&digest(&parallel_target.join(second_path.file_name().unwrap()))?==second_hash,"parallel copy contents differ");
+    // A synchronous drop queued behind an asynchronous copy must pump UI,
+    // wait for physical completion and emit no duplicate global completion.
+    let drop_source=root.join("drop-source");let drop_mid=root.join("drop-mid");let drop_final=root.join("drop-final");
+    for folder in [&drop_source,&drop_mid,&drop_final]{fs::create_dir_all(folder)?;}
+    let name=format!("drop-fifo-{}.bin",std::process::id());let source_path=drop_source.join(&name);let drop_hash=fixture(&source_path,71,65536)?;
+    let gate=Arc::new(ReplySignal(unsafe{CreateEventW(None,true,false,PCWSTR::null())}?.0 as usize));
+    bind_origin(owner.0,51,77,9)?;let origin=capture_origin(owner.0).context("drop origin")?;
+    let mut first=request(owner.0,vec![source_path.clone()],Some(drop_mid.clone()),Operation::Copy,None);first.test_gate=Some(gate.clone());
+    let earlier=COMPLETIONS.lock().unwrap().iter().filter(|(_,window,_,_)|*window==owner.0.0 as isize).count();
+    RESULTS.with(|values|values.borrow_mut().clear());PUMP_COUNT.with(|value|value.set(0));PUMP_SIGNAL.with(|value|*value.borrow_mut()=Some(gate));
+    enqueue(first)?;unsafe{PostMessageW(Some(owner.0),PUMP_DROP,WPARAM(0),LPARAM(0))?;}
+    let dropped=transfer_drop(owner.0,vec![drop_mid.join(&name)],drop_final.clone(),true)?;
+    PUMP_SIGNAL.with(|value|{value.borrow_mut().take();});pump();
+    ensure!(PUMP_COUNT.with(std::cell::Cell::get)==1,"synchronous drop did not pump owner messages");
+    ensure!(!dropped.aborted&&dropped.error.is_none()&&dropped.completed==1&&matches!(dropped.operation,Operation::Move),"synchronous drop reported no real completion: {dropped:?}");
+    ensure!(dropped.origin==Some(origin)&&!origin_current(&origin),"user input during drop changed the operation snapshot instead of only automatic selection eligibility");
+    ensure!(dropped.outputs.len()==1&&exact_completion_key(&dropped.outputs[0])==exact_completion_key(&drop_final.join(&name))
+        &&digest(&drop_final.join(&name))?==drop_hash&&!drop_mid.join(&name).exists(),"synchronous FIFO move target/source mismatch");
+    ensure!(RESULTS.with(|values|values.borrow().clone())==[0],"synchronous drop also posted a global result");
+    let after=COMPLETIONS.lock().unwrap().iter().filter(|(_,window,_,_)|*window==owner.0.0 as isize).count();
+    ensure!(after==earlier+1,"synchronous drop stored a duplicate global completion");
+    let setup_failure=transfer_drop(owner.0,vec![drop_source.join("missing-source")],drop_final.clone(),false);
+    ensure!(setup_failure.is_err(),"drop setup failure was mistaken for a completed move");
+    pump();ensure!(RESULTS.with(|values|values.borrow().clone())==[0],"synchronous setup failure posted a global result");
+    let deadline=Instant::now()+Duration::from_secs(5);while pending_operations()!=0{pump();ensure!(Instant::now()<deadline,"drop worker did not retire");thread::sleep(Duration::from_millis(5));}
     {
         let _clipboard=Clipboard::open(Some(owner.0))?;unsafe{EmptyClipboard()?;}
     }
@@ -175,6 +407,9 @@ fn exercise(root:&Path)->anyhow::Result<serde_json::Value>{
         "clipboard_with_files_locked_microseconds":clipboard_micros,"copy_did_not_open_file_contents":true,"static_cut_snapshot":true,
         "move_verified":true,"newer_clipboard_preserved":true,"non_file_clipboard_preserved":true,"cancel_not_success":true,
         "errors_not_success":true,"per_item_skip_recorded":true,"new_folder_unique":true,"permanent_fixture_delete":true,
+        "exact_copy_move_new_outputs":true,"recursive_outputs_are_top_level_only":true,"collision_overwrite_fixture":true,"partial_error_keeps_successful_outputs":true,"partial_error_injected_by_progress_sink":true,
+        "synchronous_drop_uses_same_fifo":true,"synchronous_drop_pumps_ui":true,"synchronous_drop_has_no_duplicate_notification":true,"drop_wait_does_not_override_new_selection":true,"drop_setup_error_is_not_move":true,
+        "independent_pastes_start_without_waiting":true,"repeated_inflight_paste_deduplicated":true,"parallel_worker_limit":MAX_WORKERS,
         "fifo_submit_microseconds":queue_micros,"fifo_pump_iterations":heartbeats,"fifo_order":true,"worker_retired":true,"user_clipboard_accessed":false}))
 }
 

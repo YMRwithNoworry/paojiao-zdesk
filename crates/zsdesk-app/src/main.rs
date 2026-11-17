@@ -3,6 +3,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod app;
+mod language;
 mod commands;
 // Compiled in every edition; unreachable without the `desktop` feature and dropped by the linker.
 #[cfg_attr(not(feature = "desktop"), allow(dead_code))]
@@ -18,11 +19,26 @@ mod flyout_menu;
 mod routing_control;
 mod fast_search;
 mod win_e_agent;
+mod folder_size_data;
 mod quick_search;
 mod win_e_bridge;
 mod explorer_forwarder;
+mod early_window_hook;
+mod file_dialog_takeover;
+mod folder_dde;
 mod runtime;
+mod explorer_tray;
+mod update_shutdown;
 mod context_menu_process;
+mod utility_panel;
+mod update_check;
+
+#[cfg(test)]
+mod icon_worker_tests{
+    #[test]
+    #[ignore="Owned hidden icon-worker endpoint for desktop fixtures"]
+    fn native_icon_worker_entry(){zsdesk_windows::shell::icons::run_icon_test_worker().unwrap();}
+}
 
 /// Lets the installer wait for all application windows and desktop guards to
 /// finish before replacing or uninstalling their files.
@@ -40,6 +56,15 @@ impl Drop for ApplicationLifetime {
 }
 
 fn main() {
+    language::initialize_environment();
+    if let Some(result)=update_shutdown::run_if_requested(){if let Err(error)=result{eprintln!("{error:#}");std::process::exit(1);}return;}
+    if let Some(result)=zsdesk_windows::shell::icons::maybe_handle_icon_worker(&std::env::args_os().skip(1).collect::<Vec<_>>()){
+        if let Err(error)=result{eprintln!("{error}");std::process::exit(1);}return;
+    }
+    if let Some(result)=file_dialog_takeover::guard::run_if_requested(){if let Err(error)=result{eprintln!("{error:#}");std::process::exit(1);}return;}
+    if let Some(result)=zsdesk_windows::shell::maybe_handle_packaged_state_worker(&std::env::args_os().skip(1).collect::<Vec<_>>()){
+        if let Err(error)=result{eprintln!("{error}");std::process::exit(1);}return;
+    }
     if let Some(result)=explorer_forwarder::run_guard_if_requested(){if let Err(error)=result{eprintln!("{error:#}");std::process::exit(1);}return;}
     if let Some(result)=context_menu_process::run_worker_if_requested(){if let Err(error)=result{eprintln!("{error:#}");std::process::exit(1);}return;}
     if let Some(result)=window::preview_process::run_if_requested(){

@@ -20,19 +20,19 @@ pub enum ShellLocation {
 impl ShellLocation {
     pub fn title(&self) -> String {
         match self {
-            Self::ThisPc => "此电脑".to_string(),
+            Self::ThisPc => crate::i18n::text("此电脑").to_string(),
             Self::Path(path) => path_title(path),
             Self::Shell { parsing_name, title, .. } => shell_display_title(parsing_name, title),
-            Self::Search { query, .. } => format!("搜索：{query}"),
+            Self::Search { query, .. } => tr_format!("搜索：{query}", query=query),
         }
     }
 
     pub fn address(&self) -> String {
         match self {
-            Self::ThisPc => "此电脑".to_string(),
+            Self::ThisPc => crate::i18n::text("此电脑").to_string(),
             Self::Path(path) => path.to_string_lossy().into_owned(),
             Self::Shell { parsing_name, title, .. } => if parsing_name.trim().is_empty(){shell_display_title(parsing_name,title)}else{parsing_name.clone()},
-            Self::Search { query, scope } => format!("搜索 {}：{}", scope.as_ref().map(|p|p.display().to_string()).unwrap_or_else(||"全部本地磁盘".into()), query),
+            Self::Search { query, scope } => tr_format!("搜索 {}：{}" , scope.as_ref().map(|p|p.display().to_string()).unwrap_or_else(||crate::i18n::text("全部本地磁盘").into()), query),
         }
     }
 
@@ -53,17 +53,17 @@ fn shell_display_title(parsing_name: &str, title: &str) -> String {
     let name = parsing_name.get(..6).filter(|prefix| prefix.eq_ignore_ascii_case("shell:"))
         .map_or(parsing_name, |_| &parsing_name[6..]);
     let known = [
-        ("::{645FF040-5081-101B-9F08-00AA002F954E}", "回收站"), ("RecycleBinFolder", "回收站"),
-        ("::{20D04FE0-3AEA-1069-A2D8-08002B30309D}", "此电脑"), ("MyComputerFolder", "此电脑"),
-        ("::{F02C1A0D-BE21-4350-88B0-7367FC96EF3C}", "网络"), ("NetworkPlacesFolder", "网络"),
-        ("::{679F85CB-0220-4080-B29B-5540CC05AAB6}", "主文件夹"),
-        ("::{F874310E-B6B7-47DC-BC84-B9E6B38F5903}", "主文件夹"),
-        ("::{031E4825-7B94-4DC3-B131-E946B44C8DD5}", "库"), ("Libraries", "库"),
-        ("::{26EE0668-A00A-44D7-9371-BEB064C98683}", "控制面板"), ("ControlPanelFolder", "控制面板"),
-        ("Desktop", "桌面"), ("Downloads", "下载"),
+        ("::{645FF040-5081-101B-9F08-00AA002F954E}", crate::i18n::text("回收站")), ("RecycleBinFolder", crate::i18n::text("回收站")),
+        ("::{20D04FE0-3AEA-1069-A2D8-08002B30309D}", crate::i18n::text("此电脑")), ("MyComputerFolder", crate::i18n::text("此电脑")),
+        ("::{F02C1A0D-BE21-4350-88B0-7367FC96EF3C}", crate::i18n::text("网络")), ("NetworkPlacesFolder", crate::i18n::text("网络")),
+        ("::{679F85CB-0220-4080-B29B-5540CC05AAB6}", crate::i18n::text("主文件夹")),
+        ("::{F874310E-B6B7-47DC-BC84-B9E6B38F5903}", crate::i18n::text("主文件夹")),
+        ("::{031E4825-7B94-4DC3-B131-E946B44C8DD5}", crate::i18n::text("库")), ("Libraries", crate::i18n::text("库")),
+        ("::{26EE0668-A00A-44D7-9371-BEB064C98683}", crate::i18n::text("控制面板")), ("ControlPanelFolder", crate::i18n::text("控制面板")),
+        ("Desktop", crate::i18n::text("桌面")), ("Downloads", crate::i18n::text("下载")),
     ];
     known.into_iter().find(|(candidate, _)| name.eq_ignore_ascii_case(candidate))
-        .map_or("系统位置", |(_, label)| label).to_string()
+        .map_or(crate::i18n::text("系统位置"), |(_, label)| label).to_string()
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -252,12 +252,16 @@ pub enum ContextMenuMode {
     #[default]
     #[serde(rename = "windows11")]
     Windows11,
+    #[serde(rename = "drawn-windows11")]
+    DrawnWindows11,
 }
 
 /// Menu visibility does not disable commands or keyboard shortcuts.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct ContextMenuPreferences {
+    pub hidden_commands:Vec<String>,
+    pub shown_commands:Vec<String>,
     pub mode: ContextMenuMode,
     pub show_cut_copy_paste: bool,
     pub show_copy_path: bool,
@@ -272,9 +276,9 @@ pub struct ContextMenuPreferences {
 
 impl Default for ContextMenuPreferences {
     fn default() -> Self {
-        Self { mode: ContextMenuMode::Windows11, show_cut_copy_paste: true, show_copy_path: true,
+        Self { hidden_commands:Vec::new(),shown_commands:Vec::new(),mode: ContextMenuMode::Windows11, show_cut_copy_paste: true, show_copy_path: true,
             show_rename: true, show_delete: true, show_properties: true, show_share: true,
-            show_new: true, show_seven_zip: true, show_wps: false }
+            show_new: true, show_seven_zip: true, show_wps: true }
     }
 }
 
@@ -321,21 +325,34 @@ impl Default for QuickSearchPreferences {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct ExplorerUi {
+    pub language:crate::i18n::LanguagePreference,
     pub startup_location: StartupLocation,
+    pub new_tab_location: NewTabLocation,
     pub tab_placement: TabPlacement,
+    /// Side tab width in DIP; independent of the current monitor scale.
+    pub side_tabs_width: i32,
+    pub side_tabs_compact: bool,
     pub dual_pane: bool,
     /// Split position in thousandths, independent of monitor scaling.
     pub pane_ratio: u16,
     pub double_click_close_tab: bool,
+    pub double_click_blank_up: bool,
     pub close_window_on_last_tab: bool,
     pub show_tab_count: bool,
+    pub show_tab_list: bool,
+    /// Opt-in stronger selected-tab appearance; legacy profiles keep the existing style.
+    pub tab_selection_emphasis: bool,
     pub mouse_gestures: bool,
-    /// Uses indexed metadata only; never starts a directory-size scan.
+    /// Show view-local totals; native calculation is available without an index.
     pub everything_folder_sizes: bool,
     pub show_tree: bool,
     /// Navigation tree width in DIP.
     pub tree_width: i32,
     pub show_bookmarks: bool,
+    pub bookmarks_on_right: bool,
+    /// Right bookmark panel width in DIP.
+    pub bookmarks_width: i32,
+    pub explorer_tray: bool,
     pub show_preview: bool,
     pub show_details: bool,
     pub command_bar: CommandBarPreferences,
@@ -355,6 +372,10 @@ pub struct ExplorerUi {
     /// browsing it as a folder in ZSDesk.
     pub archives_open_externally: bool,
     pub forward_unhandled_windows: bool,
+    /// Opt-in forwarding while a file window is open, without default-handler registration.
+    pub forward_while_running: bool,
+    #[serde(alias="file_dialog_tabs")]
+    pub file_dialog_takeover: bool,
     pub preview_provider: PreviewProviderPreference,
     pub navigation_auto_expand: Option<bool>,
     pub navigation_show_recycle_bin: bool,
@@ -370,6 +391,7 @@ pub struct SearchPreferences {
     pub idle_seconds:u32,pub everything_executable:Option<PathBuf>,pub folder_sizes:bool,
 }
 impl ExplorerUi{
+    pub fn tab_count_button_visible(&self)->bool{self.show_tab_count&&self.show_tab_list}
     pub fn search_preferences(&self)->SearchPreferences{SearchPreferences{backend:self.search_backend,backend_configured:self.search_backend_configured,include_development:self.search_include_development,
         index_metadata:self.search_index_metadata,pinyin_initials:self.search_pinyin_initials,idle_seconds:self.search_idle_seconds,
         everything_executable:self.everything_executable.clone(),folder_sizes:self.everything_folder_sizes}}
@@ -380,16 +402,18 @@ impl ExplorerUi{
 
 impl Default for ExplorerUi {
     fn default() -> Self {
-        Self { startup_location:StartupLocation::default(), tab_placement:TabPlacement::Top, dual_pane:false, pane_ratio:500,
+        Self { language:crate::i18n::LanguagePreference::System,startup_location:StartupLocation::default(),new_tab_location:NewTabLocation::default(), tab_placement:TabPlacement::Top, side_tabs_width:210,side_tabs_compact:true,dual_pane:false, pane_ratio:500,
             double_click_close_tab:true, mouse_gestures:true, everything_folder_sizes:false,
-            close_window_on_last_tab:true,show_tab_count:true,
-            show_tree: true, tree_width: 220, show_bookmarks: true, show_preview: false, show_details: false,
+            close_window_on_last_tab:true,double_click_blank_up:true,show_tab_count:true,show_tab_list:true,tab_selection_emphasis:false,
+            show_tree: true, tree_width: 220, show_bookmarks: true, bookmarks_on_right:false, bookmarks_width:210, explorer_tray:false, show_preview: false, show_details: false,
             command_bar: CommandBarPreferences::default(), context_menu: ContextMenuPreferences::default(),
             search_all_files: true, search_backend: SearchBackendPreference::Everything, search_backend_configured:false, space_preview: true,
             search_include_development:false,search_index_metadata:false,search_pinyin_initials:false,search_idle_seconds:300,
             everything_executable:None,
             hover_preview: false, archives_open_externally: false, preview_provider: PreviewProviderPreference::System,
             forward_unhandled_windows: true,
+            forward_while_running: false,
+            file_dialog_takeover: true,
             navigation_auto_expand: None,navigation_show_recycle_bin:true,navigation_show_network:true,navigation_expand_this_pc:None,
             appearance: AppearancePreferences::default(),
             window: None }
@@ -402,6 +426,14 @@ pub enum StartupLocation {
     RestoreSession,
     ThisPc,
     Folder(PathBuf),
+}
+
+#[derive(Clone,Debug,Default,Serialize,Deserialize,PartialEq,Eq)]
+pub enum NewTabLocation{#[default]ThisPc,CurrentFolder,Folder(PathBuf)}
+impl NewTabLocation{
+    pub fn target(&self,current:&ShellLocation)->ShellLocation{match self{
+        Self::ThisPc=>ShellLocation::ThisPc,Self::CurrentFolder=>current.clone(),Self::Folder(path)=>ShellLocation::Path(path.clone())
+    }}
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -450,6 +482,9 @@ impl ExplorerSession {
 
     pub fn normalize(&mut self) {
         if self.ui.search_backend.is_builtin(){self.ui.search_backend=SearchBackendPreference::NativeNtfs;}
+        for keys in [&mut self.ui.context_menu.hidden_commands,&mut self.ui.context_menu.shown_commands]{
+            keys.retain(|key|!key.is_empty()&&key.len()<=512&&!key.contains('\0'));keys.sort();keys.dedup();keys.truncate(1000);
+        }
         self.ui.search_idle_seconds=self.ui.search_idle_seconds.clamp(30,3600);
         if self.tabs.is_empty() {
             let id = self.take_id();
@@ -463,6 +498,8 @@ impl ExplorerSession {
         self.ui.pane_ratio = self.ui.pane_ratio.clamp(200, 800);
         self.active_tab = self.active_tab.min(self.tabs.len() - 1);
         self.ui.tree_width = self.ui.tree_width.clamp(120, 800);
+        self.ui.bookmarks_width = self.ui.bookmarks_width.clamp(120, 600);
+        self.ui.side_tabs_width=self.ui.side_tabs_width.clamp(120,420);
         let largest = self.tabs.iter().chain(self.secondary_pane.tabs.iter()).map(|t|t.id)
             .chain(self.bookmarks.iter().map(|b|b.id)).max().unwrap_or(0);
         self.next_id = self.next_id.max(largest.saturating_add(1));
@@ -826,5 +863,14 @@ mod tests {
         let path=PathBuf::from(r"E:\自定义 空格");session.ui.startup_location=StartupLocation::Folder(path.clone());session.apply_startup_location();
         assert_eq!(session.active_tab().current(),&ShellLocation::Path(path));
         let restored:ExplorerSession=serde_json::from_str(&serde_json::to_string(&session).unwrap()).unwrap();assert_eq!(restored,session);
+    }
+    #[test]fn new_tab_targets_are_independent_of_startup_restore(){
+        let current=ShellLocation::Path(r"E:\当前 目录".into());
+        assert_eq!(NewTabLocation::default().target(&current),ShellLocation::ThisPc);
+        assert_eq!(NewTabLocation::CurrentFolder.target(&current),current);
+        let location=NewTabLocation::Folder(r"E:\固定目录".into());
+        assert_eq!(location.target(&current),ShellLocation::Path(r"E:\固定目录".into()));
+        let ui:ExplorerUi=serde_json::from_str("{}").unwrap();
+        assert_eq!(ui.new_tab_location,NewTabLocation::ThisPc);assert!(ui.double_click_blank_up);
     }
 }

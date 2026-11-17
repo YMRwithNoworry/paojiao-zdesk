@@ -7,6 +7,15 @@ use windows::Win32::System::DataExchange::COPYDATASTRUCT;
 
 pub struct Instance(HANDLE);
 impl Drop for Instance {fn drop(&mut self){let _=unsafe {CloseHandle(self.0)};}}
+/// A surviving independent window can own future session saves after the
+/// original primary closes. A live owner always wins; this never sends input.
+pub(crate) fn try_own_session(path:&Path)->Result<Option<Instance>>{
+    let key=property(path);
+    let handle=unsafe{CreateMutexW(None,false,PCWSTR(key.as_ptr()))}?;
+    let existed=unsafe{GetLastError()}==ERROR_ALREADY_EXISTS;
+    let owner=Instance(handle);
+    Ok((!existed).then_some(owner))
+}
 pub const OPEN_MAGIC:usize=0x5a534432;
 pub const DIAGNOSTICS_MAGIC:usize=0x5a534449;
 pub const ACTIVATE_MAGIC:usize=0x5a534441;

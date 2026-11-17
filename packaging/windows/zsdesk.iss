@@ -45,9 +45,9 @@ AppName={#ProductName}
 AppVersion={#MyAppVersion}
 AppVerName=ZSDesk {#MyAppVersion} {#EditionName}
 AppPublisher=ZSDesk contributors
-AppPublisherURL=https://github.com/qiu7824/zsdesk
-AppSupportURL=https://github.com/qiu7824/zsdesk/issues
-AppUpdatesURL=https://github.com/qiu7824/zsdesk/releases
+AppPublisherURL=https://github.com/YMRwithNoworry/paojiao-zdesk
+AppSupportURL=https://github.com/YMRwithNoworry/paojiao-zdesk/issues
+AppUpdatesURL=https://github.com/YMRwithNoworry/paojiao-zdesk/releases
 DefaultDirName={localappdata}\Programs\{#ProductDirectory}
 DefaultGroupName={#ProductName}
 AllowNoIcons=yes
@@ -70,6 +70,7 @@ MinVersion=10.0.18362
 SetupIconFile=..\..\crates\zsdesk-app\resources\zsdesk.ico
 UninstallDisplayIcon={app}\ZSDesk.exe
 CloseApplications=yes
+CloseApplicationsFilter=ZSDesk.exe
 RestartApplications=no
 ShowLanguageDialog=auto
 LanguageDetectionMethod=uilanguage
@@ -83,7 +84,12 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
 [Files]
-Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#SourceDir}\*"; DestDir: "{app}"; Excludes: "ZSDeskWindowHook-*.dll"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#SourceDir}\ZSDeskWindowHook-*.dll"; DestDir: "{app}"; Flags: onlyifdoesntexist
+Source: "{#SourceDir}\ZSDesk.exe"; DestName: "ZSDesk-update-helper.exe"; Flags: dontcopy
+Source: "{#SourceDir}\msvcp140.dll"; Flags: dontcopy
+Source: "{#SourceDir}\vcruntime140.dll"; Flags: dontcopy
+Source: "{#SourceDir}\vcruntime140_1.dll"; Flags: dontcopy
 
 [Icons]
 Name: "{group}\{#ProductName}"; Filename: "{app}\ZSDesk.exe"; AppUserModelID: "{#ProductModelId}"; Check: not WizardNoIcons
@@ -121,6 +127,8 @@ chinesesimp.InstallNow=立即安装
 english.InstallNow=Install now
 chinesesimp.InvalidFolder=请输入完整的安装路径。
 english.InvalidFolder=Enter a full installation path.
+chinesesimp.CloseFailed=ZSDesk 仍有窗口或文件操作未结束，请完成文件操作并关闭相关窗口后重试。
+english.CloseFailed=ZSDesk still has an open window or file operation. Complete the operation and close the window, then retry.
 chinesesimp.RestoreFailed=当前安装的系统集成还原失败，卸载已停止；请在 ZSDesk 中恢复系统集成后重试。
 english.RestoreFailed=System integration could not be restored. Uninstall stopped; restore integration in ZSDesk and try again.
 chinesesimp.RunningApp=请先退出正在运行的 ZSDesk，再卸载。
@@ -136,6 +144,23 @@ function InitializeUninstall: Boolean;
 begin
   Result := not CheckForMutexes('{#ProductMutex}');
   if not Result then MsgBox(CustomMessage('RunningApp'), mbError, MB_OK);
+end;
+
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  ExitCode: Integer;
+begin
+  Result := '';
+  if FileExists(ExpandConstant('{app}\ZSDesk.exe')) then
+  begin
+    ExtractTemporaryFile('ZSDesk-update-helper.exe');
+    ExtractTemporaryFile('msvcp140.dll');
+    ExtractTemporaryFile('vcruntime140.dll');
+    ExtractTemporaryFile('vcruntime140_1.dll');
+    if not Exec(ExpandConstant('{tmp}\ZSDesk-update-helper.exe'), '--shutdown-for-update "' + ExpandConstant('{app}\ZSDesk.exe') + '"', ExpandConstant('{tmp}'), SW_HIDE, ewWaitUntilTerminated, ExitCode) then
+      Result := CustomMessage('CloseFailed')
+    else if ExitCode <> 0 then Result := CustomMessage('CloseFailed');
+  end;
 end;
 
 procedure ChooseFolder(Sender: TObject);

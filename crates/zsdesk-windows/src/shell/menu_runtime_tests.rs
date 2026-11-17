@@ -78,6 +78,60 @@ fn native_mixed_fence_menu_routes_application_and_shell_commands()->Result<()>{
     std::fs::write(output.join("verification.current.json"),serde_json::to_vec_pretty(&report)?)?;println!("{report}");result?;ensure!(closed&&unchanged,"desktop cleanup/focus failed");Ok(())
 }
 
+#[test]
+#[ignore="Rebuilds a consumed HMENU and executes a counted fixture command on a private desktop; no file or clipboard operation"]
+fn native_recreated_classic_menu_preserves_target_anchor_and_single_dispatch()->Result<()>{
+    use windows::{core::{implement,HRESULT,PSTR},Win32::UI::Shell::IContextMenu_Impl};
+    type Calls=Rc<RefCell<Vec<(Vec<Vec<u8>>,[i32;2])>>>;
+    #[implement(IContextMenu)]
+    struct BoundContext{targets:Vec<Vec<u8>>,calls:Calls,queries:Rc<Cell<usize>>}
+    #[allow(non_snake_case)]impl IContextMenu_Impl for BoundContext_Impl{
+        fn QueryContextMenu(&self,menu:HMENU,_:u32,first:u32,_:u32,_:u32)->HRESULT{
+            self.queries.set(self.queries.get()+1);
+            match unsafe{AppendMenuW(menu,MF_STRING,first as usize,w!("Execute fixture (&Z)"))}{Ok(())=>HRESULT(1),Err(error)=>error.code()}
+        }
+        fn GetCommandString(&self,id:usize,_:u32,_:*const u32,output:PSTR,count:u32)->windows::core::Result<()>{
+            let verb:Vec<u16>="zsdesk.fixture".encode_utf16().chain(Some(0)).collect();
+            if id!=0||count<verb.len()as u32{return Err(windows::core::Error::from_hresult(HRESULT(0x80070057u32 as i32)));}
+            unsafe{std::ptr::copy_nonoverlapping(verb.as_ptr(),output.0.cast(),verb.len());}Ok(())
+        }
+        fn InvokeCommand(&self,info:*const CMINVOKECOMMANDINFO)->windows::core::Result<()>{
+            if info.is_null()||unsafe{(*info).cbSize}<std::mem::size_of::<CMINVOKECOMMANDINFOEX>()as u32{return Err(windows::core::Error::from_hresult(HRESULT(0x80070057u32 as i32)));}
+            let info=unsafe{&*info.cast::<CMINVOKECOMMANDINFOEX>()};
+            if !info.lpVerb.0.is_null()||!info.lpVerbW.0.is_null(){return Err(windows::core::Error::from_hresult(HRESULT(0x80070057u32 as i32)));}
+            self.calls.borrow_mut().push((self.targets.clone(),[info.ptInvoke.x,info.ptInvoke.y]));Ok(())
+        }
+    }
+    let output=PathBuf::from(std::env::var_os("ZSDESK_NATIVE_TEST_OUTPUT").context("output")?).join("recreated-classic");std::fs::create_dir_all(&output)?;
+    let name:Vec<u16>=format!("ZSDesk.RecreatedMenu.{}",std::process::id()).encode_utf16().chain(Some(0)).collect();
+    let desktop=unsafe{CreateDesktopW(name.as_ptr(),ptr::null(),ptr::null(),0,0x000f00ff,ptr::null())};ensure!(!desktop.is_null(),"private desktop");let raw=desktop as usize;
+    let result=thread::spawn(move||->Result<serde_json::Value>{
+        ensure!(unsafe{SetThreadDesktop(raw as*mut c_void)}!=0,"private desktop attach");unsafe{OleInitialize(None)}?;let _apartment=Apartment;
+        let module=HINSTANCE(unsafe{GetModuleHandleW(None)?}.0);let class=w!("ZSDesk.RecreatedMenu.Owner");
+        unsafe{RegisterClassW(&WNDCLASSW{hInstance:module,lpfnWndProc:Some(procedure),lpszClassName:class,..Default::default()});}
+        let owner=Owner(unsafe{CreateWindowExW(WINDOW_EX_STYLE::default(),class,w!("Recreated menu"),WS_OVERLAPPEDWINDOW,20,20,600,400,None,None,Some(module),None)}?);
+        unsafe{let _=ShowWindow(owner.0,SW_SHOW);let _=SetForegroundWindow(owner.0);}
+        CHOOSE_LAST.with(|last|last.set(false));let mut checks=Vec::new();
+        for (background,targets) in [(false,vec![vec![3,0,11,0,0]]),(false,vec![vec![3,0,11,0,0],vec![3,0,12,0,0]]),(true,Vec::new())]{
+            for input_flags in [0u32,1,3]{
+                let calls:Calls=Default::default();let queries=Rc::new(Cell::new(0));
+                let context:IContextMenu=BoundContext{targets:targets.clone(),calls:calls.clone(),queries:queries.clone()}.into();
+                let mut menu=ShellMenu::new(context)?;menu.background=background;menu.input_flags.set(input_flags);menu.populate(false,false)?;
+                unsafe{DestroyMenu(menu.hmenu)}?;menu.owns_menu.set(false);
+                let anchor=POINT{x:70+(input_flags as i32)*13,y:100+(input_flags as i32)*17};let mut authorizations=0;
+                let outcome=menu.track_recreated_classic(owner.0,anchor,&[],MenuInterceptions::default(),&mut||{authorizations+=1;Ok(())})?;
+                let _=unsafe{KillTimer(Some(owner.0),1)};let _=unsafe{KillTimer(Some(owner.0),2)};
+                ensure!(outcome==MenuOutcome::ShellInvoked&&authorizations==1,"rebuilt command was not authorized and executed exactly once");
+                ensure!(*calls.borrow()==vec![(targets.clone(),[anchor.x,anchor.y])]&&queries.get()==2,"rebuilt popup changed target/anchor or replayed invocation");
+                checks.push(serde_json::json!({"background":background,"count":targets.len(),"input_flags":input_flags,"anchor":[anchor.x,anchor.y],"queries":queries.get(),"invocations":calls.borrow().len(),"authorizations":authorizations}));
+            }
+        }Ok(serde_json::json!({"cases":checks,"clipboard_untouched":true}))
+    }).join().map_err(|_|anyhow::anyhow!("recreated menu regression panicked")).and_then(|value|value);
+    let closed=unsafe{CloseDesktop(desktop)}!=0;
+    let report=serde_json::json!({"state":if result.is_ok()&&closed{"passed"}else{"failed"},"checks":result.as_ref().map_err(|error|format!("{error:#}")),"desktop_closed":closed});
+    std::fs::write(output.join("verification.current.json"),serde_json::to_vec_pretty(&report)?)?;println!("{report}");result?;ensure!(closed,"private desktop retained");Ok(())
+}
+
 // Exercise the file manager's actual IShellView subclass, rather than the
 // fence's independent PIDL context menu. Timing excludes synthetic user dwell.
 mod view_menu {
@@ -170,10 +224,10 @@ mod view_menu {
             let handled=unsafe{SendMessageW(owner.0,WM_CONTEXTMENU,Some(WPARAM(owner.0.0 as usize)),Some(position))};
             ensure!(handled.0==0,"failed context request was not handled");pump(20);
         }
-        ensure!(calls.get()==2,"failed provider queried more than once per request");
-        ensure!(FAILURES.with(Cell::get)==2&&FAILED_CODE.with(Cell::get)==0x80004005,"error was not reported to the main owner");
+        ensure!(calls.get()==1,"unresolved mouse hit queried a provider or keyboard failure was retried");
+        ensure!(FAILURES.with(Cell::get)==2&&FAILED_CODE.with(Cell::get)==0x8000000a,"unresolved mouse target was not reported to the main owner");
         ensure!(FALLBACK_REQUESTS.with(Cell::get)==0,"failed filtered menu fell through to a second menu");
-        fn delegate(_window:HWND,_view:&IShellView,_position:LPARAM)->windows::core::Result<()>{
+        fn delegate(_window:HWND,_view:&IShellView,_source:HWND,_position:LPARAM,_target:ViewMenuTarget)->windows::core::Result<()>{
             DELEGATE_CALLS.with(|calls|calls.set(calls.get()+1));rejected()
         }
         struct Delegated;impl Drop for Delegated{fn drop(&mut self){set_view_menu_delegate(None);}}
@@ -186,11 +240,11 @@ mod view_menu {
                     "delegated menu style {modern} was not consumed");pump(20);
             }
         }
-        ensure!(DELEGATE_CALLS.with(Cell::get)==4,"modern or classic style bypassed the installed isolation delegate");
-        ensure!(calls.get()==2&&FALLBACK_REQUESTS.with(Cell::get)==0,"delegated failure activated a main-process extension or retried native fallback");
+        ensure!(DELEGATE_CALLS.with(Cell::get)==2,"keyboard menu bypassed isolation or unresolved mouse target reused the previous selection");
+        ensure!(calls.get()==1&&FALLBACK_REQUESTS.with(Cell::get)==0,"delegated failure activated a main-process extension or retried native fallback");
         ensure!(FAILURES.with(Cell::get)==4,"delegated failures were not reported exactly once");
         drop(view);drop(owner);
-        Ok(serde_json::json!({"requests":6,"provider_calls":calls.get(),"original_provider_errors":2,"delegate_errors":4,"delegated_styles":["classic","modern"],"fallback_requests":0,"failure_injected_at":"IShellView::GetItemObject and isolation delegate"}))
+        Ok(serde_json::json!({"requests":6,"provider_calls":calls.get(),"original_provider_errors":1,"delegate_errors":2,"unresolved_mouse_requests_rejected":3,"delegated_styles":["classic","modern"],"fallback_requests":0,"failure_injected_at":"IShellView::GetItemObject and isolation delegate"}))
     }
     fn exercise_view(output:&std::path::Path)->Result<serde_json::Value>{
         unsafe{OleInitialize(None)?;}let _apartment=Apartment;
@@ -215,6 +269,10 @@ mod view_menu {
         let view=browser.view_window().context("actual Shell view HWND")?;
         unsafe{SetWindowSubclass(view,Some(probe_proc),PROBE_SUBCLASS,0)}.ok()?;let probe=Probe(view);
         let mut rect=RECT::default();unsafe{GetWindowRect(view,&mut rect)?;}
+        let blank=point_parameter(POINT{x:rect.right-30,y:rect.bottom-30});
+        ensure!(menu_target::classify(view,view,blank)==ViewMenuTarget::Background,"blank space with retained selection was not classified as background");
+        ensure!(browser.status().selected==1,"read-only context classification changed selection");
+        ensure!(menu_target::classify(view,view,LPARAM(-1))==ViewMenuTarget::CurrentSelection,"keyboard classification lost selection semantics");
         let mut rows=Vec::new();
         for (name,position) in [("keyboard",LPARAM(-1)),("mouse",point_parameter(POINT{x:rect.left+90,y:rect.top+90}))]{
             ENTERED.with(|value|value.set(None));CONTEXT_REQUESTS.with(|value|value.set(0));
@@ -237,6 +295,93 @@ mod view_menu {
         drop(probe);drop(browser);pump(30);drop(owner);pump(20);
         Ok(serde_json::json!({"original_view_menu":rows,"failure_route":failure,"no_command_invoked":true,
             "modern_view_menu":"not exercised","fixture_unchanged":true}))
+    }
+    fn accessible_item_point(view:HWND,name:&str)->Result<LPARAM>{
+        use windows::{core::IUnknown,Win32::{System::{Com::IDispatch,Variant::VARIANT},UI::Accessibility::*}};
+        let mut windows=vec![view];
+        unsafe extern "system" fn collect(hwnd:HWND,data:LPARAM)->BOOL{unsafe{(&mut*(data.0 as*mut Vec<HWND>)).push(hwnd);}BOOL(1)}
+        let _=unsafe{EnumChildWindows(Some(view),Some(collect),LPARAM(&mut windows as*mut _ as isize))};
+        let mut seen=std::collections::HashSet::new();let mut budget=2048;
+        for hwnd in windows{
+            let mut raw=std::ptr::null_mut();if unsafe{AccessibleObjectFromWindow(hwnd,OBJID_CLIENT.0 as u32,&IAccessible::IID,&mut raw)}.is_err()||raw.is_null(){continue;}
+            let mut pending=vec![(unsafe{IAccessible::from_raw(raw)},VARIANT::from(0i32))];
+            while let Some((object,child))=pending.pop(){
+                if budget==0{anyhow::bail!("accessible fixture exceeds bound");}budget-=1;
+                let role=unsafe{object.get_accRole(&child)}.ok().and_then(|value|u32::try_from(&value).ok());
+                if matches!(role,Some(ROLE_SYSTEM_LISTITEM|ROLE_SYSTEM_OUTLINEITEM|ROLE_SYSTEM_ROW))&&unsafe{object.get_accName(&child)}.is_ok_and(|value|value.to_string()==name){
+                    let(mut x,mut y,mut width,mut height)=(0,0,0,0);unsafe{object.accLocation(&mut x,&mut y,&mut width,&mut height,&child)}?;
+                    if width>0&&height>0{return Ok(point_parameter(POINT{x:x+30.min(width/2),y:y+height/2}));}
+                }
+                if i32::try_from(&child).ok()!=Some(0){continue;}
+                let identity=object.cast::<IUnknown>()?.as_raw()as usize;if !seen.insert(identity){continue;}
+                let count=unsafe{object.accChildCount()}.unwrap_or(0).clamp(0,512)as usize;if count==0{continue;}
+                let mut children=(0..count).map(|_|VARIANT::default()).collect::<Vec<_>>();let mut obtained=0;
+                if unsafe{AccessibleChildren(&object,0,&mut children,&mut obtained)}.is_err(){continue;}
+                for child in children.into_iter().take(obtained.max(0)as usize){
+                    if let Ok(next)=IDispatch::try_from(&child).and_then(|value|value.cast::<IAccessible>()){pending.push((next,VARIANT::from(0i32)));}
+                    else{pending.push((object.clone(),child));}
+                }
+            }
+        }
+        anyhow::bail!("accessible file row not found: {name}")
+    }
+    fn exercise_hit_target(output:&std::path::Path)->Result<serde_json::Value>{
+        use windows::Win32::{System::Com::CoTaskMemFree,UI::Shell::*};
+        unsafe{OleInitialize(None)?;}let _apartment=Apartment;
+        let folder=output.join("files");std::fs::create_dir_all(&folder)?;
+        let first=folder.join("alpha.txt");let second=folder.join("beta.txt");
+        std::fs::write(&first,b"first target")?;std::fs::write(&second,b"second target")?;
+        let instance=HINSTANCE(unsafe{GetModuleHandleW(None)?}.0);
+        unsafe{RegisterClassW(&WNDCLASSW{hInstance:instance,lpfnWndProc:Some(owner_proc),lpszClassName:w!("ZSDesk.ViewMenuHitRegression"),..Default::default()});}
+        let owner=Owner(unsafe{CreateWindowExW(WINDOW_EX_STYLE::default(),w!("ZSDesk.ViewMenuHitRegression"),w!("Context target regression"),WS_OVERLAPPEDWINDOW,20,20,800,600,None,None,Some(instance),None)?});
+        let browser=unsafe{ExplorerBrowserHost::create_transient(owner.0,RECT{left:0,top:0,right:780,bottom:560},false,Panes::default())?};
+        NAVIGATED.with(|value|value.set(false));NAV_FAILED.with(|value|value.set(false));
+        unsafe{let _=ShowWindow(owner.0,SW_SHOWNOACTIVATE);browser.navigate(&ShellLocation::Path(folder.clone()))?;}
+        let until=Instant::now()+Duration::from_secs(10);
+        while !NAVIGATED.with(Cell::get)||browser.status().items!=2{pump(20);ensure!(!NAV_FAILED.with(Cell::get)&&Instant::now()<until,"view did not load");}
+        let shell=unsafe{browser.current_view()?};let view=unsafe{shell.GetWindow()?};let fv:IFolderView2=shell.cast()?;
+        let mut checks=Vec::new();
+        for mode in [FVM_DETAILS,FVM_ICON]{
+            unsafe{fv.SetViewModeAndIconSize(mode,if mode==FVM_DETAILS{16}else{48})}.context("set hit-test view mode")?;pump(100);
+            let mut indices=Vec::new();
+            for index in 0..unsafe{fv.ItemCount(SVGIO_ALLVIEW)?}{
+                let parent:IShellFolder=unsafe{fv.GetFolder()?};let relative=unsafe{fv.Item(index)?};
+                let item:windows::core::Result<IShellItem>=unsafe{SHCreateItemWithParent(None,&parent,relative)};unsafe{CoTaskMemFree(Some(relative.cast()))};
+                let path=crate::shell::file_transfer::paths_from_pidls(&[crate::shell::pidl::item_pidl(&item?).context("PIDL")?])?.remove(0);
+                indices.push((index,path));
+            }
+            let a=indices.iter().find(|(_,path)|path==&first).context("first index")?.0;
+            let b=indices.iter().find(|(_,path)|path==&second).context("second index")?.0;
+            let point_for=|index|->Result<LPARAM>{let path=&indices.iter().find(|(item,_)|*item==index).context("point item index")?.1;
+                accessible_item_point(view,&path.file_name().unwrap().to_string_lossy())};
+            unsafe{fv.SelectItem(a,(SVSI_SELECT.0|SVSI_DESELECTOTHERS.0|SVSI_FOCUSED.0)as u32)?;}pump(20);
+            let target=point_for(b)?;
+            let classified=menu_target::classify(view,view,target);
+            ensure!(classified==ViewMenuTarget::Selection,"file point was classified {classified:?} in mode {}",mode.0);
+            ensure!(menu_target::prepare(view,view,target).context("prepare clicked item")?==ViewMenuTarget::Selection,"file click did not prepare selection");
+            ensure!(crate::shell::file_transfer::selected_paths(&shell)?==vec![second.clone()],"menu kept previous file instead of clicked file");
+            unsafe{fv.SelectItem(a,SVSI_SELECT.0 as u32)?;}pump(20);
+            menu_target::prepare(view,view,point_for(a)?)?;
+            ensure!(crate::shell::file_transfer::selected_paths(&shell)?.len()==2,"right click collapsed an existing multi-selection");
+            ensure!(menu_target::prepare(view,view,LPARAM(-1))?==ViewMenuTarget::CurrentSelection,"keyboard context changed semantics");
+            let mut rect=RECT::default();unsafe{GetWindowRect(view,&mut rect)?;}
+            let blank=point_parameter(POINT{x:rect.right-30,y:rect.bottom-30});
+            ensure!(menu_target::prepare(view,view,blank)?==ViewMenuTarget::Background,"blank space inherited previous file menu");
+            checks.push(serde_json::json!({"mode":mode.0,"clicked_item_selected":true,"multi_selection_preserved":true,"blank_and_keyboard_distinct":true}));
+        }
+        drop(fv);drop(shell);drop(browser);pump(20);drop(owner);Ok(serde_json::json!({"checks":checks,"file_commands_invoked":0}))
+    }
+    #[test]
+    #[ignore="Actual DefView mouse target and selection on a private desktop"]
+    fn native_view_menu_hit_binds_clicked_file()->Result<()>{
+        let output=PathBuf::from(std::env::var_os("ZSDESK_NATIVE_TEST_OUTPUT").context("output")?).join("view-menu-hit");std::fs::create_dir_all(&output)?;
+        let name:Vec<u16>=format!("ZSDesk.MenuHit.{}",std::process::id()).encode_utf16().chain(Some(0)).collect();
+        let desktop=unsafe{CreateDesktopW(name.as_ptr(),ptr::null(),ptr::null(),0,0x000f00ff,ptr::null())};ensure!(!desktop.is_null(),"private desktop creation failed");
+        let handle=desktop as usize;let target=output.clone();
+        let result=thread::spawn(move||{ensure!(unsafe{SetThreadDesktop(handle as*mut c_void)}!=0,"private desktop selection failed");exercise_hit_target(&target)}).join().map_err(|_|anyhow::anyhow!("hit target regression panicked")).and_then(|value|value);
+        let closed=unsafe{CloseDesktop(desktop)}!=0;
+        let report=serde_json::json!({"state":if result.is_ok()&&closed{"passed"}else{"failed"},"result":result.as_ref().map_err(|error|format!("{error:#}")),"desktop_closed":closed});
+        std::fs::write(output.join("verification.current.json"),serde_json::to_vec_pretty(&report)?)?;println!("{report}");result?;ensure!(closed,"desktop retained");Ok(())
     }
     #[test]
     #[ignore="Real file-manager original menus on an unswitched desktop; requires ZSDESK_NATIVE_TEST_OUTPUT"]

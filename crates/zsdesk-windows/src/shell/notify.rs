@@ -10,31 +10,38 @@ use windows::{
             SHCNE_DELETE, SHCNE_MKDIR, SHCNE_RENAMEFOLDER, SHCNE_RENAMEITEM, SHCNE_RMDIR, SHCNE_UPDATEDIR,
             SHCNE_UPDATEITEM, SHCNE_UPDATEIMAGE, SHCNE_DRIVEADD, SHCNE_DRIVEREMOVED, SHCNE_MEDIAINSERTED,
             SHCNE_MEDIAREMOVED, SHCNE_NETSHARE, SHCNE_NETUNSHARE, SHCNE_SERVERDISCONNECT, SHCNRF_InterruptLevel,
-            SHCNRF_NewDelivery, SHCNRF_ShellLevel, SIGDN_DESKTOPABSOLUTEPARSING, SHCNE_ID,
+            SHCNRF_NewDelivery, SHCNRF_ShellLevel, SHCNRF_RecursiveInterrupt, SIGDN_DESKTOPABSOLUTEPARSING, SHCNE_ID,
         },
     },
 };
 
-pub struct ChangeNotify(u32);
+pub struct ChangeNotify(Vec<u32>);
 
 impl ChangeNotify {
     /// Registers `hwnd` for changes inside the given folders (absolute PIDL bytes).
     pub fn register(hwnd: HWND, message: u32, folders: &[Vec<u8>], recursive: bool) -> Option<Self> {
-        let entries: Vec<SHChangeNotifyEntry> = folders.iter()
-            .map(|p| SHChangeNotifyEntry { pidl: p.as_ptr().cast_mut().cast(), fRecursive: BOOL::from(recursive) }).collect();
-        if entries.is_empty() { return None; }
+        if folders.is_empty() { return None; }
         let events = SHCNE_CREATE.0 | SHCNE_DELETE.0 | SHCNE_MKDIR.0 | SHCNE_RMDIR.0 | SHCNE_RENAMEITEM.0 | SHCNE_RENAMEFOLDER.0
             | SHCNE_UPDATEDIR.0 | SHCNE_UPDATEITEM.0 | SHCNE_ATTRIBUTES.0 | SHCNE_UPDATEIMAGE.0 | SHCNE_DRIVEADD.0
             | SHCNE_DRIVEREMOVED.0 | SHCNE_MEDIAINSERTED.0 | SHCNE_MEDIAREMOVED.0 | SHCNE_NETSHARE.0 | SHCNE_NETUNSHARE.0
             | SHCNE_SERVERDISCONNECT.0;
-        let id = unsafe { SHChangeNotifyRegister(hwnd, SHCNRF_ShellLevel | SHCNRF_InterruptLevel | SHCNRF_NewDelivery,
-            events as i32, message, entries.len() as i32, entries.as_ptr()) };
-        (id != 0).then_some(Self(id))
+        let mut sources=SHCNRF_ShellLevel | SHCNRF_InterruptLevel | SHCNRF_NewDelivery;
+        if recursive { sources |= SHCNRF_RecursiveInterrupt; }
+        // The Shell requires one entry per registration for reliable deregistration.
+        // fRecursive alone covers Shell events, not raw descendant filesystem writes.
+        let mut registrations=Self(Vec::with_capacity(folders.len()));
+        for folder in folders {
+            let entry=SHChangeNotifyEntry { pidl:folder.as_ptr().cast_mut().cast(),fRecursive:BOOL::from(recursive) };
+            let id=unsafe { SHChangeNotifyRegister(hwnd,sources,events as i32,message,1,&entry) };
+            if id==0 { return None; }
+            registrations.0.push(id);
+        }
+        Some(registrations)
     }
 }
 
 impl Drop for ChangeNotify {
-    fn drop(&mut self) { let _ = unsafe { SHChangeNotifyDeregister(self.0) }; }
+    fn drop(&mut self) { for id in self.0.drain(..) { let _ = unsafe { SHChangeNotifyDeregister(id) }; } }
 }
 
 /// One decoded notification.
