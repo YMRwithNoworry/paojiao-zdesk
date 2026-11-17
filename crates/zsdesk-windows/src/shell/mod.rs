@@ -32,3 +32,5 @@ pub use namespace_tree::{NamespaceTreeHost,NamespaceTreeOptions};
 pub use shell_item::{breadcrumb, child_folders, location_from_shell_item, open_path, shell_item, Crumb};
 pub use shell_item::is_recycle_bin_name;
 pub(crate) use shell_item::take_pwstr as take;
+
+mod view_drop;

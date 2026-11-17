@@ -66,14 +66,14 @@ pub(super) fn discover(path: &Path, preference: PreviewProviderPreference) -> Di
     let mut candidates = Vec::new(); let mut seen = HashSet::new(); let mut stale = false; let mut blocked = false;
     let mut sources = Vec::new();
     let add_default = |sources: &mut Vec<(String, &'static str)>| {
-        if let Some(id) = associated(&extension) { sources.push((id, "系统预览插件")); }
+        if let Some(id) = associated(&extension) { sources.push((id, zsdesk_core::i18n::text("系统预览插件"))); }
     };
     if preference == PreviewProviderPreference::System { add_default(&mut sources); }
     for wps in if preference == PreviewProviderPreference::Wps { [true, false] } else { [false, true] } {
         for progid in office_progids(&extension, wps) {
             for view in [RRF_SUBKEY_WOW6464KEY, RRF_SUBKEY_WOW6432KEY] {
                 if let Some(id) = registry_text(HKEY_CLASSES_ROOT, &format!("{progid}\\shellex\\{PREVIEW_IID}"), None, view) {
-                    sources.push((id, if wps { "WPS 预览插件" } else { "Office 预览插件" }));
+                    sources.push((id, if wps { zsdesk_core::i18n::text("WPS 预览插件") } else { zsdesk_core::i18n::text("Office 预览插件") }));
                 }
             }
         }
@@ -83,7 +83,7 @@ pub(super) fn discover(path: &Path, preference: PreviewProviderPreference) -> Di
         let progid = registry_text(HKEY_CLASSES_ROOT, &extension, None, view);
         for key in [Some(extension.clone()), Some(format!("SystemFileAssociations\\{extension}")), progid].into_iter().flatten() {
             if let Some(id) = registry_text(HKEY_CLASSES_ROOT, &format!("{key}\\shellex\\{PREVIEW_IID}"), None, view) {
-                sources.push((id, "已安装预览插件"));
+                sources.push((id, zsdesk_core::i18n::text("已安装预览插件")));
             }
         }
     }
@@ -95,8 +95,8 @@ pub(super) fn discover(path: &Path, preference: PreviewProviderPreference) -> Di
             [RRF_SUBKEY_WOW6464KEY, RRF_SUBKEY_WOW6432KEY].into_iter().any(|view|
                 registry_text(root, policy, Some(&id), view).is_some())) { blocked = true; continue; }
         let mut registered = false;
-        for (view, context, suffix) in [(RRF_SUBKEY_WOW6464KEY, CLSCTX_LOCAL_SERVER | CLSCTX_ACTIVATE_64_BIT_SERVER, "64 位"),
-            (RRF_SUBKEY_WOW6432KEY, CLSCTX_LOCAL_SERVER | CLSCTX_ACTIVATE_32_BIT_SERVER, "32 位")] {
+        for (view, context, suffix) in [(RRF_SUBKEY_WOW6464KEY, CLSCTX_LOCAL_SERVER | CLSCTX_ACTIVATE_64_BIT_SERVER, zsdesk_core::i18n::text("64 位")),
+            (RRF_SUBKEY_WOW6432KEY, CLSCTX_LOCAL_SERVER | CLSCTX_ACTIVATE_32_BIT_SERVER, zsdesk_core::i18n::text("32 位"))] {
             let key = format!("CLSID\\{id}");
             let server = registry_text(HKEY_CLASSES_ROOT, &format!("{key}\\InprocServer32"), None, view)
                 .or_else(|| registry_text(HKEY_CLASSES_ROOT, &format!("{key}\\LocalServer32"), None, view));
@@ -119,12 +119,12 @@ pub(super) fn discover(path: &Path, preference: PreviewProviderPreference) -> Di
     Discovery { candidates, unavailable: unavailable.into() }
 }
 fn unavailable_message(extension:&str,blocked:bool,stale:bool,found:bool)->&'static str{
-    if blocked&&!found{return "该格式的预览插件已被 Windows 或用户设置禁用。";}
-    if stale{return "此格式的预览关联未能激活对应组件，请检查该格式预览组件的安装状态。";}
-    if found{return "已找到预览组件，但未能显示此文件。";}
+    if blocked&&!found{return zsdesk_core::i18n::text("该格式的预览插件已被 Windows 或用户设置禁用。");}
+    if stale{return zsdesk_core::i18n::text("此格式的预览关联未能激活对应组件，请检查该格式预览组件的安装状态。");}
+    if found{return zsdesk_core::i18n::text("已找到预览组件，但未能显示此文件。");}
     if !office_progids(extension,false).is_empty()||!office_progids(extension,true).is_empty(){
-        "未找到此文档格式的预览组件；可安装对应 Office/WPS 组件，或使用 QuickLook。"
-    }else{"未找到此格式的预览组件；可使用 QuickLook 或默认应用打开。"}
+        zsdesk_core::i18n::text("未找到此文档格式的预览组件；可安装对应 Office/WPS 组件，或使用 QuickLook。")
+    }else{zsdesk_core::i18n::text("未找到此格式的预览组件；可使用 QuickLook 或默认应用打开。")}
 }
 
 #[cfg(test)] mod tests {

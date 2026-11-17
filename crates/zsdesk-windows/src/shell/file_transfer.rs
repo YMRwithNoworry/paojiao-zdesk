@@ -80,7 +80,7 @@ pub fn origin_current(origin:&TransferOrigin)->bool{capture_origin(HWND(origin.v
     pub outputs:Vec<PathBuf>,pub outputs_truncated:bool,pub origin:Option<TransferOrigin>,pub error:Option<HRESULT>,pub error_detail:Option<String>,
 }
 impl Completion{pub fn message(&self)->String{
-    let verb=match self.operation{Operation::Copy=>"复制",Operation::Move=>"移动",Operation::Delete{..}=>"删除",Operation::NewFolder=>"新建文件夹"};
+    let verb=match self.operation{Operation::Copy=>zsdesk_core::i18n::text("复制"),Operation::Move=>"移动",Operation::Delete{..}=>zsdesk_core::i18n::text("删除"),Operation::NewFolder=>"新建文件夹"};
     let message=if let Some(error)=self.error.filter(|error|!is_cancelled(*error)){
         let detail=self.error_detail.clone().unwrap_or_else(||error_message(&Error::from_hresult(error)));
         format!("{verb}未完成：{detail}（已完成 {} / {} 项）",self.completed,self.requested)
@@ -96,7 +96,7 @@ pub fn result_message()->u32{static ID:OnceLock<u32>=OnceLock::new();*ID.get_or_
 /// Shell and Win32 use different HRESULTs for the same explicit cancellation.
 pub fn is_cancelled(code:HRESULT)->bool{matches!(code.0 as u32,0x80270000|0x80270001|0x800704c7|0x80004004)}
 pub fn error_message(error:&Error)->String{
-    let code=error.code();if is_cancelled(code){return "操作已取消".into();}
+    let code=error.code();if is_cancelled(code){return zsdesk_core::i18n::text("操作已取消").into();}
     let text=match code.0 as u32{
         0x80070002|0x80070003=>"找不到文件或路径，请刷新后重试".into(),
         0x80070005=>"没有访问此文件或文件夹的权限".into(),
@@ -160,12 +160,24 @@ fn hdrop_bytes(paths:&[PathBuf])->Result<Vec<u8>>{
     bytes.extend([0,0]);Ok(bytes)
 }
 pub fn copy_paths(owner:HWND,paths:&[PathBuf],cut:bool)->Result<()>{
-    // Both allocations complete before replacing the user's clipboard.
-    let names=Memory::new(&hdrop_bytes(paths)?)?;
-    let effect=Memory::new(&(if cut{2u32}else{1u32}).to_le_bytes())?;
+    let data=file_data_object(owner,paths,cut)?;
+    unsafe{windows::Win32::System::Ole::OleSetClipboard(&data)}
+}
+fn file_data_object(owner:HWND,paths:&[PathBuf],cut:bool)->Result<windows::Win32::System::Com::IDataObject>{
+    // Shell's IDataObject carries CIDA and delayed descriptor/content formats
+    // used by remote clipboard bridges and copy handlers, as well as HDROP.
+    check_paths(paths)?;
+    let pidls=paths.iter().map(|path|super::pidl::location_pidl(&zsdesk_core::model::explorer::ShellLocation::Path(path.clone()))
+        .ok_or_else(||invalid(zsdesk_core::i18n::text("无法读取文件标识")))).collect::<Result<Vec<_>>>()?;
+    let data=crate::desktop::data_object(owner,&pidls)?;
     let format=unsafe{RegisterClipboardFormatW(w!("Preferred DropEffect"))};if format==0{return Err(Error::from_thread());}
-    let _clipboard=Clipboard::open(Some(owner))?;unsafe{EmptyClipboard()?;}
-    names.publish(15)?;effect.publish(format)
+    let mut memory=Memory::new(&(if cut{2u32}else{1u32}).to_le_bytes())?;
+    let descriptor=windows::Win32::System::Com::FORMATETC{cfFormat:format as u16,ptd:std::ptr::null_mut(),
+        dwAspect:windows::Win32::System::Com::DVASPECT_CONTENT.0,lindex:-1,tymed:windows::Win32::System::Com::TYMED_HGLOBAL.0 as u32};
+    let medium=windows::Win32::System::Com::STGMEDIUM{tymed:windows::Win32::System::Com::TYMED_HGLOBAL.0 as u32,
+        u:windows::Win32::System::Com::STGMEDIUM_0{hGlobal:memory.0},pUnkForRelease:std::mem::ManuallyDrop::new(None)};
+    unsafe{data.SetData(&descriptor,&medium,true)?;}memory.0=HGLOBAL::default();
+    Ok(data)
 }
 pub fn set_text(owner:HWND,text:&str)->Result<()>{
     if text.contains('\0')||text.len()>MAX_PATH_BYTES{return Err(invalid("剪贴板文字过长或含无效字符"));}
@@ -179,21 +191,20 @@ fn owned_clipboard_on_current_thread()->bool{
     let thread=unsafe{GetWindowThreadProcessId(owner,Some(&mut process))};
     process==unsafe{GetCurrentProcessId()}&&thread==unsafe{GetCurrentThreadId()}
 }
-/// Persist only this STA's filesystem clipboard. Never request CF_FILECONTENTS
-/// or flush arbitrary OLE formats; virtual-file providers keep their STA alive.
+/// Preserve the complete filesystem data object when its owning STA retires.
+/// Virtual-file providers without HDROP retain their own streaming lifetime.
 pub fn persist_owned_file_clipboard(owner:HWND)->Result<bool>{
     let mut process=0;
     if unsafe{GetWindowThreadProcessId(owner,Some(&mut process))}!=unsafe{GetCurrentThreadId()}
         ||process!=unsafe{GetCurrentProcessId()}||!owned_clipboard_on_current_thread(){return Ok(false);}
+    persist_thread_clipboard()
+}
+pub fn persist_thread_clipboard()->Result<bool>{
+    if !owned_clipboard_on_current_thread(){return Ok(true);}
     if unsafe{IsClipboardFormatAvailable(15)}.is_err(){return Ok(false);}
-    let _clipboard=Clipboard::open(Some(owner))?;
-    if !owned_clipboard_on_current_thread(){return Ok(false);}
-    let (paths,effect,sequence)=clipboard_files_locked()?;
-    let names=Memory::new(&hdrop_bytes(&paths)?)?;
-    let preferred=Memory::new(&effect.to_le_bytes())?;
-    let format=unsafe{RegisterClipboardFormatW(w!("Preferred DropEffect"))};if format==0{return Err(Error::from_thread());}
-    if unsafe{GetClipboardSequenceNumber()}!=sequence||!owned_clipboard_on_current_thread(){return Ok(false);}
-    unsafe{EmptyClipboard()?;}names.publish(15)?;preferred.publish(format)?;Ok(true)
+    // Do not replace the object with HDROP alone: doing so discards formats
+    // requested by RDP and other remote clipboard transports.
+    unsafe{windows::Win32::System::Ole::OleFlushClipboard()?;}Ok(true)
 }
 pub fn selected_paths(view:&IShellView)->Result<Vec<PathBuf>>{
     let folder:IFolderView2=view.cast()?;let items:IShellItemArray=unsafe{folder.Items(SVGIO_SELECTION)?};
@@ -226,7 +237,14 @@ pub fn filesystem_folder_path(view:&IShellView)->Result<Option<PathBuf>>{
     item_path(&item).map(Some)
 }
 pub fn copy_view(view:&IShellView,owner:HWND,cut:bool)->Result<()>{
-    let paths=selected_paths(view)?;if paths.is_empty(){return Ok(());}copy_paths(owner,&paths,cut)
+    let paths=selected_paths(view)?;if paths.is_empty(){return Ok(());}
+    if cut{
+        // DefView owns both the clipboard data object and the cut visual state.
+        // SetClipboard(TRUE) preserves that relationship, including restoring
+        // the icons when another application replaces the clipboard.
+        if let Ok(folder)=view.cast::<IShellFolderView>(){return unsafe{folder.SetClipboard(true)};}
+    }
+    copy_paths(owner,&paths,cut)
 }
 pub fn paths_from_pidls(pidls:&[Vec<u8>])->Result<Vec<PathBuf>>{
     if pidls.len()>MAX_ITEMS{return Err(invalid("选择超过 10000 项"));}

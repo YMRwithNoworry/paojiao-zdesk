@@ -30,8 +30,8 @@ enum LogMessage {
 }
 #[derive(Clone)]enum ReportKind{Diagnostics,Search(PathBuf)}
 impl ReportKind{
-    fn title(&self)->&'static str{match self{Self::Diagnostics=>"ZSDesk 诊断日志",Self::Search(_)=>"搜索引擎状态"}}
-    fn loading(&self)->&'static str{match self{Self::Diagnostics=>"正在读取本地诊断日志…",Self::Search(_)=>"正在检查搜索引擎配置、连接和索引服务…"}}
+    fn title(&self)->&'static str{match self{Self::Diagnostics=>zsdesk_core::i18n::text("ZSDesk 诊断日志"),Self::Search(_)=>zsdesk_core::i18n::text("搜索引擎状态")}}
+    fn loading(&self)->&'static str{match self{Self::Diagnostics=>zsdesk_core::i18n::text("正在读取本地诊断日志…"),Self::Search(_)=>zsdesk_core::i18n::text("正在检查搜索引擎配置、连接和索引服务…")}}
 }
 #[derive(Default)]
 struct ReportMailbox {alive:AtomicBool,latest:AtomicU64,pending:AtomicBool,reply:Mutex<Option<(u64,String)>>}
@@ -57,10 +57,10 @@ fn lock_files(root:&Path)->std::io::Result<LogFileGuard> {
     let handle=unsafe{CreateMutexW(None,false,PCWSTR(wide(&name).as_ptr()))}.map_err(std::io::Error::other)?;
     let result=unsafe{WaitForSingleObject(handle,1000)};
     if result==WAIT_OBJECT_0 || result==WAIT_ABANDONED {Ok(LogFileGuard(handle))}
-    else {let _=unsafe{CloseHandle(handle)};Err(std::io::Error::new(std::io::ErrorKind::TimedOut,"诊断文件正在使用，请稍后刷新"))}
+    else {let _=unsafe{CloseHandle(handle)};Err(std::io::Error::new(std::io::ErrorKind::TimedOut,zsdesk_core::i18n::text("诊断文件正在使用，请稍后刷新")))}
 }
 fn append(root:&Path,line:&str)->std::io::Result<()> {
-    if line.len()as u64+1>MAX_LOG_BYTES{return Err(std::io::Error::new(std::io::ErrorKind::InvalidData,"单条诊断记录过长"));}
+    if line.len()as u64+1>MAX_LOG_BYTES{return Err(std::io::Error::new(std::io::ErrorKind::InvalidData,zsdesk_core::i18n::text("单条诊断记录过长")));}
     let _files=lock_files(root)?;
     let current=root.join("events.current.jsonl");let previous=root.join("events.previous.jsonl");
     if fs::metadata(&current).is_ok_and(|metadata|metadata.len()+line.len()as u64+1>MAX_LOG_BYTES) {
@@ -123,11 +123,8 @@ pub(crate) fn flush_at_shutdown() {
     if sender.try_send(LogMessage::Flush(done)).is_ok(){let _=ready.recv_timeout(Duration::from_millis(300));}
 }
 fn status_text()->String {
-    let Some(state)=try_logger()else{return "诊断状态正在更新".into();};
-    format!("已写入 {} 条；写入失败 {} 次；待汇总丢弃事件 {} 条\r\n后台线程：{}\r\n初始化错误：{}\r\n最近写入错误：{}",
-        state.written,state.io_failures,DROPPED.load(Ordering::Relaxed),
-        if state.thread.as_ref().is_some_and(|thread|!thread.is_finished()){"运行中"}else{"未运行，可刷新重试"},
-        state.initialization_error.as_deref().unwrap_or("无"),state.last_io_error.as_deref().unwrap_or("无"))
+    let Some(state)=try_logger()else{return zsdesk_core::i18n::text("诊断状态正在更新").into();};
+    zsdesk_core::tr_format!("已写入 {} 条；写入失败 {} 次；待汇总丢弃事件 {} 条\r\n后台线程：{}\r\n初始化错误：{}\r\n最近写入错误：{}", state.written, state.io_failures, DROPPED.load(Ordering::Relaxed), if state.thread.as_ref().is_some_and(|thread|!thread.is_finished()){zsdesk_core::i18n::text("运行中")}else{zsdesk_core::i18n::text("未运行，可刷新重试")}, state.initialization_error.as_deref().unwrap_or(zsdesk_core::i18n::text("无")), state.last_io_error.as_deref().unwrap_or(zsdesk_core::i18n::text("无")))
 }
 fn log_tail(path:&Path)->String {
     use std::io::{Read,Seek,SeekFrom};
@@ -140,13 +137,12 @@ fn log_tail(path:&Path)->String {
 fn report(root:&Path)->String {
     let (current,previous)=match lock_files(root) {
         Ok(_guard)=>(log_tail(&root.join("events.current.jsonl")),log_tail(&root.join("events.previous.jsonl"))),
-        Err(error)=>(format!("无法读取事件日志：{error}"),String::new()),
+        Err(error)=>(zsdesk_core::tr_format!("无法读取事件日志：{error}", error=error),String::new()),
     };
     let menu=crate::context_menu_process::read_recent_diagnostics();
     let body=serde_json::to_string_pretty(&menu).unwrap_or_default();
-    let text=format!("ZSDesk {} {}\r\n本地诊断日志\r\n\r\n日志目录：{}\r\n\r\n记录状态\r\n{}\r\n\r\n右键菜单诊断\r\n{}\r\n\r\n最近事件\r\n{}\r\n\r\n上一代事件\r\n{}",
-        env!("CARGO_PKG_VERSION"),crate::edition::name(),root.display(),status_text(),body,current,previous);
-    let text=if text.chars().count()>200_000 {text.chars().take(200_000).chain("\r\n日志显示已截断，可在日志目录查看完整记录。".chars()).collect()}else{text};
+    let text=zsdesk_core::tr_format!("ZSDesk {} {}\r\n本地诊断日志\r\n\r\n日志目录：{}\r\n\r\n记录状态\r\n{}\r\n\r\n右键菜单诊断\r\n{}\r\n\r\n最近事件\r\n{}\r\n\r\n上一代事件\r\n{}", env!("CARGO_PKG_VERSION"), crate::edition::name(), root.display(), status_text(), body, current, previous);
+    let text=if text.chars().count()>200_000 {text.chars().take(200_000).chain(zsdesk_core::i18n::text("\r\n日志显示已截断，可在日志目录查看完整记录。").chars()).collect()}else{text};
     text.replace("\r\n","\n").replace('\n',"\r\n")
 }
 
@@ -164,7 +160,7 @@ fn request_report(hwnd:HWND,pointer:*mut DiagnosticWindow) {
     let queued=sender().is_some_and(|sender|sender.try_send(LogMessage::Snapshot{window:hwnd.0 as isize,token,sequence,kind,result:Arc::downgrade(&mailbox)}).is_ok());
     if !queued {
         mailbox.pending.store(false,Ordering::Release);
-        *mailbox.reply.lock().unwrap_or_else(|error|error.into_inner())=Some((sequence,format!("诊断报告暂不可用，请稍后刷新。\r\n\r\n{}",status_text())));
+        *mailbox.reply.lock().unwrap_or_else(|error|error.into_inner())=Some((sequence,zsdesk_core::tr_format!("诊断报告暂不可用，请稍后刷新。\r\n\r\n{}", status_text())));
         let _=unsafe{PostMessageW(Some(hwnd),REPORT_READY,WPARAM(token),LPARAM(sequence as isize))};
     }
 }
@@ -187,7 +183,7 @@ fn show_report(owner:HWND,kind:ReportKind)->Result<()> {
     let state=Box::new(DiagnosticWindow{edit:HWND::default(),buttons:[HWND::default();3],text:kind.loading().into(),kind,adopted:adopted.clone(),
         token:WINDOW_TOKEN.fetch_add(1,Ordering::Relaxed)as usize,mailbox});
     let pointer=Box::into_raw(state);
-    let result=unsafe{CreateWindowExW(WS_EX_APPWINDOW,CLASS,windows::core::w!("ZSDesk 诊断日志"),WS_OVERLAPPEDWINDOW|WS_CLIPCHILDREN,
+    let result=unsafe{CreateWindowExW(WS_EX_APPWINDOW,CLASS,windows::core::PCWSTR(zsdesk_core::i18n::wide("ZSDesk 诊断日志").as_ptr()),WS_OVERLAPPEDWINDOW|WS_CLIPCHILDREN,
         CW_USEDEFAULT,CW_USEDEFAULT,880,620,Some(owner),None,Some(instance),Some(pointer.cast()))};
     let hwnd=match result{Ok(hwnd)=>hwnd,Err(error)=>{if !adopted.get(){unsafe{drop(Box::from_raw(pointer));}}return Err(error.into());}};
     if !live_window(hwnd,pointer){return Ok(());}
@@ -202,7 +198,7 @@ fn configure_report(hwnd:HWND,pointer:*mut DiagnosticWindow){
     let(kind,edit,copy)=unsafe{((*pointer).kind.clone(),(*pointer).edit,(*pointer).buttons[1])};
     let _=unsafe{SetWindowTextW(hwnd,PCWSTR(wide(kind.title()).as_ptr()))};
     if !live_window(hwnd,pointer){return;}
-    let label=match kind{ReportKind::Search(_)=>"复制状态",ReportKind::Diagnostics=>"复制日志"};
+    let label=match kind{ReportKind::Search(_)=>zsdesk_core::i18n::text("复制状态"),ReportKind::Diagnostics=>zsdesk_core::i18n::text("复制日志")};
     let _=unsafe{SetWindowTextW(copy,PCWSTR(wide(label).as_ptr()))};
     if !live_window(hwnd,pointer){return;}
     let loading=kind.loading().to_owned();unsafe{(*pointer).text=loading.clone();}
@@ -245,7 +241,7 @@ unsafe extern "system" fn procedure(hwnd:HWND,message:u32,wp:WPARAM,lp:LPARAM)->
             if !live_window(hwnd,pointer){return LRESULT(-1);}
             let _=unsafe{SetWindowTextW(edit,PCWSTR(wide(&text).as_ptr()))};
             if !live_window(hwnd,pointer){return LRESULT(-1);}
-            for(index,(label,id))in[("刷新",REFRESH_ID),("复制日志",COPY_ID),("关闭",CLOSE_ID)].into_iter().enumerate(){
+            for(index,(label,id))in[(zsdesk_core::i18n::text("刷新"),REFRESH_ID),(zsdesk_core::i18n::text("复制日志"),COPY_ID),(zsdesk_core::i18n::text("关闭"),CLOSE_ID)].into_iter().enumerate(){
                 let button=unsafe{child(hwnd,"BUTTON",label,id,BS_PUSHBUTTON as u32,true)};
                 if !live_window(hwnd,pointer){return LRESULT(-1);}
                 if let Ok(button)=button{unsafe{(*pointer).buttons[index]=button;}}

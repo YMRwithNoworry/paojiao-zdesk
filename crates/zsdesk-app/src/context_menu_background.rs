@@ -141,7 +141,7 @@ impl SelectionSet{
         let mut bytes=0usize;let mut name_bytes=0usize;
         for (index,pidl) in pidls.iter().enumerate(){
             checkpoint(request,events,deadline)?;
-            bytes=bytes.saturating_add(pidl.len());ensure!(bytes<=MAX_REQUEST as usize,"菜单选区标识过大");
+            bytes=bytes.saturating_add(pidl.len());ensure!(bytes<=MAX_REQUEST as usize, "{}", zsdesk_core::tr_format!("菜单选区标识过大"));
             let item=zsdesk_windows::shell::pidl::item_from_pidl(pidl).context("读取菜单选区标识")?;
             ensure!(!result.by_pidl.contains_key(pidl),"菜单选区包含重复项目");
             result.by_pidl.entry(pidl.clone()).or_default().push(index);

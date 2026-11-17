@@ -20,9 +20,9 @@ const MAX_ITEMS:usize=8192;
 const WORKER_MEMORY_LIMIT:usize=512*1024*1024;
 static SERIAL:AtomicU64=AtomicU64::new(1);
 static RETIRING:Mutex<Vec<RetiredChild>>=Mutex::new(Vec::new());
-const IDLE_TIMEOUT:Duration=Duration::from_secs(300);
+const IDLE_TIMEOUT:Duration=Duration::from_secs(30);
 const MAX_SESSION_REQUESTS:u32=32;
-const MAX_IDLE_WORKERS:usize=4;
+const MAX_IDLE_WORKERS:usize=1;
 static IDLE:Mutex<Vec<IdleWorker>>=Mutex::new(Vec::new());
 static DIAGNOSTICS_LOCK:Mutex<()>=Mutex::new(());
 static PREPARING:std::sync::atomic::AtomicUsize=std::sync::atomic::AtomicUsize::new(0);
@@ -661,6 +661,7 @@ extern "C"{fn zs_menu_is_open(owner:HWND)->i32;}
 impl Worker<'_>{
     fn state(&mut self,phase:&str)->Result<()>{
         self.status.phase=phase.into();self.status.native_menu=serde_json::to_value(zsdesk_windows::shell::menu_diagnostics())?;
+        self.status.native_menu["presentation"]=zsdesk_windows::shell::menu::presentation_name().into();
         write(&self.path.with_file_name("status.json"),&self.status)?;EventSet::signal(self.events.status);Ok(())
     }
     fn allow(&mut self,before_invoke:bool)->windows::core::Result<()>{
@@ -781,7 +782,9 @@ fn run_request(path:&Path,request:Request,events:&EventSet,com_us:u64,fault_repo
     let watch=Box::new(Watch{request:state.request.clone(),path:path.into(),status_event:events.status,cancel_event:events.cancel,
         worker_started,menu_open:std::cell::Cell::new(false),tracking_started:std::cell::Cell::new(0),#[cfg(test)]command:std::cell::Cell::new(None),
         #[cfg(test)]classic_loop:std::cell::Cell::new(false),#[cfg(test)]expanded_requested:std::cell::Cell::new(false),#[cfg(test)]classic_commands:std::cell::Cell::new(0),#[cfg(test)]menu:std::cell::Cell::new(HMENU::default())});
-    let window=unsafe{CreateWindowExW(WS_EX_TOOLWINDOW,class,w!("ZSdesk"),WS_POPUP,0,0,0,0,None,None,Some(instance),Some((&*watch as*const Watch).cast()))}.context("create menu owner window")?;
+    let owner=unsafe{GetAncestor(HWND(state.request.owner as*mut _),GA_ROOT)};
+    ensure!(owner_alive(&state.request),"菜单所属窗口已关闭");
+    let window=unsafe{CreateWindowExW(WS_EX_TOOLWINDOW,class,w!("ZSdesk"),WS_POPUP,0,0,0,0,Some(owner),None,Some(instance),Some((&*watch as*const Watch).cast()))}.context("create menu owner window")?;
     struct Window(HWND);impl Drop for Window{fn drop(&mut self){let _=unsafe{DestroyWindow(self.0)};}}let owned_window=Window(window);
     state.status.window=window.0 as isize;unsafe{SetTimer(Some(window),1,15,None);}
     state.status.timing.worker_setup_microseconds=micros(setup.elapsed());
@@ -805,8 +808,11 @@ fn run_request(path:&Path,request:Request,events:&EventSet,com_us:u64,fault_repo
             Some(if let Some(pidl)=request.pidls.first(){zsdesk_windows::shell::pidl::item_from_pidl(pidl)?}
                 else{unsafe{zsdesk_windows::shell::shell_item(&zsdesk_core::model::explorer::ShellLocation::Path(request.folder.clone().context("粘贴目标缺失")?))}?})
         }else{None};
+        let effective_options=zsdesk_windows::shell::menu::context_menu_options();
+        let classic_selection=zsdesk_windows::theme::os_build()<22000&&!effective_options.modern&&!effective_options.drawn
+            &&!request.pidls.is_empty()&&!is_background;
         let background_view=if let Some(item)=&background{Some(background_view::BackgroundView::create(item,&request,events)?)}
-            else if !request.pidls.is_empty(){
+            else if !request.pidls.is_empty()&&!classic_selection{
                 let origin=match request.view_context.as_ref(){
                     Some(context) if context.results=>background_view::SelectionOrigin::Results,
                     Some(context) if context.folder.is_some()=>background_view::SelectionOrigin::Folder(context.folder.as_deref().unwrap()),
@@ -817,7 +823,6 @@ fn run_request(path:&Path,request:Request,events:&EventSet,com_us:u64,fault_repo
         state.status.timing.background_view_reused=is_background&&background_view.is_some()&&background_view::reused();
         if is_background{if let (Some(host),Some(layout))=(&background_view,&request.layout){zsdesk_windows::shell::restore_view_layout(&host.view,layout);}}
         let initial_layout=background_view.as_ref().filter(|_|is_background).and_then(|host|zsdesk_windows::shell::capture_view_layout(&host.view));
-        let effective_options=zsdesk_windows::shell::menu::context_menu_options();
         let full_context=matches!(request.mode,Mode::More|Mode::Background|Mode::CatalogSelection|Mode::CatalogBackground);
         let classic_gesture=request.extended&&!request.view_context.as_ref().is_some_and(|context|context.keyboard&&context.f10);
         let packaged=full_context&&(effective_options.drawn||!effective_options.modern||classic_gesture||matches!(request.mode,Mode::CatalogSelection|Mode::CatalogBackground));

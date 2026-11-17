@@ -153,13 +153,13 @@ pub fn profile_property(profile: &Path) -> Vec<u16> {
 }
 fn bounded_read(path: &Path) -> Result<Vec<u8>> {
     let m = path.metadata()?;
-    ensure!(m.is_file() && m.len() <= LIMIT, "配置大小或类型无效");
+    ensure!(m.is_file() && m.len() <= LIMIT, "{}", zsdesk_core::tr_format!("配置大小或类型无效"));
     let data = fs::read(path)?;
-    ensure!(data.len() as u64 == m.len(), "配置正在变化");
+    ensure!(data.len() as u64 == m.len(), "{}", zsdesk_core::tr_format!("配置正在变化"));
     Ok(data)
 }
 fn digest(path: &Path) -> Result<String> {
-    let mut file = File::open(path).with_context(|| format!("无法读取 {}", path.display()))?;
+    let mut file = File::open(path).with_context(|| zsdesk_core::tr_format!("无法读取 {}" , path.display()))?;
     let mut hash = Sha256::new();
     let mut block = [0u8; 65536];
     loop {
@@ -184,7 +184,7 @@ fn atomic(path: &Path, data: &[u8]) -> Result<()> {
     file.sync_all()?;
     drop(file);
     fs::rename(temp, path)?;
-    ensure!(fs::read(path)? == data, "配置回读校验失败");
+    ensure!(fs::read(path)? == data, "{}", zsdesk_core::tr_format!("配置回读校验失败"));
     Ok(())
 }
 fn save(profile: &Path, settings: &Settings) -> Result<()> {
@@ -205,24 +205,15 @@ pub fn save_draft(profile: &Path, settings: &Settings) -> Result<()> {
     save(profile, &next)
 }
 fn validate_settings(settings: &Settings) -> Result<()> {
-    ensure!(
-        settings.schema == 2 && settings.applications.len() <= 128,
-        "路由配置版本或数量无效"
-    );
-    ensure!(
-        settings
+    ensure!(settings.schema == 2 && settings.applications.len() <= 128, "{}", zsdesk_core::tr_format!("路由配置版本或数量无效"));
+    ensure!(settings
             .startup_name
             .as_deref()
-            .is_none_or(|name| name == STARTUP || name == LEGACY_STARTUP),
-        "启动项不属于此程序"
-    );
+            .is_none_or(|name| name == STARTUP || name == LEGACY_STARTUP), "{}", zsdesk_core::tr_format!("启动项不属于此程序"));
     let mut ids = HashSet::new();
     let mut paths = HashSet::new();
     for app in &settings.applications {
-        ensure!(
-            app.id >= 2 && ids.insert(app.id) && paths.insert(key(&app.executable)),
-            "应用编号或路径重复"
-        );
+        ensure!(app.id >= 2 && ids.insert(app.id) && paths.insert(key(&app.executable)), "{}", zsdesk_core::tr_format!("应用编号或路径重复"));
     }
     Ok(())
 }
@@ -232,7 +223,7 @@ pub fn load(profile: &Path) -> Result<Settings> {
         return Ok(Settings::default());
     }
     let raw: serde_json::Value =
-        serde_json::from_slice(&bounded_read(&path)?).context("文件位置转发配置损坏")?;
+        serde_json::from_slice(&bounded_read(&path)?).context(zsdesk_core::i18n::text("文件位置转发配置损坏"))?;
     let mut settings: Settings = serde_json::from_value(raw.clone())?;
     validate_settings(&settings)?;
     if let Some(control) = &settings.control_path {
@@ -253,30 +244,17 @@ pub fn load(profile: &Path) -> Result<Settings> {
     Ok(settings)
 }
 fn component(root: &Path, item: &Component) -> Result<PathBuf> {
-    ensure!(
-        item.file == "ShellRoutingControl.exe" || item.file == "ZSDeskRevealRouter.dll",
-        "组件名称无效"
-    );
-    ensure!(valid_hash(&item.sha256), "组件内容标识无效");
+    ensure!(item.file == "ShellRoutingControl.exe" || item.file == "ZSDeskRevealRouter.dll", "{}", zsdesk_core::tr_format!("组件名称无效"));
+    ensure!(valid_hash(&item.sha256), "{}", zsdesk_core::tr_format!("组件内容标识无效"));
     let path = root.join(&item.file);
-    ensure!(
-        digest(&path)?.eq_ignore_ascii_case(&item.sha256),
-        "组件校验失败：{}",
-        item.file
-    );
+    ensure!(digest(&path)?.eq_ignore_ascii_case(&item.sha256), "{}", zsdesk_core::tr_format!("组件校验失败：{}" , item.file));
     Ok(path)
 }
 fn bundle_at(root: &Path) -> Result<Bundle> {
     let manifest: Manifest = serde_json::from_slice(&bounded_read(&root.join("manifest.json"))?)?;
-    ensure!(
-        manifest.schema == "ZSDesk.RoutingPackage.v1" && manifest.adapter_abi == 2,
-        "组件清单版本不兼容"
-    );
-    ensure!(
-        manifest.controller.file == "ShellRoutingControl.exe"
-            && manifest.adapter.file == "ZSDeskRevealRouter.dll",
-        "组件清单无效"
-    );
+    ensure!(manifest.schema == "ZSDesk.RoutingPackage.v1" && manifest.adapter_abi == 2, "{}", zsdesk_core::tr_format!("组件清单版本不兼容"));
+    ensure!(manifest.controller.file == "ShellRoutingControl.exe"
+            && manifest.adapter.file == "ZSDeskRevealRouter.dll", "{}", zsdesk_core::tr_format!("组件清单无效"));
     component(root, &manifest.controller)?;
     component(root, &manifest.adapter)?;
     Ok(Bundle {
@@ -286,8 +264,8 @@ fn bundle_at(root: &Path) -> Result<Bundle> {
 }
 fn bundled() -> Result<Bundle> {
     let exe = std::env::current_exe()?;
-    bundle_at(&exe.parent().context("无法确定安装目录")?.join("routing"))
-        .context("此安装包缺少可用的文件位置转发组件")
+    bundle_at(&exe.parent().context(zsdesk_core::i18n::text("无法确定安装目录"))?.join("routing"))
+        .context(zsdesk_core::i18n::text("此安装包缺少可用的文件位置转发组件"))
 }
 pub fn bundle_available() -> bool {
     std::env::current_exe()
@@ -302,19 +280,13 @@ fn installed(settings: &Settings) -> Result<Option<PathBuf>> {
     let hash = settings
         .control_sha256
         .as_deref()
-        .context("转发器缺少内容标识")?;
-    ensure!(
-        path.is_absolute()
+        .context(zsdesk_core::i18n::text("转发器缺少内容标识"))?;
+    ensure!(path.is_absolute()
             && path.file_name().is_some_and(|n| n
                 .to_string_lossy()
                 .eq_ignore_ascii_case("ShellRoutingControl.exe"))
-            && valid_hash(hash),
-        "转发器绑定无效"
-    );
-    ensure!(
-        digest(path)?.eq_ignore_ascii_case(hash),
-        "已安装转发器发生变化，未执行操作"
-    );
+            && valid_hash(hash), "{}", zsdesk_core::tr_format!("转发器绑定无效"));
+    ensure!(digest(path)?.eq_ignore_ascii_case(hash), "{}", zsdesk_core::tr_format!("已安装转发器发生变化，未执行操作"));
     Ok(Some(path.clone()))
 }
 fn output(exe: &Path, args: &[&std::ffi::OsStr]) -> Result<std::process::Output> {
@@ -323,7 +295,7 @@ fn output(exe: &Path, args: &[&std::ffi::OsStr]) -> Result<std::process::Output>
         .creation_flags(0x08000000)
         .stdin(Stdio::null())
         .output()
-        .context("无法启动路由组件")
+        .context(zsdesk_core::i18n::text("无法启动路由组件"))
 }
 fn control(exe: &Path, arg: &str) -> Result<()> {
     let result = output(exe, &[arg.as_ref()])?;
@@ -349,7 +321,7 @@ fn json_output<T: serde::de::DeserializeOwned>(result: &std::process::Output) ->
     let line = text
         .lines()
         .find(|s| s.trim_start().starts_with('{'))
-        .context("组件未返回兼容信息")?;
+        .context(zsdesk_core::i18n::text("组件未返回兼容信息"))?;
     Ok(serde_json::from_str(line)?)
 }
 fn inspect(bundle: &Bundle, path: &Path, caller: Option<&Path>) -> Result<Inspection> {
@@ -359,16 +331,13 @@ fn inspect(bundle: &Bundle, path: &Path, caller: Option<&Path>) -> Result<Inspec
         args.push(caller.as_os_str());
     }
     let value: Inspection = json_output(&output(&exe, &args)?)?;
-    ensure!(value.supported, "此应用尚不兼容：{}", value.reason);
+    ensure!(value.supported, "{}", zsdesk_core::tr_format!("此应用尚不兼容：{}" , value.reason));
     Ok(value)
 }
 fn discover(bundle: &Bundle) -> Result<Vec<Inspection>> {
     let exe = component(&bundle.root, &bundle.manifest.controller)?;
     let value: Discovery = json_output(&output(&exe, &["--discover".as_ref()])?)?;
-    ensure!(
-        value.schema == "ZSDesk.RoutingDiscovery.v1" && value.applications.len() <= 128,
-        "发现结果无效"
-    );
+    ensure!(value.schema == "ZSDesk.RoutingDiscovery.v1" && value.applications.len() <= 128, "{}", zsdesk_core::tr_format!("发现结果无效"));
     Ok(value.applications)
 }
 fn label(value: &Inspection) -> String {
@@ -380,7 +349,7 @@ fn label(value: &Inspection) -> String {
         .file_name()
         .is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case("Weixin.exe"))
     {
-        "微信".into()
+        zsdesk_core::i18n::text("微信").into()
     } else {
         value
             .label
@@ -394,14 +363,8 @@ fn legacy_default_selection(value: &Inspection) -> bool {
     matches!(value.profile, 2 | 3) && matches!(label(value).as_str(), "Codex" | "微信")
 }
 fn add(settings: &mut Settings, value: Inspection, selected: bool) -> Result<()> {
-    ensure!(
-        value.supported && matches!(value.profile, 1..=4),
-        "应用不兼容"
-    );
-    ensure!(
-        key(&value.executable) != key(&std::env::current_exe()?),
-        "不需要将 ZSDesk 设为自身的来源"
-    );
+    ensure!(value.supported && matches!(value.profile, 1..=4), "{}", zsdesk_core::tr_format!("应用不兼容"));
+    ensure!(key(&value.executable) != key(&std::env::current_exe()?), "{}", zsdesk_core::tr_format!("不需要将 ZSDesk 设为自身的来源"));
     if let Some(app) = settings
         .applications
         .iter_mut()
@@ -412,7 +375,7 @@ fn add(settings: &mut Settings, value: Inspection, selected: bool) -> Result<()>
         app.enabled |= selected;
         return Ok(());
     }
-    ensure!(settings.applications.len() < 128, "应用数量超过上限");
+    ensure!(settings.applications.len() < 128, "{}", zsdesk_core::tr_format!("应用数量超过上限"));
     let id = settings
         .applications
         .iter()
@@ -420,7 +383,7 @@ fn add(settings: &mut Settings, value: Inspection, selected: bool) -> Result<()>
         .max()
         .unwrap_or(99)
         .checked_add(1)
-        .context("应用编号已用尽")?;
+        .context(zsdesk_core::i18n::text("应用编号已用尽"))?;
     settings.applications.push(Application {
         id,
         label: label(&value),
@@ -446,13 +409,13 @@ pub fn request_add_with_caller(profile: &Path, executable: PathBuf, caller_modul
 }
 pub fn diagnostic_reason(code: u32) -> (&'static str, bool) {
     (match code {
-        0 => "暂无拒绝记录", 1 => "调用来自尚未绑定的辅助模块", 2 => "此打开方式保持系统处理",
-        3 => "隐藏、最小化或特殊显示方式保持系统处理", 4 => "目标不是已核验的系统 Explorer",
-        5 => "参数不是受支持的文件夹或定位请求", 6 => "特殊启动标志保持原调用", 7 => "特殊启动信息保持原调用",
-        8 => "ANSI 参数无法无损转换", 9 => "文件或目录当前不可用", 10 => "未找到已核验的转发服务",
-        11 => "进程访问被拒绝", 12 => "访问较高权限进程被拒绝", 13 => "请求结果超时，未重复发送",
-        14 => "请求参数无效", 15 => "转发器文件身份已变化", 16 => "无法创建转发进程",
-        17 | 1467 => "请关闭对应应用、应用接管设置后再重新打开，原有转发保持不变", _ => "当前入口未提供具体诊断",
+        0 => zsdesk_core::i18n::text("暂无拒绝记录"), 1 => zsdesk_core::i18n::text("调用来自尚未绑定的辅助模块"), 2 => zsdesk_core::i18n::text("此打开方式保持系统处理"),
+        3 => zsdesk_core::i18n::text("隐藏、最小化或特殊显示方式保持系统处理"), 4 => zsdesk_core::i18n::text("目标不是已核验的系统 Explorer"),
+        5 => zsdesk_core::i18n::text("参数不是受支持的文件夹或定位请求"), 6 => zsdesk_core::i18n::text("特殊启动标志保持原调用"), 7 => zsdesk_core::i18n::text("特殊启动信息保持原调用"),
+        8 => zsdesk_core::i18n::text("ANSI 参数无法无损转换"), 9 => zsdesk_core::i18n::text("文件或目录当前不可用"), 10 => zsdesk_core::i18n::text("未找到已核验的转发服务"),
+        11 => zsdesk_core::i18n::text("进程访问被拒绝"), 12 => zsdesk_core::i18n::text("访问较高权限进程被拒绝"), 13 => zsdesk_core::i18n::text("请求结果超时，未重复发送"),
+        14 => zsdesk_core::i18n::text("请求参数无效"), 15 => zsdesk_core::i18n::text("转发器文件身份已变化"), 16 => zsdesk_core::i18n::text("无法创建转发进程"),
+        17 | 1467 => zsdesk_core::i18n::text("请关闭对应应用、应用接管设置后再重新打开，原有转发保持不变"), _ => zsdesk_core::i18n::text("当前入口未提供具体诊断"),
     }, matches!(code, 17 | 1467))
 }
 pub fn request_apply(profile: &Path, window: HWND) -> Result<()> {
@@ -513,7 +476,7 @@ pub fn uninstall_owned(profile: &Path, exe: &Path) -> Result<()> {
 fn enqueue(profile: &Path, action: Action, window: HWND) -> Result<()> {
     let _init = WORKER_INIT
         .lock()
-        .map_err(|_| anyhow::anyhow!("控制队列不可用"))?;
+        .map_err(|_| anyhow::anyhow!("{}", zsdesk_core::tr_format!("控制队列不可用")))?;
     let worker = match WORKER.get() {
         Some(w) => w.clone(),
         None => {
@@ -533,7 +496,7 @@ fn enqueue(profile: &Path, action: Action, window: HWND) -> Result<()> {
     let mut queue = worker
         .pending
         .lock()
-        .map_err(|_| anyhow::anyhow!("控制队列不可用"))?;
+        .map_err(|_| anyhow::anyhow!("{}", zsdesk_core::tr_format!("控制队列不可用")))?;
     if matches!(action, Action::Refresh)
         && queue
             .iter()
@@ -541,7 +504,7 @@ fn enqueue(profile: &Path, action: Action, window: HWND) -> Result<()> {
     {
         return Ok(());
     }
-    ensure!(queue.len() < 16, "后台设置请求较多，请稍后重试");
+    ensure!(queue.len() < 16, "{}", zsdesk_core::tr_format!("后台设置请求较多，请稍后重试"));
     queue.push_back(Request {
         profile: profile.to_path_buf(),
         action,
@@ -571,7 +534,7 @@ fn run(worker: Arc<Worker>) {
         }
         let text = match result {
             Ok(text) => text,
-            Err(e) => format!("文件位置设置未完成：{e}"),
+            Err(e) => zsdesk_core::tr_format!("文件位置设置未完成：{e}" , e=e),
         };
         let hwnd = HWND(request.window as *mut _);
         let mut pid = 0;
@@ -602,21 +565,19 @@ fn apply_request(request: &Request) -> Result<String> {
             }
             let count = settings.applications.len();
             save_draft(&request.profile, &settings)?;
-            Ok(format!(
-                "已发现 {count} 个可配置应用，请勾选后点击“一键启用所选应用”"
-            ))
+            Ok(zsdesk_core::tr_format!("已发现 {count} 个可配置应用，请勾选后点击“一键启用所选应用”" , count=count))
         }
         Action::Add(path) => {
             let bundle = bundled()?;
             add(&mut settings, inspect(&bundle, path, None)?, true)?;
             save_draft(&request.profile, &settings)?;
-            Ok("应用已加入选择，点击“一键启用所选应用”生效".into())
+            Ok(zsdesk_core::i18n::text("应用已加入选择，点击“一键启用所选应用”生效").into())
         }
         Action::AddWithCaller(path, caller) => {
             let bundle = bundled()?;
             add(&mut settings, inspect(&bundle, path, Some(caller))?, true)?;
             save_draft(&request.profile, &settings)?;
-            Ok("辅助模块已加入草稿，应用后仅允许该模块和已核验的主程序转发文件导航".into())
+            Ok(zsdesk_core::i18n::text("辅助模块已加入草稿，应用后仅允许该模块和已核验的主程序转发文件导航").into())
         }
         Action::Apply => apply_settings(&request.profile, settings),
         Action::Disable => {
@@ -626,7 +587,7 @@ fn apply_request(request: &Request) -> Result<String> {
             settings.enabled = false;
             settings.pending_changes = false;
             save(&request.profile, &settings)?;
-            Ok("文件位置转发已停用，应用选择已保留".into())
+            Ok(zsdesk_core::i18n::text("文件位置转发已停用，应用选择已保留").into())
         }
         Action::Refresh => {
             refresh_target(&settings)?;
@@ -640,7 +601,7 @@ fn read_ini(path: &Path) -> Result<BTreeMap<String, String>> {
     }
     let data = bounded_read(path)?;
     let text = if data.starts_with(&[255, 254]) {
-        ensure!(data.len() % 2 == 0, "配置编码无效");
+        ensure!(data.len() % 2 == 0, "{}", zsdesk_core::tr_format!("配置编码无效"));
         String::from_utf16(
             &data[2..]
                 .chunks_exact(2)
@@ -676,10 +637,7 @@ fn utf16_file(path: &Path, text: &str) -> Result<()> {
 fn write_ini(path: &Path, map: &BTreeMap<String, String>) -> Result<()> {
     let mut text = String::from("[Routing]\r\n");
     for (k, v) in map {
-        ensure!(
-            !k.contains(['=', '\r', '\n']) && !v.contains(['\r', '\n']),
-            "配置包含非法换行"
-        );
+        ensure!(!k.contains(['=', '\r', '\n']) && !v.contains(['\r', '\n']), "{}", zsdesk_core::tr_format!("配置包含非法换行"));
         text.push_str(&format!("{k}={v}\r\n"));
     }
     utf16_file(path, &text)
@@ -719,35 +677,23 @@ fn refresh_target(settings: &Settings) -> Result<()> {
     Ok(())
 }
 fn validate_application(bundle: &Bundle, app: &mut Application, target_hash: &str) -> Result<()> {
-    ensure!(
-        app.executable.is_absolute()
+    ensure!(app.executable.is_absolute()
             && app.caller_module.is_absolute()
             && app.executable.to_string_lossy().encode_utf16().count() < 2048
-            && app.caller_module.to_string_lossy().encode_utf16().count() < 2048,
-        "应用路径无效或过长"
-    );
+            && app.caller_module.to_string_lossy().encode_utf16().count() < 2048, "{}", zsdesk_core::tr_format!("应用路径无效或过长"));
     let actual = inspect(bundle, &app.executable, Some(&app.caller_module))?;
-    ensure!(
-        actual.profile == app.profile,
-        "调用模块发生变化，请重新发现应用"
-    );
+    ensure!(actual.profile == app.profile, "{}", zsdesk_core::tr_format!("调用模块发生变化，请重新发现应用"));
     app.executable_sha256 = digest(&app.executable)?;
     app.caller_sha256 = digest(&app.caller_module)?;
-    ensure!(
-        app.executable_sha256 != target_hash,
-        "ZSDesk 不能作为自身的来源"
-    );
+    ensure!(app.executable_sha256 != target_hash, "{}", zsdesk_core::tr_format!("ZSDesk 不能作为自身的来源"));
     Ok(())
 }
 fn write_clients(path: &Path, apps: &[Application]) -> Result<()> {
     let selected: Vec<_> = apps.iter().filter(|a| a.enabled).collect();
     let mut text = format!("[Clients]\r\nCount={}\r\n", selected.len());
     for (i, a) in selected.iter().enumerate() {
-        ensure!(
-            !a.executable.to_string_lossy().contains(['\r', '\n'])
-                && !a.caller_module.to_string_lossy().contains(['\r', '\n']),
-            "应用路径无效"
-        );
+        ensure!(!a.executable.to_string_lossy().contains(['\r', '\n'])
+                && !a.caller_module.to_string_lossy().contains(['\r', '\n']), "{}", zsdesk_core::tr_format!("应用路径无效"));
         text.push_str(&format!("\r\n[Client.{i}]\r\nId={}\r\nProfile={}\r\nEnabled=1\r\nExecutable={}\r\nExecutableSHA256={}\r\nCallerModule={}\r\nCallerSHA256={}\r\n",a.id,a.profile,a.executable.display(),a.executable_sha256,a.caller_module.display(),a.caller_sha256));
     }
     utf16_file(path, &text)
@@ -758,10 +704,7 @@ fn copy_component(root: &Path, item: &Component, target: &Path) -> Result<()> {
         return Ok(());
     }
     let bytes = fs::read(&source)?;
-    ensure!(
-        format!("{:x}", Sha256::digest(&bytes)).eq_ignore_ascii_case(&item.sha256),
-        "组件正在变化"
-    );
+    ensure!(format!("{:x}", Sha256::digest(&bytes)).eq_ignore_ascii_case(&item.sha256), "{}", zsdesk_core::tr_format!("组件正在变化"));
     atomic(target, &bytes)
 }
 fn start_watch(controller: &Path) -> Result<()> {
@@ -778,9 +721,9 @@ fn start_watch(controller: &Path) -> Result<()> {
     let until = Instant::now() + Duration::from_secs(10);
     while !service_running(controller) {
         if let Some(status) = child.try_wait()? {
-            ensure!(status.success(), "转发服务启动失败");
+            ensure!(status.success(), "{}", zsdesk_core::tr_format!("转发服务启动失败"));
         }
-        ensure!(Instant::now() < until, "转发服务尚未准备好");
+        ensure!(Instant::now() < until, "{}", zsdesk_core::tr_format!("转发服务尚未准备好"));
         std::thread::sleep(Duration::from_millis(100));
     }
     Ok(())
@@ -789,8 +732,7 @@ fn import_legacy_choices(settings: &Settings) -> bool {
     settings.legacy && settings.applications.is_empty() && !settings.pending_changes
 }
 fn require_selected_applications(settings: &Settings) -> Result<()> {
-    ensure!(settings.applications.iter().any(|app| app.enabled) || import_legacy_choices(settings),
-            "请先勾选需要接管的应用");
+    ensure!(settings.applications.iter().any(|app| app.enabled) || import_legacy_choices(settings), "{}", zsdesk_core::tr_format!("请先勾选需要接管的应用"));
     Ok(())
 }
 #[derive(Deserialize)]
@@ -814,7 +756,7 @@ fn preflight_component_replacement(profile: &Path, bundle: &Bundle, settings: &S
     }
     let path = profile.with_file_name(format!("routing-upgrade-{}.pending.ini", std::process::id()));
     let mut bytes = vec![255, 254];for value in ini.encode_utf16() { bytes.extend(value.to_le_bytes()); }
-    let mut file = fs::OpenOptions::new().write(true).create_new(true).open(&path).context("无法创建组件预检查输入")?;
+    let mut file = fs::OpenOptions::new().write(true).create_new(true).open(&path).context(zsdesk_core::i18n::text("无法创建组件预检查输入"))?;
     let input = UpgradeInput { path, bytes };
     file.write_all(&input.bytes)?;file.sync_all()?;drop(file);
     let controller = component(&bundle.root, &bundle.manifest.controller)?;
@@ -822,12 +764,12 @@ fn preflight_component_replacement(profile: &Path, bundle: &Bundle, settings: &S
     let mut args = vec![std::ffi::OsStr::new("--upgrade-check"), input.path.as_os_str()];
     if previous.is_file() { args.push(previous.as_os_str()); }
     let result = output(&controller, &args)?;
-    ensure!(result.status.success() || result.status.code() == Some(1467), "无法核验已加载的组件，当前接管未更改：{}", String::from_utf8_lossy(&result.stdout).trim());
+    ensure!(result.status.success() || result.status.code() == Some(1467), "{}", zsdesk_core::tr_format!("无法核验已加载的组件，当前接管未更改：{}" , String::from_utf8_lossy(&result.stdout).trim()));
     let check: UpgradeCheck = json_output(&result)?;
-    ensure!(check.schema == "ZSDesk.RoutingUpgrade.v1", "组件预检查协议不兼容");
+    ensure!(check.schema == "ZSDesk.RoutingUpgrade.v1", "{}", zsdesk_core::tr_format!("组件预检查协议不兼容"));
     let names = check.processes.iter().map(|process| format!("{}（PID {}）", process.application, process.pid)).collect::<Vec<_>>().join("、");
-    ensure!(!check.restart_required, "请先关闭 {names}，应用新版接管后再重新打开；当前转发服务和绑定保持不变");
-    ensure!(result.status.success(), "无法核验已加载的转发组件，未更改当前接管");
+    ensure!(!check.restart_required, "{}", zsdesk_core::tr_format!("请先关闭 {names}，应用新版接管后再重新打开；当前转发服务和绑定保持不变" , names=names));
+    ensure!(result.status.success(), "{}", zsdesk_core::tr_format!("无法核验已加载的转发组件，未更改当前接管"));
     Ok(())
 }
 fn apply_settings(profile: &Path, mut settings: Settings) -> Result<String> {
@@ -846,10 +788,7 @@ fn apply_settings(profile: &Path, mut settings: Settings) -> Result<String> {
             }
         }
     }
-    ensure!(
-        settings.applications.iter().any(|a| a.enabled),
-        "请先勾选需要接管的应用"
-    );
+    ensure!(settings.applications.iter().any(|a| a.enabled), "{}", zsdesk_core::tr_format!("请先勾选需要接管的应用"));
     for app in settings.applications.iter_mut().filter(|a| a.enabled) {
         validate_application(&bundle, app, &target_hash)?;
     }
@@ -859,7 +798,7 @@ fn apply_settings(profile: &Path, mut settings: Settings) -> Result<String> {
         .and_then(|p| p.parent())
         .map(Path::to_path_buf)
         .unwrap_or_else(|| profile.parent().unwrap_or(Path::new(".")).join("routing"));
-    ensure!(directory.is_absolute(), "组件目录无效");
+    ensure!(directory.is_absolute(), "{}", zsdesk_core::tr_format!("组件目录无效"));
     fs::create_dir_all(&directory)?;
     let controller = directory.join(&bundle.manifest.controller.file);
     let adapter = directory.join(&bundle.manifest.adapter.file);
@@ -891,10 +830,7 @@ fn apply_settings(profile: &Path, mut settings: Settings) -> Result<String> {
         .map(|name| {
             let path = directory.join(name);
             let bytes = if path.exists() {
-                ensure!(
-                    path.metadata()?.len() <= 64 * 1024 * 1024,
-                    "现有路由组件异常过大"
-                );
+                ensure!(path.metadata()?.len() <= 64 * 1024 * 1024, "{}", zsdesk_core::tr_format!("现有路由组件异常过大"));
                 Some(fs::read(&path)?)
             } else {
                 None
@@ -908,7 +844,7 @@ fn apply_settings(profile: &Path, mut settings: Settings) -> Result<String> {
     for (path, data) in &saved {
         if let Some(data) = data {
             atomic(
-                &recovery.join(path.file_name().context("组件文件名无效")?),
+                &recovery.join(path.file_name().context(zsdesk_core::i18n::text("组件文件名无效"))?),
                 data,
             )?;
         }
@@ -977,7 +913,7 @@ fn apply_settings(profile: &Path, mut settings: Settings) -> Result<String> {
                 "TargetProfileDir".into(),
                 profile
                     .parent()
-                    .context("配置目录无效")?
+                    .context(zsdesk_core::i18n::text("配置目录无效"))?
                     .to_string_lossy()
                     .into_owned(),
             ),
@@ -1022,11 +958,7 @@ fn apply_settings(profile: &Path, mut settings: Settings) -> Result<String> {
                 }
             }
         }
-        ensure!(
-            restore_errors.is_empty(),
-            "启用失败：{error}；部分组件恢复需要处理：{}",
-            restore_errors.join("；")
-        );
+        ensure!(restore_errors.is_empty(), "{}", zsdesk_core::tr_format!("启用失败：{error}；部分组件恢复需要处理：{}" , restore_errors.join("；"), error=error));
         return Err(error);
     }
     let mut latest = load(profile)?;
@@ -1042,7 +974,7 @@ fn apply_settings(profile: &Path, mut settings: Settings) -> Result<String> {
     settings.enabled = true;
     settings.legacy = false;
     save(profile, &settings)?;
-    Ok("所选应用的文件位置转发已启用；未运行的应用将在启动后接入".into())
+    Ok(zsdesk_core::i18n::text("所选应用的文件位置转发已启用；未运行的应用将在启动后接入").into())
 }
 fn merge_after_apply(settings: &mut Settings, latest: Settings, document_changed: bool) {
     // Installing the new INI changes legacy runtime inference. That is not a

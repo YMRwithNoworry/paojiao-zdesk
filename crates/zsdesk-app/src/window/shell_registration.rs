@@ -43,7 +43,7 @@ impl WindowState {
             if let Some(mut registry)=self.shell_registry.take(){registry.stop();}
             let changed=default_profile&&executable.as_ref().is_some_and(|exe|zsdesk_windows::integration::folder_integration_needs_attention(exe));
             if changed&&!self.shell_registration_warning {
-                self.show_message("文件夹接管的处理程序或隐藏标志已被修改；可在“系统集成”中恢复后重新启用。".into());
+                self.show_message(zsdesk_core::i18n::text("文件夹接管的处理程序或隐藏标志已被修改；可在“系统集成”中恢复后重新启用。").into());
             }
             self.shell_registration_warning=changed;
             return;

@@ -96,7 +96,7 @@ pub(super) fn key(message:&MSG,slot:&Slot)->bool{
     if handled{LAST_REQUEST.with(|last|*last.borrow_mut()=Some(path));}
     if !handled{
         LAST_REQUEST.with(|last|*last.borrow_mut()=None);
-        if let Ok(mut slot)=slot.try_borrow_mut(){if let Some(state)=slot.as_mut(){state.show_message("QuickLook 未运行或不可用，已使用内置预览。".into());}}
+        if let Ok(mut slot)=slot.try_borrow_mut(){if let Some(state)=slot.as_mut(){state.show_message(zsdesk_core::i18n::text("QuickLook 未运行或不可用，已使用内置预览。").into());}}
     }
     // The caller opens its built-in preview when the optional bridge is absent.
     SPACE.with(|space|space.set(handled));handled

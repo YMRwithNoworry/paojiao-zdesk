@@ -1,5 +1,5 @@
 //! One application host per profile. Each native UI keeps its own STA/thread.
-use std::{cell::Cell,collections::VecDeque,ffi::OsString,path::{Path,PathBuf},sync::{mpsc,OnceLock},thread,time::{Duration,Instant}};
+use std::{cell::{Cell,RefCell},collections::VecDeque,ffi::OsString,path::{Path,PathBuf},sync::{mpsc,OnceLock},thread,time::{Duration,Instant}};
 use anyhow::{bail,Context,Result};
 use serde::{Deserialize,Serialize};
 use windows::{core::{w,PCWSTR},Win32::{Foundation::{CloseHandle,GetLastError,HANDLE,HWND,LPARAM,LRESULT,WPARAM,ERROR_ALREADY_EXISTS},System::{DataExchange::COPYDATASTRUCT,LibraryLoader::GetModuleHandleW,Threading::CreateMutexW},UI::WindowsAndMessaging::*}};
@@ -9,13 +9,23 @@ const MAGIC:usize=0x5a535254;
 const WAKE:u32=WM_APP+110;
 const DONE:u32=WM_APP+111;
 const POOL_WAKE:u32=WM_APP+112;
+const REFRESH_TRAY:u32=WM_APP+113;
+static EXIT_REQUESTED:std::sync::atomic::AtomicBool=std::sync::atomic::AtomicBool::new(false);
+pub fn exiting()->bool{EXIT_REQUESTED.load(std::sync::atomic::Ordering::Acquire)}
+pub fn refresh_tray(){if let Some((_,window))=LOCAL.get(){let _=unsafe{PostMessageW(Some(HWND(*window as*mut _)),REFRESH_TRAY,WPARAM(0),LPARAM(0))};}}
 const MAX_PACKET:usize=128*1024;
 const MAX_WINDOW_THREADS:usize=16;
+const MAX_IDLE_WINDOW_THREADS:usize=1;
+const WINDOW_IDLE_TIMEOUT:Duration=Duration::from_secs(30);
+fn idle_retirees(mut idle:Vec<(usize,Duration)>)->Vec<usize>{
+    idle.sort_by_key(|(_,age)|*age);
+    idle.into_iter().enumerate().filter_map(|(rank,(index,age))|(rank>=MAX_IDLE_WINDOW_THREADS||age>=WINDOW_IDLE_TIMEOUT).then_some(index)).collect()
+}
 const MAX_QUEUED_WINDOWS:usize=64;
 static LOCAL:OnceLock<(PathBuf,isize)>=OnceLock::new();
 #[derive(Serialize,Deserialize)]
 struct Request{args:Vec<OsString>}
-struct Ingress{profile:PathBuf,tx:mpsc::SyncSender<Request>,accepting:Cell<bool>}
+struct Ingress{profile:PathBuf,tx:mpsc::SyncSender<Request>,accepting:Cell<bool>,tray:RefCell<crate::explorer_tray::Tray>,quit:Cell<bool>}
 struct Kernel(HANDLE);
 impl Drop for Kernel{fn drop(&mut self){let _=unsafe{CloseHandle(self.0)};}}
 struct HostWindow(HWND);
@@ -42,7 +52,7 @@ pub fn enqueue_local(profile:&Path,mut args:Vec<OsString>)->Result<bool>{
     let Some((owned,window))=LOCAL.get()else{return Ok(false);};
     if !crate::explorer_forwarder::same_path(profile,owned){return Ok(false);}
     if !args.iter().any(|arg|arg=="--profile-dir"){
-        args.extend(["--profile-dir".into(),profile.parent().context("缺少配置目录")?.as_os_str().to_owned()]);
+        args.extend(["--profile-dir".into(),profile.parent().context(zsdesk_core::i18n::text("缺少配置目录"))?.as_os_str().to_owned()]);
     }
     if !send(HWND(*window as*mut _),&args)?{bail!("ZSDesk 暂时无法接收启动请求");}Ok(true)
 }
@@ -61,6 +71,26 @@ unsafe extern "system" fn procedure(hwnd:HWND,message:u32,wp:WPARAM,lp:LPARAM)->
                 &&state.tx.try_send(request).is_ok(){let _=unsafe{PostMessageW(Some(hwnd),WAKE,WPARAM(0),LPARAM(0))};return LRESULT(1);}
         }return LRESULT(0);
     }
+    let pointer=unsafe{GetWindowLongPtrW(hwnd,GWLP_USERDATA)}as*const Ingress;
+    if !pointer.is_null(){
+        let state=unsafe{&*pointer};
+        if message==crate::update_shutdown::message()||(message==WM_ENDSESSION&&wp.0!=0){state.quit.set(true);return LRESULT(0);}
+        if message==WM_QUERYENDSESSION{return LRESULT(1);}
+        let recreated=message==unsafe{RegisterWindowMessageW(w!("TaskbarCreated"))};
+        if message==REFRESH_TRAY||recreated{
+            let enabled=!state.quit.get()&&crate::storage::load(&state.profile).is_ok_and(|session|session.ui.explorer_tray);
+            let mut tray=state.tray.borrow_mut();if recreated{tray.recreated();}tray.update(hwnd,enabled);return LRESULT(0);
+        }
+        if message==crate::explorer_tray::MESSAGE{
+            let action={state.tray.borrow().action(wp,lp)};
+            let choice=match action{Some(crate::explorer_tray::Action::Open)=>1,Some(crate::explorer_tray::Action::Menu)=>crate::explorer_tray::menu(hwnd),None=>0};
+            if choice==3{state.quit.set(true);}else if choice==1||choice==2{
+                let mut args=vec!["--profile-dir".into(),state.profile.parent().unwrap().as_os_str().to_owned()];if choice==2{args.push("--new-window".into());}
+                let _=state.tx.try_send(Request{args});
+            }
+            state.tray.borrow().focus();return LRESULT(0);
+        }
+    }
     if message==WM_CLOSE{return LRESULT(0);}
     unsafe{DefWindowProcW(hwnd,message,wp,lp)}
 }
@@ -68,7 +98,7 @@ struct Worker{id:u64,kind:&'static str,ending:bool,thread:thread::JoinHandle<()>
 struct WindowJob{id:u64,args:Vec<OsString>}
 enum PoolCommand{Run(WindowJob),Stop}
 struct WindowWorker{
-    id:u64,thread_id:Option<u32>,job:Option<u64>,requests:u64,ending:bool,
+    id:u64,thread_id:Option<u32>,job:Option<u64>,requests:u64,ending:bool,idle_since:Option<Instant>,
     commands:mpsc::SyncSender<PoolCommand>,thread:thread::JoinHandle<()>,
 }
 enum Notice{
@@ -97,7 +127,7 @@ fn run_window_pool(id:u64,destination:isize,commands:mpsc::Receiver<PoolCommand>
     notify(destination,sender,Notice::PoolReady(id,unsafe{windows::Win32::System::Threading::GetCurrentThreadId()}));
     loop{
         loop{match commands.try_recv(){
-            Ok(PoolCommand::Stop)=>return Ok(()),
+            Ok(PoolCommand::Stop)=>{zsdesk_windows::shell::file_transfer::persist_thread_clipboard()?;return Ok(());},
             Ok(PoolCommand::Run(job))=>{
                 trace(&format!("window-job-start {} pool={id}",job.id));
                 let result=std::panic::catch_unwind(||crate::app::run_arguments(job.args,true));
@@ -131,7 +161,7 @@ fn spawn_window_pool(id:u64,job:WindowJob,destination:isize,sender:mpsc::Sender<
         let error=match result{Ok(Ok(()))=>None,Ok(Err(error))=>Some(format!("{error:#}")),Err(_)=>Some("文件窗口线程池异常退出".into())};
         notify(destination,&sender,Notice::PoolReturned(id,error));
     })?;
-    Ok(WindowWorker{id,thread_id:None,job:Some(job_id),requests:1,ending:false,commands,thread})
+    Ok(WindowWorker{id,thread_id:None,job:Some(job_id),requests:1,ending:false,idle_since:None,commands,thread})
 }
 pub(crate) fn trace(stage:&str){
     if let Some(path)=std::env::var_os("ZSDESK_RUNTIME_TRACE"){
@@ -146,7 +176,7 @@ fn status(profile:&Path,workers:&[Worker],pool:&[WindowWorker],queued:usize,erro
     components.extend(pool.iter().filter(|worker|worker.job.is_some()&&!worker.ending).map(|_|"window"));
     let value=serde_json::json!({"schema":1,"pid":std::process::id(),"version":env!("CARGO_PKG_VERSION"),"components":components,"last_error":error,
         "window_pool":pool.iter().map(|worker|serde_json::json!({"id":worker.id,"thread_id":worker.thread_id,"active":worker.job.is_some(),"requests":worker.requests,"stopping":worker.ending})).collect::<Vec<_>>(),
-        "queued_window_requests":queued,"max_window_threads":MAX_WINDOW_THREADS,"retiring_menu_threads":crate::desktop::pending_menu_threads(),
+        "queued_window_requests":queued,"max_window_threads":MAX_WINDOW_THREADS,"max_idle_window_threads":MAX_IDLE_WINDOW_THREADS,"window_idle_timeout_seconds":WINDOW_IDLE_TIMEOUT.as_secs(),"retiring_menu_threads":crate::desktop::pending_menu_threads(),
         "pending_file_operations":zsdesk_windows::shell::file_transfer::pending_operations(),"pending_extension_workers":crate::context_menu_process::pending_workers(),
         "pending_search_workers":crate::fast_search::pending_workers()});
     if let Ok(bytes)=serde_json::to_vec(&value){
@@ -172,7 +202,8 @@ pub fn run(profile:PathBuf,args:Vec<OsString>)->Result<()>{
     // until every component has released its Shell/Office interfaces.
     unsafe{windows::Win32::System::Ole::OleInitialize(None)}?;let _apartment=Apartment;
     let _menus=zsdesk_windows::shell::menu::SharedMenuRuntime::new();
-    let (tx,rx)=mpsc::sync_channel(64);let mut ingress=Box::new(Ingress{profile:profile.clone(),tx,accepting:Cell::new(true)});
+    if let Ok(exe)=std::env::current_exe(){let _=zsdesk_windows::taskbar::repair_taskbar_shortcuts(&exe,crate::edition::application_id());}
+    let (tx,rx)=mpsc::sync_channel(64);let mut ingress=Box::new(Ingress{profile:profile.clone(),tx,accepting:Cell::new(true),tray:RefCell::new(Default::default()),quit:Cell::new(false)});
     let module=unsafe{GetModuleHandleW(None)}?;let instance=windows::Win32::Foundation::HINSTANCE(module.0);
     unsafe{RegisterClassW(&WNDCLASSW{lpfnWndProc:Some(procedure),hInstance:instance,lpszClassName:CLASS,..Default::default()});}
     let window=HostWindow(unsafe{CreateWindowExW(WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE,CLASS,w!("ZSdesk"),WS_POPUP,0,0,0,0,None,None,Some(instance),Some((&mut*ingress as*mut Ingress).cast()))}?);
@@ -182,11 +213,19 @@ pub fn run(profile:PathBuf,args:Vec<OsString>)->Result<()>{
         Ok(server)=>server,
         Err(error)=>{crate::window::diagnostics::record("folder-dde","startup-failed",None);trace(&format!("folder DDE startup: {error:#}"));None},
     };
+    ingress.tray.borrow_mut().update(hwnd,crate::storage::load(&profile).is_ok_and(|session|session.ui.explorer_tray));
     ingress.tx.try_send(Request{args}).context("初始启动请求失败")?;
     let (finished_tx,finished_rx)=mpsc::channel::<Notice>();let mut workers:Vec<Worker>=Vec::new();let mut pool:Vec<WindowWorker>=Vec::new();
-    let mut queued:VecDeque<WindowJob>=VecDeque::new();let mut last_error=None;let mut serial=0u64;let mut shutting_down=false;let mut previous_status=None;let mut accepted_request=None;
+    let mut queued:VecDeque<WindowJob>=VecDeque::new();let mut last_error=None;let mut serial=0u64;let mut shutting_down=false;let mut previous_status=None;let mut accepted_request=None;let mut quit_started=false;
     loop{
-        while queued.len()<MAX_QUEUED_WINDOWS{let Some(request)=accepted_request.take().or_else(||rx.try_recv().ok())else{break;};
+        if ingress.quit.get()&&!quit_started{
+            quit_started=true;EXIT_REQUESTED.store(true,std::sync::atomic::Ordering::Release);ingress.accepting.set(false);
+            ingress.tray.borrow_mut().remove();queued.clear();accepted_request=None;while rx.try_recv().is_ok(){}
+            let _=crate::quick_search::control::signal(&profile,"stop");
+            if let Ok(exe)=std::env::current_exe(){crate::update_shutdown::request_windows(&exe);}
+            crate::context_menu_process::shutdown_idle_worker();
+        }
+        while !quit_started&&queued.len()<MAX_QUEUED_WINDOWS{let Some(request)=accepted_request.take().or_else(||rx.try_recv().ok())else{break;};
             // Draining extension dialogs or STA finalizers must not leave a
             // profile permanently rejecting new file windows. Retiring workers
             // remain retired; the new request gets a live/fresh worker.
@@ -211,7 +250,7 @@ pub fn run(profile:PathBuf,args:Vec<OsString>)->Result<()>{
             Notice::PoolReady(id,thread_id)=>if let Some(worker)=pool.iter_mut().find(|worker|worker.id==id){worker.thread_id=Some(thread_id);},
             Notice::WindowReturned(id,job,error)=>{
                 if error.is_some(){last_error=error;}
-                if let Some(worker)=pool.iter_mut().find(|worker|worker.id==id&&worker.job==Some(job)){worker.job=None;}
+                if let Some(worker)=pool.iter_mut().find(|worker|worker.id==id&&worker.job==Some(job)){worker.job=None;worker.idle_since=Some(Instant::now());}
             }
             Notice::PoolReturned(id,error)=>{
                 if error.is_some(){last_error=error;}
@@ -224,7 +263,7 @@ pub fn run(profile:PathBuf,args:Vec<OsString>)->Result<()>{
             if let Some(index)=pool.iter().position(|worker|worker.job.is_none()&&!worker.ending){
                 let job=queued.pop_front().unwrap();let id=job.id;let worker=&mut pool[index];
                 match worker.commands.try_send(PoolCommand::Run(job)){
-                    Ok(())=>{worker.job=Some(id);worker.requests+=1;if let Err(error)=wake_pool(worker){last_error=Some(format!("文件窗口唤醒失败：{error:#}"));}}
+                    Ok(())=>{worker.job=Some(id);worker.idle_since=None;worker.requests+=1;if let Err(error)=wake_pool(worker){last_error=Some(format!("文件窗口唤醒失败：{error:#}"));}}
                     Err(error)=>{
                         let command=match error{mpsc::TrySendError::Full(command)|mpsc::TrySendError::Disconnected(command)=>command};
                         if let PoolCommand::Run(job)=command{queued.push_front(job);}
@@ -238,10 +277,17 @@ pub fn run(profile:PathBuf,args:Vec<OsString>)->Result<()>{
                 }
             }else{break;}
         }
+        let idle=pool.iter().enumerate().filter(|(_,worker)|worker.job.is_none()&&!worker.ending)
+            .filter_map(|(index,worker)|worker.idle_since.map(|since|(index,since.elapsed()))).collect();
+        for index in idle_retirees(idle){
+            let worker=&mut pool[index];worker.ending=true;let _=worker.commands.try_send(PoolCommand::Stop);
+            if let Err(error)=wake_pool(worker){last_error=Some(format!("文件窗口线程退出通知失败：{error:#}"));}
+        }
+        unsafe{if pool.iter().any(|worker|worker.job.is_none()&&!worker.ending&&worker.idle_since.is_some()){SetTimer(Some(hwnd),2,1000,None);}else{let _=KillTimer(Some(hwnd),2);}}
         // Idle STAs stay reusable while a desktop/background component or
         // another window remains alive. Once the last component ends, retire
         // the pool while the host's first STA continues pumping COM messages.
-        if !shutting_down&&workers.is_empty()&&queued.is_empty()&&pool.iter().all(|worker|worker.job.is_none()){
+        if !shutting_down&&!ingress.tray.borrow().enabled()&&workers.is_empty()&&queued.is_empty()&&pool.iter().all(|worker|worker.job.is_none()){
             shutting_down=true;
             crate::context_menu_process::shutdown_idle_worker();
             for worker in &mut pool{
@@ -274,7 +320,17 @@ pub fn run(profile:PathBuf,args:Vec<OsString>)->Result<()>{
     drop(folder_dde);
     crate::context_menu_process::shutdown_idle_worker();
     crate::window::diagnostics::flush_at_shutdown();
-    drop(window);drop(ingress);
+    ingress.tray.borrow_mut().remove();drop(window);drop(ingress);
     if let Err(error)=crate::fast_search::everything::shutdown_managed_if_unused(){trace(&format!("Everything shutdown: {error:#}"));}
     if let Some(error)=last_error{bail!("{error}");}Ok(())
+}
+
+#[cfg(test)]mod idle_pool_tests{
+    use super::*;
+    #[test]fn retain_one_recent_idle_sta_and_retire_only_the_idle_candidates(){
+        assert_eq!(idle_retirees(vec![(7,Duration::from_secs(4)),(2,Duration::from_secs(1)),(9,Duration::from_secs(8))]),vec![7,9]);
+        assert!(idle_retirees(vec![(3,Duration::from_secs(29))]).is_empty());
+        assert_eq!(idle_retirees(vec![(3,Duration::from_secs(30))]),vec![3]);
+        assert!(idle_retirees(Vec::new()).is_empty());
+    }
 }

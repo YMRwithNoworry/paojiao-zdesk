@@ -147,9 +147,10 @@ fn release_window_properties(hwnd:HWND){
 }
 
 pub(crate) fn shortcut_help_text()->&'static str{
-    let text=input::SHORTCUTS;
-    if crate::edition::DESKTOP_ONLY{text.find("桌面格子").map(|at|&text[at..]).unwrap_or(text)}
-    else if crate::edition::DESKTOP{text}else{text.split("\n\n桌面格子").next().unwrap_or(text)}
+    let text=zsdesk_core::i18n::text(input::SHORTCUTS);
+    let desktop=zsdesk_core::i18n::text("桌面格子");
+    if crate::edition::DESKTOP_ONLY{text.find(desktop).map(|at|&text[at..]).unwrap_or(text)}
+    else if crate::edition::DESKTOP{text}else{text.split(desktop).next().unwrap_or(text).trim_end()}
 }
 
 #[cfg(test)]pub(crate) fn verify_builtin_preview_without_handlers(owner:HWND,path:&std::path::Path)->Result<()>{
@@ -164,9 +165,10 @@ pub fn run(session: ExplorerSession, config_path: PathBuf, selection: Option<std
     unsafe { OleInitialize(None).context("OleInitialize failed")?; }
     let result = unsafe { run_inner(session, config_path, selection, modern, secondary_window,focus_search) };
     crate::runtime::trace("window-loop-return");
+    let clipboard=zsdesk_windows::shell::file_transfer::persist_thread_clipboard();
     unsafe { OleUninitialize(); }
     crate::runtime::trace("window-ole-uninit-return");
-    result
+    result.and(clipboard.map(|_|()).map_err(Into::into))
 }
 
 unsafe fn run_inner(session: ExplorerSession, config_path: PathBuf, selection: Option<std::ffi::OsString>, modern: bool, secondary_window: bool,focus_search:Option<bool>) -> Result<()> {
@@ -198,13 +200,14 @@ unsafe fn run_window(session: ExplorerSession, config_path: PathBuf, selection: 
     let _ = unsafe { SetWindowPos(hwnd, None, 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE) };
     let created = slot.borrow_mut().as_mut().map(|s| unsafe { s.create(hwnd) });
     if let Some(Err(error)) = created {
-        let text = wide(&format!("无法创建文件管理窗口：{error:#}"));
+        let text = wide(&zsdesk_core::tr_format!("无法创建文件管理窗口：{error:#}", error=error));
         unsafe { MessageBoxW(Some(hwnd), pcwstr(&text), PCWSTR(wide("ZSDesk").as_ptr()), MB_OK | MB_ICONERROR); }
         let _ = unsafe { DestroyWindow(hwnd) };
         return Err(error);
     }
     flush_deferred(hwnd,true);
     // Before the first show, so the taskbar button is created in the pin's group.
+    if !cfg!(test){if let Ok(exe)=std::env::current_exe(){let _=zsdesk_windows::taskbar::repair_taskbar_shortcuts(&exe,crate::edition::application_id());}}
     if let Some((command,icon))=&relaunch{
         let _=zsdesk_windows::taskbar::set_identity(hwnd,&zsdesk_windows::taskbar::Identity{app_id:crate::edition::application_id(),
             relaunch_command:command,display_name:"ZSDesk",icon});
@@ -274,7 +277,7 @@ unsafe fn run_window(session: ExplorerSession, config_path: PathBuf, selection: 
             if msg.wParam.0==VK_SPACE.0 as usize {
                 let request=preview_process::selected_preview_request(&slot);
                 if let Some((path,provider,dark))=request {
-                    match preview_process::PreviewProcess::open_with_options(hwnd,&path,provider,dark,false){Ok(preview)=>quick_preview=Some(preview),Err(error)=>{if let Ok(mut s)=slot.try_borrow_mut(){if let Some(s)=s.as_mut(){s.show_message(format!("无法预览：{error}"));}}}}
+                    match preview_process::PreviewProcess::open_with_options(hwnd,&path,provider,dark,false){Ok(preview)=>quick_preview=Some(preview),Err(error)=>{if let Ok(mut s)=slot.try_borrow_mut(){if let Some(s)=s.as_mut(){s.show_message(zsdesk_core::tr_format!("无法预览：{error}", error=error));}}}}
                     continue;
                 }
             }
@@ -288,7 +291,7 @@ unsafe fn run_window(session: ExplorerSession, config_path: PathBuf, selection: 
         if msg.message == WM_KEYDOWN || msg.message == WM_SYSKEYDOWN {
             if let Some(action) = keyboard::resolve(msg.wParam.0 as u16, modifiers, true, editing) {
                 let loading=slot.try_borrow().ok().is_some_and(|s|s.as_ref().is_some_and(|state|state.file_input_loading(msg.hwnd)));
-                if loading{if let Ok(mut slot)=slot.try_borrow_mut(){if let Some(state)=slot.as_mut(){state.show_message("文件夹正在加载，请完成后再操作".into());}}continue;}
+                if loading{if let Ok(mut slot)=slot.try_borrow_mut(){if let Some(state)=slot.as_mut(){state.show_message(zsdesk_core::i18n::text("文件夹正在加载，请完成后再操作").into());}}continue;}
                 let view = slot.try_borrow().ok().and_then(|s| s.as_ref().and_then(|s| s.keyboard_view(&msg, true)));
                 if let Some(view) = view {
                     // Shell verbs can enter COM/modal loops: release the state borrow first.
@@ -434,6 +437,7 @@ struct WindowState {
     tab_drag: Option<TabDrag>,
     bookmark_drag:Option<BookmarkDrag>,
     splitter_drag: Option<(i32, i32)>,
+    bookmark_resize: Option<(i32,i32)>,
     side_tab_resize:Option<(i32,i32)>,
     side_tab_scroll_drag:Option<(i32,usize)>,
     side_tab_first:Option<usize>,
@@ -492,7 +496,7 @@ impl WindowState {
             tooltip: HWND::default(), tooltip_text: vec![0], font: HFONT::default(), gfx: None, surface: None,
             palette: Palette::light(), dark: false, mica: false, active: true, layout: ChromeLayout::default(),
             crumbs: Vec::new(), crumb_slots: Vec::new(), crumbs_for: None, address_editing: false, open_chevron: None,
-            hover: Hit::None, hover_crumb: None, pressed: None, tracking_mouse: false, tab_drag: None,bookmark_drag:None, splitter_drag: None,
+            hover: Hit::None, hover_crumb: None, pressed: None, tracking_mouse: false, tab_drag: None,bookmark_drag:None, splitter_drag: None,bookmark_resize:None,
             side_tab_resize:None,side_tab_scroll_drag:None,side_tab_first:None,side_tab_wheel:0,
             icons: HashMap::new(), view_status: ViewStatus::default(), view_mode: (0, 0), bookmark_widths: Vec::new(),bookmark_order:Vec::new(),
             drop_registration: None, drop_zones: Rc::new(Cell::new(DropZones::default())), last_focus: HWND::default(),
@@ -526,7 +530,7 @@ impl WindowState {
         let preferred_show=if self.session.ui.window.is_some_and(|p|p.maximized){SW_SHOWMAXIMIZED.0}else{SW_SHOWNORMAL.0};
         unsafe{SetPropW(hwnd,windows::core::w!("ZSDesk.PreferredShow"),Some(windows::Win32::Foundation::HANDLE(preferred_show as usize as *mut _)))?;}
         let (family, _) = zsdesk_windows::gfx::system_ui_font(Some(hwnd));
-        self.gfx = Some(Gfx::new(&family).context("Direct2D 初始化失败")?);
+        self.gfx = Some(Gfx::new(&family).context(zsdesk_core::i18n::text("Direct2D 初始化失败"))?);
         // Menus are drawn, not created by Win32: prepare them before first use.
         zsdesk_windows::flyout::prepare();
         self.address_edit = unsafe { child(hwnd, "EDIT", "", ID_ADDRESS, ES_AUTOHSCROLL as u32, false)? };
@@ -555,10 +559,10 @@ impl WindowState {
         if self.picker.is_none(){
             self.check_integration();
             if let Err(error) = crate::routing_control::refresh_owned_target(&self.config_path, hwnd) {
-                self.show_message(format!("文件位置绑定检查失败：{error}"));
+                self.show_message(zsdesk_core::tr_format!("文件位置绑定检查失败：{error}", error=error));
             }
             if let Err(error) = crate::quick_search::start_if_enabled(&self.config_path) {
-                self.show_message(format!("后台搜索启动失败：{error:#}"));
+                self.show_message(zsdesk_core::tr_format!("后台搜索启动失败：{error:#}", error=error));
             }
             crate::update_check::start_daily(&self.config_path,hwnd);
         }
@@ -575,7 +579,7 @@ impl WindowState {
         if level==Integration::Default {
             if let Ok(exe)=std::env::current_exe(){
                 if let Err(error)=integration::upgrade_default(&exe,&self.config_path.with_file_name("takeover-backup.json")) {
-                    self.show_message(format!("系统打开接管尚未更新：{error}"));
+                    self.show_message(zsdesk_core::tr_format!("系统打开接管尚未更新：{error}", error=error));
                 }
             }
         }
@@ -584,7 +588,7 @@ impl WindowState {
         if std::path::Path::new(&registered).exists() { return; }
         if let Ok(exe) = std::env::current_exe() {
             let backup = self.config_path.with_file_name("takeover-backup.json");
-            if integration::apply(level, &exe, &backup).is_err() { self.show_message("系统集成需要修复：请在 ≡ → 系统集成 中重新选择".into()); }
+            if integration::apply(level, &exe, &backup).is_err() { self.show_message(zsdesk_core::i18n::text("系统集成需要修复：请在 ≡ → 系统集成 中重新选择").into()); }
         }
     }
 
@@ -632,7 +636,7 @@ impl WindowState {
             tab_count: self.session.tabs.len(), active_tab: self.session.active_tab,
             show_tab_list:self.session.ui.tab_count_button_visible(),
             show_tree: self.session.ui.show_tree && self.tree.is_some() && (!self.session.ui.show_preview || width>=self.s(if self.session.ui.tab_placement==zsdesk_core::model::explorer::TabPlacement::Top{900}else{1110})), tree_width: self.s(self.session.ui.tree_width),
-            show_bookmarks: self.session.ui.show_bookmarks,bookmarks_on_right:self.session.ui.bookmarks_on_right, status_bar: true, bookmark_widths: &self.bookmark_widths,
+            show_bookmarks: self.session.ui.show_bookmarks,bookmarks_on_right:self.session.ui.bookmarks_on_right,bookmarks_width:self.s(self.session.ui.bookmarks_width), status_bar: true, bookmark_widths: &self.bookmark_widths,
         };
         let mut layout=ChromeLayout::new(&input);
         layout.retain_tab_viewport(&self.layout,self.session.tabs.len(),self.session.active_tab);
@@ -734,7 +738,7 @@ impl WindowState {
         }
         let (normal, focused, text) = (colorref(self.palette.input), colorref(self.palette.input_focused), colorref(self.palette.text));
         let _=replace_edit_colors(self.hwnd,normal,focused,text);
-        let cue = wide(&format!("搜索 {}", self.current_location().title()));
+        let cue = wide(&zsdesk_core::tr_format!("搜索 {}", self.current_location().title()));
         unsafe { SendMessageW(self.search_edit, EM_SETCUEBANNER, Some(WPARAM(1)), Some(LPARAM(cue.as_ptr() as isize))); }
         // Chrome owns the edit surface and border. An Explorer-themed native
         // edit paints another theme-dependent layer over this explicit palette.
@@ -826,13 +830,13 @@ impl WindowState {
                 }
                 self.bookmarks_saved=bookmarks;
             },
-            Err(e)=>self.show_message(format!("保存会话失败：{e}")),
+            Err(e)=>self.show_message(zsdesk_core::tr_format!("保存会话失败：{e}", e=e)),
         }
     }
 
     fn toggle_file_dialog_takeover(&mut self){
         let value=!storage::load(&self.config_path).map_or(self.session.ui.file_dialog_takeover,|saved|saved.ui.file_dialog_takeover);
-        match storage::save_file_dialog_takeover(&self.config_path,value){Ok(())=>{self.session.ui.file_dialog_takeover=value;let _=crate::quick_search::start_if_enabled(&self.config_path);},Err(error)=>self.show_message(format!("无法保存文件选择设置：{error}"))}
+        match storage::save_file_dialog_takeover(&self.config_path,value){Ok(())=>{self.session.ui.file_dialog_takeover=value;let _=crate::quick_search::start_if_enabled(&self.config_path);},Err(error)=>self.show_message(zsdesk_core::tr_format!("无法保存文件选择设置：{error}", error=error))}
     }
 
     fn remember_placement(&mut self) {
@@ -926,7 +930,7 @@ fn caption_rects(hwnd:HWND)->Option<[LayoutRect;3]>{
     }
     let width=scale(46,dpi);Some([0,1,2].map(|i|LayoutRect::new(client.right-width*(3-i),0,width,scale(STRIP_H,dpi))))
 }
-fn caption_hit(hwnd:HWND,mut point:POINT)->Option<u32>{
+fn painted_caption_hit(hwnd:HWND,mut point:POINT)->Option<u32>{
     unsafe{ScreenToClient(hwnd,&mut point)}.ok().ok()?;
     let mut buttons=caption_rects(hwnd)?;
     if screen_edge_window(hwnd){
@@ -935,11 +939,24 @@ fn caption_hit(hwnd:HWND,mut point:POINT)->Option<u32>{
     }
     buttons.iter().zip([HTMINBUTTON,HTMAXBUTTON,HTCLOSE]).find_map(|(rect,hit)|rect.contains(point.x,point.y).then_some(hit))
 }
+fn caption_hit(hwnd:HWND,point:POINT)->Option<u32>{
+    let fallback=painted_caption_hit(hwnd,point);
+    if native_caption(hwnd){
+        let position=LPARAM(((point.x as u16 as u32)|((point.y as u16 as u32)<<16))as isize);
+        let mut result=LRESULT(0);
+        if unsafe{DwmDefWindowProc(hwnd,WM_NCHITTEST,WPARAM(0),position,&mut result)}.as_bool(){
+            let padding=if caption_padding_hit(hwnd,point){fallback}else{None};
+            let hit=geometry::native_caption_hit(result.0,padding)as u32;
+            return [HTMINBUTTON,HTMAXBUTTON,HTCLOSE].contains(&hit).then_some(hit);
+        }
+    }
+    fallback
+}
 fn screen_edge_window(hwnd:HWND)->bool{
     window_actions::fullscreen(hwnd)||unsafe{IsZoomed(hwnd)}.as_bool()
 }
 fn caption_padding_hit(hwnd:HWND,mut point:POINT)->bool{
-    if !screen_edge_window(hwnd)||caption_hit(hwnd,point).is_none(){return false;}
+    if !screen_edge_window(hwnd)||painted_caption_hit(hwnd,point).is_none(){return false;}
     if !unsafe{ScreenToClient(hwnd,&mut point)}.as_bool(){return false;}
     caption_rects(hwnd).is_some_and(|buttons|buttons.iter().all(|rect|!rect.contains(point.x,point.y)))
 }
@@ -952,6 +969,30 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
     if msg==WM_NCDESTROY{release_window_properties(hwnd);}
     let native_caption = native_caption(hwnd);
     let caption_message = matches!(msg, WM_NCHITTEST | WM_NCMOUSEMOVE | WM_NCMOUSELEAVE | WM_NCLBUTTONDOWN | WM_NCLBUTTONUP | WM_NCLBUTTONDBLCLK);
+    let owns_caption_press=!unsafe{GetPropW(hwnd,windows::core::w!("ZSDesk.CaptionPress"))}.0.is_null();
+    let padding_press=msg==WM_NCLBUTTONDOWN&&caption_padding_hit(hwnd,POINT{x:x_lparam(lp.0),y:y_lparam(lp.0)});
+    // Native buttons must share DWM's exact hit map with DWM's own drawing.
+    // An aggregate caption rectangle split into thirds is only a fallback for
+    // painted buttons; it must not override native button widths or hover.
+    if native_caption && caption_message && (!owns_caption_press||msg==WM_NCMOUSELEAVE) && !padding_press {
+        let mut result = LRESULT(0);
+        if unsafe { DwmDefWindowProc(hwnd, msg, wp, lp, &mut result) }.as_bool() {
+            if msg==WM_NCHITTEST{
+                let point=POINT{x:x_lparam(lp.0),y:y_lparam(lp.0)};
+                let padding=caption_padding_hit(hwnd,point).then(||painted_caption_hit(hwnd,point)).flatten();
+                result=LRESULT(geometry::native_caption_hit(result.0,padding));
+                if unsafe{IsZoomed(hwnd)}.as_bool()&&geometry::is_resize_hit(result.0 as u32){return unsafe{hit_test(hwnd,lp)};}
+            }
+            return result;
+        }
+    }
+    // Keep the native pressed/hover tracking loop outside the WindowState
+    // borrow. Only painted buttons and extra screen-edge pixels need capture.
+    if native_caption&&!owns_caption_press&&!padding_press
+        &&matches!(msg,WM_NCLBUTTONDOWN|WM_NCLBUTTONUP|WM_NCLBUTTONDBLCLK)
+        &&[HTMINBUTTON,HTMAXBUTTON,HTCLOSE].contains(&(wp.0 as u32)){
+        return unsafe{DefWindowProcW(hwnd,msg,wp,lp)};
+    }
     if msg==WM_NCHITTEST&&screen_edge_window(hwnd){
         let mut point=POINT{x:x_lparam(lp.0),y:y_lparam(lp.0)};
         if let Some(hit)=caption_hit(hwnd,point){return LRESULT(hit as isize);}
@@ -960,15 +1001,6 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
             if !pointer.is_null(){if let Ok(slot)=unsafe{&*pointer}.try_borrow(){
                 if slot.as_ref().is_some_and(|state|matches!(state.chrome_hit(point.x,point.y),Hit::Tab(_)|Hit::TabClose(_))){return LRESULT(HTCLIENT as isize);}
             }}
-        }
-    }
-    let owns_caption_press=!unsafe{GetPropW(hwnd,windows::core::w!("ZSDesk.CaptionPress"))}.0.is_null();
-    let padding_press=msg==WM_NCLBUTTONDOWN&&caption_padding_hit(hwnd,POINT{x:x_lparam(lp.0),y:y_lparam(lp.0)});
-    if native_caption && caption_message && !owns_caption_press && !padding_press {
-        let mut result = LRESULT(0);
-        if unsafe { DwmDefWindowProc(hwnd, msg, wp, lp, &mut result) }.as_bool() {
-            if msg==WM_NCHITTEST&&unsafe{IsZoomed(hwnd)}.as_bool()&&geometry::is_resize_hit(result.0 as u32){return unsafe{hit_test(hwnd,lp)};}
-            return result;
         }
     }
     if msg==WM_APPCOMMAND&&mouse_navigation::app_command(hwnd,wp,lp){return LRESULT(1);}
@@ -1004,7 +1036,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
     // DwmDefWindowProc has already had first refusal for a native caption.
     // When it declines button input, keep the same explicit fallback used by
     // the painted caption instead of entering DefWindowProc's tracking loop.
-    if msg==WM_NCLBUTTONDOWN&&[HTMINBUTTON,HTMAXBUTTON,HTCLOSE].contains(&(wp.0 as u32)){
+    if matches!(msg,WM_NCLBUTTONDOWN|WM_NCLBUTTONDBLCLK)&&[HTMINBUTTON,HTMAXBUTTON,HTCLOSE].contains(&(wp.0 as u32)){
         unsafe{SetPropW(hwnd,windows::core::w!("ZSDesk.CaptionPress"),Some(windows::Win32::Foundation::HANDLE(wp.0 as*mut _))).ok();SetCapture(hwnd);}
         track_caption_buttons(hwnd,msg,wp);return LRESULT(0);
     }
@@ -1188,7 +1220,7 @@ fn track_caption_buttons(hwnd: HWND, msg: u32, wp: WPARAM) {
             let _ = unsafe { TrackMouseEvent(&mut track) };
             (if is_button { code } else { 0 }, pressed && is_button && code == old)
         }
-        WM_NCLBUTTONDOWN => (if is_button { code } else { 0 }, is_button),
+        WM_NCLBUTTONDOWN | WM_NCLBUTTONDBLCLK => (if is_button { code } else { 0 }, is_button),
         WM_NCLBUTTONUP => (if is_button { code } else { 0 }, false),
         WM_NCMOUSELEAVE | WM_MOUSEMOVE | WM_CANCELMODE | WM_CAPTURECHANGED | WM_KILLFOCUS => (0, false),
         _ => return,
@@ -1306,8 +1338,8 @@ impl WindowState {
             picker::WM_NATIVE_REPLY=>{self.picker_native_reply(wp.0 as u64,lp.0);return Some(LRESULT(0));},
             WM_QUERYENDSESSION=>return Some(LRESULT(1)),
             WM_ENDSESSION=>{self.session_ending=wp.0!=0;if self.session_ending{self.save();}return None;},
-            WM_CLOSE if self.picker.is_none()&&!self.session_ending&&self.session.has_locked_tabs()=>{
-                self.show_message(if !self.session.ui.dual_pane&&self.session.secondary_pane.tabs.iter().any(|t|t.locked){"隐藏窗格中有已锁定的标签页，请开启双栏并解锁后再关闭窗口"}else{"有已锁定的标签页，请先在标签右键菜单中解锁后再关闭窗口"}.into());return Some(LRESULT(0));
+            WM_CLOSE if self.picker.is_none()&&!self.session_ending&&!crate::runtime::exiting()&&self.session.has_locked_tabs()=>{
+                self.show_message(if !self.session.ui.dual_pane&&self.session.secondary_pane.tabs.iter().any(|t|t.locked){zsdesk_core::i18n::text("隐藏窗格中有已锁定的标签页，请开启双栏并解锁后再关闭窗口")}else{zsdesk_core::i18n::text("有已锁定的标签页，请先在标签右键菜单中解锁后再关闭窗口")}.into());return Some(LRESULT(0));
             },
             // Release Shell hosts while the owner is still a live window.
             // WM_DESTROY is the fallback for direct/native destruction.
@@ -1369,7 +1401,7 @@ impl WindowState {
             WM_MOUSEWHEEL=>{let message=MSG{hwnd:self.hwnd,message:msg,wParam:wp,lParam:lp,..Default::default()};if self.side_tabs_wheel(&message){return Some(LRESULT(0));}},
             WM_MOUSELEAVE => {
                 self.tracking_mouse = false;
-                if self.tab_drag.is_none() && self.splitter_drag.is_none()&&self.side_tab_resize.is_none()&&self.side_tab_scroll_drag.is_none() { self.set_hover(Hit::None, None); }
+                if self.tab_drag.is_none() && self.splitter_drag.is_none()&&self.bookmark_resize.is_none()&&self.side_tab_resize.is_none()&&self.side_tab_scroll_drag.is_none() { self.set_hover(Hit::None, None); }
             }
             WM_LBUTTONDOWN => self.mouse_down(point()),
             WM_LBUTTONUP => self.mouse_up(point()),
@@ -1377,22 +1409,22 @@ impl WindowState {
             WM_MBUTTONUP => self.middle_click(point()),
             WM_RBUTTONUP => self.right_click(point()),
             WM_CANCELMODE => {
-                self.tab_drag = None;self.bookmark_drag=None; self.splitter_drag = None; self.pane_splitter_drag=None;self.side_tab_resize=None;self.side_tab_scroll_drag=None; self.pressed = None;
+                self.tab_drag = None;self.bookmark_drag=None; self.splitter_drag = None; self.bookmark_resize=None;self.pane_splitter_drag=None;self.side_tab_resize=None;self.side_tab_scroll_drag=None; self.pressed = None;
                 if unsafe { GetCapture() } == self.hwnd { let _ = unsafe { ReleaseCapture() }; }
                 self.set_hover(Hit::None, None); self.invalidate();
             }
-            WM_CAPTURECHANGED => { self.tab_drag = None;self.bookmark_drag=None; self.splitter_drag = None; self.pane_splitter_drag=None;self.side_tab_resize=None;self.side_tab_scroll_drag=None; self.pressed = None; self.invalidate(); }
+            WM_CAPTURECHANGED => { self.tab_drag = None;self.bookmark_drag=None; self.splitter_drag = None; self.bookmark_resize=None;self.pane_splitter_drag=None;self.side_tab_resize=None;self.side_tab_scroll_drag=None; self.pressed = None; self.invalidate(); }
             WM_SETCURSOR => {
                 if (lp.0 & 0xFFFF) as u32 == HTCLIENT {
                     let mut p = POINT::default();
                     let _ = unsafe { GetCursorPos(&mut p) };
                     let _ = unsafe { ScreenToClient(self.hwnd, &mut p) };
                     let cursor = match self.chrome_hit(p.x, p.y) {
-                        Hit::Splitter | Hit::PaneSplitter | Hit::TabSplitter => Some(IDC_SIZEWE),
+                        Hit::Splitter | Hit::PaneSplitter | Hit::TabSplitter | Hit::BookmarkSplitter => Some(IDC_SIZEWE),
                         Hit::Address if !self.address_editing && self.crumb_at(p.x, p.y).is_none() => Some(IDC_IBEAM),
                         _ => None,
                     };
-                    let cursor = cursor.or(self.side_tab_resize.or(self.splitter_drag).or(self.pane_splitter_drag.map(|(x,w)|(x,i32::from(w)))).map(|_| IDC_SIZEWE)).unwrap_or(IDC_ARROW);
+                    let cursor = cursor.or(self.side_tab_resize.or(self.splitter_drag).or(self.bookmark_resize).or(self.pane_splitter_drag.map(|(x,w)|(x,i32::from(w)))).map(|_| IDC_SIZEWE)).unwrap_or(IDC_ARROW);
                     if let Ok(c) = unsafe { LoadCursorW(None, cursor) } { unsafe { SetCursor(Some(c)); } }
                     return Some(LRESULT(1));
                 }
@@ -1445,18 +1477,18 @@ impl WindowState {
                 }
             },
             crate::update_check::NOTICE=>if let Some(release)=crate::update_check::take_notice(&self.config_path){
-                if let Err(error)=crate::utility_panel::offer_update(self.hwnd,&self.config_path,release){self.show_message(format!("无法显示更新信息：{error:#}"));}
+                if let Err(error)=crate::utility_panel::offer_update(self.hwnd,&self.config_path,release){self.show_message(zsdesk_core::tr_format!("无法显示更新信息：{error:#}", error=error));}
             },
             crate::routing_control::WM_RESULT => if lp.0!=0{self.show_message(unsafe{*Box::from_raw(lp.0 as *mut String)});},
             message if message>=0xC000&&message==zsdesk_windows::shell::file_transfer::result_message()=>{
                 let code=wp.0 as u32;
                 let completion=zsdesk_windows::shell::file_transfer::take_completion(self.hwnd,lp.0 as usize);
                 if let Some(completion)=completion{self.show_message(completion.message());self.receive_transfer_completion(&completion);}
-                else if zsdesk_windows::shell::file_transfer::is_cancelled(windows::core::HRESULT(code as i32)){self.show_message("文件操作已取消".into());}
-                else if code!=0{self.show_message(format!("文件操作未完成：{}",zsdesk_windows::shell::file_transfer::error_message(&windows::core::Error::from_hresult(windows::core::HRESULT(code as i32)))));}
+                else if zsdesk_windows::shell::file_transfer::is_cancelled(windows::core::HRESULT(code as i32)){self.show_message(zsdesk_core::i18n::text("文件操作已取消").into());}
+                else if code!=0{self.show_message(zsdesk_core::tr_format!("文件操作未完成：{}", zsdesk_windows::shell::file_transfer::error_message(&windows::core::Error::from_hresult(windows::core::HRESULT(code as i32)))));}
             },
         message if message >= 0xC000 && (message == zsdesk_windows::shell::menu::failure_message()||message==zsdesk_windows::shell::file_transfer::result_message()) => {
-                self.show_message(format!("系统右键操作未完成（0x{:08X}），请查看诊断日志。", wp.0 as u32));
+                self.show_message(zsdesk_core::tr_format!("系统右键操作未完成（0x{:08X}），请查看诊断日志。", wp.0 as u32));
             }
             WM_DESTROY => { crate::runtime::trace("window-destroy");zsdesk_windows::taskbar::clear_identity(self.hwnd);unsafe { self.destroy(); PostQuitMessage(0); }crate::runtime::trace("window-quit-posted"); }
             _ => return None,

@@ -20,19 +20,19 @@ pub enum ShellLocation {
 impl ShellLocation {
     pub fn title(&self) -> String {
         match self {
-            Self::ThisPc => "此电脑".to_string(),
+            Self::ThisPc => crate::i18n::text("此电脑").to_string(),
             Self::Path(path) => path_title(path),
             Self::Shell { parsing_name, title, .. } => shell_display_title(parsing_name, title),
-            Self::Search { query, .. } => format!("搜索：{query}"),
+            Self::Search { query, .. } => tr_format!("搜索：{query}", query=query),
         }
     }
 
     pub fn address(&self) -> String {
         match self {
-            Self::ThisPc => "此电脑".to_string(),
+            Self::ThisPc => crate::i18n::text("此电脑").to_string(),
             Self::Path(path) => path.to_string_lossy().into_owned(),
             Self::Shell { parsing_name, title, .. } => if parsing_name.trim().is_empty(){shell_display_title(parsing_name,title)}else{parsing_name.clone()},
-            Self::Search { query, scope } => format!("搜索 {}：{}", scope.as_ref().map(|p|p.display().to_string()).unwrap_or_else(||"全部本地磁盘".into()), query),
+            Self::Search { query, scope } => tr_format!("搜索 {}：{}" , scope.as_ref().map(|p|p.display().to_string()).unwrap_or_else(||crate::i18n::text("全部本地磁盘").into()), query),
         }
     }
 
@@ -53,17 +53,17 @@ fn shell_display_title(parsing_name: &str, title: &str) -> String {
     let name = parsing_name.get(..6).filter(|prefix| prefix.eq_ignore_ascii_case("shell:"))
         .map_or(parsing_name, |_| &parsing_name[6..]);
     let known = [
-        ("::{645FF040-5081-101B-9F08-00AA002F954E}", "回收站"), ("RecycleBinFolder", "回收站"),
-        ("::{20D04FE0-3AEA-1069-A2D8-08002B30309D}", "此电脑"), ("MyComputerFolder", "此电脑"),
-        ("::{F02C1A0D-BE21-4350-88B0-7367FC96EF3C}", "网络"), ("NetworkPlacesFolder", "网络"),
-        ("::{679F85CB-0220-4080-B29B-5540CC05AAB6}", "主文件夹"),
-        ("::{F874310E-B6B7-47DC-BC84-B9E6B38F5903}", "主文件夹"),
-        ("::{031E4825-7B94-4DC3-B131-E946B44C8DD5}", "库"), ("Libraries", "库"),
-        ("::{26EE0668-A00A-44D7-9371-BEB064C98683}", "控制面板"), ("ControlPanelFolder", "控制面板"),
-        ("Desktop", "桌面"), ("Downloads", "下载"),
+        ("::{645FF040-5081-101B-9F08-00AA002F954E}", crate::i18n::text("回收站")), ("RecycleBinFolder", crate::i18n::text("回收站")),
+        ("::{20D04FE0-3AEA-1069-A2D8-08002B30309D}", crate::i18n::text("此电脑")), ("MyComputerFolder", crate::i18n::text("此电脑")),
+        ("::{F02C1A0D-BE21-4350-88B0-7367FC96EF3C}", crate::i18n::text("网络")), ("NetworkPlacesFolder", crate::i18n::text("网络")),
+        ("::{679F85CB-0220-4080-B29B-5540CC05AAB6}", crate::i18n::text("主文件夹")),
+        ("::{F874310E-B6B7-47DC-BC84-B9E6B38F5903}", crate::i18n::text("主文件夹")),
+        ("::{031E4825-7B94-4DC3-B131-E946B44C8DD5}", crate::i18n::text("库")), ("Libraries", crate::i18n::text("库")),
+        ("::{26EE0668-A00A-44D7-9371-BEB064C98683}", crate::i18n::text("控制面板")), ("ControlPanelFolder", crate::i18n::text("控制面板")),
+        ("Desktop", crate::i18n::text("桌面")), ("Downloads", crate::i18n::text("下载")),
     ];
     known.into_iter().find(|(candidate, _)| name.eq_ignore_ascii_case(candidate))
-        .map_or("系统位置", |(_, label)| label).to_string()
+        .map_or(crate::i18n::text("系统位置"), |(_, label)| label).to_string()
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -325,6 +325,7 @@ impl Default for QuickSearchPreferences {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct ExplorerUi {
+    pub language:crate::i18n::LanguagePreference,
     pub startup_location: StartupLocation,
     pub new_tab_location: NewTabLocation,
     pub tab_placement: TabPlacement,
@@ -349,6 +350,9 @@ pub struct ExplorerUi {
     pub tree_width: i32,
     pub show_bookmarks: bool,
     pub bookmarks_on_right: bool,
+    /// Right bookmark panel width in DIP.
+    pub bookmarks_width: i32,
+    pub explorer_tray: bool,
     pub show_preview: bool,
     pub show_details: bool,
     pub command_bar: CommandBarPreferences,
@@ -396,10 +400,10 @@ impl ExplorerUi{
 
 impl Default for ExplorerUi {
     fn default() -> Self {
-        Self { startup_location:StartupLocation::default(),new_tab_location:NewTabLocation::default(), tab_placement:TabPlacement::Top, side_tabs_width:210,side_tabs_compact:true,dual_pane:false, pane_ratio:500,
+        Self { language:crate::i18n::LanguagePreference::System,startup_location:StartupLocation::default(),new_tab_location:NewTabLocation::default(), tab_placement:TabPlacement::Top, side_tabs_width:210,side_tabs_compact:true,dual_pane:false, pane_ratio:500,
             double_click_close_tab:true, mouse_gestures:true, everything_folder_sizes:false,
             close_window_on_last_tab:true,double_click_blank_up:true,show_tab_count:true,show_tab_list:true,tab_selection_emphasis:false,
-            show_tree: true, tree_width: 220, show_bookmarks: true, bookmarks_on_right:false, show_preview: false, show_details: false,
+            show_tree: true, tree_width: 220, show_bookmarks: true, bookmarks_on_right:false, bookmarks_width:210, explorer_tray:false, show_preview: false, show_details: false,
             command_bar: CommandBarPreferences::default(), context_menu: ContextMenuPreferences::default(),
             search_all_files: true, search_backend: SearchBackendPreference::NativeNtfs, space_preview: true,
             search_include_development:false,search_index_metadata:false,search_pinyin_initials:false,search_idle_seconds:300,
@@ -492,6 +496,7 @@ impl ExplorerSession {
         self.ui.pane_ratio = self.ui.pane_ratio.clamp(200, 800);
         self.active_tab = self.active_tab.min(self.tabs.len() - 1);
         self.ui.tree_width = self.ui.tree_width.clamp(120, 800);
+        self.ui.bookmarks_width = self.ui.bookmarks_width.clamp(120, 600);
         self.ui.side_tabs_width=self.ui.side_tabs_width.clamp(120,420);
         let largest = self.tabs.iter().chain(self.secondary_pane.tabs.iter()).map(|t|t.id)
             .chain(self.bookmarks.iter().map(|b|b.id)).max().unwrap_or(0);

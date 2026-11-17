@@ -23,7 +23,7 @@ pub(super) fn search_item(scope:Option<&Path>,query:&str)->Result<IShellItem>{
     let pidls:Vec<Vec<u8>>=paths.into_iter().filter_map(|p|super::pidl::location_pidl(&ShellLocation::Path(p))).collect();
     if pidls.is_empty(){return Err(windows::core::Error::from_hresult(windows::core::HRESULT(0x80070003u32 as i32)));}
     let pointers:Vec<_>=pidls.iter().map(|p|p.as_ptr().cast()).collect();
-    let title:Vec<u16>=format!("搜索：{query}").encode_utf16().chain(Some(0)).collect();
+    let title:Vec<u16>=zsdesk_core::tr_format!("搜索：{query}", query=query).encode_utf16().chain(Some(0)).collect();
     let query:Vec<u16>=query.encode_utf16().chain(Some(0)).collect();
     let key=PROPERTYKEY{fmtid:windows::core::GUID::from_u128(0x41cf5ae0_f75a_4806_bd87_59c7d9248eb9),pid:100};
     unsafe {

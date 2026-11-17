@@ -503,7 +503,7 @@ impl FenceWin {
                 let content = rf(g.content);
                 cv.push_clip(content);
                 if self.entries.is_empty() && !self.standalone {
-                    let hint = self.message.clone().unwrap_or_else(|| if fence.is_desktop() { "将桌面图标拖到这里".into() } else { "此文件夹为空".into() });
+                    let hint = self.message.clone().unwrap_or_else(|| if fence.is_desktop() { zsdesk_core::i18n::text("将桌面图标拖到这里").into() } else { zsdesk_core::i18n::text("此文件夹为空").into() });
                     cv.text(&hint, content, &TextStyle::ui(sf(12.0)).align(Align::Center), col(palette.text_secondary));
                 }
                 let label_style = if fence.view == FenceView::List { TextStyle::ui(sf(12.0)) } else { TextStyle::ui(sf(12.0)).align(Align::Center).top().wrapped() };

@@ -24,7 +24,7 @@ pub(crate) struct FileType{pub label:String,pub pattern:String}
 pub(crate) enum SelectionKind{Files,Folders}
 impl SelectionKind{
     pub fn folders(self)->bool{self==Self::Folders}
-    pub fn title(self)->&'static str{if self.folders(){"选择文件夹"}else{"选择文件"}}
+    pub fn title(self)->&'static str{if self.folders(){zsdesk_core::i18n::text("选择文件夹")}else{zsdesk_core::i18n::text("选择文件")}}
 }
 #[derive(Clone)]pub(crate) struct Options{
     pub token:u64,pub title:String,pub initial:ShellLocation,pub multiple:bool,pub kind:SelectionKind,
@@ -87,14 +87,14 @@ impl WindowState{
             picker.submission.confirmed=true;*picker.result.borrow_mut()=Outcome::Cancelled;post(self.hwnd,WM_CLOSE,0,0);return;
         }
         unsafe{let _=EnableWindow(picker.accept,false);}
-        self.show_message("正在等待原程序确认选择…".into());
+        self.show_message(zsdesk_core::i18n::text("正在等待原程序确认选择…").into());
     }
     pub(super) fn picker_native_reply(&mut self,token:u64,code:isize){
         let reply=match code{1=>NativeReply::Accepted,2=>NativeReply::Cancelled,3=>NativeReply::Rejected,4=>NativeReply::Waiting,5=>NativeReply::Fallback,_=>return};
         let Some(picker)=self.picker.as_mut().filter(|picker|picker.options.token==token)else{return;};
         if let Some(outcome)=picker.submission.reply(reply){*picker.result.borrow_mut()=outcome;post(self.hwnd,WM_CLOSE,0,0);return;}
         unsafe{let _=EnableWindow(picker.accept,!picker.submission.waiting);}
-        self.show_message(match reply{NativeReply::Rejected=>"原程序未接受选择，请检查后重试",_=>"原程序尚未完成选择，可取消后重新打开"}.into());
+        self.show_message(match reply{NativeReply::Rejected=>zsdesk_core::i18n::text("原程序未接受选择，请检查后重试"),_=>zsdesk_core::i18n::text("原程序尚未完成选择，可取消后重新打开")}.into());
     }
     pub(super) fn picker_height(&self)->i32{if self.picker.is_some(){self.s(FOOTER_H)}else{0}}
     pub(super) fn initialize_picker(&mut self)->Result<()>{
@@ -104,7 +104,7 @@ impl WindowState{
             picker.name=child(self.hwnd,"EDIT",&picker.options.initial_name,NAME,ES_AUTOHSCROLL as u32,true)?;
             picker.filter=child(self.hwnd,"COMBOBOX","",FILTER,(CBS_DROPDOWNLIST|WS_VSCROLL.0 as i32)as u32,!picker.options.kind.folders())?;
             picker.accept=child(self.hwnd,"BUTTON",picker.options.kind.title(),ACCEPT,BS_DEFPUSHBUTTON as u32,true)?;
-            picker.cancel=child(self.hwnd,"BUTTON","取消",CANCEL,BS_PUSHBUTTON as u32,true)?;
+            picker.cancel=child(self.hwnd,"BUTTON",zsdesk_core::i18n::text("取消"),CANCEL,BS_PUSHBUTTON as u32,true)?;
             for value in &picker.options.types{SendMessageW(picker.filter,CB_ADDSTRING,Some(WPARAM(0)),Some(LPARAM(wide(&value.label).as_ptr()as isize)));}
             SendMessageW(picker.filter,CB_SETCURSEL,Some(WPARAM(picker.options.filter)),Some(LPARAM(0)));
         }Ok(())
@@ -128,7 +128,7 @@ impl WindowState{
         let Some(picker)=&self.picker else{return;};let(w,h)=self.client_size();let top=h-self.s(FOOTER_H);
         canvas.fill(RectF::new(0.0,top as f32,w as f32,self.s(FOOTER_H)as f32),paint::c(self.palette.layer));
         canvas.line(0.0,top as f32,w as f32,top as f32,paint::c(self.palette.divider),1.0);
-        canvas.text(if picker.options.kind.folders(){"文件夹："}else{"文件名："},RectF::new(self.sf(12.0),(top+self.s(8))as f32,self.sf(64.0),self.sf(28.0)),&self.ui_style(),paint::c(self.palette.text));
+        canvas.text(if picker.options.kind.folders(){zsdesk_core::i18n::text("文件夹：")}else{zsdesk_core::i18n::text("文件名：")},RectF::new(self.sf(12.0),(top+self.s(8))as f32,self.sf(64.0),self.sf(28.0)),&self.ui_style(),paint::c(self.palette.text));
     }
     pub(super) fn picker_selection_changed(&mut self){
         let Some(picker)=self.picker.as_ref()else{return;};if picker.edited&&unsafe{GetFocus()}==picker.name{return;}
@@ -156,7 +156,7 @@ impl WindowState{
     pub(super) fn picker_accept(&mut self){
         let Some(picker)=self.picker.as_ref()else{return;};
         if picker.submission.waiting{return;}
-        if self.pending.is_some()||self.queued.is_some(){self.show_message("文件夹正在加载，请稍后选择".into());return;}
+        if self.pending.is_some()||self.queued.is_some(){self.show_message(zsdesk_core::i18n::text("文件夹正在加载，请稍后选择").into());return;}
         let kind=picker.options.kind;
         let mut paths=if picker.edited{let text=control_text(picker.name);if kind.folders()&&text.trim().is_empty(){Vec::new()}else{match parse_names(&text,self.current_location().as_path()){Ok(paths)=>paths,Err(error)=>{self.show_message(error);return;}}}}
             else{self.browser.as_ref().map(|browser|browser.selection_paths_limit(257).into_iter().map(PathBuf::from).collect()).unwrap_or_default()};
@@ -171,19 +171,19 @@ impl WindowState{
 }
 fn control_text(window:HWND)->String{let mut value=vec![0u16;32768];let len=unsafe{GetWindowTextW(window,&mut value)}.max(0)as usize;String::from_utf16_lossy(&value[..len])}
 fn parse_names(text:&str,folder:Option<&Path>)->Result<Vec<PathBuf>,String>{
-    let text=text.trim();if text.is_empty(){return Err("请选择文件".into());}
-    let resolve=|value:&str|->Result<PathBuf,String>{let path=PathBuf::from(value);if path.is_absolute(){Ok(path)}else{folder.map(|folder|folder.join(path)).ok_or_else(||"请打开文件夹后选择文件".into())}};
+    let text=text.trim();if text.is_empty(){return Err(zsdesk_core::i18n::text("请选择文件").into());}
+    let resolve=|value:&str|->Result<PathBuf,String>{let path=PathBuf::from(value);if path.is_absolute(){Ok(path)}else{folder.map(|folder|folder.join(path)).ok_or_else(||zsdesk_core::i18n::text("请打开文件夹后选择文件").into())}};
     if !text.contains('"'){let whole=resolve(text)?;if whole.exists(){return Ok(vec![whole]);}}
     let mut quoted=false;let mut part=String::new();let mut names=Vec::new();
     for c in text.chars(){match c{'"'=>quoted=!quoted,c if c.is_whitespace()&&!quoted=>{if !part.is_empty(){names.push(resolve(&part)?);part.clear();}},_=>part.push(c)}}
-    if quoted{return Err("文件名的引号不完整".into());}if !part.is_empty(){names.push(resolve(&part)?);}Ok(names)
+    if quoted{return Err(zsdesk_core::i18n::text("文件名的引号不完整").into());}if !part.is_empty(){names.push(resolve(&part)?);}Ok(names)
 }
 pub(crate) fn validate_paths(paths:&[PathBuf],multiple:bool,kind:SelectionKind)->Result<(),String>{
     if paths.is_empty(){return Err(kind.title().into());}
-    if !multiple&&paths.len()!=1{return Err(if kind.folders(){"此窗口每次只能选择一个文件夹"}else{"此窗口每次只能选择一个文件"}.into());}
-    if paths.len()>256{return Err("一次最多选择 256 个项目".into());}
-    if paths.iter().any(|path|!path.is_absolute()||if kind.folders(){!path.is_dir()}else{!path.is_file()}){return Err(if kind.folders(){"所选文件夹已移动、不可用或不是文件夹"}else{"所选文件已移动、不可用或不是普通文件"}.into());}
-    if paths.iter().map(|path|path.as_os_str().len()+3).sum::<usize>()>30000{return Err("所选文件路径过长，请分批选择".into());}
+    if !multiple&&paths.len()!=1{return Err(if kind.folders(){zsdesk_core::i18n::text("此窗口每次只能选择一个文件夹")}else{zsdesk_core::i18n::text("此窗口每次只能选择一个文件")}.into());}
+    if paths.len()>256{return Err(zsdesk_core::i18n::text("一次最多选择 256 个项目").into());}
+    if paths.iter().any(|path|!path.is_absolute()||if kind.folders(){!path.is_dir()}else{!path.is_file()}){return Err(if kind.folders(){zsdesk_core::i18n::text("所选文件夹已移动、不可用或不是文件夹")}else{zsdesk_core::i18n::text("所选文件已移动、不可用或不是普通文件")}.into());}
+    if paths.iter().map(|path|path.as_os_str().len()+3).sum::<usize>()>30000{return Err(zsdesk_core::i18n::text("所选文件路径过长，请分批选择").into());}
     Ok(())
 }
 pub(super) fn pre_translate(slot:&Slot,message:&MSG)->bool{

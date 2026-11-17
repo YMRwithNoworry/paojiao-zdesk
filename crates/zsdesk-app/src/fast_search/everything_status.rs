@@ -22,7 +22,7 @@ impl Snapshot{
             connection:ConnectionState::NotConnected,fallback_builtin:false,services:Vec::new(),note:None}
     }
     fn render(&self)->String{
-        let mut rows=vec!["搜索引擎状态".to_owned(),String::new(),format!("配置搜索引擎：{}",if self.builtin{"自带搜索"}else{"Everything"}),
+        let mut rows=vec![zsdesk_core::i18n::text("搜索引擎状态").to_owned(),String::new(),format!("配置搜索引擎：{}",if self.builtin{"自带搜索"}else{"Everything"}),
             format!("配置来源：{}",if self.configured.is_some(){"指定的 Everything 程序"}else{"自动选择已运行、已安装或内置 Everything"})];
         if let Some(path)=&self.configured{rows.push(format!("指定程序：{}",path.display()));}
         if self.builtin{
@@ -71,7 +71,7 @@ fn service_state(name:&str)->String{
     if unsafe{QueryServiceStatusEx(service.0,0,(&mut status as*mut ServiceStatus).cast(),std::mem::size_of::<ServiceStatus>()as u32,&mut needed)}==0{
         return format!("{name}：无法读取（{}）",std::io::Error::last_os_error());
     }
-    let state=match status.state{1=>"已停止",2=>"正在启动",3=>"正在停止",4=>"运行中",5=>"正在继续",6=>"正在暂停",7=>"已暂停",_=>"状态未知"};
+    let state=match status.state{1=>"已停止",2=>"正在启动",3=>"正在停止",4=>zsdesk_core::i18n::text("运行中"),5=>"正在继续",6=>"正在暂停",7=>zsdesk_core::i18n::text("已暂停"),_=>"状态未知"};
     if status.state==4{format!("{name}：{state}（服务进程 {}）",status.pid)}else{format!("{name}：{state}")}
 }
 

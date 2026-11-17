@@ -38,7 +38,7 @@ pub(super) struct QuickPreview { state: Rc<PreviewState> }
 impl QuickPreview {
     pub(super) fn create_worker(owner:HWND,provider:PreviewProviderPreference,dark:bool,hover:bool,bounds:Option<RECT>)->Result<Self>{
         let preview=Self::open_impl(owner,Path::new(""),true,true,provider,dark,hover,bounds)?;
-        *preview.state.notice.borrow_mut()="正在加载预览…".into();preview.state.invalidate();Ok(preview)
+        *preview.state.notice.borrow_mut()=zsdesk_core::i18n::text("正在加载预览…").into();preview.state.invalidate();Ok(preview)
     }
     pub(super) fn window(&self)->HWND{self.state.hwnd.get()}
     pub(super) fn status(&self)->(String,String){
@@ -68,7 +68,7 @@ impl QuickPreview {
             font: Cell::new(HFONT::default()), brush:Cell::new(unsafe { CreateSolidBrush(COLORREF(colors.background)) }),
             colors:Cell::new(colors),requested_dark:Cell::new(dark),refreshing_theme:Cell::new(false),laying_out:Cell::new(false),allow_system_handler, provider, hover,embedded:embedded.is_some() });
         let bounds = embedded.unwrap_or_else(||initial_bounds(owner));
-        let hwnd = unsafe { CreateWindowExW(if embedded.is_some(){WINDOW_EX_STYLE::default()}else{WS_EX_TOOLWINDOW | if hover { WS_EX_NOACTIVATE } else { WINDOW_EX_STYLE::default() }}, CLASS_NAME, windows::core::w!("快速预览"),
+        let hwnd = unsafe { CreateWindowExW(if embedded.is_some(){WINDOW_EX_STYLE::default()}else{WS_EX_TOOLWINDOW | if hover { WS_EX_NOACTIVATE } else { WINDOW_EX_STYLE::default() }}, CLASS_NAME, windows::core::PCWSTR(zsdesk_core::i18n::wide("快速预览").as_ptr()),
             if embedded.is_some(){WS_CHILD|WS_CLIPCHILDREN}else{WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_CLIPCHILDREN},
             bounds.left, bounds.top, bounds.right - bounds.left, bounds.bottom - bounds.top,
             Some(owner), None, Some(instance), Some((&state as *const Rc<PreviewState>).cast()))? };
@@ -105,30 +105,30 @@ impl QuickPreview {
     pub(super) fn set_dark(&self,dark:bool){if self.state.requested_dark.replace(dark)!=dark{self.state.refresh_theme();}}
     pub(super) fn update(&mut self, path: &Path) -> Result<()> {
         let _dpi=PreviewDpiScope::for_window(self.state.hwnd.get());
-        if path.as_os_str().is_empty(){self.state.release_content();self.state.path.borrow_mut().clear();self.state.summary.borrow_mut().clear();*self.state.notice.borrow_mut()="选择文件以显示预览".into();self.state.invalidate();return Ok(());}
+        if path.as_os_str().is_empty(){self.state.release_content();self.state.path.borrow_mut().clear();self.state.summary.borrow_mut().clear();*self.state.notice.borrow_mut()=zsdesk_core::i18n::text("选择文件以显示预览").into();self.state.invalidate();return Ok(());}
         if !self.is_open() || self.state.path.borrow().as_path() == path { return Ok(()); }
         self.state.release_content();
         if !self.is_open() { return Ok(()); }
         *self.state.path.borrow_mut() = path.to_path_buf();
-        *self.state.notice.borrow_mut()="正在加载预览…".into();
+        *self.state.notice.borrow_mut()=zsdesk_core::i18n::text("正在加载预览…").into();
         // Paint the themed empty surface before a decoder/COM handler pumps its
         // own messages. The old content must not leave an unpainted white frame.
         self.state.paint_pending();
-        let title = format!("{} — 快速预览", path.file_name().unwrap_or(path.as_os_str()).to_string_lossy());
+        let title = zsdesk_core::tr_format!("{} — 快速预览", path.file_name().unwrap_or(path.as_os_str()).to_string_lossy());
         let _ = unsafe { SetWindowTextW(self.state.hwnd.get(), PCWSTR(wide(&title).as_ptr())) };
         let metadata = match fs::metadata(path) {
             Ok(metadata) => metadata,
             Err(error) => {
                 self.state.summary.borrow_mut().clear();
-                *self.state.notice.borrow_mut() = format!("无法读取此文件。\r\n{error}");
+                *self.state.notice.borrow_mut() = zsdesk_core::tr_format!("无法读取此文件。\r\n{error}", error=error);
                 self.state.invalidate();
                 return Ok(());
             }
         };
-        *self.state.summary.borrow_mut() = if metadata.is_dir() { "文件夹".into() }
+        *self.state.summary.borrow_mut() = if metadata.is_dir() { zsdesk_core::i18n::text("文件夹").into() }
             else { format!("{} · {}", file_type(path), zsdesk_ui::chrome::format_size(metadata.len())) };
         if metadata.is_dir() {
-            *self.state.notice.borrow_mut() = "请选择文件以显示内容预览。".into();
+            *self.state.notice.borrow_mut() = zsdesk_core::i18n::text("请选择文件以显示内容预览。").into();
             self.state.invalidate();
             return Ok(());
         }
@@ -142,12 +142,12 @@ impl QuickPreview {
             let bounds=((rect.right-rect.left).max(1)as u32,(rect.bottom-rect.top).max(1)as u32);
             match image_decode::decode(path,self.state.colors.get().background,bounds,||self.state.hwnd.get()!=hwnd||image_request_cancelled(path)) {
                 Ok(image)=>Some(Content::Image(image)),
-                Err(error)=>{handler_error=Some(format!("图片预览失败：{error:#}"));None}
+                Err(error)=>{handler_error=Some(zsdesk_core::tr_format!("图片预览失败：{error:#}", error=error));None}
             }
         } else {None};
         let content=content.or_else(||if media_preview::supported(path)&&self.is_open()&&!image_request_cancelled(path){
             match MediaPreview::open(hwnd,path,rect,self.state.colors.get().dark,self.state.hover){
-                Ok(media)=>Some(Content::Media(Rc::new(media))),Err(error)=>{handler_error=Some(format!("系统媒体预览不可用：{error:#}。可使用 QuickLook 或默认播放器打开。"));None}
+                Ok(media)=>Some(Content::Media(Rc::new(media))),Err(error)=>{handler_error=Some(zsdesk_core::tr_format!("系统媒体预览不可用：{error:#}。可使用 QuickLook 或默认播放器打开。", error=error));None}
             }
         }else{None});
         let content = content.or_else(||if self.state.allow_system_handler && !is_image_path(path)&&!media_preview::supported(path) && metadata.len() <= MAX_HANDLER_BYTES
@@ -164,7 +164,7 @@ impl QuickPreview {
                 let mut handler=system_preview_with_provider(hwnd,&rendered.pdf,rect,PreviewProviderPreference::System,self.state.colors.get())?;handler.rendered=Some(rendered);Ok(handler)
             }){
                 Ok(handler)=>Some(Content::Handler(handler)),
-                Err(error)=>{handler_error=Some(format!("WPS 文档预览失败：{error:#}"));None}
+                Err(error)=>{handler_error=Some(zsdesk_core::tr_format!("WPS 文档预览失败：{error:#}", error=error));None}
             }
         });
         let content = content.or_else(|| {
@@ -182,8 +182,8 @@ impl QuickPreview {
             Some(content) => { self.state.notice.borrow_mut().clear();*self.state.content.borrow_mut() = content; }
             None => {
                 *self.state.notice.borrow_mut() = if metadata.len() > MAX_HANDLER_BYTES {
-                    "文件较大，快速预览仅显示文件信息。".into()
-                } else { handler_error.unwrap_or_else(|| "此文件暂无可用的内容预览。".into()) };
+                    zsdesk_core::i18n::text("文件较大，快速预览仅显示文件信息。").into()
+                } else { handler_error.unwrap_or_else(|| zsdesk_core::i18n::text("此文件暂无可用的内容预览。").into()) };
             }
         }
         self.state.refresh_theme();
@@ -412,7 +412,7 @@ impl PreviewState {
         let mut header = RECT { left: self.s(12), top: self.s(10), right: client.right - self.s(12), bottom: self.s(42) };
         draw_text(dc, &self.summary.borrow(), &mut header, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
         let mut footer = RECT { left: self.s(12), top: (client.bottom - self.s(28)).max(0), right: client.right - self.s(12), bottom: client.bottom };
-        draw_text(dc, if self.embedded{"Alt+P 关闭预览窗格"}else{"空格 / Esc 关闭"}, &mut footer, DT_SINGLELINE | DT_VCENTER | DT_RIGHT | DT_NOPREFIX);
+        draw_text(dc, if self.embedded{zsdesk_core::i18n::text("Alt+P 关闭预览窗格")}else{zsdesk_core::i18n::text("空格 / Esc 关闭")}, &mut footer, DT_SINGLELINE | DT_VCENTER | DT_RIGHT | DT_NOPREFIX);
         let content = self.content_rect();
         match &*self.content.borrow() {
             Content::Image(image) => {
@@ -539,7 +539,7 @@ fn system_preview_with_provider(hwnd: HWND, path: &Path, rect: RECT, preference:
     let discovery = super::preview_handlers::discover(path, preference);
     let mut failures = Vec::new();
     for candidate in discovery.candidates.iter().take(12) {
-        if !unsafe{IsWindow(Some(hwnd))}.as_bool(){bail!("预览窗口已关闭");}
+        if !unsafe{IsWindow(Some(hwnd))}.as_bool(){bail!("{}", zsdesk_core::tr_format!("预览窗口已关闭"));}
         eprintln!("preview activate {:?} {:?} {}",candidate.clsid,candidate.context,candidate.label);
         // Never load an Office or third-party document decoder into this process.
         let first: IPreviewHandler = match unsafe { CoCreateInstance(&candidate.clsid, None, candidate.context) } {
@@ -548,10 +548,10 @@ fn system_preview_with_provider(hwnd: HWND, path: &Path, rect: RECT, preference:
         };
         let supported = [first.cast::<IInitializeWithStream>().is_ok(), first.cast::<IInitializeWithFile>().is_ok(), first.cast::<IInitializeWithItem>().is_ok()];
         eprintln!("preview interfaces {supported:?}");
-        if !supported.iter().any(|value| *value) { failures.push(format!("{} 未提供兼容的只读预览接口", candidate.label)); continue; }
+        if !supported.iter().any(|value| *value) { failures.push(zsdesk_core::tr_format!("{} 未提供兼容的只读预览接口", candidate.label)); continue; }
         let mut first = Some(first);
         for (kind, supported) in supported.into_iter().enumerate() {
-            if !unsafe{IsWindow(Some(hwnd))}.as_bool(){bail!("预览窗口已关闭");}
+            if !unsafe{IsWindow(Some(hwnd))}.as_bool(){bail!("{}", zsdesk_core::tr_format!("预览窗口已关闭"));}
             if !supported { continue; }
             let handler = match first.take() {
                 Some(handler) => handler,
@@ -574,29 +574,29 @@ fn initialize_preview(handler: IPreviewHandler, hwnd: HWND, path: &Path, rect: R
     let _dpi = PreviewDpiScope::for_window(hwnd);
     let site: IPreviewHandlerFrame = PreviewFrame { hwnd: hwnd.0 as isize,embedded:unsafe{GetWindowLongPtrW(hwnd,GWL_STYLE)}as u32&WS_CHILD.0!=0 }.into();
     let mut preview = SystemPreview { handler, _stream: None, _site: site, owner: hwnd, rendered:None };
-    let with_site = preview.handler.cast::<IObjectWithSite>().context("预览器未提供宿主连接")?;
-    unsafe { with_site.SetSite(&preview._site) }.context("预览器连接宿主失败")?;
-    if !unsafe{IsWindow(Some(hwnd))}.as_bool(){bail!("预览窗口已关闭");}
+    let with_site = preview.handler.cast::<IObjectWithSite>().context(zsdesk_core::i18n::text("预览器未提供宿主连接"))?;
+    unsafe { with_site.SetSite(&preview._site) }.context(zsdesk_core::i18n::text("预览器连接宿主失败"))?;
+    if !unsafe{IsWindow(Some(hwnd))}.as_bool(){bail!("{}", zsdesk_core::tr_format!("预览窗口已关闭"));}
     eprintln!("preview site connected");
     match kind {
         0 => {
             let initialize = preview.handler.cast::<IInitializeWithStream>()?;
             let stream = read_stream(path)?;
-            unsafe { initialize.Initialize(&stream, STGM_READ.0) }.context("预览器只读流初始化失败")?;
+            unsafe { initialize.Initialize(&stream, STGM_READ.0) }.context(zsdesk_core::i18n::text("预览器只读流初始化失败"))?;
             preview._stream = Some(stream);
         }
         1 => {
-            let initialize = preview.handler.cast::<IInitializeWithFile>().context("预览器未提供只读文件接口")?;
+            let initialize = preview.handler.cast::<IInitializeWithFile>().context(zsdesk_core::i18n::text("预览器未提供只读文件接口"))?;
             let file = wide_path(path);
-            unsafe { initialize.Initialize(PCWSTR(file.as_ptr()), STGM_READ.0) }.context("预览器只读文件初始化失败")?;
+            unsafe { initialize.Initialize(PCWSTR(file.as_ptr()), STGM_READ.0) }.context(zsdesk_core::i18n::text("预览器只读文件初始化失败"))?;
         }
         _ => {
             let initialize = preview.handler.cast::<IInitializeWithItem>()?;
             let item = unsafe { zsdesk_windows::shell::shell_item(&ShellLocation::Path(path.into()))? };
-            unsafe { initialize.Initialize(&item, STGM_READ.0) }.context("预览器只读项目初始化失败")?;
+            unsafe { initialize.Initialize(&item, STGM_READ.0) }.context(zsdesk_core::i18n::text("预览器只读项目初始化失败"))?;
         }
     }
-    if !unsafe { IsWindow(Some(hwnd)) }.as_bool() { bail!("预览窗口已关闭"); }
+    if !unsafe { IsWindow(Some(hwnd)) }.as_bool() { bail!("{}", zsdesk_core::tr_format!("预览窗口已关闭")); }
     // Set the requested palette before the handler creates/paints its child.
     // Applying it only after DoPreview permits a light first frame in dark mode.
     if let Ok(visuals)=preview.handler.cast::<IPreviewHandlerVisuals>(){
@@ -604,11 +604,11 @@ fn initialize_preview(handler: IPreviewHandler, hwnd: HWND, path: &Path, rect: R
         let _=unsafe{visuals.SetTextColor(COLORREF(colors.text))};
     }
     eprintln!("preview initialized; binding window");
-    unsafe { preview.handler.SetWindow(hwnd, &rect) }.context("预览器绑定窗口失败")?;
-    if !unsafe{IsWindow(Some(hwnd))}.as_bool(){bail!("预览窗口已关闭");}
+    unsafe { preview.handler.SetWindow(hwnd, &rect) }.context(zsdesk_core::i18n::text("预览器绑定窗口失败"))?;
+    if !unsafe{IsWindow(Some(hwnd))}.as_bool(){bail!("{}", zsdesk_core::tr_format!("预览窗口已关闭"));}
     eprintln!("preview bound; loading content");
-    unsafe { preview.handler.DoPreview() }.context("预览器加载内容失败")?;
-    if !unsafe{IsWindow(Some(hwnd))}.as_bool(){bail!("预览窗口已关闭");}
+    unsafe { preview.handler.DoPreview() }.context(zsdesk_core::i18n::text("预览器加载内容失败"))?;
+    if !unsafe{IsWindow(Some(hwnd))}.as_bool(){bail!("{}", zsdesk_core::tr_format!("预览窗口已关闭"));}
     eprintln!("preview loaded");
     Ok(preview)
 }
@@ -618,12 +618,12 @@ fn initialize_preview(handler: IPreviewHandler, hwnd: HWND, path: &Path, rect: R
 mod preview_lifecycle_regression;
 
 fn preview_handler_clsid(path: &Path) -> Result<windows::core::GUID> {
-    let extension = path.extension().and_then(|v| v.to_str()).context("文件没有预览类型")?;
+    let extension = path.extension().and_then(|v| v.to_str()).context(zsdesk_core::i18n::text("文件没有预览类型"))?;
     let extension = wide(&format!(".{extension}"));
     let iid = windows::core::w!("{8895B1C6-B41F-4C1C-A562-0D564250836F}");
     let mut length = 0;
     let _ = unsafe { AssocQueryStringW(ASSOCF_NOTRUNCATE, ASSOCSTR_SHELLEXTENSION, PCWSTR(extension.as_ptr()), iid, None, &mut length) };
-    if !(2..=1024).contains(&length) { bail!("没有已注册的预览器"); }
+    if !(2..=1024).contains(&length) { bail!("{}", zsdesk_core::tr_format!("没有已注册的预览器")); }
     let mut clsid = vec![0u16; length as usize];
     unsafe { AssocQueryStringW(ASSOCF_NOTRUNCATE, ASSOCSTR_SHELLEXTENSION, PCWSTR(extension.as_ptr()), iid, Some(PWSTR(clsid.as_mut_ptr())), &mut length).ok()?; }
     Ok(unsafe { CLSIDFromString(PCWSTR(clsid.as_ptr()))? })
@@ -651,8 +651,8 @@ fn read_text(path: &Path) -> Result<String> {
     File::open(path)?.take((MAX_TEXT_BYTES + 1) as u64).read_to_end(&mut bytes)?;
     let truncated = bytes.len() > MAX_TEXT_BYTES;
     bytes.truncate(MAX_TEXT_BYTES);
-    let mut text = decode_text(&bytes).context("文件不是可显示的文本")?;
-    if truncated { text.push_str("\r\n\r\n…仅显示前 256 KB"); }
+    let mut text = decode_text(&bytes).context(zsdesk_core::i18n::text("文件不是可显示的文本"))?;
+    if truncated { text.push_str(zsdesk_core::i18n::text("\r\n\r\n…仅显示前 256 KB")); }
     Ok(text)
 }
 
@@ -699,7 +699,7 @@ fn is_text_path(path: &Path) -> bool {
 }
 fn is_image_path(path: &Path) -> bool { matches!(extension(path).as_str(), "png"|"jpg"|"jpeg"|"jpe"|"jfif"|"bmp"|"dib"|"gif"|"tif"|"tiff"|"webp"|"ico"|"jxr"|"wdp"|"hdp"|"heic"|"heif"|"avif"|"dds") }
 fn extension(path: &Path) -> String { path.extension().unwrap_or_default().to_string_lossy().to_ascii_lowercase() }
-fn file_type(path: &Path) -> String { let ext = extension(path); if ext.is_empty() { "文件".into() } else { format!("{} 文件", ext.to_uppercase()) } }
+fn file_type(path: &Path) -> String { let ext = extension(path); if ext.is_empty() { zsdesk_core::i18n::text("文件").into() } else { zsdesk_core::tr_format!("{} 文件", ext.to_uppercase()) } }
 fn wide(value: &str) -> Vec<u16> { value.encode_utf16().chain(Some(0)).collect() }
 fn wide_path(path: &Path) -> Vec<u16> {
     use std::os::windows::ffi::OsStrExt;

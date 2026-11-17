@@ -39,8 +39,11 @@ impl MouseGestures {
             }));
             let Some((view,identity,threshold))=context else{return false;};
             let point=LPARAM(((msg.pt.x as u16 as u32)|((msg.pt.y as u16 as u32)<<16))as isize);
-            if !matches!(zsdesk_windows::shell::menu::classify_view_menu_point(view,msg.hwnd,point),
-                zsdesk_windows::shell::menu::ViewMenuTarget::Selection|zsdesk_windows::shell::menu::ViewMenuTarget::Background){return false;}
+            // File rows own native left/right OLE drags. A gesture may only
+            // capture blank space; consuming a row's right-down loses the
+            // Shell's drag source and its Copy/Move/Link drop menu.
+            if zsdesk_windows::shell::menu::classify_view_menu_point(view,msg.hwnd,point)
+                !=zsdesk_windows::shell::menu::ViewMenuTarget::Background{return false;}
             let current=slot.try_borrow().ok().is_some_and(|slot|slot.as_ref().is_some_and(|state|
                 state.file_view_for_input(msg.hwnd)==Some((view,identity.source))&&state.identity_for_source(identity.source)==Some(identity)));
             if !current{return false;}

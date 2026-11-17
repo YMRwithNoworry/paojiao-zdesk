@@ -38,6 +38,7 @@ pub(super) fn observe(message:u32,point:POINT){
         _=>{},
     }
 }
+pub(super) fn cancel_observation(){GESTURE.with(|slot|slot.set(None));RELEASED.with(|slot|slot.set(Some(Instant::now())));}
 pub(super) fn start(){
     if unsafe{GetAsyncKeyState(VK_LBUTTON.0 as i32)}>=0||unsafe{GetAsyncKeyState(VK_ESCAPE.0 as i32)}<0{return;}
     if !with_host(|host|host.config.settings.organize&&!host.config.settings.hidden&&host.internal_drag.is_none()).unwrap_or(false){return;}

@@ -61,6 +61,14 @@ pub fn save_forwarding(path:&Path,registered:bool,enabled:bool)->Result<()>{
     if registered{session.ui.forward_unhandled_windows=enabled;}else{session.ui.forward_while_running=enabled;}
     save_unlocked(path,&session)
 }
+pub fn save_language(path:&Path,language:zsdesk_core::i18n::LanguagePreference)->Result<()>{
+    let _write=SAVE_LOCK.lock().map_err(|_|anyhow::anyhow!("会话保存锁异常"))?;
+    let mut session=if path.try_exists()?{load(path)?}else{default_session()};session.ui.language=language;save_unlocked(path,&session)
+}
+pub fn save_explorer_tray(path:&Path,enabled:bool)->Result<()>{
+    let _write=SAVE_LOCK.lock().map_err(|_|anyhow::anyhow!("会话保存锁异常"))?;
+    let mut session=if path.try_exists()?{load(path)?}else{default_session()};session.ui.explorer_tray=enabled;save_unlocked(path,&session)
+}
 pub fn save_tab_selection_emphasis(path:&Path,enabled:bool)->Result<()>{
     let _write=SAVE_LOCK.lock().map_err(|_|anyhow::anyhow!("会话保存锁异常"))?;
     let mut session=if path.try_exists()?{load(path)?}else{default_session()};
@@ -118,7 +126,8 @@ fn save_window_preferences(path:&Path,session:&ExplorerSession,secondary:bool,
     baseline:&SearchPreferences,baseline_bookmarks:Option<&[Bookmark]>)->Result<(SearchPreferences,Vec<Bookmark>)>{
     let _write=SAVE_LOCK.lock().map_err(|_|anyhow::anyhow!("会话保存锁异常"))?;
     let saved=load(path).ok();let mut next=session.clone();
-    if let Some(saved)=&saved {next.ui.startup_location=saved.ui.startup_location.clone();next.ui.new_tab_location=saved.ui.new_tab_location.clone();next.ui.context_menu=saved.ui.context_menu.clone();next.ui.forward_unhandled_windows=saved.ui.forward_unhandled_windows;next.ui.forward_while_running=saved.ui.forward_while_running;next.ui.tab_selection_emphasis=saved.ui.tab_selection_emphasis;}
+    if let Some(saved)=&saved {next.ui.explorer_tray=saved.ui.explorer_tray;next.ui.language=saved.ui.language;
+        next.ui.startup_location=saved.ui.startup_location.clone();next.ui.new_tab_location=saved.ui.new_tab_location.clone();next.ui.context_menu=saved.ui.context_menu.clone();next.ui.forward_unhandled_windows=saved.ui.forward_unhandled_windows;next.ui.forward_while_running=saved.ui.forward_while_running;next.ui.tab_selection_emphasis=saved.ui.tab_selection_emphasis;}
     if next.ui.search_preferences()==*baseline{if let Some(saved)=&saved{next.ui.apply_search_preferences(&saved.ui.search_preferences());}}
     if let (Some(baseline),Some(saved))=(baseline_bookmarks,&saved){
         next.bookmarks=merge_bookmarks(baseline,&next.bookmarks,&saved.bookmarks,next.next_id.max(saved.next_id));
@@ -172,6 +181,15 @@ mod tests {
     use super::*;
     use std::{sync::{Arc,Barrier},thread};
     use zsdesk_core::model::explorer::{ExplorerTab,ShellLocation};
+    #[test]fn tray_preference_survives_other_windows_saving_their_sessions(){
+        let root=std::env::temp_dir().join(format!("zsdesk-tray-{}-{}",std::process::id(),SAVE_SERIAL.fetch_add(1,Ordering::Relaxed)));
+        fs::create_dir(&root).unwrap();let path=root.join("session.json");let original=default_session();save(&path,&original).unwrap();
+        save_explorer_tray(&path,true).unwrap();
+        save_window_with_shared_preferences(&path,&original,false,&original.ui.search_preferences(),&original.bookmarks).unwrap();
+        assert!(load(&path).unwrap().ui.explorer_tray);
+        save_explorer_tray(&path,false).unwrap();assert!(!load(&path).unwrap().ui.explorer_tray);
+        fs::remove_file(path).unwrap();fs::remove_dir(root).unwrap();
+    }
     #[test]
     fn category_deletion_survives_stale_edits_and_concurrent_ids_remain_distinct(){
         let base=vec![Bookmark::folder(10,"分类".into(),None),Bookmark::link(11,"保留".into(),ShellLocation::ThisPc,None)];

@@ -57,7 +57,7 @@ impl PreviewProcess {
     fn open_impl(owner:HWND,path:&Path,provider:PreviewProviderPreference,dark:bool,hover:bool,embedded:Option<[i32;4]>)->Result<Self>{
         let root=std::env::var_os("ZSDESK_PREVIEW_ROOT").map(PathBuf::from)
             .unwrap_or_else(||dirs::cache_dir().unwrap_or_else(std::env::temp_dir).join(crate::edition::profile_name()).join("previews"));
-        if !root.is_absolute(){bail!("预览缓存目录必须是绝对路径");}
+        if !root.is_absolute(){bail!("{}", zsdesk_core::tr_format!("预览缓存目录必须是绝对路径"));}
         fs::create_dir_all(&root)?;
         let workspace=root.join(format!("preview-{}-{}-{}",std::process::id(),SERIAL.fetch_add(1,Ordering::Relaxed),
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos()));
@@ -123,7 +123,7 @@ impl PreviewProcess {
             self.release_exited();
             if !exit.success(){
                 super::diagnostics::record("preview","worker-exit",exit.code());
-                return Some(format!("预览宿主异常退出（{exit}），文件管理窗口可继续使用。"));
+                return Some(zsdesk_core::tr_format!("预览宿主异常退出（{exit}），文件管理窗口可继续使用。", exit=exit));
             }
             return None;
         }
@@ -139,7 +139,7 @@ impl PreviewProcess {
         }
         if self.is_open()&&!self.ready.get()&&self.started.elapsed()>LOAD_TIMEOUT{
             super::diagnostics::record("preview","load-timeout",Some(0x800705b4u32 as i32));
-            self.close();return Some("预览加载超时，已关闭预览宿主；文件管理窗口可继续使用。".into());
+            self.close();return Some(zsdesk_core::i18n::text("预览加载超时，已关闭预览宿主；文件管理窗口可继续使用。").into());
         }
         None
     }
@@ -186,14 +186,14 @@ pub(crate) fn run_if_requested()->Option<Result<()>>{
     if let Some(result)=super::wps_preview::run_worker_if_requested(){return Some(result);}
     if std::env::args_os().nth(1).as_deref()!=Some(std::ffi::OsStr::new("--preview-worker")){return None;}
     Some((||{
-        let path=PathBuf::from(std::env::args_os().nth(2).context("缺少预览请求")?);
-        if std::env::args_os().count()!=3||!path.is_absolute(){bail!("预览请求无效");}
+        let path=PathBuf::from(std::env::args_os().nth(2).context(zsdesk_core::i18n::text("缺少预览请求"))?);
+        if std::env::args_os().count()!=3||!path.is_absolute(){bail!("{}", zsdesk_core::tr_format!("预览请求无效"));}
         unsafe{OleInitialize(None)}?;
         let result=run_worker(&path);
         unsafe{OleUninitialize();}result
     })())
 }
-fn read_request(path:&Path)->Result<Request>{let bytes=fs::read(path)?;if bytes.len()>65536{bail!("预览请求过长");}Ok(serde_json::from_slice(&bytes)?)}
+fn read_request(path:&Path)->Result<Request>{let bytes=fs::read(path)?;if bytes.len()>65536{bail!("{}", zsdesk_core::tr_format!("预览请求过长"));}Ok(serde_json::from_slice(&bytes)?)}
 fn owner_alive(request:&Request)->bool{
     let mut pid=0;let hwnd=HWND(request.owner as*mut _);unsafe{GetWindowThreadProcessId(hwnd,Some(&mut pid));}
     pid==request.parent&&unsafe{IsWindow(Some(hwnd))}.as_bool()
@@ -267,7 +267,7 @@ pub(super) fn sync_pane(owner:HWND,slot:&super::Slot,pane:&mut Option<PreviewPro
     if pane.is_none(){
         match PreviewProcess::open_impl(owner,&path,provider,dark,false,Some(bounds)){
             Ok(process)=>*pane=Some(process),
-            Err(error)=>if let Ok(mut slot)=slot.try_borrow_mut(){if let Some(state)=slot.as_mut(){state.show_message(format!("无法打开预览窗格：{error}"));}},
+            Err(error)=>if let Ok(mut slot)=slot.try_borrow_mut(){if let Some(state)=slot.as_mut(){state.show_message(zsdesk_core::tr_format!("无法打开预览窗格：{error}", error=error));}},
         }
     }
     if let Some(pane)=pane.as_mut(){

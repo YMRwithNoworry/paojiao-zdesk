@@ -151,7 +151,7 @@ impl WindowState {
             let r=rf(self.layout.new_tab);
             if self.layout.vertical_tabs{
                 cv.glyph(glyph::ADD,RectF::new(r.x,r.y,self.sf(32.0),r.h),self.sf(12.0),text);
-                cv.text("新建标签页",RectF::new(r.x+self.sf(34.0),r.y,(r.w-self.sf(38.0)).max(0.0),r.h),&self.ui_style(),text);
+                cv.text(zsdesk_core::i18n::text("新建标签页"),RectF::new(r.x+self.sf(34.0),r.y,(r.w-self.sf(38.0)).max(0.0),r.h),&self.ui_style(),text);
             }else{cv.glyph(glyph::ADD,r,self.sf(12.0),text);}
         }
         if !self.layout.tab_list.is_empty() {
@@ -321,11 +321,11 @@ impl WindowState {
         self.paint_chrome_layer(cv, rf(l.bookmarks_row));
         if l.bookmarks_vertical{
             let r=l.bookmarks_row;cv.line(r.x as f32,r.y as f32,r.x as f32,r.bottom()as f32,c(p.divider),1.0);
-            cv.text("收藏夹",rf(l.bookmarks_title),&self.ui_style(),c(p.text_secondary));
+            cv.text(zsdesk_core::i18n::text("收藏夹"),rf(l.bookmarks_title),&self.ui_style(),c(p.text_secondary));
         }
         if self.session.bookmarks.is_empty() {
             let r = rf(l.bookmarks_row);
-            let (text,y,h)=if l.bookmarks_vertical{("拖入文件夹或按 Ctrl+D",l.bookmarks_title.bottom()as f32+self.sf(6.0),self.sf(32.0))}else{("将文件夹拖到这里，或按 Ctrl+D 收藏当前文件夹",r.y,r.h)};
+            let (text,y,h)=if l.bookmarks_vertical{(zsdesk_core::i18n::text("拖入文件夹或按 Ctrl+D"),l.bookmarks_title.bottom()as f32+self.sf(6.0),self.sf(32.0))}else{(zsdesk_core::i18n::text("将文件夹拖到这里，或按 Ctrl+D 收藏当前文件夹"),r.y,r.h)};
             cv.text(text, RectF::new(r.x + self.sf(14.0), y, r.w - self.sf(28.0), h), &self.ui_style(), c(p.text_secondary));
         }
         for (i, rect) in l.bookmarks.iter().enumerate() {
@@ -352,7 +352,7 @@ impl WindowState {
         }
         if !l.bookmark_overflow.is_empty() {
             self.button_fill(cv, l.bookmark_overflow, Hit::BookmarkOverflow, self.sf(4.0));
-            if l.bookmarks_vertical{cv.text("更多收藏…",rf(l.bookmark_overflow),&self.ui_style(),c(p.text));}
+            if l.bookmarks_vertical{cv.text(zsdesk_core::i18n::text("更多收藏…"),rf(l.bookmark_overflow),&self.ui_style(),c(p.text));}
             else{cv.glyph("\u{E76C}", rf(l.bookmark_overflow), self.sf(10.0), c(p.text));}
         }
         if let Some(index)=self.renamed_bookmark_index(){if !self.bookmark_order.iter().take(l.bookmarks.len()).any(|i|*i==index){self.text_box(cv,rf(self.bookmark_rect(index)),true,false);}}
@@ -387,6 +387,7 @@ impl WindowState {
                 cv.line(middle,split.y,middle,split.bottom(),c(p.divider),1.0);
             }
         }
+        if !l.bookmark_splitter.is_empty()&&(self.hover==Hit::BookmarkSplitter||self.bookmark_resize.is_some()){cv.fill(rf(l.bookmark_splitter),c(p.hover));}
         if !l.splitter.is_empty() && (self.hover == Hit::Splitter || self.splitter_drag.is_some()) {
             let x = l.splitter.x as f32 + l.splitter.width as f32 / 2.0;
             cv.line(x, l.splitter.y as f32, x, l.splitter.bottom() as f32, c(p.divider), 1.0);
@@ -410,9 +411,9 @@ impl WindowState {
         }
         let r = rf(l.status);
         cv.fill(r, c(p.content));
-        let mut text = format!("{} 个项目", self.view_status.items);
+        let mut text = zsdesk_core::tr_format!("{} 个项目", self.view_status.items);
         if self.view_status.selected > 0 {
-            text.push_str(&format!("    选中 {} 个项目", self.view_status.selected));
+            text.push_str(&zsdesk_core::tr_format!("    选中 {} 个项目", self.view_status.selected));
             if let Some(bytes) = self.view_status.selected_bytes { text.push_str(&format!("  {}", format_size(bytes))); }
         }
         let style = TextStyle::ui(self.sf(UI_TEXT - 0.5));
@@ -545,7 +546,10 @@ mod icon_geometry_tests {
 /// Status text that reports a failure is drawn in the critical color; progress
 /// and confirmations ("已复制 3 个路径") stay neutral.
 fn status_is_error(text: &str) -> bool {
-    ["失败", "无法", "错误", "未找到", "不支持", "未保存", "未更新", "未启动", "异常", "超时", "需要修复"].iter().any(|word| text.contains(word))
+    let text=text.to_lowercase();
+    ["失败","无法","错误","未找到","不支持","未保存","未更新","未启动","异常","超时","需要修复",
+        "failed","cannot","error","not found","unsupported","not saved","not updated","not started","timed out","needs repair"]
+        .iter().any(|word|text.contains(word))
 }
 
 #[cfg(test)]

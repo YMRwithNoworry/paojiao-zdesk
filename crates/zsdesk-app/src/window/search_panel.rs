@@ -38,8 +38,8 @@ impl SearchCategory {
 
     fn label(self) -> &'static str {
         match self {
-            Self::All => "全部", Self::Folders => "文件夹", Self::Documents => "文档",
-            Self::Images => "图片", Self::Videos => "视频", Self::Audio => "音频",
+            Self::All => zsdesk_core::i18n::text("全部"), Self::Folders => zsdesk_core::i18n::text("文件夹"), Self::Documents => zsdesk_core::i18n::text("文档"),
+            Self::Images => zsdesk_core::i18n::text("图片"), Self::Videos => zsdesk_core::i18n::text("视频"), Self::Audio => zsdesk_core::i18n::text("音频"),
         }
     }
 }
@@ -80,8 +80,8 @@ fn color(c: zsdesk_ui::theme::Color) -> Color { Color::rgba8(c.r, c.g, c.b, c.a)
 
 fn sort_label(sort: SearchSort) -> &'static str {
     match sort {
-        SearchSort::NameAsc => "名称升序", SearchSort::NameDesc => "名称降序",
-        SearchSort::ModifiedDesc => "最近修改", SearchSort::SizeDesc => "大小降序",
+        SearchSort::NameAsc => zsdesk_core::i18n::text("名称升序"), SearchSort::NameDesc => zsdesk_core::i18n::text("名称降序"),
+        SearchSort::ModifiedDesc => zsdesk_core::i18n::text("最近修改"), SearchSort::SizeDesc => zsdesk_core::i18n::text("大小降序"),
     }
 }
 
@@ -90,22 +90,22 @@ impl WindowState {
         let controls=self.search_controls();
         let categories=SearchCategory::ALL.iter().enumerate().map(|(index,category)|
             menus::entry(category.label(),&format!("search-filter-{index}"),true,*category==controls.category)).collect();
-        menus::submenu("搜索选项",vec![
-            menus::submenu("文件类型",categories),
-            menus::item("搜索范围…","search-scope"),
-            menus::item("结果排序…","search-order"),
-            menus::entry("上一页结果","search-page-previous",!controls.busy&&controls.offset>0,false),
-            menus::entry("下一页结果","search-page-next",!controls.busy&&controls.shown>0&&u64::from(controls.offset)+(controls.shown as u64)<controls.total,false),
-            menus::item("重新搜索","search-refresh"),
-            menus::item("关闭搜索\tEsc","search-close"),
+        menus::submenu(zsdesk_core::i18n::text("搜索选项"),vec![
+            menus::submenu(zsdesk_core::i18n::text("文件类型"),categories),
+            menus::item(zsdesk_core::i18n::text("搜索范围…"),"search-scope"),
+            menus::item(zsdesk_core::i18n::text("结果排序…"),"search-order"),
+            menus::entry(zsdesk_core::i18n::text("上一页结果"),"search-page-previous",!controls.busy&&controls.offset>0,false),
+            menus::entry(zsdesk_core::i18n::text("下一页结果"),"search-page-next",!controls.busy&&controls.shown>0&&u64::from(controls.offset)+(controls.shown as u64)<controls.total,false),
+            menus::item(zsdesk_core::i18n::text("重新搜索"),"search-refresh"),
+            menus::item(zsdesk_core::i18n::text("关闭搜索\tEsc"),"search-close"),
             menus::MenuItemSpec::Separator,
-            if self.session.ui.search_backend.is_builtin(){menus::item("重建自带索引","search-native-rebuild")}else{menus::item("Everything 索引设置…","search-settings")},
-            menus::item("搜索引擎状态…","search-engine-status"),
+            if self.session.ui.search_backend.is_builtin(){menus::item(zsdesk_core::i18n::text("重建自带索引"),"search-native-rebuild")}else{menus::item(zsdesk_core::i18n::text("Everything 索引设置…"),"search-settings")},
+            menus::item(zsdesk_core::i18n::text("搜索引擎状态…"),"search-engine-status"),
         ])
     }
 
     pub(super) unsafe fn apply_search_option(&mut self,id:&str)->bool {
-        if id=="search-engine-status"{self.sync_search_preferences();if let Err(error)=super::diagnostics::show_search(self.hwnd,&self.config_path){self.show_message(format!("无法显示搜索引擎状态：{error:#}"));}return true;}
+        if id=="search-engine-status"{self.sync_search_preferences();if let Err(error)=super::diagnostics::show_search(self.hwnd,&self.config_path){self.show_message(zsdesk_core::tr_format!("无法显示搜索引擎状态：{error:#}", error=error));}return true;}
         if id=="search-native-rebuild"{self.rebuild_search_index();return true;}
         let hit=match id {
             "search-scope"=>SearchPanelHit::Scope,"search-order"=>SearchPanelHit::Sort,
@@ -151,11 +151,11 @@ impl WindowState {
         cv.stroke_round(card, radius, color(fence.border), 1.0);
         let title = rect(layout.title);
         cv.glyph(glyph::SEARCH, RectF::new(title.x, title.y, self.sf(22.0), title.h), self.sf(16.0), accent);
-        cv.text("搜索", RectF::new(title.x + self.sf(30.0), title.y, title.w - self.sf(30.0), title.h),
+        cv.text(zsdesk_core::i18n::text("搜索"), RectF::new(title.x + self.sf(30.0), title.y, title.w - self.sf(30.0), title.h),
             &TextStyle::ui(self.sf(15.0)).weight(600), text);
 
         self.search_panel_button(cv, layout.scope, SearchPanelHit::Scope, true, &fence);
-        let scope = controls.scope.as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|| "全部磁盘".into());
+        let scope = controls.scope.as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|| zsdesk_core::i18n::text("全部磁盘").into());
         let scope_rect = rect(layout.scope);
         cv.glyph(glyph::FOLDER, RectF::new(scope_rect.x + self.sf(6.0), scope_rect.y, self.sf(16.0), scope_rect.h), self.sf(13.0), secondary);
         cv.text(&scope, RectF::new(scope_rect.x + self.sf(28.0), scope_rect.y,
@@ -187,17 +187,17 @@ impl WindowState {
 
         let is_query = matches!(self.current_location(), ShellLocation::Search { .. });
         let status = if let Some(error) = &controls.error {
-            format!("搜索未完成 · {}", error.lines().next().unwrap_or("请重试"))
+            zsdesk_core::tr_format!("搜索未完成 · {}", error.lines().next().unwrap_or(zsdesk_core::i18n::text("请重试")))
         } else if controls.busy {
-            "正在搜索…".to_owned()
+            zsdesk_core::i18n::text("正在搜索…").to_owned()
         } else if controls.total > 0 {
             let first = if controls.shown == 0 { 0 } else { u64::from(controls.offset) + 1 };
             let last = (u64::from(controls.offset) + controls.shown as u64).min(controls.total);
-            format!("共 {} 项 · 显示 {first}–{last}", controls.total)
+            zsdesk_core::tr_format!("共 {} 项 · 显示 {first}–{last}", controls.total, first=first, last=last)
         } else if is_query {
-            "没有匹配项目 · 尝试其他关键词或搜索范围".to_owned()
+            zsdesk_core::i18n::text("没有匹配项目 · 尝试其他关键词或搜索范围").to_owned()
         } else {
-            if self.session.ui.search_backend.is_builtin(){"自带搜索：输入文件名、路径或类型筛选".to_owned()}else{"Everything 搜索：输入文件名、路径或搜索语法".to_owned()}
+            if self.session.ui.search_backend.is_builtin(){zsdesk_core::i18n::text("自带搜索：输入文件名、路径或类型筛选").to_owned()}else{zsdesk_core::i18n::text("Everything 搜索：输入文件名、路径或搜索语法").to_owned()}
         };
         let status_color = if controls.error.is_some() {
             if self.dark { Color::rgba8(255, 180, 171, 255) } else { Color::rgba8(165, 38, 44, 255) }
@@ -205,7 +205,7 @@ impl WindowState {
         cv.text(&status, rect(layout.status), &small, status_color);
         if controls.error.is_some() {
             self.search_panel_button(cv, layout.retry, SearchPanelHit::Retry, !controls.busy, &fence);
-            cv.text("重试", rect(layout.retry), &small.clone().align(Align::Center), accent);
+            cv.text(zsdesk_core::i18n::text("重试"), rect(layout.retry), &small.clone().align(Align::Center), accent);
         }
 
         self.search_panel_button(cv, layout.sort, SearchPanelHit::Sort, true, &fence);
@@ -215,7 +215,7 @@ impl WindowState {
             (sorting.w - self.sf(46.0)).max(0.0), sorting.h), &small, text);
         cv.glyph(glyph::CHEVRON_DOWN, RectF::new(sorting.right() - self.sf(16.0), sorting.y, self.sf(12.0), sorting.h), self.sf(8.0), secondary);
         self.search_panel_button(cv, layout.index_settings, SearchPanelHit::IndexSettings, true, &fence);
-        cv.text("索引设置", rect(layout.index_settings), &small.clone().align(Align::Center), secondary);
+        cv.text(zsdesk_core::i18n::text("索引设置"), rect(layout.index_settings), &small.clone().align(Align::Center), secondary);
         let previous = controls.offset > 0 && !controls.busy;
         let next = u64::from(controls.offset) + (controls.shown as u64) < controls.total
             && controls.shown > 0 && !controls.busy;
@@ -278,9 +278,9 @@ impl WindowState {
         let current = super::integrated_search::font_scope::folder_scope(self.current_location())
             .or_else(||self.search_scope.as_ref().and_then(super::integrated_search::font_scope::folder_scope));
         let spec = menus::menu(vec![
-            menus::entry("全部磁盘", "all", true, controls.scope.is_none()),
-            menus::entry("当前文件夹", "current", current.is_some(), current.is_some() && controls.scope == current),
-            menus::item("选择文件夹…", "choose"),
+            menus::entry(zsdesk_core::i18n::text("全部磁盘"), "all", true, controls.scope.is_none()),
+            menus::entry(zsdesk_core::i18n::text("当前文件夹"), "current", current.is_some(), current.is_some() && controls.scope == current),
+            menus::item(zsdesk_core::i18n::text("选择文件夹…"), "choose"),
         ]);
         let choice = super::input::popup(self.hwnd, &spec, Some(self.layout.search_panel.scope));
         let scope = match choice.as_deref() {
@@ -288,7 +288,7 @@ impl WindowState {
             Some("current") => { let Some(path) = current else { return }; Some(path) },
             Some("choose") => match choose_scope(self.hwnd) {
                 Ok(Some(path)) => Some(path), Ok(None) => return,
-                Err(error) => { self.show_message(format!("无法选择搜索文件夹：{error:#}")); return; }
+                Err(error) => { self.show_message(zsdesk_core::tr_format!("无法选择搜索文件夹：{error:#}", error=error)); return; }
             },
             _ => return,
         };

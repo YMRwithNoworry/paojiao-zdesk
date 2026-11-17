@@ -8,7 +8,7 @@ pub(super) struct SettingsJob{
     result:std::sync::mpsc::Receiver<anyhow::Result<()>>,
     thread:Option<std::thread::JoinHandle<()>>,
 }
-impl Drop for SettingsJob{fn drop(&mut self){if let Some(thread)=self.thread.take(){let _=thread.join();}}}
+impl Drop for SettingsJob{fn drop(&mut self){if let Some(thread)=self.thread.take(){if thread.is_finished(){let _=thread.join();}}}}
 
 #[derive(Clone,Debug,PartialEq,Eq)]
 pub(super) struct SubmittedSearch{
@@ -50,7 +50,7 @@ impl WindowState{
         let fallback = match &location { ShellLocation::Search { query, .. } => query.clone(), _ => String::new() };
         let scope = match &location {
             ShellLocation::Search { scope, .. } => scope.clone(),
-            location if !self.session.ui.search_all_files => font_scope::folder_scope(location),
+            location if !self.session.ui.search_all_files||location.as_path().is_some_and(crate::fast_search::network::is_remote) => font_scope::folder_scope(location),
             _ => None,
         };
         let controls = self.search_panel.tabs.entry(id).or_insert_with(|| SearchControls { scope, ..Default::default() });
@@ -66,9 +66,9 @@ impl WindowState{
 
     pub(super) fn launch_search_settings(&mut self,service:bool){
         self.sync_search_preferences();
-        if self.session.ui.search_backend.is_builtin(){self.show_message("当前使用自带搜索，可在搜索设置中调整索引选项".into());return;}
+        if self.session.ui.search_backend.is_builtin(){self.show_message(zsdesk_core::i18n::text("当前使用自带搜索，可在搜索设置中调整索引选项").into());return;}
         self.poll_search_settings();
-        if self.search_settings_job.is_some(){self.show_message("正在打开搜索设置…".into());return;}
+        if self.search_settings_job.is_some(){self.show_message(zsdesk_core::i18n::text("正在打开搜索设置…").into());return;}
         let profile=self.config_path.clone();let(sender,receiver)=std::sync::mpsc::sync_channel(1);
         match std::thread::Builder::new().name("zsdesk-search-settings".into()).spawn(move||{
             let result=(||{
@@ -78,15 +78,15 @@ impl WindowState{
             })();let _=sender.send(result);
         }){
             Ok(thread)=>self.search_settings_job=Some(SettingsJob{result:receiver,thread:Some(thread)}),
-            Err(error)=>self.show_message(format!("无法打开搜索设置：{error}")),
+            Err(error)=>self.show_message(zsdesk_core::tr_format!("无法打开搜索设置：{error}", error=error)),
         }
     }
     pub(super) fn poll_search_settings(&mut self){
         use std::sync::mpsc::TryRecvError;
         let result=self.search_settings_job.as_ref().map(|job|job.result.try_recv());
         match result{
-            Some(Ok(result))=>{self.search_settings_job=None;if let Err(error)=result{self.show_message(format!("搜索设置未完成：{error:#}"));}},
-            Some(Err(TryRecvError::Disconnected))=>{self.search_settings_job=None;self.show_message("搜索设置任务已结束，请重试".into());},_=>{},
+            Some(Ok(result))=>{self.search_settings_job=None;if let Err(error)=result{self.show_message(zsdesk_core::tr_format!("搜索设置未完成：{error:#}", error=error));}},
+            Some(Err(TryRecvError::Disconnected))=>{self.search_settings_job=None;self.show_message(zsdesk_core::i18n::text("搜索设置任务已结束，请重试").into());},_=>{},
         }
     }
     pub(super) unsafe fn open_integrated_search(&mut self){
@@ -96,7 +96,7 @@ impl WindowState{
             self.search_panel.open=true;
             let scope = match self.current_location() {
                 ShellLocation::Search { scope, .. } => scope.clone(),
-                location if !self.session.ui.search_all_files => font_scope::folder_scope(location),
+                location if !self.session.ui.search_all_files||location.as_path().is_some_and(crate::fast_search::network::is_remote) => font_scope::folder_scope(location),
                 _ => None,
             };
             if self.search_controls().origin.is_none() { self.search_controls_mut().scope = scope; }

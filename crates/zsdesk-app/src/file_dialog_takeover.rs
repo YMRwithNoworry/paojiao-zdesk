@@ -87,7 +87,7 @@ fn initial_location(value:&str)->Option<zsdesk_core::model::explorer::ShellLocat
     let value=value.split_once(": ").or_else(||value.split_once('：')).map_or(value,|(_,value)|value).trim();
     if Path::new(value).is_absolute(){return Some(ShellLocation::Path(value.into()));}
     match value.to_lowercase().as_str(){"桌面"|"desktop"=>zsdesk_windows::desktop::user_desktop().map(ShellLocation::Path),"此电脑"|"this pc"=>Some(ShellLocation::ThisPc),
-        "主文件夹"|"home"=>Some(ShellLocation::Shell{pidl:None,parsing_name:"shell:HomeFolder".into(),title:"主文件夹".into()}),_=>None}
+        "主文件夹"|"home"=>Some(ShellLocation::Shell{pidl:None,parsing_name:"shell:HomeFolder".into(),title:zsdesk_core::i18n::text("主文件夹").into()}),_=>None}
 }
 fn pattern(label:&str)->String{
     let value=label.replace('（',"(").replace('）',")");

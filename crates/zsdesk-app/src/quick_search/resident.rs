@@ -13,7 +13,7 @@ fn chord(text:&str)->Result<(HOT_KEY_MODIFIERS,u32)>{control::native_hotkey(text
 fn focus_main(profile:&Path,settings:bool)->Result<()>{
     if !settings{return super::popup::show(profile);}
     if crate::instance::focus_search(profile,settings)?{return Ok(());}
-    let args=vec![if settings{"--search-settings"}else{"--focus-search"}.into(),"--profile-dir".into(),profile.parent().context("配置目录缺失")?.as_os_str().to_owned()];
+    let args=vec![if settings{"--search-settings"}else{"--focus-search"}.into(),"--profile-dir".into(),profile.parent().context(zsdesk_core::i18n::text("配置目录缺失"))?.as_os_str().to_owned()];
     if !crate::runtime::enqueue_local(profile,args.clone())?{
         use std::os::windows::process::CommandExt;
         std::process::Command::new(std::env::current_exe()?).args(args).creation_flags(0x08000000).spawn()?;
@@ -34,12 +34,12 @@ fn configure(hwnd:HWND,state:&mut State)->Result<bool>{
             Ok(())=>{state.registered=true;state.hotkey=prefs.hotkey.clone();},
             Err(error)=>{
                 let reason=match error.code().0 as u32{
-                    0x80070581=>"已被其他程序占用",
-                    0x800705b3=>"需要在已登录用户的交互式会话中运行",
-                    _=>"系统未接受注册",
+                    0x80070581=>zsdesk_core::i18n::text("已被其他程序占用"),
+                    0x800705b3=>zsdesk_core::i18n::text("需要在已登录用户的交互式会话中运行"),
+                    _=>zsdesk_core::i18n::text("系统未接受注册"),
                 };
-                state.error=Some(format!("快捷键 {} 未注册（{reason}）：{error}",prefs.hotkey));
-                if let Some((mods,key))=previous{if unsafe{RegisterHotKey(Some(hwnd),HOTKEY,mods,key)}.is_ok(){state.registered=true;state.error.as_mut().unwrap().push_str("；原快捷键仍可使用");}}
+                state.error=Some(zsdesk_core::tr_format!("快捷键 {} 未注册（{reason}）：{error}" , prefs.hotkey, reason=reason, error=error));
+                if let Some((mods,key))=previous{if unsafe{RegisterHotKey(Some(hwnd),HOTKEY,mods,key)}.is_ok(){state.registered=true;state.error.as_mut().unwrap().push_str(zsdesk_core::i18n::text("；原快捷键仍可使用"));}}
                 if !state.registered{state.hotkey=prefs.hotkey.clone();}
             },
         }
@@ -55,7 +55,7 @@ unsafe extern "system" fn proc(hwnd:HWND,message:u32,wp:WPARAM,lp:LPARAM)->LRESU
     if pointer.is_null(){return unsafe{DefWindowProcW(hwnd,message,wp,lp)};}
     if message==WM_HOTKEY&&wp.0==HOTKEY as usize{
         let profile=unsafe{&*pointer}.profile.clone();let result=focus_main(&profile,false);
-        let state=unsafe{&mut*pointer};state.error=result.err().map(|error|format!("无法打开快速搜索：{error:#}"));state.visible=super::popup::is_open();
+        let state=unsafe{&mut*pointer};state.error=result.err().map(|error|zsdesk_core::tr_format!("无法打开快速搜索：{error:#}", error=error));state.visible=super::popup::is_open();
         control::write_status(&profile,state.error.as_deref(),state.visible,&state.hotkey,state.registered);return LRESULT(0);
     }
     if message==EVENT{
@@ -73,7 +73,7 @@ unsafe extern "system" fn proc(hwnd:HWND,message:u32,wp:WPARAM,lp:LPARAM)->LRESU
             }
             Some("open"|"settings"|"rebuild")=>{
                 let result=focus_main(&profile,action!=Some("open"));let state=unsafe{&mut*pointer};
-                state.error=result.err().map(|error|format!("无法打开搜索窗口：{error:#}"));state.visible=super::popup::is_open();
+                state.error=result.err().map(|error|zsdesk_core::tr_format!("无法打开搜索窗口：{error:#}" , error=error));state.visible=super::popup::is_open();
                 control::write_status(&profile,state.error.as_deref(),state.visible,&state.hotkey,state.registered);
             },_=>{}
         }return LRESULT(0);

@@ -20,11 +20,11 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Error::NotFound(p) => write!(f, "路径不存在：{p}"),
-            Error::AccessDenied(p) => write!(f, "无权限访问：{p}"),
-            Error::DeviceUnavailable(p) => write!(f, "设备不可用：{p}"),
-            Error::InvalidInput(msg) => write!(f, "无效输入：{msg}"),
-            Error::Conflict(msg) => write!(f, "操作冲突：{msg}"),
+            Error::NotFound(p) => write!(f, "{}", tr_format!("路径不存在：{p}" , p=p)),
+            Error::AccessDenied(p) => write!(f, "{}", tr_format!("无权限访问：{p}" , p=p)),
+            Error::DeviceUnavailable(p) => write!(f, "{}", tr_format!("设备不可用：{p}" , p=p)),
+            Error::InvalidInput(msg) => write!(f, "{}", tr_format!("无效输入：{msg}" , msg=msg)),
+            Error::Conflict(msg) => write!(f, "{}", tr_format!("操作冲突：{msg}" , msg=msg)),
         }
     }
 }

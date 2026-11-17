@@ -11,18 +11,18 @@ fn entries(items:&[MenuCatalogItem],settings:&ContextMenuPreferences,flat:&mut V
         let index=flat.len();flat.push(item.clone());
         let label=item.label.replace('&',"&&");
         let visible=parent_visible&&!menu::catalog_item_hidden(item,&options);
-        let command=menus::entry(if item.submenu{"显示此菜单"}else{&label},&format!("catalog-{index}"),item.manageable,visible);
+        let command=menus::entry(if item.submenu{zsdesk_core::i18n::text("显示此菜单")}else{&label},&format!("catalog-{index}"),item.manageable,visible);
         if item.submenu{
             let mut children=vec![command,MenuItemSpec::Separator];children.extend(entries(&item.children,settings,flat,visible));
-            if item.truncated{children.push(menus::entry("其余项目由系统动态提供","catalog-truncated",false,false));}
+            if item.truncated{children.push(menus::entry(zsdesk_core::i18n::text("其余项目由系统动态提供"),"catalog-truncated",false,false));}
             menus::submenu(&label,children)
         }else{command}
     }).collect()
 }
 fn specification(catalog:&[MenuCatalogItem],settings:&ContextMenuPreferences)->(MenuSpec,Vec<MenuCatalogItem>){
-    let mut flat=Vec::new();let mut items=vec![menus::entry("勾选表示显示；仅影响 ZSDesk","catalog-heading",false,false),MenuItemSpec::Separator];
+    let mut flat=Vec::new();let mut items=vec![menus::entry(zsdesk_core::i18n::text("勾选表示显示；仅影响 ZSDesk"),"catalog-heading",false,false),MenuItemSpec::Separator];
     items.extend(entries(catalog,settings,&mut flat,true));
-    items.extend([MenuItemSpec::Separator,menus::item("还原所有菜单命令","catalog-reset")]);
+    items.extend([MenuItemSpec::Separator,menus::item(zsdesk_core::i18n::text("还原所有菜单命令"),"catalog-reset")]);
     (menus::menu(items),flat)
 }
 fn toggle(settings:&mut ContextMenuPreferences,item:&MenuCatalogItem,flat:&[MenuCatalogItem]){
@@ -39,22 +39,22 @@ impl WindowState{
     pub(super) fn persist_context_menu(&mut self)->bool{
         if let Err(error)=storage::save_context_menu(&self.config_path,&self.session.ui.context_menu){
             if let Ok(saved)=storage::load(&self.config_path){self.session.ui.context_menu=saved.ui.context_menu;}
-            self.show_message(format!("右键菜单设置未保存：{error:#}"));return false;
+            self.show_message(zsdesk_core::tr_format!("右键菜单设置未保存：{error:#}", error=error));return false;
         }
         true
     }
     pub(super) fn load_context_catalog(&mut self){
-        if self.pending.is_some(){self.show_message("请等待当前文件夹加载完成".into());return;}
+        if self.pending.is_some(){self.show_message(zsdesk_core::i18n::text("请等待当前文件夹加载完成").into());return;}
         let result=(||->windows::core::Result<()>{
             let Some(identity)=self.identity_for_source(self.browser_source)else{return Ok(());};
             let Some(browser)=&self.browser else{return Ok(());};
             let view=unsafe{browser.current_view()?};let preferences=self.menu_source_preferences(identity.source)?;
             super::context_menu::show_catalog(self.hwnd,&view,identity,preferences)
         })();
-        match result{Ok(())=>self.show_message("正在读取此处的系统右键菜单…".into()),Err(error)=>self.show_message(format!("无法读取右键菜单：{error}"))}
+        match result{Ok(())=>self.show_message(zsdesk_core::i18n::text("正在读取此处的系统右键菜单…").into()),Err(error)=>self.show_message(zsdesk_core::tr_format!("无法读取右键菜单：{error}", error=error))}
     }
     pub(super) fn manage_context_catalog(&mut self,catalog:Vec<MenuCatalogItem>){
-        if catalog.is_empty(){self.show_message("此处没有可管理的系统菜单项".into());return;}
+        if catalog.is_empty(){self.show_message(zsdesk_core::i18n::text("此处没有可管理的系统菜单项").into());return;}
         let (spec,_)=specification(&catalog,&self.session.ui.context_menu);
         let hwnd=self.hwnd;let anchor=Some(self.layout.app_menu);
         super::input::popup_persistent(hwnd,&spec,anchor,&mut|action|{

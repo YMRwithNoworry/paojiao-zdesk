@@ -32,7 +32,7 @@ impl WindowState {
         if let Some(browser) = &self.browser {
             match browser.set_view_mode(mode, size) {
                 Ok(()) => { self.view_mode = browser.view_mode().unwrap_or((mode, size)); unsafe { self.capture_active(); } self.save(); self.invalidate(); }
-                Err(error) => self.show_message(format!("无法切换视图：{error}")),
+                Err(error) => self.show_message(zsdesk_core::tr_format!("无法切换视图：{error}", error=error)),
             }
         }
     }
@@ -123,7 +123,7 @@ impl WindowState {
                     let _=SetWindowPos(self.hwnd,None,0,0,0,0,SWP_FRAMECHANGED|SWP_NOMOVE|SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE);
                 }
             }
-            self.show_message(format!("无法切换全屏：{error}"));
+            self.show_message(zsdesk_core::tr_format!("无法切换全屏：{error}", error=error));
         }
         unsafe { self.resize(); }
         self.remember_placement();self.save();
@@ -141,16 +141,16 @@ impl WindowState {
         let arguments=match crate::app::new_window_arguments(profile,location){Ok(args)=>args,Err(error)=>{self.show_message(error.to_string());return false;}};
         match crate::runtime::enqueue_local(&self.config_path,arguments.clone()){Ok(true)=>return true,Err(error)=>{self.show_message(error.to_string());return false;},Ok(false)=>{}}
         let executable=match std::env::current_exe(){Ok(path)=>path,Err(error)=>{self.show_message(error.to_string());return false;}};
-        if !crate::app::window_command_line_fits(&executable,&arguments){self.show_message("窗口位置超过系统命令行容量，标签页已保留".into());return false;}
+        if !crate::app::window_command_line_fits(&executable,&arguments){self.show_message(zsdesk_core::i18n::text("窗口位置超过系统命令行容量，标签页已保留").into());return false;}
         let mut command = std::process::Command::new(executable);
         command.args(arguments);
-        match command.spawn(){Ok(_)=>true,Err(error)=>{self.show_message(format!("无法打开新窗口：{error}"));false}}
+        match command.spawn(){Ok(_)=>true,Err(error)=>{self.show_message(zsdesk_core::tr_format!("无法打开新窗口：{error}", error=error));false}}
     }
     /// A tab dragged out of the tab strip continues in its own window.
     pub(super) unsafe fn tear_off_tab(&mut self,index:usize) {
         let Some(tab)=self.session.tabs.get(index) else{return;};
-        if self.session.tabs.len()<2{self.show_message("只有一个标签页，已保留在当前窗口".into());return;}
-        if tab.locked{self.show_message("已锁定的标签页不能拖出为新窗口".into());return;}
+        if self.session.tabs.len()<2{self.show_message(zsdesk_core::i18n::text("只有一个标签页，已保留在当前窗口").into());return;}
+        if tab.locked{self.show_message(zsdesk_core::i18n::text("已锁定的标签页不能拖出为新窗口").into());return;}
         let location=tab.current().clone();
         // Open first: if the new window cannot start, the tab stays here.
         if self.open_in_new_window(&location){unsafe{self.close_tab(index);}}

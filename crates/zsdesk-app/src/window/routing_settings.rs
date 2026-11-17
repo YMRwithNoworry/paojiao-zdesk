@@ -9,17 +9,17 @@ impl WindowState {
         let mut settings = match routing_control::load(&self.config_path) {
             Ok(value) => value,
             Err(error) => {
-                self.show_message(format!("无法读取文件位置转发配置：{error}"));
+                self.show_message(zsdesk_core::tr_format!("无法读取文件位置转发配置：{error}", error=error));
                 return;
             }
         };
         let available = routing_control::bundle_available();
         let status = if settings.pending_changes {
-            "选择已保存，尚未应用"
+            zsdesk_core::i18n::text("选择已保存，尚未应用")
         } else if settings.enabled {
-            "文件位置转发已启用"
+            zsdesk_core::i18n::text("文件位置转发已启用")
         } else {
-            "文件位置转发未启用"
+            zsdesk_core::i18n::text("文件位置转发未启用")
         };
         let mut items = vec![
             entry(status, "status", false, false),
@@ -45,46 +45,46 @@ impl WindowState {
             }
         }
         if !known.is_empty() {
-            items.push(submenu("Codex / 微信", known));
+            items.push(submenu(zsdesk_core::i18n::text("Codex / 微信"), known));
         }
         if !others.is_empty() {
             // Pages keep a long installed-application list within native menu bounds.
             if others.len() <= 20 {
-                items.push(submenu("其他应用", others));
+                items.push(submenu(zsdesk_core::i18n::text("其他应用"), others));
             } else {
                 for (index, chunk) in others.chunks(20).enumerate() {
                     items.push(submenu(
-                        &format!("其他应用 {}–{}", index * 20 + 1, index * 20 + chunk.len()),
+                        &zsdesk_core::tr_format!("其他应用 {}–{}", index * 20 + 1, index * 20 + chunk.len()),
                         chunk.to_vec(),
                     ));
                 }
             }
         }
         items.extend([
-            entry("发现可配置的应用…", "discover", available, false),
-            entry("添加其他程序…", "add", available, false),
+            entry(zsdesk_core::i18n::text("发现可配置的应用…"), "discover", available, false),
+            entry(zsdesk_core::i18n::text("添加其他程序…"), "add", available, false),
             MenuItemSpec::Separator,
-            entry("登录时启用", "startup", true, settings.start_with_windows),
+            entry(zsdesk_core::i18n::text("登录时启用"), "startup", true, settings.start_with_windows),
             entry(
-                "一键启用所选应用",
+                zsdesk_core::i18n::text("一键启用所选应用"),
                 "apply",
                 available && settings.applications.iter().any(|a| a.enabled),
                 false,
             ),
             entry(
-                "停用文件位置转发",
+                zsdesk_core::i18n::text("停用文件位置转发"),
                 "disable",
                 settings.control_path.is_some(),
                 false,
             ),
         ]);
         if !settings.applications.is_empty() {
-            items.push(submenu("补充程序组件（高级）", settings.applications.iter().map(|app| {
+            items.push(submenu(zsdesk_core::i18n::text("补充程序组件（高级）"), settings.applications.iter().map(|app| {
                 entry(&format!("{}{}", app.label.replace('&', "&&"), if app.profile == 4 { "（已配置）" } else { "" }),
                     &format!("caller-{}", app.id), available, false)
             }).collect()));
             items.push(submenu(
-                "移除应用",
+                zsdesk_core::i18n::text("移除应用"),
                 settings
                     .applications
                     .iter()
@@ -101,7 +101,7 @@ impl WindowState {
         }
         if !available {
             items.push(entry(
-                "当前安装包未包含路由组件",
+                zsdesk_core::i18n::text("当前安装包未包含路由组件"),
                 "package-missing",
                 false,
                 false,
@@ -121,7 +121,7 @@ impl WindowState {
             Some("startup") => {
                 settings.start_with_windows = !settings.start_with_windows;
                 routing_control::save_draft(&self.config_path, &settings)
-                    .map(|_| self.show_message("登录启动选择已保存，应用设置后生效".into()))
+                    .map(|_| self.show_message(zsdesk_core::i18n::text("登录启动选择已保存，应用设置后生效").into()))
             }
             Some(value) if value.starts_with("application-") => {
                 if let Ok(id) = value[12..].parse::<u32>() {
@@ -130,14 +130,14 @@ impl WindowState {
                     }
                 }
                 routing_control::save_draft(&self.config_path, &settings)
-                    .map(|_| self.show_message("应用选择已保存，点击“一键启用所选应用”生效".into()))
+                    .map(|_| self.show_message(zsdesk_core::i18n::text("应用选择已保存，点击“一键启用所选应用”生效").into()))
             }
             Some(value) if value.starts_with("remove-") => {
                 if let Ok(id) = value[7..].parse::<u32>() {
                     settings.applications.retain(|a| a.id != id);
                 }
                 routing_control::save_draft(&self.config_path, &settings)
-                    .map(|_| self.show_message("应用已从选择中移除，应用设置后更新转发规则".into()))
+                    .map(|_| self.show_message(zsdesk_core::i18n::text("应用已从选择中移除，应用设置后更新转发规则").into()))
             }
             Some(value) if value.starts_with("caller-") => {
                 match value[7..].parse::<u32>().ok().and_then(|id| settings.applications.iter().find(|app| app.id == id)) {
@@ -151,7 +151,7 @@ impl WindowState {
             _ => Ok(()),
         };
         if let Err(error) = result {
-            self.show_message(format!("文件位置设置未完成：{error}"));
+            self.show_message(zsdesk_core::tr_format!("文件位置设置未完成：{error}", error=error));
         }
     }
 }

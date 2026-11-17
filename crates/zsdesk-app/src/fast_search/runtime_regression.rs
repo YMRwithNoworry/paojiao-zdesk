@@ -18,7 +18,7 @@ impl Drop for Fixture{fn drop(&mut self){
         &&fs::read(self.root.join("owner")).is_ok_and(|bytes|bytes==self.marker.as_bytes()) {let _=fs::remove_dir_all(&self.root);}
 }}
 fn shared()->Shared{Shared{control:Mutex::new(Control::default()),wake:Condvar::new(),stop:AtomicBool::new(false),engine_stop:AtomicBool::new(false),generation:AtomicU64::new(1),
-    notified:AtomicBool::new(false),hwnd:0,message:0,notifier:None,maintenance_role:AtomicU64::new(0),native_page:Mutex::new(None)}}
+    notified:AtomicBool::new(false),hwnd:0,message:0,notifier:None,maintenance_role:AtomicU64::new(0),query_active:AtomicBool::new(false),native_page:Mutex::new(None),network_io:Mutex::new(None)}}
 fn direct(core:&native::Core,fixture:&Fixture,options:SearchOptions,text:&str,offset:u32,limit:u32,sort:everything::SearchSort)->Result<(Vec<PathBuf>,SearchEvent)>{
     let shared=shared();let(sender,receiver)=mpsc::sync_channel(128);let request=Request{generation:1,query:text.into(),preferred:None,invalid:None,offset,limit,sort};
     let deadline=Instant::now()+Duration::from_secs(30);let mut paths=Vec::new();
@@ -312,4 +312,35 @@ fn native_backend_choice_does_not_cross_start()->Result<()>{
     let report=json!({"state":"passed","persisted_selection_respected":true,"missing_everything_uses_builtin":true,"native_syntax_no_everything_fallback":true,
         "missing_preferences_fail_closed":true,"scoped_native_fallback_returned_file":true,"native_snapshot_created":true,"engine_process_started":false});
     fs::write(output.join("verification.current.json"),serde_json::to_vec_pretty(&report)?)?;println!("{report}");Ok(())
+}
+
+#[test]
+fn background_maintenance_does_not_renew_query_idle_lifetime()->Result<()>{
+    let fixture=Fixture::new(&std::env::temp_dir())?;let expected=fixture.write("idle-needle.txt",b"kept")?;
+    let options=SearchOptions{backend:BackendPreference::DirectoryScan,..Default::default()};let core=native::shared(&fixture.index);
+    let(paths,_)=direct(&core,&fixture,options,"idle-needle",0,20,everything::SearchSort::NameAsc)?;assert_eq!(paths,vec![expected.clone()]);
+    let builds=native::inspect(&core).2;let used=native::set_idle_for_test(&core,Duration::from_secs(31));
+    let shared=shared();let(sender,_receiver)=mpsc::sync_channel(128);
+    native::prepare(&core,&options,Some(std::slice::from_ref(&fixture.files)),&shared,&sender)?;
+    assert_eq!(native::last_use_for_test(&core),used,"background maintenance renewed the user activity clock");
+    native::evict_if_idle(&core,30);assert_eq!(native::inspect(&core).0,0);assert!(fixture.index.is_file());
+    let(paths,_)=direct(&core,&fixture,options,"idle-needle",0,20,everything::SearchSort::NameAsc)?;
+    assert_eq!(paths,vec![expected]);assert_eq!(native::inspect(&core).2,builds,"idle release forced a full index rebuild");Ok(())
+}
+
+#[test]
+fn scoped_directory_search_uses_names_without_a_local_volume_catalog()->Result<()>{
+    let fixture=Fixture::new(&std::env::temp_dir())?;
+    let one=fixture.write("folder/网络合同.txt",b"one")?;let two=fixture.write("other/网络合同2.txt",b"two")?;
+    fixture.write("excluded/无关.txt",b"other")?;
+    let shared=shared();let(sender,receiver)=mpsc::sync_channel(128);
+    let request=Request{generation:1,query:"网络合同".into(),preferred:Some(fixture.files.clone()),invalid:None,offset:0,limit:1,sort:everything::SearchSort::NameAsc};
+    network::execute(&shared,&sender,&request,&fixture.files,false)?;
+    let events=receiver.try_iter().collect::<Vec<_>>();let paths=events.iter().flat_map(|event|event.paths.clone()).collect::<Vec<_>>();
+    assert_eq!(paths,vec![one]);let last=events.last().unwrap();assert!(last.finished&&last.truncated);assert_eq!(last.indexed,2);
+    assert!(!fixture.index.exists(),"scoped search wrote or loaded a local-volume index");
+    let request=Request{offset:1,..request};network::execute(&shared,&sender,&request,&fixture.files,false)?;
+    assert_eq!(receiver.try_iter().flat_map(|event|event.paths).collect::<Vec<_>>(),vec![two]);
+    shared.generation.store(2,Ordering::Release);
+    assert!(network::execute(&shared,&sender,&request,&fixture.files,false).is_err());assert!(receiver.try_recv().is_err());Ok(())
 }

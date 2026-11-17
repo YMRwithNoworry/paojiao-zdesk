@@ -4,12 +4,12 @@ pub(super) struct InfoRow{pub section:bool,pub key:String,pub description:String
 pub(super) fn shortcut_rows(body:&str)->Vec<InfoRow>{
     let mut rows=Vec::new();
     for line in body.lines().map(str::trim).filter(|line|!line.is_empty()){
-        if matches!(line,"文件管理器"|"桌面格子"|"全局搜索"){
+        if ["文件管理器","桌面格子","全局搜索"].iter().any(|title|line==*title||line==zsdesk_core::i18n::text(title)){
             rows.push(InfoRow{section:true,key:String::new(),description:line.into()});continue;
         }
         for part in line.split('　').map(str::trim).filter(|part|!part.is_empty()){
             let chinese=part.char_indices().find(|(_,c)|('\u{3400}'..='\u{9fff}').contains(c)).map(|(index,_)|index);
-            let pair=match chinese{Some(index)if index>0=>Some((&part[..index],&part[index..])),Some(0)=>part.split_once(' '),_=>None};
+            let pair=match chinese{Some(index)if index>0=>Some((&part[..index],&part[index..])),Some(0)=>part.split_once(' '),_=>part.split_once("  ")};
             let(key,description)=pair.unwrap_or(("",part));
             rows.push(InfoRow{section:false,key:key.trim().into(),description:description.trim().into()});
         }
@@ -61,8 +61,8 @@ impl Panel{
             draw_text(dc,&format!("{} · {}",env!("CARGO_PKG_VERSION"),crate::edition::name()),RECT{left:self.s(80),top:self.s(42),right:rect.right,bottom:self.s(70)},self.font,secondary);
             let card=RECT{left:0,top:self.s(90),right:rect.right,bottom:(self.s(202)).min(rect.bottom)};
             rounded(dc,card,rgb(p.input),composite(p.divider,p.input),self.s(10));
-            wrapped(dc,"多标签文件管理器与桌面整理",RECT{left:self.s(18),top:self.s(106),right:rect.right-self.s(18),bottom:self.s(138)},self.font,composite(p.text,p.input));
-            wrapped(dc,"文件浏览、快速搜索、内容预览与桌面格子。",RECT{left:self.s(18),top:self.s(144),right:rect.right-self.s(18),bottom:card.bottom-self.s(10)},self.font,composite(p.text_secondary,p.input));
+            wrapped(dc,zsdesk_core::i18n::text("多标签文件管理器与桌面整理"),RECT{left:self.s(18),top:self.s(106),right:rect.right-self.s(18),bottom:self.s(138)},self.font,composite(p.text,p.input));
+            wrapped(dc,zsdesk_core::i18n::text("文件浏览、快速搜索、内容预览与桌面格子。"),RECT{left:self.s(18),top:self.s(144),right:rect.right-self.s(18),bottom:card.bottom-self.s(10)},self.font,composite(p.text_secondary,p.input));
             return;
         }
         let saved=unsafe{SaveDC(dc)};unsafe{IntersectClipRect(dc,rect.left,rect.top,rect.right,rect.bottom);}
@@ -93,6 +93,13 @@ impl Panel{
 
 #[cfg(test)]mod tests{
     use super::*;
+    #[test]fn english_shortcuts_keep_section_and_key_columns(){
+        let _language=zsdesk_core::i18n::Scope::english(true);
+        let rows=shortcut_rows(crate::window::shortcut_help_text());
+        assert_eq!(rows.iter().filter(|row|row.section).count(),if crate::edition::DESKTOP&&!crate::edition::DESKTOP_ONLY{2}else{1});
+        if !crate::edition::DESKTOP_ONLY{assert!(rows.iter().any(|row|row.key=="Ctrl+W / Ctrl+F4"&&row.description=="Close tab"));}
+        if crate::edition::DESKTOP{assert!(rows.iter().any(|row|row.key=="Hover"&&row.description=="Expand a collapsed fence"));}
+    }
     #[test]fn shortcut_aliases_and_groups_keep_their_meaning(){
         let rows=shortcut_rows("文件管理器\nCtrl+W / Ctrl+F4 关闭标签　Ctrl+F1 展开或收起命令栏\n\n桌面格子\n鼠标悬停 展开格子");
         assert_eq!(rows.len(),5);assert!(rows[0].section&&rows[3].section);

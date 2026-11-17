@@ -15,6 +15,7 @@ mod drag_placement;
 mod external_drop;
 mod clipboard;
 mod outside_selection;
+mod mouse_input;
 mod protocol;
 #[cfg(test)]mod window_message_regression;
 #[cfg(test)]mod context_menu_regression;
@@ -42,7 +43,7 @@ fn stale_startup_for_profile(current:&str,expected:&str)->bool{
 pub fn startup_enabled(config: &std::path::Path) -> anyhow::Result<bool> {
     let executable = std::env::current_exe()?;
     let expected = host::fence_startup_command(&executable, config)
-        .ok_or_else(|| anyhow::anyhow!("无法确定桌面格子的程序和配置目录"))?;
+        .ok_or_else(|| anyhow::anyhow!("{}", zsdesk_core::tr_format!("无法确定桌面格子的程序和配置目录")))?;
     for name in [startup_value(config),crate::edition::desktop_startup_value().into()]{
         if zsdesk_windows::desktop::autostart_command(&name)?.as_deref().is_some_and(|current|zsdesk_windows::desktop::autostart_owned(current,&expected)){return Ok(true);}
     }Ok(false)
@@ -50,10 +51,10 @@ pub fn startup_enabled(config: &std::path::Path) -> anyhow::Result<bool> {
 
 /// Applies the same ownership checks as the desktop tray's login switch.
 pub fn set_startup_enabled(config: &std::path::Path, enabled: bool) -> anyhow::Result<()> {
-    anyhow::ensure!(crate::edition::DESKTOP, "当前版本不包含桌面格子");
+    anyhow::ensure!(crate::edition::DESKTOP, "{}", zsdesk_core::tr_format!("当前版本不包含桌面格子"));
     let executable = std::env::current_exe()?;
     let expected = host::fence_startup_command(&executable, config)
-        .ok_or_else(|| anyhow::anyhow!("无法确定桌面格子的程序和配置目录"))?;
+        .ok_or_else(|| anyhow::anyhow!("{}", zsdesk_core::tr_format!("无法确定桌面格子的程序和配置目录")))?;
     let name=startup_value(config);let legacy_name=crate::edition::desktop_startup_value();
     let legacy=zsdesk_windows::desktop::autostart_command(legacy_name)?;
     let current=zsdesk_windows::desktop::autostart_command(&name)?;
@@ -70,7 +71,7 @@ pub fn set_startup_enabled(config: &std::path::Path, enabled: bool) -> anyhow::R
         // set_autostart rechecks the exact value; unrelated installs survive.
         zsdesk_windows::desktop::set_autostart(legacy_name,&legacy,false)?;
     }
-    anyhow::ensure!(startup_enabled(config)?==enabled,"桌面格子登录启动未能确认保存");
+    anyhow::ensure!(startup_enabled(config)?==enabled, "{}", zsdesk_core::tr_format!("桌面格子登录启动未能确认保存"));
     Ok(())
 }
 
@@ -164,6 +165,7 @@ pub enum DesktopCommand { Show, Organize, Restore, NewFence, Map(PathBuf), Tray,
 thread_local! {
     static HOST: RefCell<Option<DesktopHost>> = const { RefCell::new(None) };
     static HOOK: Cell<isize> = const { Cell::new(0) };
+    static MOUSE_MONITOR:RefCell<Option<mouse_input::Monitor>>=const{RefCell::new(None)};
     static HOST_HWND: Cell<isize> = const { Cell::new(0) };
     static LAST_CLICK: Cell<Option<DesktopClick>> = const { Cell::new(None) };
     /// Only explicit desktop-layer updates may change a fence's z-order.
@@ -271,16 +273,17 @@ pub fn run(config_path: PathBuf, explorer_config: PathBuf, command: DesktopComma
     if command == DesktopCommand::Quit { let _ = unsafe { CloseHandle(mutex) }; return Ok(()); }
     if matches!(command, DesktopCommand::Diagnostics(_)) {
         let _ = unsafe { CloseHandle(mutex) };
-        anyhow::bail!("当前配置的桌面格子未运行，未为诊断启动任何窗口");
+        anyhow::bail!("{}", zsdesk_core::tr_format!("当前配置的桌面格子未运行，未为诊断启动任何窗口"));
     }
     if let Err(error) = unsafe { OleInitialize(None) }.context("OleInitialize failed") {
         let _ = unsafe { CloseHandle(mutex) };
         return Err(error);
     }
     let result = run_host(config_path, explorer_config, command, &key);
+    let clipboard=zsdesk_windows::shell::file_transfer::persist_thread_clipboard();
     unsafe { OleUninitialize(); }
     let _ = unsafe { CloseHandle(mutex) };
-    result
+    result.and(clipboard.map(|_|()).map_err(Into::into))
 }
 
 fn forward(key: &[u16], command: &DesktopCommand) -> Result<()> {
@@ -297,7 +300,7 @@ fn forward(key: &[u16], command: &DesktopCommand) -> Result<()> {
         }
         std::thread::sleep(std::time::Duration::from_millis(60));
     }
-    anyhow::bail!("桌面格子正在启动，请稍后重试")
+    anyhow::bail!("{}", zsdesk_core::tr_format!("桌面格子正在启动，请稍后重试"))
 }
 
 fn run_host(config_path: PathBuf, explorer_config: PathBuf, command: DesktopCommand, key: &[u16]) -> Result<()> {
@@ -309,11 +312,11 @@ fn run_host(config_path: PathBuf, explorer_config: PathBuf, command: DesktopComm
         RegisterClassW(&WNDCLASSW { style: CS_DBLCLKS, lpfnWndProc: Some(fence_proc), hInstance: instance,
             hCursor: LoadCursorW(None, IDC_ARROW)?, lpszClassName: PCWSTR(fence_class.as_ptr()), ..Default::default() });
     }
-    let hwnd = unsafe { CreateWindowExW(WS_EX_TOOLWINDOW, PCWSTR(host_class.as_ptr()), w!("ZSDesk 桌面格子"), WS_POPUP, 0, 0, 0, 0, None, None, Some(instance), None)? };
+    let hwnd = unsafe { CreateWindowExW(WS_EX_TOOLWINDOW, PCWSTR(host_class.as_ptr()), windows::core::PCWSTR(zsdesk_core::i18n::wide("ZSDesk 桌面格子").as_ptr()), WS_POPUP, 0, 0, 0, 0, None, None, Some(instance), None)? };
     unsafe { SetPropW(hwnd, PCWSTR(key.as_ptr()), Some(HANDLE(1usize as *mut _)))?; }
     HOST_HWND.with(|h| h.set(hwnd.0 as isize));
     let (family, _) = zsdesk_windows::gfx::system_ui_font(None);
-    let gfx = Gfx::new(&family).context("Direct2D 初始化失败")?;
+    let gfx = Gfx::new(&family).context(zsdesk_core::i18n::text("Direct2D 初始化失败"))?;
     zsdesk_windows::flyout::prepare();
     let config = host::load_config(&config_path);
     HOST.with(|h| *h.borrow_mut() = Some(DesktopHost::new(hwnd, config_path, explorer_config, config, gfx)));
@@ -359,7 +362,7 @@ fn execute(command: DesktopCommand) {
         DesktopCommand::Tray => { h.show_tray(); After::Nothing }
         DesktopCommand::Quit => After::Nothing,
         DesktopCommand::Diagnostics(path) => {
-            if let Err(error) = h.write_diagnostics(&path) { eprintln!("桌面资源诊断失败：{error:#}"); }
+            if let Err(error) = h.write_diagnostics(&path) { eprintln!("{}", zsdesk_core::tr_format!("桌面资源诊断失败：{error:#}" , error=error)); }
             After::Nothing
         }
     });
@@ -379,7 +382,7 @@ pub fn guard(config_path: PathBuf, pid: u32, desktop_thread: Option<u32>) -> Res
     let process = Owned(unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, pid)? });
     let thread = if let Some(id)=desktop_thread {
         let handle=Owned(unsafe{OpenThread(THREAD_SYNCHRONIZE|THREAD_QUERY_LIMITED_INFORMATION,false,id)}?);
-        anyhow::ensure!(unsafe{GetProcessIdOfThread(handle.0)}==pid,"桌面监护线程不属于目标进程");
+        anyhow::ensure!(unsafe{GetProcessIdOfThread(handle.0)}==pid, "{}", zsdesk_core::tr_format!("桌面监护线程不属于目标进程"));
         Some(handle)
     } else { None };
     let mut handles=vec![process.0];
@@ -391,7 +394,7 @@ pub fn guard(config_path: PathBuf, pid: u32, desktop_thread: Option<u32>) -> Res
     unsafe { SetEvent(ready.0)?; }
     drop(ready);
     let waited=unsafe { WaitForMultipleObjects(&handles, false, INFINITE) }.0;
-    anyhow::ensure!((waited as usize)<handles.len(),"桌面监护等待失败：{waited:#x}");
+    anyhow::ensure!((waited as usize)<handles.len(), "{}", zsdesk_core::tr_format!("桌面监护等待失败：{waited:#x}" , waited=waited));
     drop(thread);drop(process);
     let mut config = host::load_config(&config_path);
     if config.settings.icons_hidden_by_zsdesk {
@@ -402,7 +405,7 @@ pub fn guard(config_path: PathBuf, pid: u32, desktop_thread: Option<u32>) -> Res
             config.settings.icons_hidden_by_zsdesk = false;
             host::save_config(&config_path, &config)?;
         } else {
-            anyhow::bail!("系统桌面图标恢复失败，恢复标记已保留");
+            anyhow::bail!("{}", zsdesk_core::tr_format!("系统桌面图标恢复失败，恢复标记已保留"));
         }
     }
     Ok(())
@@ -419,6 +422,7 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
         return LRESULT(0);
     }
     match msg {
+        mouse_input::MESSAGE=>{process_mouse_input();return LRESULT(0);}
         outside_selection::MESSAGE=>{outside_selection::dispatch();return LRESULT(0);}
         WM_TIMER if wp.0==outside_selection::TIMER=>{outside_selection::tick();return LRESULT(0);}
         external_drop::MESSAGE=>{external_drop::start();return LRESULT(0);}
@@ -484,11 +488,11 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                 if wp.0 == TIMER_ICONS { let _ = unsafe { KillTimer(Some(h.hwnd), TIMER_ICONS) }; h.icons_ready(); }
             });
             // Busy with a modal operation: try again shortly.
-            if done.is_none() { unsafe { SetTimer(Some(hwnd), wp.0, 500, None); } }
+            if done.is_none() { unsafe { SetTimer(Some(hwnd), wp.0, if wp.0==TIMER_ICONS{16}else{500}, None); } }
             return LRESULT(0);
         }
         WM_ICON_READY => {
-            if with_host(|h| if h.accept_icon_notification(wp.0) { h.icons_ready(); }).is_none() { unsafe { SetTimer(Some(hwnd), TIMER_ICONS, 50, None); } }
+            if with_host(|h|h.accept_icon_notification(wp.0)).unwrap_or(true){unsafe{SetTimer(Some(hwnd),TIMER_ICONS,16,None);}}
             return LRESULT(0);
         }
         WM_DESKTOP_DBLCLICK => {
@@ -543,8 +547,8 @@ fn point_of(lp: LPARAM) -> POINT { POINT { x: (lp.0 as i16) as i32, y: ((lp.0 >>
 
 unsafe extern "system" fn fence_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     if msg != 0 && msg == zsdesk_windows::shell::menu::failure_message() {
-        let text = wide(&format!("右键菜单加载失败（0x{:08X}），隐藏设置仍保留。", wp.0 as u32));
-        unsafe { MessageBoxW(Some(hwnd), PCWSTR(text.as_ptr()), w!("ZSDesk 桌面格子"), MB_OK | MB_ICONWARNING); }
+        let text = wide(&zsdesk_core::tr_format!("右键菜单加载失败（0x{:08X}），隐藏设置仍保留。" , wp.0 as u32));
+        unsafe { MessageBoxW(Some(hwnd), PCWSTR(text.as_ptr()), windows::core::PCWSTR(zsdesk_core::i18n::wide("ZSDesk 桌面格子").as_ptr()), MB_OK | MB_ICONWARNING); }
         request_layer_repair();
         return LRESULT(0);
     }
@@ -678,14 +682,14 @@ fn file_operation_finished(fence:u64,owner:HWND,code:u32,token:usize){
 
 fn file_action_error(owner: HWND, error: &windows::core::Error) {
     if zsdesk_windows::shell::file_transfer::is_cancelled(error.code()) || !unsafe { IsWindow(Some(owner)) }.as_bool() { return; }
-    let text = wide(&format!("无法完成文件操作：{}",zsdesk_windows::shell::file_transfer::error_message(error)));
-    unsafe { MessageBoxW(Some(owner), PCWSTR(text.as_ptr()), w!("ZSDesk 桌面格子"), MB_OK | MB_ICONWARNING); }
+    let text = wide(&zsdesk_core::tr_format!("无法完成文件操作：{}" , zsdesk_windows::shell::file_transfer::error_message(error)));
+    unsafe { MessageBoxW(Some(owner), PCWSTR(text.as_ptr()), windows::core::PCWSTR(zsdesk_core::i18n::wide("ZSDesk 桌面格子").as_ptr()), MB_OK | MB_ICONWARNING); }
 }
 
 fn dispatch_application_menu(fence: u64, owner: HWND, command: u32, ids: &[String], point: POINT) {
     if !unsafe { IsWindow(Some(owner)) }.as_bool() { return; }
     let Some(id) = command.checked_sub(APP_FIRST).and_then(|offset| ids.get(offset as usize)) else {
-        file_action_error(owner, &windows::core::Error::new(windows::core::HRESULT(0x80070057u32 as i32), "菜单命令已失效"));
+        file_action_error(owner, &windows::core::Error::new(windows::core::HRESULT(0x80070057u32 as i32), zsdesk_core::i18n::text("菜单命令已失效")));
         return;
     };
     if let Some(after) = with_host(|host| host.menu_command(Some(fence), id, point)) { run_after(after); }
@@ -711,7 +715,7 @@ fn run_after(after: After) {
         After::Notice(message) => {
             let owner = with_host(|host| host.hwnd).unwrap_or_default();
             let text = wide(message);
-            unsafe { MessageBoxW(Some(owner), PCWSTR(text.as_ptr()), w!("ZSDesk 桌面格子"), MB_OK | MB_ICONINFORMATION); }
+            unsafe { MessageBoxW(Some(owner), PCWSTR(text.as_ptr()), windows::core::PCWSTR(zsdesk_core::i18n::wide("ZSDesk 桌面格子").as_ptr()), MB_OK | MB_ICONINFORMATION); }
         }
         After::Rename { fence, key, name } => {
             let target = with_host(|h| h.win_index(fence).and_then(|i| h.fences[i].entries.iter().find(|e| e.key == key).map(|e| (h.fences[i].hwnd, e.pidl.clone())))).flatten();
@@ -722,19 +726,19 @@ fn run_after(after: After) {
         }
         After::PickFolder { replace } => {
             let owner = with_host(|h| h.hwnd).unwrap_or_default();
-            if let Some(path) = desktop::pick_folder(owner, "选择要映射到桌面格子的文件夹") { with_host(|h| h.add_folder_fence(path, replace)); }
+            if let Some(path) = desktop::pick_folder(owner, zsdesk_core::i18n::text("选择要映射到桌面格子的文件夹")) { with_host(|h| h.add_folder_fence(path, replace)); }
         }
         After::PickFolderTab { to } => {
             let owner = with_host(|h| h.hwnd).unwrap_or_default();
-            if let Some(path) = desktop::pick_folder(owner, "选择要映射为标签的文件夹") { with_host(|h| h.add_folder_tab(to, path)); }
+            if let Some(path) = desktop::pick_folder(owner, zsdesk_core::i18n::text("选择要映射为标签的文件夹")) { with_host(|h| h.add_folder_tab(to, path)); }
         }
         After::AddTab { fence, point } => tab_popup(fence, point, |h| h.add_tab_menu()),
         After::TabList { fence, point } => tab_popup(fence, point, |h| h.tab_list_menu(fence)),
         After::DeleteFence(id) => {
             let Some((hwnd, title, tab)) = with_host(|h| h.config.fence(id).map(|f| (h.hwnd, f.title.clone(), f.group != 0))).flatten() else { return };
-            let text = wide(&if tab { format!("关闭标签“{title}”？\n\n标签中的文件和文件夹不会被删除。") }
-                else { format!("删除格子“{title}”？\n\n格子中的文件和文件夹不会被删除。") });
-            let answer = unsafe { MessageBoxW(Some(hwnd), PCWSTR(text.as_ptr()), w!("ZSDesk 桌面格子"), MB_OKCANCEL | MB_ICONQUESTION) };
+            let text = wide(&if tab { zsdesk_core::tr_format!("关闭标签“{title}”？\n\n标签中的文件和文件夹不会被删除。" , title=title) }
+                else { zsdesk_core::tr_format!("删除格子“{title}”？\n\n格子中的文件和文件夹不会被删除。" , title=title) });
+            let answer = unsafe { MessageBoxW(Some(hwnd), PCWSTR(text.as_ptr()), windows::core::PCWSTR(zsdesk_core::i18n::wide("ZSDesk 桌面格子").as_ptr()), MB_OKCANCEL | MB_ICONQUESTION) };
             if answer == IDOK { with_host(|h| h.delete_fence(id)); }
         }
     }
@@ -866,7 +870,7 @@ fn finish_menu(fence:u64,hwnd:HWND,point:POINT,target_key:Option<String>,ids:&[S
             let index = target_key.as_ref().and_then(|key| with_host(|h| h.win_index(fence)
                 .and_then(|i| h.fences[i].entries.iter().position(|entry| &entry.key == key))).flatten());
             let Some(index) = index else {
-                file_action_error(hwnd, &windows::core::Error::new(windows::core::HRESULT(0x80070490u32 as i32), "所选项目已变化，请重新选择"));
+                file_action_error(hwnd, &windows::core::Error::new(windows::core::HRESULT(0x80070490u32 as i32), zsdesk_core::i18n::text("所选项目已变化，请重新选择")));
                 return;
             };
             if action == MenuOutcome::Rename {
@@ -1022,9 +1026,9 @@ fn run_history(fence: u64, action: HistoryAction) {
         menu.invoke_history(hwnd, action)
     })();
     if let Err(error) = result {
-        let verb = if action == HistoryAction::Undo { "撤销" } else { "重做" };
-        let text = wide(&format!("无法{verb}文件操作：{error}"));
-        unsafe { MessageBoxW(Some(hwnd), PCWSTR(text.as_ptr()), w!("ZSDesk 桌面格子"), MB_OK | MB_ICONINFORMATION); }
+        let verb = if action == HistoryAction::Undo { zsdesk_core::i18n::text("撤销") } else { zsdesk_core::i18n::text("重做") };
+        let text = wide(&zsdesk_core::tr_format!("无法{verb}文件操作：{error}" , verb=verb, error=error));
+        unsafe { MessageBoxW(Some(hwnd), PCWSTR(text.as_ptr()), windows::core::PCWSTR(zsdesk_core::i18n::wide("ZSDesk 桌面格子").as_ptr()), MB_OK | MB_ICONINFORMATION); }
     }
     refresh_fence(fence);
 }
@@ -1192,13 +1196,14 @@ pub fn update_hook(double_click: bool, organize:bool) {
     outside_selection::configure(organize);
     let enabled=double_click||organize;
     LAST_CLICK.with(|click| click.set(None));
-    let current = HOOK.with(Cell::get);
-    if enabled && current == 0 {
-        let instance = unsafe { GetModuleHandleW(None) }.ok().map(|m| HINSTANCE(m.0));
-        if let Ok(hook) = unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook), instance, 0) } { HOOK.with(|h| h.set(hook.0 as isize)); }
-    } else if !enabled && current != 0 {
-        let _ = unsafe { UnhookWindowsHookEx(HHOOK(current as *mut _)) };
-        HOOK.with(|h| h.set(0));
+    if enabled&&HOOK.with(Cell::get)==0{
+        let owner=HWND(HOST_HWND.with(Cell::get)as*mut _);
+        match mouse_input::Monitor::start(owner){
+            Ok(monitor)=>{HOOK.with(|slot|slot.set(monitor.thread_id()as isize));MOUSE_MONITOR.with(|slot|*slot.borrow_mut()=Some(monitor));},
+            Err(error)=>crate::runtime::trace(&format!("mouse observer: {error:#}")),
+        }
+    }else if !enabled{
+        let monitor=MOUSE_MONITOR.with(|slot|slot.borrow_mut().take());drop(monitor);HOOK.with(|slot|slot.set(0));
     }
 }
 
@@ -1223,27 +1228,31 @@ fn next_desktop_click(previous: Option<DesktopClick>, current: Option<DesktopCli
 fn pack_screen_point(point: POINT) -> isize { ((u64::from(point.y as u32) << 32) | u64::from(point.x as u32)) as isize }
 fn unpack_screen_point(value: isize) -> POINT { POINT { x: value as u32 as i32, y: ((value as u64) >> 32) as u32 as i32 } }
 
-unsafe extern "system" fn mouse_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
-    let mut double=false;
-    if code >= 0 && wp.0 as u32 == WM_LBUTTONDOWN && lp.0 != 0 && DOUBLE_CLICK_ENABLED.with(Cell::get) {
-        let info = unsafe { &*(lp.0 as *const MSLLHOOKSTRUCT) };
-        let limit = unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime() };
-        let (dx, dy) = (unsafe { GetSystemMetrics(SM_CXDOUBLECLK) }, unsafe { GetSystemMetrics(SM_CYDOUBLECLK) });
-        let current = desktop_click_root(info.pt).map(|root| DesktopClick { root: root.0 as isize, time: info.time, x: info.pt.x, y: info.pt.y });
-        let (next, found_double) = next_desktop_click(LAST_CLICK.with(Cell::get), current, limit, dx, dy);
-        double=found_double;
-        LAST_CLICK.with(|click| click.set(next));
-        if double {
-            let host = HOST_HWND.with(Cell::get);
-            if let Some(current) = current {
-                let _ = unsafe { PostMessageW(Some(HWND(host as *mut _)), WM_DESKTOP_DBLCLICK, WPARAM(current.root as usize), LPARAM(pack_screen_point(info.pt))) };
-            }
-        }
-    } else if code >= 0 && matches!(wp.0 as u32, WM_RBUTTONDOWN | WM_RBUTTONUP | WM_MBUTTONDOWN | WM_XBUTTONDOWN | WM_MOUSEWHEEL | WM_MOUSEHWHEEL) {
-        LAST_CLICK.with(|click| click.set(None));
+fn reset_observed_gesture(){
+    LAST_CLICK.with(|slot|slot.set(None));outside_selection::cancel();external_drop::cancel_observation();
+}
+fn mouse_observer_diagnostics()->serde_json::Value{
+    MOUSE_MONITOR.with(|slot|slot.borrow().as_ref().map_or(serde_json::Value::Null,mouse_input::Monitor::diagnostics))
+}
+fn process_mouse_input(){
+    let Some((events,lost))=MOUSE_MONITOR.with(|slot|slot.borrow().as_ref().map(mouse_input::Monitor::take))else{return;};
+    if lost{reset_observed_gesture();}
+    for info in events{
+        let now=unsafe{windows::Win32::System::SystemInformation::GetTickCount64()}as u32;
+        if now.wrapping_sub(info.time)>1000{reset_observed_gesture();continue;}
+        let mut double=false;
+        if info.message==WM_LBUTTONDOWN&&DOUBLE_CLICK_ENABLED.with(Cell::get){
+            let limit=unsafe{windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime()};
+            let(dx,dy)=(unsafe{GetSystemMetrics(SM_CXDOUBLECLK)},unsafe{GetSystemMetrics(SM_CYDOUBLECLK)});
+            let current=desktop_click_root(info.point).map(|root|DesktopClick{root:root.0 as isize,time:info.time,x:info.point.x,y:info.point.y});
+            let(next,found)=next_desktop_click(LAST_CLICK.with(Cell::get),current,limit,dx,dy);double=found;LAST_CLICK.with(|slot|slot.set(next));
+            if double{if let Some(current)=current{let host=HOST_HWND.with(Cell::get);
+                let _=unsafe{PostMessageW(Some(HWND(host as*mut _)),WM_DESKTOP_DBLCLICK,WPARAM(current.root as usize),LPARAM(pack_screen_point(info.point)))};
+            }}
+        }else if matches!(info.message,WM_RBUTTONDOWN|WM_RBUTTONUP|WM_MBUTTONDOWN|WM_XBUTTONDOWN|WM_MOUSEWHEEL|WM_MOUSEHWHEEL){LAST_CLICK.with(|slot|slot.set(None));}
+        outside_selection::observe_with_modifiers(info.message,info.point,double,info.control,info.shift);
+        external_drop::observe(info.message,info.point);
     }
-    if code>=0&&lp.0!=0{let info=unsafe{&*(lp.0 as*const MSLLHOOKSTRUCT)};outside_selection::observe(wp.0 as u32,info.pt,double);external_drop::observe(wp.0 as u32,info.pt);}
-    unsafe { CallNextHookEx(None, code, wp, lp) }
 }
 
 // ---- rename edit -------------------------------------------------------------------

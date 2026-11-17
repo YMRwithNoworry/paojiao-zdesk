@@ -5,6 +5,7 @@ mod native_scan;
 mod snapshot;
 pub(crate) mod query;
 mod native;
+pub(crate) mod network;
 #[cfg(test)]#[path="fast_search/runtime_regression.rs"]mod runtime_regression;
 pub(crate) mod everything;
 pub use zsdesk_core::model::explorer::SearchBackendPreference as BackendPreference;
@@ -43,14 +44,20 @@ pub struct SearchEvent{
 #[derive(Default)]struct Control{request:Option<Request>,action:ScanAction,release_idle:bool,settings_changed:bool}
 struct Shared{
     control:Mutex<Control>,wake:Condvar,stop:AtomicBool,engine_stop:AtomicBool,generation:AtomicU64,notified:AtomicBool,
-    hwnd:isize,message:u32,notifier:Option<Arc<dyn Fn()+Send+Sync>>,maintenance_role:AtomicU64,
+    hwnd:isize,message:u32,notifier:Option<Arc<dyn Fn()+Send+Sync>>,maintenance_role:AtomicU64,query_active:AtomicBool,
     native_page:Mutex<Option<(u64,Vec<PathBuf>)>>,
+    network_io:Mutex<Option<Arc<network::IoThread>>>,
 }
 static ACTIVE_WORKERS:AtomicU64=AtomicU64::new(0);
 struct WorkerPermit;
 impl WorkerPermit{fn new()->Self{ACTIVE_WORKERS.fetch_add(1,Ordering::AcqRel);Self}}
 impl Drop for WorkerPermit{fn drop(&mut self){ACTIVE_WORKERS.fetch_sub(1,Ordering::AcqRel);}}
 pub(crate) fn pending_workers()->usize{ACTIVE_WORKERS.load(Ordering::Acquire)as usize}
+pub(crate) fn memory_diagnostics()->serde_json::Value{native::diagnostics()}
+fn any_active_query(profile:&Path)->bool{
+    CLIENTS.get().is_some_and(|registry|registry.lock().unwrap_or_else(|e|e.into_inner()).get(profile).is_some_and(|clients|
+        clients.iter().filter_map(Weak::upgrade).any(|client|!client.stop.load(Ordering::Acquire)&&client.query_active.load(Ordering::Acquire))))
+}
 impl Shared{
     fn current(&self,generation:u64)->bool{!self.stop.load(Ordering::Acquire)&&self.generation.load(Ordering::Acquire)==generation}
     fn cancelled(&self)->bool{self.stop.load(Ordering::Acquire)||self.engine_stop.load(Ordering::Acquire)}
@@ -101,7 +108,7 @@ impl FastSearch{
     fn create(path:PathBuf,hwnd:HWND,message:u32,options:SearchOptions,roots:Option<Vec<PathBuf>>,notifier:Option<Arc<dyn Fn()+Send+Sync>>,profile:Option<PathBuf>)->Result<Self>{
         let path=std::path::absolute(path)?;let profile=profile.unwrap_or_else(||path.with_file_name("explorer-session.json"));
         let shared=Arc::new(Shared{control:Mutex::new(Control::default()),wake:Condvar::new(),stop:AtomicBool::new(false),engine_stop:AtomicBool::new(false),
-            generation:AtomicU64::new(0),notified:AtomicBool::new(false),hwnd:hwnd.0 as isize,message,notifier,maintenance_role:AtomicU64::new(0),native_page:Mutex::new(None)});
+            generation:AtomicU64::new(0),notified:AtomicBool::new(false),hwnd:hwnd.0 as isize,message,notifier,maintenance_role:AtomicU64::new(0),query_active:AtomicBool::new(false),native_page:Mutex::new(None),network_io:Mutex::new(None)});
         CLIENTS.get_or_init(Default::default).lock().unwrap_or_else(|e|e.into_inner()).entry(profile.clone()).or_default().push(Arc::downgrade(&shared));
         let (sender,events)=mpsc::sync_channel(4);let state=shared.clone();
         let permit=WorkerPermit::new();
@@ -110,16 +117,16 @@ impl FastSearch{
     }
     pub fn start(&self,query:&str,preferred:Option<PathBuf>)->u64{self.start_page(query,preferred,0,2000,everything::SearchSort::NameAsc)}
     pub fn start_page(&self,query:&str,preferred:Option<PathBuf>,offset:u32,limit:u32,sort:everything::SearchSort)->u64{
-        let generation=self.shared.generation.fetch_add(1,Ordering::AcqRel)+1;self.discard_events();
+        let generation=self.shared.generation.fetch_add(1,Ordering::AcqRel)+1;network::cancel(&self.shared);self.discard_events();
         let text:String=query.trim().chars().take(513).collect();let invalid=if text.chars().count()>512||text.contains('\0'){Some("搜索内容过长或包含无效字符".into())}else{None};
         let mut control=self.shared.control.lock().unwrap_or_else(|e|e.into_inner());control.release_idle=text.is_empty();
         control.request=(!text.is_empty()).then(||Request{generation,query:text,preferred,invalid,offset,limit:limit.clamp(1,2000),sort});
-        self.shared.engine_stop.store(control.request.is_none(),Ordering::Release);drop(control);self.shared.wake.notify_all();generation
+        self.shared.query_active.store(control.request.is_some(),Ordering::Release);self.shared.engine_stop.store(control.request.is_none(),Ordering::Release);drop(control);self.shared.wake.notify_all();generation
     }
-    pub fn cancel(&self){self.shared.generation.fetch_add(1,Ordering::AcqRel);self.shared.engine_stop.store(true,Ordering::Release);
+    pub fn cancel(&self){self.shared.query_active.store(false,Ordering::Release);self.shared.generation.fetch_add(1,Ordering::AcqRel);self.shared.engine_stop.store(true,Ordering::Release);network::cancel(&self.shared);
         let mut control=self.shared.control.lock().unwrap_or_else(|e|e.into_inner());control.request=None;control.action=ScanAction::None;control.release_idle=true;drop(control);self.discard_events();self.shared.wake.notify_all();}
     /// Changing the query cancels results, not the shared catalog's progress.
-    pub fn cancel_query(&self){self.shared.generation.fetch_add(1,Ordering::AcqRel);
+    pub fn cancel_query(&self){self.shared.query_active.store(false,Ordering::Release);self.shared.generation.fetch_add(1,Ordering::AcqRel);network::cancel(&self.shared);
         let mut control=self.shared.control.lock().unwrap_or_else(|e|e.into_inner());control.request=None;control.release_idle=true;
         drop(control);self.discard_events();self.shared.wake.notify_all();}
     pub fn refresh(&self){self.schedule(ScanAction::Refresh);}
@@ -132,7 +139,7 @@ impl FastSearch{
         if drained==4{self.shared.notify();}events}
     fn discard_events(&self){self.shared.notified.store(false,Ordering::Release);for _ in 0..4{if self.events.try_recv().is_err(){break;}}}
 }
-impl Drop for FastSearch{fn drop(&mut self){self.shared.stop.store(true,Ordering::Release);self.shared.engine_stop.store(true,Ordering::Release);self.shared.wake.notify_all();if let Some(worker)=self.worker.take(){if worker.is_finished(){let _=worker.join();}}}}
+impl Drop for FastSearch{fn drop(&mut self){self.shared.query_active.store(false,Ordering::Release);self.shared.stop.store(true,Ordering::Release);self.shared.engine_stop.store(true,Ordering::Release);network::cancel(&self.shared);self.shared.wake.notify_all();if let Some(worker)=self.worker.take(){if worker.is_finished(){let _=worker.join();}}}}
 
 fn emit(shared:&Shared,sender:&SyncSender<SearchEvent>,mut event:SearchEvent){
     loop{if !shared.current(event.generation){return;}match sender.try_send(event){Ok(())=>{shared.notify();return;},Err(TrySendError::Full(value))=>{event=value;thread::sleep(Duration::from_millis(5));},Err(TrySendError::Disconnected(_))=>return,}}
@@ -143,6 +150,7 @@ fn worker_loop(path:PathBuf,profile:PathBuf,initial:SearchOptions,roots:Option<V
     let mut background=false;
     let mut external_available=true;
     let mut native_generation=None;
+    let mut released_at:Option<Instant>=None;
     loop{
         let control={let mut guard=shared.control.lock().unwrap_or_else(|e|e.into_inner());
             if guard.request.is_none()&&guard.action==ScanAction::None&&!guard.settings_changed&&!shared.stop.load(Ordering::Acquire){
@@ -159,11 +167,14 @@ fn worker_loop(path:PathBuf,profile:PathBuf,initial:SearchOptions,roots:Option<V
             external_available=everything::available(configured.as_deref());
         }
         let options=options.with_external_available(external_available);
+        if control.request.is_some()||control.action!=ScanAction::None{released_at=None;}
+        else if control.release_idle{released_at.get_or_insert_with(Instant::now);}
         if options.backend.is_builtin()!=background{
             use windows::Win32::System::Threading::{GetCurrentThread,SetThreadPriority,THREAD_MODE_BACKGROUND_BEGIN,THREAD_MODE_BACKGROUND_END};
             let _=unsafe{SetThreadPriority(GetCurrentThread(),if options.backend.is_builtin(){THREAD_MODE_BACKGROUND_BEGIN}else{THREAD_MODE_BACKGROUND_END})};background=options.backend.is_builtin();
         }
-        if !options.backend.is_builtin(){core=None;}else if control.request.is_none()&&control.action==ScanAction::None{if let Some(core)=&core{native::evict_if_idle(core,options.idle_seconds);}}
+        if !options.backend.is_builtin(){core=None;}else if control.request.is_none()&&control.action==ScanAction::None{if let Some(core)=&core{let detached=released_at.is_some_and(|at|at.elapsed()>=Duration::from_secs(30))&&!any_active_query(&profile);
+            native::evict_if_idle(core,if detached{options.idle_seconds.min(30)}else{options.idle_seconds});}}
         if control.settings_changed{core=None;}
         let Some(request)=control.request else{
             if control.action!=ScanAction::None&&options.backend.is_builtin(){
@@ -179,6 +190,14 @@ fn worker_loop(path:PathBuf,profile:PathBuf,initial:SearchOptions,roots:Option<V
         };
         if !shared.current(request.generation){continue;}
         if let Some(error)=&request.invalid{emit(&shared,&sender,failure(request.generation,if options.backend.is_builtin(){BackendKind::DirectoryScan}else{BackendKind::Everything},error.clone()));continue;}
+        if let Some(root)=request.preferred.as_deref().filter(|root|network::is_remote(root)){
+            if let Some(local)=core.take(){native::persist(&local);}
+            shared.maintenance_role.store(1,Ordering::Release);
+            if let Err(error)=network::execute(&shared,&sender,&request,root,options.pinyin_initials){
+                if shared.current(request.generation)&&!shared.cancelled(){emit(&shared,&sender,failure(request.generation,BackendKind::DirectoryScan,format!("{error:#}")));}
+            }
+            shared.maintenance_role.store(0,Ordering::Release);continue;
+        }
         if options.backend.is_builtin(){
             shared.maintenance_role.store(1,Ordering::Release);let core=core.get_or_insert_with(||native::shared(&path));
             if control.action==ScanAction::Rebuild{native::invalidate(core);}

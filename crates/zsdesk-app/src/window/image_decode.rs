@@ -22,13 +22,13 @@ pub(super) fn dimensions_allowed(width:u32,height:u32)->bool{
     width>0&&height>0&&width<=100_000&&height<=100_000&&u64::from(width)*u64::from(height)<=MAX_SOURCE_PIXELS
 }
 fn checked_bytes(width:u32,height:u32,bytes_per_pixel:u32,limit:u64)->Result<(u32,usize)>{
-    ensure!(width>0&&height>0,"图片尺寸无效");
-    let stride=width.checked_mul(bytes_per_pixel).context("图片宽度溢出")?;
+    ensure!(width>0&&height>0, "{}", zsdesk_core::tr_format!("图片尺寸无效"));
+    let stride=width.checked_mul(bytes_per_pixel).context(zsdesk_core::i18n::text("图片宽度溢出"))?;
     let bytes=u64::from(stride)*u64::from(height);
-    ensure!(bytes<=limit&&bytes<=u64::from(u32::MAX),"图片解码缓冲超出预览范围");
+    ensure!(bytes<=limit&&bytes<=u64::from(u32::MAX), "{}", zsdesk_core::tr_format!("图片解码缓冲超出预览范围"));
     Ok((stride,bytes as usize))
 }
-fn cancelled(check:&impl Fn()->bool)->Result<()>{if check(){bail!("预览已取消");}Ok(())}
+fn cancelled(check:&impl Fn()->bool)->Result<()>{if check(){bail!("{}", zsdesk_core::tr_format!("预览已取消"));}Ok(())}
 fn orientation(frame:&IWICBitmapFrameDecode)->u16{
     let Ok(reader)=(unsafe{frame.GetMetadataQueryReader()})else{return 1;};
     for query in ["/app1/ifd/{ushort=274}","/ifd/{ushort=274}","/eXIf/ifd/{ushort=274}"]{
@@ -52,7 +52,7 @@ fn native_source(factory:&IWICImagingFactory,frame:&IWICBitmapFrameDecode,target
     let(mut width,mut height)=target;
     unsafe{transform.GetClosestSize(&mut width,&mut height)}?;
     if (width,height)==original{return Ok(None);}
-    ensure!(width<=original.0&&height<=original.1&&width>=target.0&&height>=target.1,"图片解码器返回了无效缩放尺寸");
+    ensure!(width<=original.0&&height<=original.1&&width>=target.0&&height>=target.1, "{}", zsdesk_core::tr_format!("图片解码器返回了无效缩放尺寸"));
     // Preserve the decoder's color model until its ICC profile is applied.
     let mut format=unsafe{frame.GetPixelFormat()}?;
     unsafe{transform.GetClosestPixelFormat(&mut format)}?;
@@ -73,7 +73,7 @@ fn native_source(factory:&IWICImagingFactory,frame:&IWICBitmapFrameDecode,target
 fn apply_color(factory:&IWICImagingFactory,frame:&IWICBitmapFrameDecode,source:&IWICBitmapSource)->Result<(IWICBitmapSource,bool)>{
     let mut count=0;
     if unsafe{frame.GetColorContexts(&mut [],&mut count)}.is_ok()&&count>0{
-        ensure!(count<=16,"图片颜色配置过多");
+        ensure!(count<=16, "{}", zsdesk_core::tr_format!("图片颜色配置过多"));
         let mut contexts=Vec::with_capacity(count as usize);
         for _ in 0..count{contexts.push(Some(unsafe{factory.CreateColorContext()}?));}
         unsafe{frame.GetColorContexts(&mut contexts,&mut count)}?;
@@ -87,7 +87,7 @@ fn apply_color(factory:&IWICImagingFactory,frame:&IWICBitmapFrameDecode,source:&
             if kind==WICColorContextUninitialized{continue;}
             let conversion=unsafe{factory.CreateColorTransformer()}?;
             unsafe{conversion.Initialize(source,&context,&destination,&GUID_WICPixelFormat32bppBGRA)}
-                .context("无法应用图片颜色配置")?;
+                .context(zsdesk_core::i18n::text("无法应用图片颜色配置"))?;
             return Ok((conversion.cast()?,true));
         }
     }
@@ -116,7 +116,7 @@ pub(super) fn decode(path:&Path,background:u32,bounds:(u32,u32),check:impl Fn()-
     let decoder=unsafe{factory.CreateDecoderFromStream(&stream,ptr::null(),WICDecodeMetadataCacheOnDemand)}?;
     let frame=unsafe{decoder.GetFrame(0)}?;
     let(mut width,mut height)=(0,0);unsafe{frame.GetSize(&mut width,&mut height)}?;
-    ensure!(dimensions_allowed(width,height),"图片像素尺寸超出快速预览范围");
+    ensure!(dimensions_allowed(width,height), "{}", zsdesk_core::tr_format!("图片像素尺寸超出快速预览范围"));
     let orientation=orientation(&frame);
     let bounds=(bounds.0.clamp(1,MAX_BITMAP_WIDTH),bounds.1.clamp(1,MAX_BITMAP_HEIGHT));
     let raw_bounds=if orientation>=5{(bounds.1,bounds.0)}else{bounds};
@@ -125,7 +125,7 @@ pub(super) fn decode(path:&Path,background:u32,bounds:(u32,u32),check:impl Fn()-
     let(source,native)=match native_source(&factory,&frame,target,(width,height),&check)?{
         Some(source)=>source,
         None=>{
-            ensure!(u64::from(width)*u64::from(height)<=MAX_GENERIC_PIXELS,"此图片解码器不支持受控缩放，请使用支持此格式的图片查看器");
+            ensure!(u64::from(width)*u64::from(height)<=MAX_GENERIC_PIXELS, "{}", zsdesk_core::tr_format!("此图片解码器不支持受控缩放，请使用支持此格式的图片查看器"));
             (frame.cast::<IWICBitmapSource>()?,(width,height))
         }
     };

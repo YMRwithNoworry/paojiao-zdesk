@@ -14,15 +14,15 @@ pub fn submenu(label: &str, items: Vec<MenuItemSpec>) -> MenuItemSpec {
 
 pub fn tab_menu(count: usize, index: usize, can_restore: bool,locked:bool) -> MenuSpec {
     menu(vec![
-        entry("新建标签页\tCtrl+T", "new", true, false),
-        entry("复制此标签页", "duplicate", true, false),
-        entry("添加到收藏栏", "bookmark", true, false),
-        entry(if locked{"解锁此标签页"}else{"锁定此标签页"},"lock",true,locked),
+        entry(zsdesk_core::i18n::text("新建标签页\tCtrl+T"), "new", true, false),
+        entry(zsdesk_core::i18n::text("复制此标签页"), "duplicate", true, false),
+        entry(zsdesk_core::i18n::text("添加到收藏栏"), "bookmark", true, false),
+        entry(if locked{zsdesk_core::i18n::text("解锁此标签页")}else{zsdesk_core::i18n::text("锁定此标签页")},"lock",true,locked),
         MenuItemSpec::Separator,
-        entry("关闭此标签页\tCtrl+W", "close", !locked, false),
-        entry("关闭其他标签页\tCtrl+Alt+W", "close-others", count > 1, false),
-        entry("关闭右侧标签页", "close-right", index + 1 < count, false),
-        entry("重新打开关闭的标签页\tCtrl+Shift+T", "restore", can_restore, false),
+        entry(zsdesk_core::i18n::text("关闭此标签页\tCtrl+W"), "close", !locked, false),
+        entry(zsdesk_core::i18n::text("关闭其他标签页\tCtrl+Alt+W"), "close-others", count > 1, false),
+        entry(zsdesk_core::i18n::text("关闭右侧标签页"), "close-right", index + 1 < count, false),
+        entry(zsdesk_core::i18n::text("重新打开关闭的标签页\tCtrl+Shift+T"), "restore", can_restore, false),
     ])
 }
 
@@ -61,17 +61,17 @@ pub struct ShowState {
 
 pub fn view_menu(mode: i32, icon: i32, show: ShowState) -> MenuSpec {
     let current = current_view(mode, icon);
-    let mut items: Vec<MenuItemSpec> = VIEW_CHOICES.iter().map(|(label, id, _)| entry(label, id, true, *id == current)).collect();
+    let mut items: Vec<MenuItemSpec> = VIEW_CHOICES.iter().map(|(label, id, _)| entry(zsdesk_core::i18n::text(label), id, true, *id == current)).collect();
     items.push(MenuItemSpec::Separator);
-    items.push(submenu("显示", vec![
-        entry("导航窗格", "show-nav", true, show.navigation),
-        entry("预览窗格\tAlt+P", "show-preview", true, show.preview),
-        entry("详细信息窗格\tAlt+Shift+P", "show-details", true, show.details),
-        entry("收藏栏", "show-bookmarks", true, show.bookmarks),
+    items.push(submenu(zsdesk_core::i18n::text("显示"), vec![
+        entry(zsdesk_core::i18n::text("导航窗格"), "show-nav", true, show.navigation),
+        entry(zsdesk_core::i18n::text("预览窗格\tAlt+P"), "show-preview", true, show.preview),
+        entry(zsdesk_core::i18n::text("详细信息窗格\tAlt+Shift+P"), "show-details", true, show.details),
+        entry(zsdesk_core::i18n::text("收藏栏"), "show-bookmarks", true, show.bookmarks),
         MenuItemSpec::Separator,
-        entry("项目复选框", "show-checkboxes", true, show.checkboxes),
-        entry("文件扩展名", "show-extensions", true, show.extensions),
-        entry("隐藏的项目", "show-hidden", true, show.hidden),
+        entry(zsdesk_core::i18n::text("项目复选框"), "show-checkboxes", true, show.checkboxes),
+        entry(zsdesk_core::i18n::text("文件扩展名"), "show-extensions", true, show.extensions),
+        entry(zsdesk_core::i18n::text("隐藏的项目"), "show-hidden", true, show.hidden),
     ]));
     menu(items)
 }
@@ -87,15 +87,15 @@ pub const SORT_KEYS: &[(&str, &str, SortKey)] = &[
 
 pub fn sort_menu(current: Option<(SortKey, bool)>, group: Option<SortKey>) -> MenuSpec {
     let mut items: Vec<MenuItemSpec> = SORT_KEYS.iter()
-        .map(|(label, id, key)| entry(label, id, true, current.is_some_and(|(k, _)| k == *key))).collect();
+        .map(|(label, id, key)| entry(zsdesk_core::i18n::text(label), id, true, current.is_some_and(|(k, _)| k == *key))).collect();
     let ascending = current.is_none_or(|(_, asc)| asc);
     items.push(MenuItemSpec::Separator);
-    items.push(entry("递增", "sort-asc", true, ascending));
-    items.push(entry("递减", "sort-desc", true, !ascending));
+    items.push(entry(zsdesk_core::i18n::text("递增"), "sort-asc", true, ascending));
+    items.push(entry(zsdesk_core::i18n::text("递减"), "sort-desc", true, !ascending));
     items.push(MenuItemSpec::Separator);
-    let mut groups = vec![entry("（无）", "group-none", true, group.is_none())];
-    groups.extend(SORT_KEYS.iter().map(|(label, id, key)| entry(label, &id.replace("sort-", "group-"), true, group == Some(*key))));
-    items.push(submenu("分组依据", groups));
+    let mut groups = vec![entry(zsdesk_core::i18n::text("（无）"), "group-none", true, group.is_none())];
+    groups.extend(SORT_KEYS.iter().map(|(label, id, key)| entry(zsdesk_core::i18n::text(label), &id.replace("sort-", "group-"), true, group == Some(*key))));
+    items.push(submenu(zsdesk_core::i18n::text("分组依据"), groups));
     menu(items)
 }
 
@@ -107,26 +107,26 @@ pub fn sort_key(id: &str) -> Option<SortKey> {
 /// Command bar "…" menu, ordered like Windows 11 Explorer's "See more".
 pub fn more_menu(has_selection: bool, network: bool) -> MenuSpec {
     let mut items = vec![
-        entry("撤销\tCtrl+Z", "undo", true, false),
+        entry(zsdesk_core::i18n::text("撤销\tCtrl+Z"), "undo", true, false),
         MenuItemSpec::Separator,
-        entry("全部选择\tCtrl+A", "select-all", true, false),
-        entry("全部取消", "select-none", has_selection, false),
-        entry("反向选择\tCtrl+Shift+A", "select-invert", true, false),
+        entry(zsdesk_core::i18n::text("全部选择\tCtrl+A"), "select-all", true, false),
+        entry(zsdesk_core::i18n::text("全部取消"), "select-none", has_selection, false),
+        entry(zsdesk_core::i18n::text("反向选择\tCtrl+Shift+A"), "select-invert", true, false),
         MenuItemSpec::Separator,
-        entry("复制路径\tCtrl+Shift+C", "copy-path", true, false),
-        entry("在终端中打开", "terminal", true, false),
-        entry("属性\tAlt+Enter", "properties", true, false),
+        entry(zsdesk_core::i18n::text("复制路径\tCtrl+Shift+C"), "copy-path", true, false),
+        entry(zsdesk_core::i18n::text("在终端中打开"), "terminal", true, false),
+        entry(zsdesk_core::i18n::text("属性\tAlt+Enter"), "properties", true, false),
         MenuItemSpec::Separator,
     ];
     if network {
         items.extend([
-            item("映射网络驱动器…", "map-drive"),
-            item("断开网络驱动器…", "disconnect-drive"),
-            item("添加网络位置…", "add-netplace"),
+            item(zsdesk_core::i18n::text("映射网络驱动器…"), "map-drive"),
+            item(zsdesk_core::i18n::text("断开网络驱动器…"), "disconnect-drive"),
+            item(zsdesk_core::i18n::text("添加网络位置…"), "add-netplace"),
             MenuItemSpec::Separator,
         ]);
     }
-    items.push(item("选项", "options"));
+    items.push(item(zsdesk_core::i18n::text("选项"), "options"));
     menu(items)
 }
 
@@ -167,111 +167,117 @@ pub fn group(label: &str, id: &str, items: Vec<MenuItemSpec>) -> MenuItemSpec {
 /// Every entry is a checkable state or a radio choice; actions that open a
 /// window end with "…".
 pub fn interface_settings_menu(ui: &ExplorerUi) -> MenuSpec {
-    menu(vec![layout_settings(ui), tab_settings(ui), preview_settings(ui), search_settings(ui)])
+    use zsdesk_core::i18n::LanguagePreference;
+    menu(vec![layout_settings(ui), tab_settings(ui), preview_settings(ui), search_settings(ui),submenu(zsdesk_core::i18n::text("语言 / Language"),vec![
+        entry(zsdesk_core::i18n::text("跟随系统 / System default"),"language-system",true,ui.language==LanguagePreference::System),
+        entry(zsdesk_core::i18n::text("简体中文"),"language-zh",true,ui.language==LanguagePreference::Chinese),
+        entry("English","language-en",true,ui.language==LanguagePreference::English),
+    ])])
 }
 
 fn layout_settings(ui: &ExplorerUi) -> MenuItemSpec {
     let mut buttons: Vec<MenuItemSpec> = COMMAND_BAR_CHOICES.iter().map(|(label, key)| {
-        entry(label, &format!("command-bar-item-{}", key.key()), ui.command_bar.visible, ui.command_bar.item_visible(*key))
+        entry(zsdesk_core::i18n::text(label), &format!("command-bar-item-{}", key.key()), ui.command_bar.visible, ui.command_bar.item_visible(*key))
     }).collect();
     buttons.push(MenuItemSpec::Separator);
-    buttons.push(item("恢复默认按钮", "command-bar-defaults"));
-    group("布局", "settings-layout", vec![
-        entry("命令栏", "command-bar-visible", true, ui.command_bar.visible),
-        submenu("命令栏按钮", buttons),
-        entry("收藏栏", "interface-bookmarks", true, ui.show_bookmarks),
-        submenu("收藏栏位置",vec![
-            entry("上方","bookmarks-placement-top",true,!ui.bookmarks_on_right),
-            entry("右侧","bookmarks-placement-right",true,ui.bookmarks_on_right),
+    buttons.push(item(zsdesk_core::i18n::text("恢复默认按钮"), "command-bar-defaults"));
+    group(zsdesk_core::i18n::text("布局"), "settings-layout", vec![
+        entry(zsdesk_core::i18n::text("命令栏"), "command-bar-visible", true, ui.command_bar.visible),
+        submenu(zsdesk_core::i18n::text("命令栏按钮"), buttons),
+        entry(zsdesk_core::i18n::text("收藏栏"), "interface-bookmarks", true, ui.show_bookmarks),
+        entry(zsdesk_core::i18n::text("资源管理器托盘图标"), "explorer-tray", true, ui.explorer_tray),
+        submenu(zsdesk_core::i18n::text("收藏栏位置"),vec![
+            entry(zsdesk_core::i18n::text("上方"),"bookmarks-placement-top",true,!ui.bookmarks_on_right),
+            entry(zsdesk_core::i18n::text("右侧"),"bookmarks-placement-right",true,ui.bookmarks_on_right),
         ]),
-        entry("显示标签页数量", "show-tab-count", true, ui.tab_count_button_visible()),
-        entry("当前标签增强对比", "tab-selection-emphasis", true, ui.tab_selection_emphasis),
-        entry("双栏布局", "dual-pane", true, ui.dual_pane),
+        entry(zsdesk_core::i18n::text("显示标签页数量"), "show-tab-count", true, ui.tab_count_button_visible()),
+        entry(zsdesk_core::i18n::text("当前标签增强对比"), "tab-selection-emphasis", true, ui.tab_selection_emphasis),
+        entry(zsdesk_core::i18n::text("双栏布局"), "dual-pane", true, ui.dual_pane),
         MenuItemSpec::Separator,
-        entry("导航窗格", "interface-navigation", true, ui.show_tree),
-        submenu("导航窗格选项", vec![
-            entry("展开到当前文件夹", "navigation-auto-expand", true, ui.navigation_auto_expand.unwrap_or(false)),
-            entry("显示回收站", "navigation-recycle-bin", true, ui.navigation_show_recycle_bin),
-            entry("显示网络", "navigation-network", true, ui.navigation_show_network),
+        entry(zsdesk_core::i18n::text("导航窗格"), "interface-navigation", true, ui.show_tree),
+        submenu(zsdesk_core::i18n::text("导航窗格选项"), vec![
+            entry(zsdesk_core::i18n::text("展开到当前文件夹"), "navigation-auto-expand", true, ui.navigation_auto_expand.unwrap_or(false)),
+            entry(zsdesk_core::i18n::text("显示回收站"), "navigation-recycle-bin", true, ui.navigation_show_recycle_bin),
+            entry(zsdesk_core::i18n::text("显示网络"), "navigation-network", true, ui.navigation_show_network),
             MenuItemSpec::Separator,
-            entry("此电脑：跟随起始位置", "navigation-this-pc-auto", true, ui.navigation_expand_this_pc.is_none()),
-            entry("此电脑：始终展开", "navigation-this-pc-expand", true, ui.navigation_expand_this_pc == Some(true)),
-            entry("此电脑：始终折叠", "navigation-this-pc-collapse", true, ui.navigation_expand_this_pc == Some(false)),
+            entry(zsdesk_core::i18n::text("此电脑：跟随起始位置"), "navigation-this-pc-auto", true, ui.navigation_expand_this_pc.is_none()),
+            entry(zsdesk_core::i18n::text("此电脑：始终展开"), "navigation-this-pc-expand", true, ui.navigation_expand_this_pc == Some(true)),
+            entry(zsdesk_core::i18n::text("此电脑：始终折叠"), "navigation-this-pc-collapse", true, ui.navigation_expand_this_pc == Some(false)),
         ]),
     ])
 }
 
 fn tab_settings(ui: &ExplorerUi) -> MenuItemSpec {
     use zsdesk_core::model::explorer::TabPlacement;
-    group("标签页", "settings-tabs", vec![
-        entry("标签栏在上方", "tab-placement-top", true, ui.tab_placement == TabPlacement::Top),
-        entry("标签栏在左侧", "tab-placement-left", true, ui.tab_placement == TabPlacement::Left),
-        entry("标签栏在右侧", "tab-placement-right", true, ui.tab_placement == TabPlacement::Right),
-        entry("紧凑侧边标签", "side-tabs-compact", true, ui.side_tabs_compact),
-        entry("恢复侧边标签宽度", "side-tabs-width-reset", ui.tab_placement != TabPlacement::Top, false),
+    group(zsdesk_core::i18n::text("标签页"), "settings-tabs", vec![
+        entry(zsdesk_core::i18n::text("标签栏在上方"), "tab-placement-top", true, ui.tab_placement == TabPlacement::Top),
+        entry(zsdesk_core::i18n::text("标签栏在左侧"), "tab-placement-left", true, ui.tab_placement == TabPlacement::Left),
+        entry(zsdesk_core::i18n::text("标签栏在右侧"), "tab-placement-right", true, ui.tab_placement == TabPlacement::Right),
+        entry(zsdesk_core::i18n::text("紧凑侧边标签"), "side-tabs-compact", true, ui.side_tabs_compact),
+        entry(zsdesk_core::i18n::text("恢复侧边标签宽度"), "side-tabs-width-reset", ui.tab_placement != TabPlacement::Top, false),
         MenuItemSpec::Separator,
-        entry("双击关闭标签页", "double-click-close-tab", true, ui.double_click_close_tab),
-        submenu("新标签页打开位置",vec![
-            entry("此电脑","new-tab-this-pc",true,matches!(ui.new_tab_location,zsdesk_core::model::explorer::NewTabLocation::ThisPc)),
-            entry("当前文件夹","new-tab-current",true,matches!(ui.new_tab_location,zsdesk_core::model::explorer::NewTabLocation::CurrentFolder)),
-            entry("选择固定文件夹…","new-tab-folder",true,matches!(ui.new_tab_location,zsdesk_core::model::explorer::NewTabLocation::Folder(_))),
+        entry(zsdesk_core::i18n::text("双击关闭标签页"), "double-click-close-tab", true, ui.double_click_close_tab),
+        submenu(zsdesk_core::i18n::text("新标签页打开位置"),vec![
+            entry(zsdesk_core::i18n::text("此电脑"),"new-tab-this-pc",true,matches!(ui.new_tab_location,zsdesk_core::model::explorer::NewTabLocation::ThisPc)),
+            entry(zsdesk_core::i18n::text("当前文件夹"),"new-tab-current",true,matches!(ui.new_tab_location,zsdesk_core::model::explorer::NewTabLocation::CurrentFolder)),
+            entry(zsdesk_core::i18n::text("选择固定文件夹…"),"new-tab-folder",true,matches!(ui.new_tab_location,zsdesk_core::model::explorer::NewTabLocation::Folder(_))),
         ]),
-        entry("关闭最后一个标签页时关闭窗口", "close-window-last-tab", true, ui.close_window_on_last_tab),
+        entry(zsdesk_core::i18n::text("关闭最后一个标签页时关闭窗口"), "close-window-last-tab", true, ui.close_window_on_last_tab),
         MenuItemSpec::Separator,
-        submenu("重新打开窗口时",vec![
-            entry("恢复上次的标签页","startup-restore",true,matches!(ui.startup_location,zsdesk_core::model::explorer::StartupLocation::RestoreSession)),
-            entry("打开此电脑","startup-this-pc",true,matches!(ui.startup_location,zsdesk_core::model::explorer::StartupLocation::ThisPc)),
-            entry(&match &ui.startup_location {zsdesk_core::model::explorer::StartupLocation::Folder(path)=>format!("默认文件夹：{}…",path.display().to_string().replace('&',"&&")),_=>"选择默认文件夹…".into()},
+        submenu(zsdesk_core::i18n::text("重新打开窗口时"),vec![
+            entry(zsdesk_core::i18n::text("恢复上次的标签页"),"startup-restore",true,matches!(ui.startup_location,zsdesk_core::model::explorer::StartupLocation::RestoreSession)),
+            entry(zsdesk_core::i18n::text("打开此电脑"),"startup-this-pc",true,matches!(ui.startup_location,zsdesk_core::model::explorer::StartupLocation::ThisPc)),
+            entry(&match &ui.startup_location {zsdesk_core::model::explorer::StartupLocation::Folder(path)=>zsdesk_core::tr_format!("默认文件夹：{}…", path.display().to_string().replace('&',"&&")),_=>zsdesk_core::i18n::text("选择默认文件夹…").into()},
                 "startup-folder",true,matches!(ui.startup_location,zsdesk_core::model::explorer::StartupLocation::Folder(_))),
         ]),
     ])
 }
 
 fn preview_settings(ui: &ExplorerUi) -> MenuItemSpec {
-    group("预览与操作", "settings-preview", vec![
-        entry("双击空白处返回上一级","double-click-blank-up",true,ui.double_click_blank_up),
-        submenu("空格预览方式",vec![
-            entry("内置预览（默认）","space-preview-builtin",true,ui.space_preview),
-            entry("QuickLook（需单独安装并运行）","space-preview-quicklook",true,!ui.space_preview),
+    group(zsdesk_core::i18n::text("预览与操作"), "settings-preview", vec![
+        entry(zsdesk_core::i18n::text("双击空白处返回上一级"),"double-click-blank-up",true,ui.double_click_blank_up),
+        submenu(zsdesk_core::i18n::text("空格预览方式"),vec![
+            entry(zsdesk_core::i18n::text("内置预览（默认）"),"space-preview-builtin",true,ui.space_preview),
+            entry(zsdesk_core::i18n::text("QuickLook（需单独安装并运行）"),"space-preview-quicklook",true,!ui.space_preview),
         ]),
-        entry("悬停预览文件", "hover-preview", true, ui.hover_preview),
-        submenu("Office 文档预览", vec![
-            entry("系统默认", "preview-provider-system", true, ui.preview_provider == PreviewProviderPreference::System),
-            entry("Office 优先", "preview-provider-office", true, ui.preview_provider == PreviewProviderPreference::Office),
-            entry("WPS 优先", "preview-provider-wps", true, ui.preview_provider == PreviewProviderPreference::Wps),
+        entry(zsdesk_core::i18n::text("悬停预览文件"), "hover-preview", true, ui.hover_preview),
+        submenu(zsdesk_core::i18n::text("Office 文档预览"), vec![
+            entry(zsdesk_core::i18n::text("系统默认"), "preview-provider-system", true, ui.preview_provider == PreviewProviderPreference::System),
+            entry(zsdesk_core::i18n::text("Office 优先"), "preview-provider-office", true, ui.preview_provider == PreviewProviderPreference::Office),
+            entry(zsdesk_core::i18n::text("WPS 优先"), "preview-provider-wps", true, ui.preview_provider == PreviewProviderPreference::Wps),
         ]),
         MenuItemSpec::Separator,
-        entry("压缩包：在 ZSDesk 中浏览", "archive-browse", true, !ui.archives_open_externally),
-        entry("压缩包：用默认解压软件打开", "archive-external", true, ui.archives_open_externally),
+        entry(zsdesk_core::i18n::text("压缩包：在 ZSDesk 中浏览"), "archive-browse", true, !ui.archives_open_externally),
+        entry(zsdesk_core::i18n::text("压缩包：用默认解压软件打开"), "archive-external", true, ui.archives_open_externally),
         MenuItemSpec::Separator,
-        entry("鼠标手势（按住右键拖动）", "mouse-gestures", true, ui.mouse_gestures),
+        entry(zsdesk_core::i18n::text("鼠标手势（按住右键拖动）"), "mouse-gestures", true, ui.mouse_gestures),
     ])
 }
 
 fn search_settings(ui: &ExplorerUi) -> MenuItemSpec {
     let builtin=ui.search_backend.is_builtin();
-    group("搜索", "settings-search", vec![
-        entry("自带搜索", "search-backend-native", true, builtin),
-        entry("Everything 搜索", "search-backend-everything", true, !builtin),
-        submenu("自带搜索选项",vec![
-            entry("收录开发和缓存目录内容", "search-native-development",builtin,ui.search_include_development),
-            entry("索引文件大小和修改时间", "search-native-metadata",builtin,ui.search_index_metadata),
-            entry("拼音首字母匹配", "search-native-pinyin",builtin,ui.search_pinyin_initials),
-            entry("空闲 1 分钟释放索引", "search-native-idle-60",builtin,ui.search_idle_seconds==60),
-            entry("空闲 5 分钟释放索引", "search-native-idle-300",builtin,ui.search_idle_seconds==300),
-            entry("空闲 15 分钟释放索引", "search-native-idle-900",builtin,ui.search_idle_seconds==900),
+    group(zsdesk_core::i18n::text("搜索"), "settings-search", vec![
+        entry(zsdesk_core::i18n::text("自带搜索"), "search-backend-native", true, builtin),
+        entry(zsdesk_core::i18n::text("Everything 搜索"), "search-backend-everything", true, !builtin),
+        submenu(zsdesk_core::i18n::text("自带搜索选项"),vec![
+            entry(zsdesk_core::i18n::text("收录开发和缓存目录内容"), "search-native-development",builtin,ui.search_include_development),
+            entry(zsdesk_core::i18n::text("索引文件大小和修改时间"), "search-native-metadata",builtin,ui.search_index_metadata),
+            entry(zsdesk_core::i18n::text("拼音首字母匹配"), "search-native-pinyin",builtin,ui.search_pinyin_initials),
+            entry(zsdesk_core::i18n::text("空闲 1 分钟释放索引"), "search-native-idle-60",builtin,ui.search_idle_seconds==60),
+            entry(zsdesk_core::i18n::text("空闲 5 分钟释放索引"), "search-native-idle-300",builtin,ui.search_idle_seconds==300),
+            entry(zsdesk_core::i18n::text("空闲 15 分钟释放索引"), "search-native-idle-900",builtin,ui.search_idle_seconds==900),
         ]),
         MenuItemSpec::Separator,
-        entry("搜索全部本地磁盘", "search-all-files", true, ui.search_all_files),
-        entry("仅搜索当前文件夹", "search-current-folder", true, !ui.search_all_files),
-        entry("显示文件夹大小", "everything-folder-sizes", true, ui.everything_folder_sizes),
+        entry(zsdesk_core::i18n::text("搜索全部本地磁盘"), "search-all-files", true, ui.search_all_files),
+        entry(zsdesk_core::i18n::text("仅搜索当前文件夹"), "search-current-folder", true, !ui.search_all_files),
+        entry(zsdesk_core::i18n::text("显示文件夹大小"), "everything-folder-sizes", true, ui.everything_folder_sizes),
         MenuItemSpec::Separator,
-        item("重建文件名索引", "search-rebuild-index"),
-        entry("Everything 索引设置…", "search-index-settings",!builtin,false),
-        entry("启用 Everything 索引服务…", "search-everything-service",!builtin,false),
-        entry("选择已安装的 Everything…", "search-everything-program",!builtin,ui.everything_executable.is_some()),
-        entry("自动选择已安装或内置 Everything", "search-everything-auto",!builtin,ui.everything_executable.is_none()),
-        item("搜索引擎状态…", "search-engine-status"),
+        item(zsdesk_core::i18n::text("重建文件名索引"), "search-rebuild-index"),
+        entry(zsdesk_core::i18n::text("Everything 索引设置…"), "search-index-settings",!builtin,false),
+        entry(zsdesk_core::i18n::text("启用 Everything 索引服务…"), "search-everything-service",!builtin,false),
+        entry(zsdesk_core::i18n::text("选择已安装的 Everything…"), "search-everything-program",!builtin,ui.everything_executable.is_some()),
+        entry(zsdesk_core::i18n::text("自动选择已安装或内置 Everything"), "search-everything-auto",!builtin,ui.everything_executable.is_none()),
+        item(zsdesk_core::i18n::text("搜索引擎状态…"), "search-engine-status"),
     ])
 }
 
@@ -295,6 +301,10 @@ pub fn apply_interface_setting(ui: &mut ExplorerUi, choice: &str) -> bool {
         "navigation-this-pc-auto"=>ui.navigation_expand_this_pc=None,
         "navigation-this-pc-expand"=>ui.navigation_expand_this_pc=Some(true),
         "navigation-this-pc-collapse"=>ui.navigation_expand_this_pc=Some(false),
+        "language-system"=>ui.language=zsdesk_core::i18n::LanguagePreference::System,
+        "language-zh"=>ui.language=zsdesk_core::i18n::LanguagePreference::Chinese,
+        "language-en"=>ui.language=zsdesk_core::i18n::LanguagePreference::English,
+        "explorer-tray" => ui.explorer_tray=!ui.explorer_tray,
         "interface-bookmarks" => ui.show_bookmarks = !ui.show_bookmarks,
         "bookmarks-placement-top"=>ui.bookmarks_on_right=false,
         "bookmarks-placement-right"=>ui.bookmarks_on_right=true,
@@ -345,25 +355,25 @@ pub fn context_menu_settings_menu(options: &ContextMenuPreferences) -> MenuSpec 
 }
 
 /// Both visual styles retain the same registered command sources and rules.
-pub fn context_menu_settings_menu_for(options: &ContextMenuPreferences, modern_available: bool) -> MenuSpec {
+pub fn context_menu_settings_menu_for(options: &ContextMenuPreferences, _modern_available: bool) -> MenuSpec {
     let original = options.mode == ContextMenuMode::Original;
-    let modern = entry(if modern_available{"原版 Windows 11（默认）"}else{"原版 Windows 11（默认，当前兼容显示）"}, "context-menu-windows11", true, options.mode==ContextMenuMode::Windows11);
+    let modern = entry(zsdesk_core::i18n::text("Windows 11（自动兼容）"), "context-menu-windows11", true, options.mode==ContextMenuMode::Windows11);
     menu(vec![
         modern,
-        entry("自绘 Windows 11", "context-menu-drawn-windows11", true, options.mode==ContextMenuMode::DrawnWindows11),
-        entry("Windows 10 经典风格", "context-menu-original", true, original),
-        item("管理此处的完整右键菜单…","manage-context-commands"),
+        entry(zsdesk_core::i18n::text("自绘 Windows 11"), "context-menu-drawn-windows11", true, options.mode==ContextMenuMode::DrawnWindows11),
+        entry(zsdesk_core::i18n::text("Windows 10 经典风格"), "context-menu-original", true, original),
+        item(zsdesk_core::i18n::text("管理此处的完整右键菜单…"),"manage-context-commands"),
         MenuItemSpec::Separator,
-        submenu("显示的命令", vec![
-            entry("剪切、复制和粘贴", "context-action-cut-copy-paste", true, options.show_cut_copy_paste),
-            entry("复制路径", "context-action-copy-path", true, options.show_copy_path),
-            entry("重命名", "context-action-rename", true, options.show_rename),
-            entry("删除", "context-action-delete", true, options.show_delete),
-            entry("属性", "context-action-properties", true, options.show_properties),
-            entry("共享", "context-action-share", true, options.show_share),
-            entry("新建", "context-action-new", true, options.show_new),
+        submenu(zsdesk_core::i18n::text("显示的命令"), vec![
+            entry(zsdesk_core::i18n::text("剪切、复制和粘贴"), "context-action-cut-copy-paste", true, options.show_cut_copy_paste),
+            entry(zsdesk_core::i18n::text("复制路径"), "context-action-copy-path", true, options.show_copy_path),
+            entry(zsdesk_core::i18n::text("重命名"), "context-action-rename", true, options.show_rename),
+            entry(zsdesk_core::i18n::text("删除"), "context-action-delete", true, options.show_delete),
+            entry(zsdesk_core::i18n::text("属性"), "context-action-properties", true, options.show_properties),
+            entry(zsdesk_core::i18n::text("共享"), "context-action-share", true, options.show_share),
+            entry(zsdesk_core::i18n::text("新建"), "context-action-new", true, options.show_new),
         ]),
-        item("恢复默认", "context-menu-defaults"),
+        item(zsdesk_core::i18n::text("恢复默认"), "context-menu-defaults"),
     ])
 }
 
@@ -408,42 +418,42 @@ pub fn app_menu(state: AppMenuState) -> MenuSpec {
 /// help. Settings open in place as submenus instead of a second popup.
 pub fn app_menu_with_capabilities(state: AppMenuState, ui: &ExplorerUi, themed: bool) -> MenuSpec {
     let mut items = vec![
-        item("新建标签页\tCtrl+T", "new-tab"),
-        item("新建窗口\tCtrl+N", "new-window"),
-        item("收藏当前文件夹\tCtrl+D", "bookmark"),
+        item(zsdesk_core::i18n::text("新建标签页\tCtrl+T"), "new-tab"),
+        item(zsdesk_core::i18n::text("新建窗口\tCtrl+N"), "new-window"),
+        item(zsdesk_core::i18n::text("收藏当前文件夹\tCtrl+D"), "bookmark"),
         MenuItemSpec::Separator,
     ];
     items.extend(interface_settings_menu(ui).items);
-    items.push(group("右键菜单", "settings-context-menu",
+    items.push(group(zsdesk_core::i18n::text("右键菜单"), "settings-context-menu",
         context_menu_settings_menu_for(&ui.context_menu, !state.modern_menu_unavailable).items));
-    if themed { items.push(group("主题与材质", "settings-appearance", appearance_menu(&ui.appearance).items)); }
+    if themed { items.push(group(zsdesk_core::i18n::text("主题与材质"), "settings-appearance", appearance_menu(&ui.appearance).items)); }
     if let Some(running) = state.desktop_running {
-        items.push(group("桌面格子", "settings-desktop", vec![
-            item(if running { "显示桌面格子" } else { "启动桌面格子" }, "desktop-start"),
-            item("一键整理桌面", "desktop-organize"),
-            item("将当前文件夹映射为格子", "desktop-map"),
+        items.push(group(zsdesk_core::i18n::text("桌面格子"), "settings-desktop", vec![
+            item(if running { zsdesk_core::i18n::text("显示桌面格子") } else { zsdesk_core::i18n::text("启动桌面格子") }, "desktop-start"),
+            item(zsdesk_core::i18n::text("一键整理桌面"), "desktop-organize"),
+            item(zsdesk_core::i18n::text("将当前文件夹映射为格子"), "desktop-map"),
             MenuItemSpec::Separator,
-            entry("显示托盘图标", "desktop-tray", running, false),
-            entry("退出桌面格子", "desktop-quit", running, false),
+            entry(zsdesk_core::i18n::text("显示托盘图标"), "desktop-tray", running, false),
+            entry(zsdesk_core::i18n::text("退出桌面格子"), "desktop-quit", running, false),
         ]));
     }
-    items.push(group("系统集成", "settings-integration", vec![
-        entry("不接管系统资源管理器", "integration-off", true, state.integration == 0),
-        entry("右键菜单“使用 ZSDesk 打开”", "integration-context", true, state.integration == 1),
-        entry("默认打开文件夹、磁盘和此电脑", "integration-default", true, state.integration == 2),
-        entry("接管新出现的系统浏览窗口", "integration-forward-unhandled", true, if state.integration==2{state.forward_unhandled_windows}else{ui.forward_while_running}),
-        entry("接管文件选择窗口（多标签）", "integration-file-dialog-takeover", true, ui.file_dialog_takeover),
+    items.push(group(zsdesk_core::i18n::text("系统集成"), "settings-integration", vec![
+        entry(zsdesk_core::i18n::text("不接管系统资源管理器"), "integration-off", true, state.integration == 0),
+        entry(zsdesk_core::i18n::text("右键菜单“使用 ZSDesk 打开”"), "integration-context", true, state.integration == 1),
+        entry(zsdesk_core::i18n::text("默认打开文件夹、磁盘和此电脑"), "integration-default", true, state.integration == 2),
+        entry(zsdesk_core::i18n::text("接管新出现的系统浏览窗口"), "integration-forward-unhandled", true, if state.integration==2{state.forward_unhandled_windows}else{ui.forward_while_running}),
+        entry(zsdesk_core::i18n::text("接管文件选择窗口（多标签）"), "integration-file-dialog-takeover", true, ui.file_dialog_takeover),
         MenuItemSpec::Separator,
-        item("开机启动与全局快捷键…", "quick-search-settings"),
-        item("快速搜索…", "quick-search-open"),
-        item("文件位置转发…", "routing-settings"),
+        item(zsdesk_core::i18n::text("开机启动与全局快捷键…"), "quick-search-settings"),
+        item(zsdesk_core::i18n::text("快速搜索…"), "quick-search-open"),
+        item(zsdesk_core::i18n::text("文件位置转发…"), "routing-settings"),
     ]));
     items.extend([
         MenuItemSpec::Separator,
-        item("文件夹选项", "folder-options"),
-        item("键盘快捷键", "shortcuts"),
-        item("诊断日志…", "diagnostics"),
-        item("关于 ZSDesk", "about"),
+        item(zsdesk_core::i18n::text("文件夹选项"), "folder-options"),
+        item(zsdesk_core::i18n::text("键盘快捷键"), "shortcuts"),
+        item(zsdesk_core::i18n::text("诊断日志…"), "diagnostics"),
+        item(zsdesk_core::i18n::text("关于 ZSDesk"), "about"),
     ]);
     menu(items)
 }
@@ -453,14 +463,14 @@ pub fn appearance_menu(preferences: &AppearancePreferences) -> MenuSpec {
     let backdrop = preferences.backdrop;
     let scheme = preferences.color_scheme;
     menu(vec![
-        entry("材质：跟随系统", "appearance-backdrop-system", true, backdrop == BackdropStyle::System),
-        entry("材质：Mica", "appearance-mica", true, backdrop == BackdropStyle::Mica),
-        entry("材质：亚克力", "appearance-acrylic", true, backdrop == BackdropStyle::Acrylic),
-        entry("材质：纯色", "appearance-solid", true, backdrop == BackdropStyle::Solid),
+        entry(zsdesk_core::i18n::text("材质：跟随系统"), "appearance-backdrop-system", true, backdrop == BackdropStyle::System),
+        entry(zsdesk_core::i18n::text("材质：Mica"), "appearance-mica", true, backdrop == BackdropStyle::Mica),
+        entry(zsdesk_core::i18n::text("材质：亚克力"), "appearance-acrylic", true, backdrop == BackdropStyle::Acrylic),
+        entry(zsdesk_core::i18n::text("材质：纯色"), "appearance-solid", true, backdrop == BackdropStyle::Solid),
         MenuItemSpec::Separator,
-        entry("颜色：跟随系统", "appearance-color-system", true, scheme == ColorScheme::System),
-        entry("颜色：浅色", "appearance-color-light", true, scheme == ColorScheme::Light),
-        entry("颜色：深色", "appearance-color-dark", true, scheme == ColorScheme::Dark),
+        entry(zsdesk_core::i18n::text("颜色：跟随系统"), "appearance-color-system", true, scheme == ColorScheme::System),
+        entry(zsdesk_core::i18n::text("颜色：浅色"), "appearance-color-light", true, scheme == ColorScheme::Light),
+        entry(zsdesk_core::i18n::text("颜色：深色"), "appearance-color-dark", true, scheme == ColorScheme::Dark),
     ])
 }
 
@@ -486,13 +496,28 @@ pub fn tab_list_menu(titles: &[String], active: usize, can_restore: bool) -> Men
     let mut items: Vec<MenuItemSpec> = titles.iter().enumerate()
         .map(|(i, t)| entry(&t.replace('&', "&&"), &format!("tab-{i}"), true, i == active)).collect();
     items.push(MenuItemSpec::Separator);
-    items.push(entry("重新打开关闭的标签页\tCtrl+Shift+T", "restore", can_restore, false));
+    items.push(entry(zsdesk_core::i18n::text("重新打开关闭的标签页\tCtrl+Shift+T"), "restore", can_restore, false));
     menu(items)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn english_menus_keep_commands_and_user_names_intact() {
+        let _language=zsdesk_core::i18n::Scope::english(true);
+        fn check(spec:&MenuSpec){for item in &spec.items{let label=match item{
+            MenuItemSpec::Command{label,..}=>label,
+            MenuItemSpec::Submenu{label,menu,..}=>{check(menu);label},
+            _=>continue,
+        };assert!(label=="简体中文"||!label.chars().any(|c|('\u{3400}'..='\u{9fff}').contains(&c)),"Untranslated menu: {label}");}}
+        for spec in [view_menu(4,16,ShowState::default()),sort_menu(None,None),
+            interface_settings_menu(&ExplorerUi::default()),more_menu(true,true),tab_menu(2,0,true,false)]{check(&spec);}
+        let spec=tab_list_menu(&["图片".into()],0,false);
+        assert!(matches!(&spec.items[0],MenuItemSpec::Command{label,..}if label=="图片"));
+        assert_eq!(crate::chrome::CommandId::New.label(),Some("New"));
+        assert_eq!(crate::chrome::CommandId::Cut.tooltip(),"Cut (Ctrl+X)");
+    }
     fn ids(spec: &MenuSpec) -> Vec<String> {
         spec.items.iter().filter_map(|i| match i {
             MenuItemSpec::Command { command: UiCommand::Custom { id, .. }, .. } => Some(id.clone()), _ => None }).collect()

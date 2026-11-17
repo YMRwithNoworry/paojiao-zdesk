@@ -8,10 +8,10 @@ fn action_kind(label:&str)->ActionKind {
     let label=control_label(label);
     if ["文件和文件夹","文件或文件夹","文件/文件夹","files and folders","files or folders","files/folders","file or folder"]
         .iter().any(|text|label.contains(text)){return ActionKind::Mixed;}
-    if ["选择文件夹","选择此文件夹","选取文件夹","选取目录","选择目录","上传文件夹","添加文件夹",
+    if [zsdesk_core::i18n::text("选择文件夹"),"选择此文件夹","选取文件夹","选取目录","选择目录","上传文件夹","添加文件夹",
         "select folder","choose folder","select directory","choose directory","upload folder","add folder"]
         .iter().any(|text|label.starts_with(text)){return ActionKind::Folders;}
-    if ["选择文件","选取文件","上传文件","添加文件","select file","choose file","upload file","add file"]
+    if [zsdesk_core::i18n::text("选择文件"),"选取文件","上传文件","添加文件","select file","choose file","upload file","add file"]
         .iter().any(|text|label.starts_with(text)){return ActionKind::Files;}
     ActionKind::Other
 }

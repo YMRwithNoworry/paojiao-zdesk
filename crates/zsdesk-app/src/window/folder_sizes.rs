@@ -28,11 +28,11 @@ impl Drop for Variant{fn drop(&mut self){let _=unsafe{PropVariantClear(&mut self
 #[derive(Clone)]struct ChildPidl(Vec<u16>);
 impl ChildPidl{
     fn take(pointer:*mut ITEMIDLIST)->windows::core::Result<Self>{
-        if pointer.is_null(){return Err(error("空项目标识",0x80070057));}
+        if pointer.is_null(){return Err(error(zsdesk_core::i18n::text("空项目标识"),0x80070057));}
         let length=unsafe{ILGetSize(Some(pointer))}as usize;
         let result=if (2..=8192).contains(&length){let mut data=vec![0u16;length.div_ceil(2)];
             unsafe{std::ptr::copy_nonoverlapping(pointer.cast::<u8>(),data.as_mut_ptr().cast::<u8>(),length);}Ok(Self(data))}
-            else{Err(error("项目标识长度无效",0x80070057))};
+            else{Err(error(zsdesk_core::i18n::text("项目标识长度无效"),0x80070057))};
         unsafe{CoTaskMemFree(Some(pointer.cast()))};result
     }
     fn pointer(&self)->*const ITEMIDLIST{self.0.as_ptr().cast()}
@@ -47,18 +47,18 @@ impl Gather{
         for _ in 0..CHUNK{
             let mut pointers=[std::ptr::null_mut()];let mut fetched=0;
             let status=unsafe{self.enumerator.Next(&mut pointers,Some(&mut fetched))};
-            status.ok().map_err(|e|stage("枚举文件夹项目",e))?;
+            status.ok().map_err(|e|stage(zsdesk_core::i18n::text("枚举文件夹项目"),e))?;
             if fetched==0{return Ok(true);}
             let pidl=ChildPidl::take(pointers[0])?;
-            let item:IShellItem=unsafe{SHCreateItemWithParent(None,&self.folder,pidl.pointer())}.map_err(|e|stage("读取文件夹项目",e))?;
+            let item:IShellItem=unsafe{SHCreateItemWithParent(None,&self.folder,pidl.pointer())}.map_err(|e|stage(zsdesk_core::i18n::text("读取文件夹项目"),e))?;
             if unsafe{item.GetAttributes(SFGAO_FILESYSTEM)}?.0&SFGAO_FILESYSTEM.0==0{continue;}
-            let value=unsafe{item.GetDisplayName(SIGDN_FILESYSPATH)}.map_err(|e|stage("读取项目路径",e))?;
+            let value=unsafe{item.GetDisplayName(SIGDN_FILESYSPATH)}.map_err(|e|stage(zsdesk_core::i18n::text("读取项目路径"),e))?;
             if value.is_null(){continue;}
             let path=unsafe{PathBuf::from(OsString::from_wide(value.as_wide()))};unsafe{CoTaskMemFree(Some(value.0.cast()))};
             let Some(name)=path.file_name().map(|name|name.to_os_string())else{continue;};
-            if !self.names.insert(pidl.0.clone()){return Err(error("目录正在变化，正在重新读取",0x8000000a));}
+            if !self.names.insert(pidl.0.clone()){return Err(error(zsdesk_core::i18n::text("目录正在变化，正在重新读取"),0x8000000a));}
             self.bytes=self.bytes.saturating_add(pidl.0.len()*2+name.as_encoded_bytes().len()+64);
-            if self.rows.len()>=MAX_ITEMS||self.bytes>MAX_BYTES{return Err(error("目录项目过多，无法完整计算总大小；已保留原生大小列",0x8007000e));}
+            if self.rows.len()>=MAX_ITEMS||self.bytes>MAX_BYTES{return Err(error(zsdesk_core::i18n::text("目录项目过多，无法完整计算总大小；已保留原生大小列"),0x8007000e));}
             self.rows.push(Row{item:Item{name},pidl});
             if status==HRESULT(1){return Ok(true);}
         }Ok(false)
@@ -134,9 +134,9 @@ impl FolderSizes{
     pub(super) fn active(&self)->bool{self.columns.is_some()}
     pub(super) fn busy(&self)->bool{!self.blocked&&(self.pending||self.gather.is_some()||self.dirty.is_some())}
     pub(super) fn progress(&self)->Option<String>{match &self.status{
-        Status::Reading=>Some("正在读取大小计算范围…".into()),
-        Status::Pending{done,total}=>Some(format!("正在计算大小 {done} / {total}")),
-        Status::Ready{unknown,skipped_links,..} if *unknown>0||*skipped_links>0=>Some(format!("大小已更新 · {unknown} 项未知{}",if *skipped_links>0{format!(" · 未跟随 {skipped_links} 个目录链接")}else{String::new()})),
+        Status::Reading=>Some(zsdesk_core::i18n::text("正在读取大小计算范围…").into()),
+        Status::Pending{done,total}=>Some(zsdesk_core::tr_format!("正在计算大小 {done} / {total}", done=done, total=total)),
+        Status::Ready{unknown,skipped_links,..} if *unknown>0||*skipped_links>0=>Some(zsdesk_core::tr_format!("大小已更新 · {unknown} 项未知{}", if *skipped_links>0{zsdesk_core::tr_format!(" · 未跟随 {skipped_links} 个目录链接", skipped_links=skipped_links)}else{String::new()}, unknown=unknown)),
         _=>None,
     }}
     pub(super) fn invalidate(&mut self){if self.view.is_some(){self.dirty=Some(Instant::now());self.blocked=false;self.retry_after=None;}}
@@ -164,14 +164,14 @@ impl FolderSizes{
         match self.watch.as_ref().map(FilesystemWatch::changed){
             Some(Ok(true))=>self.invalidate(),Some(Err(_))=>{self.watch=None;self.invalidate();},_=>(),
         }
-        let folder=match view.cast::<IFolderView2>(){Ok(folder)=>folder,Err(error)=>return self.unavailable(format!("此视图不支持总大小：{error}"))};
-        let count=match unsafe{folder.ItemCount(SVGIO_ALLVIEW)}{Ok(count)=>count.max(0),Err(error)=>return self.unavailable(format!("无法读取目录项目：{error}"))};
+        let folder=match view.cast::<IFolderView2>(){Ok(folder)=>folder,Err(error)=>return self.unavailable(zsdesk_core::tr_format!("此视图不支持总大小：{error}", error=error))};
+        let count=match unsafe{folder.ItemCount(SVGIO_ALLVIEW)}{Ok(count)=>count.max(0),Err(error)=>return self.unavailable(zsdesk_core::tr_format!("无法读取目录项目：{error}", error=error))};
         if self.count.is_some_and(|old|old!=count){self.invalidate();self.count=Some(count);}
-        if count as usize>MAX_ITEMS{self.stop_work();self.columns=None;self.watch=None;self.notify=None;self.blocked=true;self.count=Some(count);return self.unavailable("目录项目过多，无法完整计算总大小；已保留原生大小列".into());}
+        if count as usize>MAX_ITEMS{self.stop_work();self.columns=None;self.watch=None;self.notify=None;self.blocked=true;self.count=Some(count);return self.unavailable(zsdesk_core::i18n::text("目录项目过多，无法完整计算总大小；已保留原生大小列").into());}
         if self.blocked{return None;}
         if self.retry_after.is_some_and(|until|Instant::now()<until){return None;}
-        if self.columns.is_none(){match Columns::activate(&view){Ok(columns)=>self.columns=Some(columns),Err(error)=>return self.unavailable(format!("此视图不支持总大小列：{error}"))}}
-        if let Some(columns)=&mut self.columns{if let Err(error)=columns.synchronize(){return self.unavailable(format!("无法更新总大小列：{error}"));}}
+        if self.columns.is_none(){match Columns::activate(&view){Ok(columns)=>self.columns=Some(columns),Err(error)=>return self.unavailable(zsdesk_core::tr_format!("此视图不支持总大小列：{error}", error=error))}}
+        if let Some(columns)=&mut self.columns{if let Err(error)=columns.synchronize(){return self.unavailable(zsdesk_core::tr_format!("无法更新总大小列：{error}", error=error));}}
         if !details_with_total_column(&view,&folder)&&!folder_totals::ordered_by_totals(&view){
             if self.pending||self.gather.is_some()||!self.rows.is_empty(){self.stop_work();}
             self.last_refresh=None;self.watch=None;self.notify=None;self.dirty=None;
@@ -183,7 +183,7 @@ impl FolderSizes{
         if refresh{
             self.stop_work();self.dirty=None;self.count=Some(count);self.status=Status::Reading;
             if count==0{self.last_refresh=Some(Instant::now());self.status=Status::Ready{known:0,unknown:0,skipped_links:0};return None;}
-            match Gather::new(&folder){Ok(gather)=>self.gather=Some(gather),Err(error)=>return self.retry(format!("无法枚举目录：{error}"))}
+            match Gather::new(&folder){Ok(gather)=>self.gather=Some(gather),Err(error)=>return self.retry(zsdesk_core::tr_format!("无法枚举目录：{error}", error=error))}
         }
         if let Some(gather)=&mut self.gather{
             match gather.step(){
@@ -192,11 +192,11 @@ impl FolderSizes{
                     let rows=self.gather.take().unwrap().rows;self.failures=0;self.rows=Arc::new(rows);
                     self.originals=(0..self.rows.len()).map(|_|None).collect();self.values=vec![None;self.rows.len()];
                     if self.rows.is_empty(){self.columns=None;self.notify=None;self.watch=None;self.blocked=true;self.last_refresh=Some(Instant::now());self.status=Status::WaitingForDetails;return None;}
-                    if self.worker.is_none(){match Worker::new(){Ok(worker)=>self.worker=Some(worker),Err(error)=>return self.retry(format!("无法启动大小计算：{error}"))}}
+                    if self.worker.is_none(){match Worker::new(){Ok(worker)=>self.worker=Some(worker),Err(error)=>return self.retry(zsdesk_core::tr_format!("无法启动大小计算：{error}", error=error))}}
                     self.generation=self.generation.wrapping_add(1);self.pending=true;self.status=Status::Pending{done:0,total:self.rows.len()};
                     self.worker.as_ref().unwrap().request(Request{generation:self.generation,profile:profile.into(),directory:path.clone(),rows:self.rows.clone(),watch_needed:self.watch.is_none()});
                 },
-                Err(error)=>{self.gather=None;if error.code().0 as u32==0x8007000e{self.stop_work();self.columns=None;self.watch=None;self.notify=None;self.blocked=true;return self.unavailable(error.message());}return self.retry(format!("读取目录项目失败：{error}"));}
+                Err(error)=>{self.gather=None;if error.code().0 as u32==0x8007000e{self.stop_work();self.columns=None;self.watch=None;self.notify=None;self.blocked=true;return self.unavailable(error.message());}return self.retry(zsdesk_core::tr_format!("读取目录项目失败：{error}", error=error));}
             }
         }
         let replies=self.worker.as_ref().map(Worker::take).unwrap_or_default();let mut changed=false;
@@ -208,7 +208,7 @@ impl FolderSizes{
                     let Some(row)=self.rows.get(index)else{continue;};
                     if let Some(size)=value.bytes{
                         if self.originals[index].is_none(){self.originals[index]=Some(Variant(unsafe{folder.GetViewProperty(row.pidl.pointer(),&PKEY_TOTAL_SIZE)}.unwrap_or_default()));}
-                        if let Err(error)=write_size(&folder,&row.pidl,size){super::diagnostics::record("folder-sizes",&format!("设置总大小：{error}"),Some(error.code().0));self.invalidate();continue;}
+                        if let Err(error)=write_size(&folder,&row.pidl,size){super::diagnostics::record("folder-sizes",&zsdesk_core::tr_format!("设置总大小：{error}", error=error),Some(error.code().0));self.invalidate();continue;}
                         changed=true;
                     }
                     if let Some(error)=value.error.take(){super::diagnostics::record("folder-sizes",&error,None);}
@@ -216,13 +216,13 @@ impl FolderSizes{
                 },
                 ResultValue::Done(error)=>{
                     self.pending=false;self.last_refresh=Some(Instant::now());
-                    if let Some(error)=error{return self.retry(format!("大小计算未完成：{error}"));}
+                    if let Some(error)=error{return self.retry(zsdesk_core::tr_format!("大小计算未完成：{error}", error=error));}
                 }
             }
         }
         if changed{self.order_dirty=true;invalidate(&view);}
         if self.order_dirty&&(!self.pending||self.last_order.is_none_or(|last|last.elapsed()>=Duration::from_millis(500))){
-            if let Err(error)=folder_totals::refresh_order(&view){return self.retry(format!("总大小排序未完成：{error}"));}
+            if let Err(error)=folder_totals::refresh_order(&view){return self.retry(zsdesk_core::tr_format!("总大小排序未完成：{error}", error=error));}
             self.order_dirty=false;self.last_order=Some(Instant::now());
         }
         let known=self.values.iter().filter(|value|value.as_ref().is_some_and(|value|value.bytes.is_some())).count();
@@ -263,6 +263,6 @@ fn details_with_total_column(view:&IShellView,folder:&IFolderView2)->bool{
 fn write_size(view:&IFolderView2,pidl:&ChildPidl,size:u64)->windows::core::Result<()>{
     let value=Variant::size(size);unsafe{view.SetViewProperty(pidl.pointer(),&PKEY_TOTAL_SIZE,&value.0)}?;
     let readback=Variant(unsafe{view.GetViewProperty(pidl.pointer(),&PKEY_TOTAL_SIZE)}?);
-    if unsafe{PropVariantToUInt64(&readback.0)}?!=size{return Err(error("总大小缓存校验失败",0x80004005));}Ok(())
+    if unsafe{PropVariantToUInt64(&readback.0)}?!=size{return Err(error(zsdesk_core::i18n::text("总大小缓存校验失败"),0x80004005));}Ok(())
 }
 #[cfg(test)]#[path="folder_sizes_tests.rs"]mod tests;

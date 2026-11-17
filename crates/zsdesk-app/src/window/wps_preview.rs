@@ -22,7 +22,7 @@ impl Drop for OfficeDpiScope {
 fn wide(text:&str)->Vec<u16>{text.encode_utf16().chain(Some(0)).collect()}
 fn invoke(object:&IDispatch,name:&str,flags:DISPATCH_FLAGS,mut args:Vec<VARIANT>)->Result<VARIANT>{
     let name_wide=wide(name);let mut id=0;
-    unsafe {object.GetIDsOfNames(&GUID::zeroed(),&PCWSTR(name_wide.as_ptr()),1,0x409,&mut id)}.with_context(||format!("WPS 接口 {name}"))?;
+    unsafe {object.GetIDsOfNames(&GUID::zeroed(),&PCWSTR(name_wide.as_ptr()),1,0x409,&mut id)}.with_context(||zsdesk_core::tr_format!("WPS 接口 {name}", name=name))?;
     args.reverse();let mut property_id=-3;
     let params=DISPPARAMS{rgvarg:args.as_mut_ptr(),cArgs:args.len()as u32,
         rgdispidNamedArgs:if flags==DISPATCH_PROPERTYPUT{&mut property_id}else{std::ptr::null_mut()},
@@ -39,8 +39,8 @@ fn get(object:&IDispatch,name:&str)->Result<VARIANT>{invoke(object,name,DISPATCH
 fn set(object:&IDispatch,name:&str,value:VARIANT)->Result<()>{invoke(object,name,DISPATCH_PROPERTYPUT,vec![value]).map(|_|())}
 fn call(object:&IDispatch,name:&str,args:Vec<VARIANT>)->Result<VARIANT>{invoke(object,name,DISPATCH_METHOD,args)}
 fn dispatch(value:VARIANT)->Result<IDispatch>{
-    if value.vt()!=VT_DISPATCH {bail!("WPS 未返回文档对象");}
-    unsafe {value.Anonymous.Anonymous.Anonymous.pdispVal.as_ref().cloned()}.context("WPS 对象为空")
+    if value.vt()!=VT_DISPATCH {bail!("{}", zsdesk_core::tr_format!("WPS 未返回文档对象"));}
+    unsafe {value.Anonymous.Anonymous.Anonymous.pdispVal.as_ref().cloned()}.context(zsdesk_core::i18n::text("WPS 对象为空"))
 }
 fn count(object:&IDispatch)->Result<i32>{Ok(i32::try_from(&get(object,"Count")?)?)}
 fn number(object:&IDispatch,name:&str)->Option<i32>{get(object,name).ok().and_then(|v|i32::try_from(&v).ok())}
@@ -155,23 +155,23 @@ pub(super) fn render(path:&Path,workspace:&Path)->Result<RenderedDocument>{
 
 fn render_owned(path:&Path,workspace:&Path)->Result<RenderedDocument>{
     let _dpi=OfficeDpiScope::enter();
-    let family=family(path).context("不支持此 WPS 文档类型")?;
+    let family=family(path).context(zsdesk_core::i18n::text("不支持此 WPS 文档类型"))?;
     let (progid,collection)=match family{Family::Word=>("KWPS.Application","Documents"),Family::Sheet=>("KET.Application","Workbooks"),Family::Slides=>("KWPP.Application","Presentations")};
-    let clsid=unsafe{CLSIDFromProgID(PCWSTR(wide(progid).as_ptr()))}.context("未安装 WPS 自动化组件")?;
+    let clsid=unsafe{CLSIDFromProgID(PCWSTR(wide(progid).as_ptr()))}.context(zsdesk_core::i18n::text("未安装 WPS 自动化组件"))?;
     let app:IDispatch=unsafe{CoCreateInstance(&clsid,None,CLSCTX_LOCAL_SERVER|CLSCTX_ACTIVATE_32_BIT_SERVER)}
         .or_else(|_|unsafe{CoCreateInstance(&clsid,None,CLSCTX_LOCAL_SERVER)})
-        .context("无法启动 WPS 只读渲染组件")?;
+        .context(zsdesk_core::i18n::text("无法启动 WPS 只读渲染组件"))?;
     let mut owned=Application{app,documents:None,document:None,initial:-1,family,original_alerts:None,original_security:None,report:workspace.join("wps-lifecycle.json"),opening:None};
     let docs=dispatch(get(&owned.app,collection)?)?;
     owned.initial=count(&docs)?;owned.documents=Some(docs);
-    if owned.initial!=0 {bail!("WPS 正在使用已有文档，未改变该实例；请使用已安装的预览插件或稍后重试");}
+    if owned.initial!=0 {bail!("{}", zsdesk_core::tr_format!("WPS 正在使用已有文档，未改变该实例；请使用已安装的预览插件或稍后重试"));}
     owned.original_alerts=get(&owned.app,"DisplayAlerts").ok();
     owned.original_security=get(&owned.app,"AutomationSecurity").ok();
     // CoCreateInstance may return an existing empty WPS instance. A visible
     // instance is not ours to hide or quit, even when it has no documents.
-    if bool::try_from(&get(&owned.app,"Visible")?)? {bail!("WPS 正在显示窗口，未改变该实例");}
+    if bool::try_from(&get(&owned.app,"Visible")?)? {bail!("{}", zsdesk_core::tr_format!("WPS 正在显示窗口，未改变该实例"));}
     set(&owned.app,"DisplayAlerts",if matches!(family,Family::Slides){1i32.into()}else{0i32.into()})?;
-    set(&owned.app,"AutomationSecurity",3i32.into()).context("WPS 不支持禁用文档宏，已停止预览")?;
+    set(&owned.app,"AutomationSecurity",3i32.into()).context(zsdesk_core::i18n::text("WPS 不支持禁用文档宏，已停止预览"))?;
     let filename=VARIANT::from(BSTR::from(path.as_os_str().to_string_lossy().as_ref()));
     let args=match family{
         Family::Word=>vec![filename,false.into(),true.into(),false.into(),missing(),missing(),false.into(),missing(),missing(),missing(),missing(),false.into()],
@@ -180,8 +180,8 @@ fn render_owned(path:&Path,workspace:&Path)->Result<RenderedDocument>{
     };
     owned.opening=Some(path.into());
     owned.document=Some(dispatch(call(owned.documents.as_ref().unwrap(),"Open",args)?)?);
-    if !bool::try_from(&get(owned.document.as_ref().unwrap(),"ReadOnly")?)?{bail!("WPS 未以只读方式打开文档");}
-    if render_process::cancelled(workspace){bail!("文档预览已取消");}
+    if !bool::try_from(&get(owned.document.as_ref().unwrap(),"ReadOnly")?)?{bail!("{}", zsdesk_core::tr_format!("WPS 未以只读方式打开文档"));}
+    if render_process::cancelled(workspace){bail!("{}", zsdesk_core::tr_format!("文档预览已取消"));}
     if matches!(family,Family::Sheet){
         // Materialize hidden-workbook print metrics before exporting. These
         // reads retain the workbook's own column widths, font and page setup.
@@ -196,7 +196,7 @@ fn render_owned(path:&Path,workspace:&Path)->Result<RenderedDocument>{
     // A preview workspace is created uniquely by the parent and is never a document directory.
     if pdf.exists(){std::fs::remove_file(&pdf)?;}
     let target=VARIANT::from(BSTR::from(pdf.as_os_str().to_string_lossy().as_ref()));
-    if render_process::cancelled(workspace){bail!("文档预览已取消");}
+    if render_process::cancelled(workspace){bail!("{}", zsdesk_core::tr_format!("文档预览已取消"));}
     let doc=owned.document.as_ref().unwrap();
     match family{
         Family::Word=>{call(doc,"ExportAsFixedFormat",vec![target,17i32.into()])?;}
@@ -211,9 +211,9 @@ fn render_owned(path:&Path,workspace:&Path)->Result<RenderedDocument>{
     }
     drop(owned);
     if let Ok(bytes)=std::fs::read(workspace.join("wps-lifecycle.json")){
-        if serde_json::from_slice::<serde_json::Value>(&bytes).ok().is_some_and(|report|report["document_closed"]!=true){bail!("WPS 文档关闭未完成，保留现有会话");}
+        if serde_json::from_slice::<serde_json::Value>(&bytes).ok().is_some_and(|report|report["document_closed"]!=true){bail!("{}", zsdesk_core::tr_format!("WPS 文档关闭未完成，保留现有会话"));}
     }
-    if std::fs::metadata(&pdf).map_or(true,|m|m.len()<5){bail!("WPS 未生成有效预览");}
+    if std::fs::metadata(&pdf).map_or(true,|m|m.len()<5){bail!("{}", zsdesk_core::tr_format!("WPS 未生成有效预览"));}
     Ok(RenderedDocument{pdf})
 }
 

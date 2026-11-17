@@ -266,7 +266,7 @@ fn open_level(provider:&Provider,gfx:&Gfx,owner:HWND,menu:HMENU,index:u32,place:
             Place::Beside{parent,top}=>place_shell_submenu(parent,top,width,height,work,metrics)};
         let shadow=metrics.px(geometry::SHADOW_DIP)as i32;let module=unsafe{GetModuleHandleW(None)}?;
         native_only|=(i64::from(width)+2*i64::from(shadow))*(i64::from(height)+2*i64::from(shadow))*4>64*1024*1024;
-        let hwnd=unsafe{CreateWindowExW(WS_EX_LAYERED|WS_EX_TOOLWINDOW|WS_EX_TOPMOST|WS_EX_NOACTIVATE,CLASS,w!("右键菜单"),WS_POPUP,
+        let hwnd=unsafe{CreateWindowExW(WS_EX_LAYERED|WS_EX_TOOLWINDOW|WS_EX_TOPMOST|WS_EX_NOACTIVATE,CLASS,windows::core::PCWSTR(zsdesk_core::i18n::wide("右键菜单").as_ptr()),WS_POPUP,
             x-shadow,y-shadow,width+shadow*2,height+shadow*2,Some(owner),None,Some(module.into()),None)}?;
         Ok(Some(Level{menu,hwnd,body:Bounds::new(x,y,x+width,y+height),metrics,layout,items,toolbar,accelerator_width,keyboard_focus:false,scroll:0.,highlight:None,pressed:None,open_child:None,surface:None,initialized:true,native_only}))
     })();

@@ -197,7 +197,7 @@ impl WindowState {
             let paths=zsdesk_windows::shell::file_transfer::selected_paths(&view)?;
             if paths.is_empty(){return Ok(());}
             if paths.iter().all(|path|path.parent().is_some_and(|parent|crate::explorer_forwarder::same_path(parent,&destination))){
-                return Err(windows::core::Error::new(windows::core::HRESULT(0x80070057u32 as i32),"两栏显示同一目录，无需复制或移动"));
+                return Err(windows::core::Error::new(windows::core::HRESULT(0x80070057u32 as i32),zsdesk_core::i18n::text("两栏显示同一目录，无需复制或移动")));
             }
             // Snapshot and submit one native batch. No clipboard roundtrip,
             // recursive Rust copy, or second enumeration of selected files.
@@ -295,7 +295,7 @@ impl WindowState {
         self.swap_pane_runtime();self.relayout();
         match self.create_browser() {
             Ok(browser)=>{self.browser=Some(browser);unsafe{self.navigate_current();}},
-            Err(error)=>{self.session.ui.dual_pane=false;self.status=format!("无法打开双栏：{error}");},
+            Err(error)=>{self.session.ui.dual_pane=false;self.status=zsdesk_core::tr_format!("无法打开双栏：{error}", error=error);},
         }
         self.swap_pane_runtime();self.background_pane=false;
         self.relayout();self.position_children();unsafe{self.update_address();}self.save();

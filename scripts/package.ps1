@@ -208,6 +208,21 @@ try {
         }
         $readme+=@('portable.flag 使用程序旁 data 目录；--profile-dir 指定独立配置。','安装包与便携包不包含用户路径、桌面布局、搜索索引或系统接管记录。','源码与许可证：https://github.com/qiu7824/zsdesk')
         $readme -join "`r`n" | Set-Content -LiteralPath (Join-Path $stage '说明.txt') -Encoding utf8BOM
+        $english=@("ZSDesk $version ($edition) — Windows x64",'',
+            'Language: non-Chinese Windows systems use English by default.',
+            'File manager: menu → Interface settings → Language. Restart ZSDesk after changing the language.',
+            'File names and Windows Shell labels retain their original language.',
+            'Run ZSDesk.exe. Ctrl+F searches files; Alt+P toggles the preview pane; Space opens quick preview.',
+            'Network share searches stay within the selected UNC folder or existing mapped network folder.',
+            'Settings are preserved during updates. Exit ZSDesk before replacing portable files.',
+            'Use portable.flag for a data folder beside the program, or --profile-dir for a separate configuration.',
+            'Source and licenses: https://github.com/qiu7824/zsdesk')
+        if($definition.DesktopOnly){$english=@("ZSDesk $version Desktop Box — Windows x64",'',
+            'Run ZSDesk.exe to start desktop fences. This edition does not include the file manager or search.',
+            'The interface follows the Windows display language, using English on non-Chinese systems.',
+            'Settings: %APPDATA%\ZSDesk-DesktopBox. Files and folders remain in their original locations.',
+            'Source and licenses: https://github.com/qiu7824/zsdesk')}
+        $english -join "`r`n" | Set-Content -LiteralPath (Join-Path $stage 'README.en.txt') -Encoding utf8BOM
         $files=[ordered]@{}
         foreach ($file in (Get-ChildItem -LiteralPath $stage -File -Recurse | Sort-Object FullName)) {
             if ($file.LastWriteTimeUtc.Year -lt 1980) { $file.LastWriteTimeUtc=[datetime]'1980-01-01T00:00:00Z' }

@@ -128,7 +128,7 @@ fn packet(snapshot:&Snapshot)->Result<Vec<u8>>{
 fn start_target(profile:&Path,snapshot:&Snapshot)->Result<()>{
     use std::os::windows::process::CommandExt;
     let mut command=std::process::Command::new(std::env::current_exe()?);
-    command.arg("--profile-dir").arg(profile.parent().context("配置目录缺失")?);
+    command.arg("--profile-dir").arg(profile.parent().context(zsdesk_core::i18n::text("配置目录缺失"))?);
     if snapshot.this_pc{command.arg("--this-pc");}else{command.arg(&snapshot.folder);}
     command.creation_flags(0x08000000).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn()?;
     Ok(())

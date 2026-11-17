@@ -25,8 +25,8 @@ fn lock<'a>(core:&'a Core,shared:&Shared)->Result<MutexGuard<'a,Store>>{
     loop{ensure!(!shared.cancelled(),"搜索已取消");match core.try_lock(){Ok(value)=>return Ok(value),Err(TryLockError::WouldBlock)=>thread::sleep(Duration::from_millis(10)),
         Err(TryLockError::Poisoned(error))=>{let mut value=error.into_inner();value.volumes=None;value.force=true;return Ok(value);}}}
 }
-pub(super) fn invalidate(core:&Core){if let Ok(mut store)=core.lock(){store.volumes=None;store.force=true;store.dirty=false;store.backoff.clear();}}
-pub(super) fn refresh(core:&Core){if let Ok(mut store)=core.lock(){store.last_check=Instant::now()-DIRECTORY_REFRESH;store.backoff.clear();}}
+pub(super) fn invalidate(core:&Core){if let Ok(mut store)=core.lock(){store.volumes=None;store.force=true;store.dirty=false;store.backoff.clear();store.last_use=Instant::now();}}
+pub(super) fn refresh(core:&Core){if let Ok(mut store)=core.lock(){store.last_check=Instant::now()-DIRECTORY_REFRESH;store.backoff.clear();store.last_use=Instant::now();}}
 pub(super) fn pending(core:&Core)->bool{core.try_lock().is_ok_and(|store|store.pending)}
 pub(super) fn persist(core:&Core){if let Ok(mut store)=core.try_lock(){if store.dirty{if let Err(error)=store.save(&||false){crate::window::diagnostics::record("search",&format!("native-snapshot-save-failed: {error:#}"),None);}}}}
 pub(super) fn evict_if_idle(core:&Core,seconds:u32){
@@ -34,6 +34,19 @@ pub(super) fn evict_if_idle(core:&Core,seconds:u32){
     if store.save_retry.is_some_and(|at|Instant::now()<at){return;}
     if store.dirty{if let Err(error)=store.save(&||false){store.save_retry=Some(Instant::now()+FAILED_BUILD_RETRY);crate::window::diagnostics::record("search",&format!("native-snapshot-save-failed: {error:#}"),None);return;}}
     store.volumes=None;store.dirty=false;store.pending=false;
+}
+#[cfg(test)]pub(super) fn set_idle_for_test(core:&Core,age:Duration)->Instant{
+    let mut store=core.lock().unwrap();store.last_use=Instant::now()-age;store.last_use
+}
+#[cfg(test)]pub(super) fn last_use_for_test(core:&Core)->Instant{core.lock().unwrap().last_use}
+pub(super) fn diagnostics()->serde_json::Value{
+    let cores=CORES.get().map(|cores|cores.lock().unwrap_or_else(|e|e.into_inner()).values().filter_map(Weak::upgrade).collect::<Vec<_>>()).unwrap_or_default();
+    serde_json::Value::Array(cores.into_iter().map(|core|match core.try_lock(){
+        Ok(store)=>serde_json::json!({"busy":false,"resident":store.volumes.is_some(),"idle_milliseconds":store.last_use.elapsed().as_millis()as u64,"scan_pending":store.pending,
+            "heap_bytes":store.volumes.as_ref().map_or(0,|volumes|volumes.iter().map(|v|v.index.heap_bytes()+v.pending_dirs.capacity()*8).sum::<usize>()),
+            "rows":store.volumes.as_ref().map_or(0,|volumes|volumes.iter().map(|v|v.index.len()).sum::<usize>()),"snapshot_warning":store.snapshot_warning}),
+        Err(_)=>serde_json::json!({"busy":true}),
+    }).collect())
 }
 fn policy(options:&SearchOptions)->snapshot::Policy{snapshot::Policy{development:options.include_development,metadata:options.index_metadata}}
 impl Store{
@@ -47,7 +60,7 @@ impl Store{
         snapshot::save(&self.path,&snapshot::Policy{development,metadata},volumes,cancel)?;self.dirty=false;self.save_retry=None;self.last_save=Instant::now();Ok(())
     }
     fn prepare(&mut self,options:&SearchOptions,roots:Option<&[PathBuf]>,shared:&Shared,sender:&SyncSender<SearchEvent>,load_only:bool)->Result<()>{
-        self.last_use=Instant::now();let generation=shared.generation.load(Ordering::Acquire);let signature=(options.include_development,options.index_metadata);
+        let generation=shared.generation.load(Ordering::Acquire);let signature=(options.include_development,options.index_metadata);
         if self.policy!=Some(signature){self.volumes=None;self.pending=false;self.policy=Some(signature);}
         let cold=self.volumes.is_none();
         if cold&&!self.force{

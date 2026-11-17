@@ -250,7 +250,7 @@ fn perform(shared:&Shared,state:&WindowState,owner:HWND,request:&Request,timing:
     let stage=Instant::now();
     validate(shared,request,false)?;
     timing.initial_validation_microseconds=micros(stage.elapsed());
-    if !foreground_allowed(request.foreground){return Err(windows::core::Error::new(windows::core::HRESULT(0x80004004u32 as i32),"菜单打开前前台窗口已改变"));}
+    if !foreground_allowed(request.foreground){return Err(windows::core::Error::new(windows::core::HRESULT(0x80004004u32 as i32),zsdesk_core::i18n::text("菜单打开前前台窗口已改变")));}
     let stage=Instant::now();
     let (options,cache_hit)=state.policy.borrow_mut().options(&request.profile);
     timing.settings_cache_hit=cache_hit;

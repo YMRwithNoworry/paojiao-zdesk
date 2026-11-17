@@ -41,7 +41,7 @@ fn identity(path:&Path)->Result<(u32,u64)>{
     Ok((info.dwVolumeSerialNumber,(u64::from(info.nFileIndexHigh)<<32)|u64::from(info.nFileIndexLow)))
 }
 struct Directory{path:PathBuf,entries:ReadDir,identity:(u32,u64)}
-impl Directory{fn open(path:PathBuf)->Result<Self>{let identity=identity(&path)?;let entries=fs::read_dir(&path).with_context(||format!("无法读取 {}",path.display()))?;Ok(Self{path,entries,identity})}}
+impl Directory{fn open(path:PathBuf)->Result<Self>{let identity=identity(&path)?;let entries=fs::read_dir(&path).with_context(||zsdesk_core::tr_format!("无法读取 {}" , path.display()))?;Ok(Self{path,entries,identity})}}
 struct Scan{root:PathBuf,stack:Vec<Directory>,bytes:u64,skipped:u64}
 impl Scan{
     fn new(path:PathBuf)->Result<Self>{Ok(Self{stack:vec![Directory::open(path.clone())?],root:path,bytes:0,skipped:0})}

@@ -126,11 +126,11 @@ pub(super) fn return_entries(owner:HWND,entries:&[ShellEntry],point:POINT,moving
         match with_host(|host|host.release_desktop_keys(&keys,point)) {
             Some(Ok(count))=>count,
             Some(Err(message))=>{failure=Some(error(&message));0},
-            None=>{failure=Some(error("桌面窗口未能完成分组调整；已移动的文件仍保留在桌面目录。"));0},
+            None=>{failure=Some(error(zsdesk_core::i18n::text("桌面窗口未能完成分组调整；已移动的文件仍保留在桌面目录。")));0},
         }
     };
     if published!=requested && failure.is_none() {
-        failure=Some(error("部分项目未能移回桌面，未完成的文件仍保留在原位置。"));
+        failure=Some(error(zsdesk_core::i18n::text("部分项目未能移回桌面，未完成的文件仍保留在原位置。")));
     }
     let complete=published==requested && failure.is_none();
     if let Some(error)=failure { super::file_action_error(owner,&error); }

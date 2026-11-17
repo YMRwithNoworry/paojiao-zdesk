@@ -85,7 +85,7 @@ fn parse(args: impl IntoIterator<Item=OsString>) -> Result<Options> {
         }
         if arg == "--apply-import" { opts.apply_import = true; continue; }
         if arg == "--classic-menu" { opts.classic = true; continue; }
-        if arg == "--profile-dir" { opts.profile = Some(PathBuf::from(iter.next().context("缺少配置目录")?)); continue; }
+        if arg == "--profile-dir" { opts.profile = Some(PathBuf::from(iter.next().context(zsdesk_core::i18n::text("缺少配置目录"))?)); continue; }
         if arg == "--select" { opts.select = true; continue; }
         // Registered by system integration: behaves like a plain path argument.
         if arg == "--shell-open" {opts.shell_open=true; continue; }
@@ -263,6 +263,7 @@ pub(crate) fn run_arguments(args:Vec<OsString>,in_host:bool)->Result<()> {
     let _ = unsafe { windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID(windows::core::PCWSTR(app_id.as_ptr())) };
     let opts = parse(args.iter().cloned())?;
     let config = std::path::absolute(opts.profile.as_ref().map(|p| p.join("explorer-session.json")).unwrap_or_else(storage::config_path))?;
+    if !in_host{crate::language::initialize_profile(&config);}
     if !in_host&&managed(&opts){return crate::runtime::run(config,args);}
     let desktop_config = config.with_file_name("desktop-fences.json");
     if opts.integration_enable{

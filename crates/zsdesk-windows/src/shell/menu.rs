@@ -344,8 +344,20 @@ fn file_sha256(path: &std::path::Path) -> Option<String> {
     Some(hasher.finalize().iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
+fn presentation(modern:bool,drawn:bool,build:u32,verified_native:bool)->(bool,bool){
+    if drawn{return(true,true);}
+    if !modern||build<22000{return(false,false);}
+    // Unknown private ABI layouts retain the Windows 11 appearance through
+    // documented Shell commands. They never enter an unverified vtable.
+    (true,!verified_native)
+}
+pub fn presentation_name()->&'static str{
+    let options=context_menu_options();if options.drawn{"public-windows11"}else if options.modern{"verified-native-windows11"}else{"native-classic"}
+}
 pub fn set_context_menu_options(mut options: ContextMenuOptions) {
-    if !options.drawn{options.modern=options.modern&&modern_presenter_supported()!=Some(false);}
+    let build=crate::theme::os_build();
+    let verified=options.modern&&!options.drawn&&build>=22000&&modern_presenter_supported()==Some(true);
+    (options.modern,options.drawn)=presentation(options.modern,options.drawn,build,verified);
     for rules in [&mut options.hidden_verbs,&mut options.shown_verbs]{
         rules.retain(|v| !v.is_empty() && v.len() <= 512 && !v.contains('\0'));
         for verb in rules.iter_mut(){verb.make_ascii_lowercase();}
@@ -1324,3 +1336,17 @@ pub fn parent_pidl(pidl: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 #[path="menu_runtime_tests.rs"]
 mod runtime_tests;
+
+#[cfg(test)]mod presentation_tests{
+    use super::*;
+    #[test]fn menu_style_routes_by_platform_capability_not_one_machine(){
+        for build in [17763,19041,19045]{assert_eq!(presentation(true,false,build,false),(false,false));}
+        for build in [22000,22621,26100,26300,30000]{
+            assert_eq!(presentation(true,false,build,false),(true,true));
+            assert_eq!(presentation(true,false,build,true),(true,false));
+            assert_eq!(presentation(false,false,build,true),(false,false));
+        }
+        assert_eq!(presentation(true,true,19045,false),(true,true));
+        assert_eq!(presentation(true,false,0,false),(false,false));
+    }
+}

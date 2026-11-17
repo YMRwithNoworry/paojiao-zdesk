@@ -4,7 +4,9 @@ Windows 多标签文件管理器与桌面格子。可以在一个窗口里浏览
 
 [下载安装](https://github.com/qiu7824/zsdesk/releases/latest) · [使用说明](docs/user-guide.md) · [更新日志](CHANGELOG.md) · [问题反馈](https://github.com/qiu7824/zsdesk/issues)
 
-适用于 Windows 10 / 11，64 位。目前正式版为 **0.3.15**；主分支的待发布改进列在更新日志“未发布”中。
+适用于 Windows 10 / 11，64 位。当前版本为 **0.3.17**，支持简体中文和英文界面。
+
+English UI is available. Non-Chinese Windows systems use English by default. Choose **≡ → Language → English**, then restart ZSDesk to change the language. Each package includes `README.en.txt`.
 
 ## 选哪个版本
 
@@ -43,12 +45,16 @@ Windows 多标签文件管理器与桌面格子。可以在一个窗口里浏览
 
 ## 搜索、预览和右键
 
-- **搜索**：可选择自带搜索或 Everything。首次建立索引需要时间；搜索没有结果时，先在搜索设置中查看引擎、索引就绪状态和搜索范围。
+- **搜索**：可选择自带搜索或 Everything；网络共享及已有映射网络目录使用限定目录遍历搜索。首次建立本地索引需要时间，可在搜索设置中查看引擎、索引就绪状态和范围。
 - **预览**：内置预览与 QuickLook 可选择。Office 文档预览需要相应的已安装组件；图片、音视频格式取决于系统解码器。
-- **右键**：提供系统经典菜单、Windows 11 菜单和自绘样式。原生 Windows 11 菜单受系统组件版本影响；无法使用时可在设置中切换样式。
+- **右键**：Windows 10 使用经典系统菜单；Windows 11 按系统能力选择已验证的原生呈现或公共 Shell 命令兼容呈现。Shift 右键可直接使用经典菜单。
 - **Listary**：安装和连接方式见[详细使用说明](docs/user-guide.md)及 `integrations/listary`。
 
-## 主分支待发布改进
+## 0.3.17 更新
+
+- 增加英文界面和语言设置，修复网络文件夹搜索、剪切图标变浅及搜索后导航。
+- 分离鼠标观察与桌面绘制，减少图标完成后的重复重绘，修复索引空闲释放，限制空闲菜单进程和文件窗口线程。
+- 增加文件管理器托盘开关与右侧收藏夹宽度调整，改善任务栏分组、远程文件剪贴板及安装升级退出。
 
 - 个别环境中当前标签难以辨认时，可开启“≡ → 布局 → 当前标签增强对比”；默认关闭，不改变既有主题，增强模式使用中性色轮廓而非蓝色短线。
 - 地址栏支持在当前本地目录启动 `cmd`、`cmd.exe`；网络目录使用 PowerShell 或 pwsh。

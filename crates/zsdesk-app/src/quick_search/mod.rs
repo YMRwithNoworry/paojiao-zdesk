@@ -23,12 +23,12 @@ pub fn start_if_enabled(profile: &Path) -> Result<()> {
 }
 
 pub(crate) fn spawn_utility(profile:&Path,action:&str)->Result<()> {
-    let arguments=vec![action.into(),"--profile-dir".into(),profile.parent().context("缺少配置目录")?.as_os_str().to_owned()];
+    let arguments=vec![action.into(),"--profile-dir".into(),profile.parent().context(zsdesk_core::i18n::text("缺少配置目录"))?.as_os_str().to_owned()];
     if crate::runtime::enqueue_local(profile,arguments)?{return Ok(());}
     use std::os::windows::ffi::OsStrExt;
     use windows::{core::{PCWSTR,PWSTR},Win32::{Foundation::CloseHandle,System::Threading::{CreateProcessW,CREATE_NO_WINDOW,STARTUPINFOW,PROCESS_INFORMATION}}};
     let executable=std::env::current_exe()?;
-    let directory=profile.parent().context("缺少配置目录")?;
+    let directory=profile.parent().context(zsdesk_core::i18n::text("缺少配置目录"))?;
     let command=format!("{} {action} --profile-dir {}",control::quote_argument(&executable.to_string_lossy()),control::quote_argument(&directory.to_string_lossy()));
     let name:Vec<u16>=executable.as_os_str().encode_wide().chain(Some(0)).collect();
     let mut command:Vec<u16>=command.encode_utf16().chain(Some(0)).collect();

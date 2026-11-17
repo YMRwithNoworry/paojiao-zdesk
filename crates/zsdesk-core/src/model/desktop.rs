@@ -23,11 +23,11 @@ pub enum Category { Apps, Folders, Documents, Images, Media, Archives, Others }
 
 impl Category {
     pub const ALL: [Category; 7] = [Self::Apps, Self::Folders, Self::Documents, Self::Images, Self::Media, Self::Archives, Self::Others];
-    pub const fn title(self) -> &'static str {
-        match self {
+    pub fn title(self) -> &'static str {
+        crate::i18n::text(match self {
             Self::Apps => "应用与快捷方式", Self::Folders => "文件夹", Self::Documents => "文档",
             Self::Images => "图片", Self::Media => "视频与音乐", Self::Archives => "压缩包", Self::Others => "其他",
-        }
+        })
     }
 }
 

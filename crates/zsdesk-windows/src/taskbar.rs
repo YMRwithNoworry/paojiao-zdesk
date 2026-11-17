@@ -55,6 +55,43 @@ pub fn clear_identity(hwnd: HWND) {
     let _ = unsafe { store.Commit() };
 }
 
+/// Upgrade pins made from an executable or an older shortcut, without changing
+/// their target, arguments, icon or pinned position. Only this executable's
+/// existing taskbar links are eligible.
+pub fn repair_taskbar_shortcuts(executable:&std::path::Path,app_id:&str)->windows::core::Result<usize>{
+    use windows::{core::Interface,Win32::{System::Com::{CoCreateInstance,IPersistFile,CLSCTX_INPROC_SERVER,STGM_READWRITE},
+        UI::Shell::{IShellLinkW,ShellLink,SLGP_RAWPATH,SHChangeNotify,SHCNE_UPDATEITEM,SHCNF_PATHW}}};
+    let Some(appdata)=std::env::var_os("APPDATA")else{return Ok(0);};
+    let directory=std::path::PathBuf::from(appdata).join("Microsoft/Internet Explorer/Quick Launch/User Pinned/TaskBar");
+    let Ok(entries)=std::fs::read_dir(directory)else{return Ok(0);};
+    let wanted=normalized_target(executable);let mut changed=0;
+    for entry in entries.flatten(){
+        let path=entry.path();
+        if !entry.file_type().is_ok_and(|kind|kind.is_file())||!path.extension().is_some_and(|extension|extension.eq_ignore_ascii_case("lnk")){continue;}
+        let name:Vec<u16>=path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let result=(||->windows::core::Result<bool>{
+            let link:IShellLinkW=unsafe{CoCreateInstance(&ShellLink,None,CLSCTX_INPROC_SERVER)?};let file:IPersistFile=link.cast()?;
+            unsafe{file.Load(PCWSTR(name.as_ptr()),STGM_READWRITE)?;}
+            let mut target=vec![0u16;32768];unsafe{link.GetPath(&mut target,std::ptr::null_mut(),SLGP_RAWPATH.0 as u32)?;}
+            let length=target.iter().position(|unit|*unit==0).unwrap_or(target.len());
+            let target=std::path::PathBuf::from(String::from_utf16_lossy(&target[..length]));
+            if normalized_target(&target)!=wanted{return Ok(false);}
+            let store:IPropertyStore=link.cast()?;let old=Value(unsafe{store.GetValue(&ID)?});
+            let current=unsafe{let value=&*old.0.Anonymous.Anonymous;
+                if value.vt==VT_LPWSTR&&!value.Anonymous.pwszVal.is_null(){PCWSTR(value.Anonymous.pwszVal.0).to_string().ok()}else{None}};
+            if current.as_deref()==Some(app_id){return Ok(false);}
+            let value=Value::text(app_id)?;unsafe{store.SetValue(&ID,&value.0)?;store.Commit()?;file.Save(PCWSTR(name.as_ptr()),true)?;}
+            Ok(true)
+        })();
+        if result==Ok(true){changed+=1;unsafe{SHChangeNotify(SHCNE_UPDATEITEM,SHCNF_PATHW,Some(name.as_ptr().cast()),None);}}
+    }
+    Ok(changed)
+}
+use std::os::windows::ffi::OsStrExt;
+fn normalized_target(path:&std::path::Path)->String{
+    std::fs::canonicalize(path).unwrap_or_else(|_|path.to_path_buf()).to_string_lossy().trim_start_matches(r"\\?\").replace('/',"\\").to_lowercase()
+}
+
 /// Reads the window's own ID; `None` when it inherits the process ID.
 pub fn window_app_id(hwnd: HWND) -> Option<String> {
     let store: IPropertyStore = unsafe { SHGetPropertyStoreForWindow(hwnd) }.ok()?;

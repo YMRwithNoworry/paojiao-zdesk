@@ -9,7 +9,7 @@ pub(super) const TIMER:usize=19;
 pub(super) type SourcePreferences=(bool,menu::ContextMenuOptions);
 impl WindowState{
     pub(super) fn menu_source_preferences(&self,source:usize)->windows::core::Result<SourcePreferences>{
-        let results=self.menu_source_is_results(source).ok_or_else(||failure("菜单源视图已改变"))?;
+        let results=self.menu_source_is_results(source).ok_or_else(||failure(zsdesk_core::i18n::text("菜单源视图已改变")))?;
         Ok((results,crate::context_preferences::native(&self.session.ui.context_menu)))
     }
 }
@@ -32,9 +32,9 @@ fn snapshot(view:&IShellView)->windows::core::Result<Vec<Vec<u8>>>{
     let folder:IFolderView2=view.cast()?;
     if unsafe{folder.ItemCount(SVGIO_SELECTION)?}==0{return Ok(Vec::new());}
     let items:IShellItemArray=unsafe{folder.Items(SVGIO_SELECTION)?};let count=unsafe{items.GetCount()?};
-    if count>8192{return Err(failure("选择数量过多，请减少后重试"));}
+    if count>8192{return Err(failure(zsdesk_core::i18n::text("选择数量过多，请减少后重试")));}
     let mut pidls=Vec::with_capacity(count as usize);
-    for index in 0..count{let item=unsafe{items.GetItemAt(index)?};pidls.push(zsdesk_windows::shell::pidl::item_pidl(&item).ok_or_else(||failure("无法读取文件标识"))?);}
+    for index in 0..count{let item=unsafe{items.GetItemAt(index)?};pidls.push(zsdesk_windows::shell::pidl::item_pidl(&item).ok_or_else(||failure(zsdesk_core::i18n::text("无法读取文件标识")))?);}
     Ok(pidls)
 }
 fn same_identities(expected:&[Vec<u8>],current:&[Vec<u8>])->bool{
@@ -44,11 +44,11 @@ struct ChildPidl(*mut ITEMIDLIST);
 impl Drop for ChildPidl{fn drop(&mut self){if !self.0.is_null(){unsafe{CoTaskMemFree(Some(self.0.cast()));}}}}
 impl ChildPidl{
     fn bytes(&self)->windows::core::Result<Vec<u8>>{
-        if self.0.is_null(){return Err(failure("菜单选区返回空标识"));}
+        if self.0.is_null(){return Err(failure(zsdesk_core::i18n::text("菜单选区返回空标识")));}
         let size=unsafe{ILGetSize(Some(self.0))}as usize;
-        if !(2..=65536).contains(&size){return Err(failure("菜单选区标识大小无效"));}
+        if !(2..=65536).contains(&size){return Err(failure(zsdesk_core::i18n::text("菜单选区标识大小无效")));}
         let bytes=unsafe{std::slice::from_raw_parts(self.0.cast::<u8>(),size)};
-        if !zsdesk_windows::shell::pidl::valid(bytes){return Err(failure("菜单选区标识无效"));}Ok(bytes.to_vec())
+        if !zsdesk_windows::shell::pidl::valid(bytes){return Err(failure(zsdesk_core::i18n::text("菜单选区标识无效")));}Ok(bytes.to_vec())
     }
 }
 struct VisualSelection{folder:Vec<u8>,children:Vec<Vec<u8>>,focused:Option<Vec<u8>>}
@@ -61,13 +61,13 @@ impl VisualSelection{
             let mut raw=[std::ptr::null_mut()];let mut fetched=0;
             let status=unsafe{selected.Next(&mut raw,Some(&mut fetched))};let child=ChildPidl(raw[0]);status.ok()?;
             if fetched==0{break;}
-            if children.len()>=8192{return Err(failure("菜单选区数量过多"));}
-            let id=child.bytes()?;bytes=bytes.saturating_add(id.len());if bytes>3*1024*1024{return Err(failure("菜单选区标识过大"));}
+            if children.len()>=8192{return Err(failure(zsdesk_core::i18n::text("菜单选区数量过多")));}
+            let id=child.bytes()?;bytes=bytes.saturating_add(id.len());if bytes>3*1024*1024{return Err(failure(zsdesk_core::i18n::text("菜单选区标识过大")));}
             let item:IShellItem=unsafe{SHCreateItemWithParent(None,&folder,child.0)}?;
-            absolute.push(zsdesk_windows::shell::pidl::item_pidl(&item).ok_or_else(||failure("无法确认菜单选区标识"))?);
+            absolute.push(zsdesk_windows::shell::pidl::item_pidl(&item).ok_or_else(||failure(zsdesk_core::i18n::text("无法确认菜单选区标识")))?);
             children.push(id);
         }
-        if !same_identities(expected,&absolute){return Err(failure("菜单选区在读取期间已改变"));}
+        if !same_identities(expected,&absolute){return Err(failure(zsdesk_core::i18n::text("菜单选区在读取期间已改变")));}
         let focused=unsafe{folder_view.GetFocusedItem()}.ok().filter(|index|*index>=0)
             .and_then(|index|unsafe{folder_view.Item(index)}.ok()).and_then(|item|ChildPidl(item).bytes().ok())
             .filter(|item|children.contains(item));
@@ -85,7 +85,7 @@ impl VisualSelection{
             for child in &self.children{
                 if !permit(){return Ok(false);}
                 let item:IShellItem=unsafe{SHCreateItemWithParent(None,&parent,child.as_ptr().cast())}?;
-                live.push(zsdesk_windows::shell::pidl::item_pidl(&item).ok_or_else(||failure("菜单选区标识已失效"))?);
+                live.push(zsdesk_windows::shell::pidl::item_pidl(&item).ok_or_else(||failure(zsdesk_core::i18n::text("菜单选区标识已失效")))?);
             }
             if !same_identities(expected,&live)||!permit(){return Ok(false);}
             for (index,child) in self.children.iter().enumerate(){
@@ -134,8 +134,8 @@ pub(super) fn close(owner:HWND){
 pub(super) fn destroy(owner:HWND){close(owner);GENERATIONS.with(|generations|{generations.borrow_mut().remove(&(owner.0 as isize));});}
 pub(super) fn show(window:HWND,view:&IShellView,_source_window:HWND,position:LPARAM,target:menu::ViewMenuTarget)->windows::core::Result<()>{
     let owner=root(window);
-    let source=source(owner,window).ok_or_else(||failure("文件视图正在切换，请稍后重试"))?;
-    let identity=super::pane_input::identity(owner,source).ok_or_else(||failure("文件视图已切换，请重新打开菜单"))?;
+    let source=source(owner,window).ok_or_else(||failure(zsdesk_core::i18n::text("文件视图正在切换，请稍后重试")))?;
+    let identity=super::pane_input::identity(owner,source).ok_or_else(||failure(zsdesk_core::i18n::text("文件视图已切换，请重新打开菜单")))?;
     start(owner,window,view,identity,menu::context_menu_point(view,position)?,false,false,position.0==-1,target==menu::ViewMenuTarget::Background,None)
 }
 pub(super) fn show_new(owner:HWND,view:&IShellView,identity:super::pane_input::Identity,point:POINT,preferences:SourcePreferences)->windows::core::Result<()>{
@@ -180,12 +180,12 @@ fn start(owner:HWND,window:HWND,view:&IShellView,identity:super::pane_input::Ide
     let layout=zsdesk_windows::shell::capture_view_layout(view);
     let pointer=unsafe{GetWindowLongPtrW(owner,GWLP_USERDATA)}as*const Slot;
     let results=captured.as_ref().map(|(results,_)|*results).or_else(||if pointer.is_null(){None}else{unsafe{&*pointer}.try_borrow().ok().and_then(|slot|slot.as_ref().and_then(|state|state.menu_source_is_results(identity.source)))})
-        .ok_or_else(||failure("菜单源视图已改变"))?;
+        .ok_or_else(||failure(zsdesk_core::i18n::text("菜单源视图已改变")))?;
     let view_context=crate::context_menu_process::MenuViewContext{folder:Some(background_pidl(view)?),results,keyboard,
         f10:keyboard&&unsafe{GetKeyState(VK_F10.0 as i32)}<0};
     let file_actions=!new&&!catalog&&if pidls.is_empty(){file_transfer::filesystem_folder_path(view).ok().flatten().is_some()}else{file_transfer::paths_from_pidls(&pidls).is_ok()};
     let client=Client::spawn_with_context(owner,point,targets,folder.clone(),options,MenuInterceptions{rename:true,open:true,file_actions},mode,unsafe{GetKeyState(VK_SHIFT.0 as i32)}<0,layout,Some(view_context))
-        .map_err(|error|failure(&format!("无法启动系统菜单：{error:#}")))?;
+        .map_err(|error|failure(&zsdesk_core::tr_format!("无法启动系统菜单：{error:#}", error=error)))?;
     if !current(owner,generation){return Ok(());}
     ACTIVE.with(|active|{active.borrow_mut().insert(owner.0 as isize,Session{generation,identity,view_window:window,foreground,view:view.clone(),pidls,folder,background,client,catalog,input,visual,invocation_authorized:false,point,started:std::time::Instant::now(),loading_notified:false,mode,extended});});
     unsafe{SetTimer(Some(owner),TIMER,50,None)};Ok(())
@@ -260,7 +260,7 @@ pub(super) fn poll(owner:HWND){
         Some(Ok(_)) if session.catalog=>{super::pane_input::post(owner,identity,super::pane_input::Intent::ContextCatalog(catalog));},
         None=>{
             if !session.loading_notified&&session.client.preparing()&&session.started.elapsed()>=std::time::Duration::from_millis(250){
-                session.loading_notified=true;super::pane_input::post(owner,identity,super::pane_input::Intent::TransferMessage("正在加载右键菜单…".into()));
+                session.loading_notified=true;super::pane_input::post(owner,identity,super::pane_input::Intent::TransferMessage(zsdesk_core::i18n::text("正在加载右键菜单…").into()));
             }
             ACTIVE.with(|active|{active.borrow_mut().insert(owner.0 as isize,session);});
         },
@@ -271,22 +271,23 @@ pub(super) fn poll(owner:HWND){
             if action==MenuOutcome::Paste&&(!file_transfer::has_filesystem_clipboard()||destination.is_none()){
                 match Client::spawn(owner,POINT::default(),session.pidls.clone(),session.folder.clone(),menu::context_menu_options(),MenuInterceptions::default(),WorkerMode::Paste){
                     Ok(client)=>{session.client=client;ACTIVE.with(|active|{active.borrow_mut().insert(owner.0 as isize,session);});unsafe{SetTimer(Some(owner),TIMER,50,None);}},
-                    Err(error)=>{super::pane_input::post(owner,identity,super::pane_input::Intent::TransferMessage(format!("无法启动系统粘贴：{error:#}")));},
+                    Err(error)=>{super::pane_input::post(owner,identity,super::pane_input::Intent::TransferMessage(zsdesk_core::tr_format!("无法启动系统粘贴：{error:#}", error=error)));},
                 }
                 return;
             }
             let operation=(||->windows::core::Result<()>{
                 match action{
-                    MenuOutcome::Copy|MenuOutcome::Cut=>file_transfer::copy_items(window,&session.pidls,action==MenuOutcome::Cut),
+                    MenuOutcome::Copy=>file_transfer::copy_items(window,&session.pidls,false),
+                    MenuOutcome::Cut=>file_transfer::copy_view(&session.view,window,true),
                     MenuOutcome::Delete{permanent}=>file_transfer::delete_paths(window,file_transfer::paths_from_pidls(&session.pidls)?,permanent),
                     MenuOutcome::Paste=>{
-                        file_transfer::paste(window,destination.as_deref().ok_or_else(||failure("当前目录不支持路径粘贴"))?)
+                        file_transfer::paste(window,destination.as_deref().ok_or_else(||failure(zsdesk_core::i18n::text("当前目录不支持路径粘贴")))?)
                     },_=>unreachable!(),
                 }
             })();
             let message=match operation{
-                Ok(())=>match action{MenuOutcome::Copy=>format!("已复制 {} 个项目到剪贴板",session.pidls.len()),MenuOutcome::Cut=>format!("已剪切 {} 个项目到剪贴板",session.pidls.len()),MenuOutcome::Paste=>"正在粘贴…".into(),_=>"正在删除…".into()},
-                Err(error)=>format!("文件操作未完成：{}",file_transfer::error_message(&error)),
+                Ok(())=>match action{MenuOutcome::Copy=>zsdesk_core::tr_format!("已复制 {} 个项目到剪贴板", session.pidls.len()),MenuOutcome::Cut=>zsdesk_core::tr_format!("已剪切 {} 个项目到剪贴板", session.pidls.len()),MenuOutcome::Paste=>zsdesk_core::i18n::text("正在粘贴…").into(),_=>zsdesk_core::i18n::text("正在删除…").into()},
+                Err(error)=>zsdesk_core::tr_format!("文件操作未完成：{}", file_transfer::error_message(&error)),
             };
             super::pane_input::post(owner,identity,super::pane_input::Intent::TransferMessage(message));
         },

@@ -12,7 +12,7 @@ impl TerminalKind {
         match self { Self::PowerShell => "pwsh.exe", Self::WindowsPowerShell => "powershell.exe", Self::Nushell => "nu.exe", Self::CommandPrompt => "cmd.exe" }
     }
     fn label(self) -> &'static str {
-        match self { Self::PowerShell => "PowerShell 7", Self::WindowsPowerShell => "Windows PowerShell", Self::Nushell => "Nushell", Self::CommandPrompt => "命令提示符" }
+        match self { Self::PowerShell => "PowerShell 7", Self::WindowsPowerShell => "Windows PowerShell", Self::Nushell => "Nushell", Self::CommandPrompt => zsdesk_core::i18n::text("命令提示符") }
     }
 }
 
@@ -46,13 +46,13 @@ pub(super) fn parse(text: &str) -> Option<Result<TerminalRequest, &'static str>>
             (TerminalKind::Nushell, "--no-config-file" | "-n") => "-n",
             (TerminalKind::Nushell, "--no-history") => "--no-history",
             (TerminalKind::Nushell, "--no-std-lib") => "--no-std-lib",
-            _ => return Some(Err("地址栏终端仅接受启动开关，不接受命令、脚本或重定向参数")),
+            _ => return Some(Err(zsdesk_core::i18n::text("地址栏终端仅接受启动开关，不接受命令、脚本或重定向参数"))),
         };
-        if arguments.len() >= 8 { return Some(Err("终端启动参数过多")); }
+        if arguments.len() >= 8 { return Some(Err(zsdesk_core::i18n::text("终端启动参数过多"))); }
         if !arguments.contains(&canonical) { arguments.push(canonical); }
     }
     if arguments.contains(&"-STA") && arguments.contains(&"-MTA") {
-        return Some(Err("不能同时指定 -STA 和 -MTA"));
+        return Some(Err(zsdesk_core::i18n::text("不能同时指定 -STA 和 -MTA")));
     }
     Some(Ok(TerminalRequest { kind, arguments }))
 }
@@ -96,24 +96,24 @@ fn shell_command(executable: &Path, arguments: &[&str], directory: &Path) -> Com
 
 impl WindowState {
     fn terminal_working_directory(&mut self) -> Option<PathBuf> {
-        if self.pending.is_some() { self.show_message("请等待文件夹打开后再启动终端".into()); return None; }
+        if self.pending.is_some() { self.show_message(zsdesk_core::i18n::text("请等待文件夹打开后再启动终端").into()); return None; }
         let directory = working_directory(self.current_location());
-        if directory.is_none() { self.show_message("此位置没有文件系统工作目录，请先打开文件夹".into()); }
+        if directory.is_none() { self.show_message(zsdesk_core::i18n::text("此位置没有文件系统工作目录，请先打开文件夹").into()); }
         directory
     }
 
     pub(super) fn launch_terminal(&mut self, request: &TerminalRequest) -> bool {
         let Some(directory) = self.terminal_working_directory() else { return false };
         if request.kind==TerminalKind::CommandPrompt&&directory.to_string_lossy().starts_with(r"\\"){
-            self.show_message("CMD 不支持网络路径作为工作目录，请使用 PowerShell 或 pwsh".into());return false;
+            self.show_message(zsdesk_core::i18n::text("CMD 不支持网络路径作为工作目录，请使用 PowerShell 或 pwsh").into());return false;
         }
         let Some(executable) = resolve(request.kind) else {
-            self.show_message(format!("未找到 {}（{}），请安装并加入 PATH", request.kind.label(), request.kind.executable()));
+            self.show_message(zsdesk_core::tr_format!("未找到 {}（{}），请安装并加入 PATH", request.kind.label(), request.kind.executable()));
             return false;
         };
         match shell_command(&executable, &request.arguments, &directory).spawn() {
             Ok(_) => true,
-            Err(error) => { self.show_message(format!("无法在当前文件夹启动 {}：{error}", request.kind.label())); false }
+            Err(error) => { self.show_message(zsdesk_core::tr_format!("无法在当前文件夹启动 {}：{error}", request.kind.label(), error=error)); false }
         }
     }
 

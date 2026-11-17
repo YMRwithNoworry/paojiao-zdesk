@@ -1,4 +1,31 @@
 use super::*;
+#[test]fn native_file_data_preserves_shell_formats_and_move_intent_without_changing_clipboard(){
+    use windows::Win32::System::{Com::{DVASPECT_CONTENT,FORMATETC,TYMED_HGLOBAL},Ole::ReleaseStgMedium};
+    unsafe{OleInitialize(None)}.unwrap();
+    struct Apartment;impl Drop for Apartment{fn drop(&mut self){unsafe{OleUninitialize();}}}let _apartment=Apartment;
+    let root=std::env::temp_dir().join(format!("zsdesk-data-object-{}-{}",std::process::id(),unsafe{GetCurrentThreadId()}));
+    std::fs::create_dir_all(root.join("另一目录")).unwrap();
+    struct Fixture(PathBuf);impl Drop for Fixture{fn drop(&mut self){let _=std::fs::remove_dir_all(&self.0);}}let _fixture=Fixture(root.clone());
+    let paths=vec![root.join("文件一.txt"),root.join("另一目录").join("文件二.txt")];
+    for path in &paths{std::fs::write(path,b"clipboard-format-fixture").unwrap();}
+    let sequence=unsafe{GetClipboardSequenceNumber()};
+    for cut in [false,true]{
+        let data=file_data_object(HWND::default(),&paths,cut).unwrap();
+        for name in [CFSTR_SHELLIDLIST,CFSTR_PREFERREDDROPEFFECT]{
+            let format=unsafe{RegisterClipboardFormatW(name)};
+            let request=FORMATETC{cfFormat:format as u16,ptd:std::ptr::null_mut(),dwAspect:DVASPECT_CONTENT.0,lindex:-1,tymed:TYMED_HGLOBAL.0 as u32};
+            unsafe{data.QueryGetData(&request)}.unwrap();
+            let mut medium=unsafe{data.GetData(&request)}.unwrap();
+            if name==CFSTR_PREFERREDDROPEFFECT{
+                let memory=unsafe{medium.u.hGlobal};let pointer=unsafe{GlobalLock(memory)};assert!(!pointer.is_null());
+                assert_eq!(unsafe{pointer.cast::<u32>().read_unaligned()},if cut{2}else{1});let _=unsafe{GlobalUnlock(memory)};
+            }
+            unsafe{ReleaseStgMedium(&mut medium)};
+        }
+        assert_eq!(crate::ole::hdrop_paths(&data),paths);
+    }
+    assert_eq!(unsafe{GetClipboardSequenceNumber()},sequence);
+}
 #[test]fn shell_cancellation_and_production_collision_policy(){
     for code in [0x80270000u32,0x80270001,0x800704c7,0x80004004]{assert!(is_cancelled(HRESULT(code as i32)));}
     for code in [0u32,1,0x80070005,0x80070020,0x80270003]{assert!(!is_cancelled(HRESULT(code as i32)));}

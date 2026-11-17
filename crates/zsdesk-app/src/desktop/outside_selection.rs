@@ -45,14 +45,17 @@ fn exceeded(start:POINT,current:POINT)->bool{
     (i64::from(start.x)-i64::from(current.x)).abs()>=dx||(i64::from(start.y)-i64::from(current.y)).abs()>=dy
 }
 /// Called from the existing low-level hook. Never consumes the input or calls COM.
-pub(super) fn observe(message:u32,point:POINT,double:bool){
+#[cfg(test)]pub(super) fn observe(message:u32,point:POINT,double:bool){
+    observe_with_modifiers(message,point,double,unsafe{GetAsyncKeyState(VK_CONTROL.0 as i32)}<0,unsafe{GetAsyncKeyState(VK_SHIFT.0 as i32)}<0);
+}
+pub(super) fn observe_with_modifiers(message:u32,point:POINT,double:bool,control:bool,shift:bool){
     if !ENABLED.with(Cell::get){return;}
     match message{
         WM_LBUTTONDOWN=>{
             if double{cancel_observation();return;}
             let Some(desktop)=background_root(point)else{cancel_observation();return;};
             let generation=NEXT.with(|slot|{let value=slot.get();slot.set(value.wrapping_add(1).max(1));value});
-            let event=Observation{generation,desktop,start:point,current:point,control:unsafe{GetAsyncKeyState(VK_CONTROL.0 as i32)}<0,shift:unsafe{GetAsyncKeyState(VK_SHIFT.0 as i32)}<0,finished:false,cancelled:false};
+            let event=Observation{generation,desktop,start:point,current:point,control,shift,finished:false,cancelled:false};
             CANCEL_PENDING.with(|slot|slot.set(false));OBSERVATION.with(|slot|slot.set(Some(event)));post();
         },
         WM_MOUSEMOVE|WM_LBUTTONUP=>{

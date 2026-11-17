@@ -48,19 +48,19 @@ impl CommandId {
         }
     }
     /// Label shown next to the icon; icon-only buttons return `None`.
-    pub const fn label(self) -> Option<&'static str> {
+    pub fn label(self) -> Option<&'static str> {
         match self {
             Self::New => Some("新建"), Self::Sort => Some("排序"), Self::View => Some("查看"),
             Self::PreviewPane => Some("预览"), Self::DetailsPane => Some("详细信息"), _ => None,
-        }
+        }.map(zsdesk_core::i18n::text)
     }
-    pub const fn tooltip(self) -> &'static str {
-        match self {
+    pub fn tooltip(self) -> &'static str {
+        zsdesk_core::i18n::text(match self {
             Self::New => "新建项目", Self::Cut => "剪切 (Ctrl+X)", Self::Copy => "复制 (Ctrl+C)",
             Self::Paste => "粘贴 (Ctrl+V)", Self::Rename => "重命名 (F2)", Self::Share => "共享",
             Self::Delete => "删除 (Del)", Self::Sort => "排序方式", Self::View => "布局和视图选项",
             Self::More => "查看更多", Self::PreviewPane => "预览窗格 (Alt+P)", Self::DetailsPane => "详细信息窗格 (Alt+Shift+P)",
-        }
+        })
     }
     pub const fn has_dropdown(self) -> bool { matches!(self, Self::New | Self::Sort | Self::View) }
     const fn width(self) -> i32 {
@@ -96,6 +96,7 @@ pub struct ChromeInput<'a> {
     pub tree_width: i32,
     pub show_bookmarks: bool,
     pub bookmarks_on_right: bool,
+    pub bookmarks_width: i32,
     /// Search is active; show the close action beside the fixed native edit.
     pub search_panel_open: bool,
     pub command_bar: &'a CommandBarPreferences,
@@ -232,6 +233,7 @@ pub struct ChromeLayout {
     pub separators: Vec<Rect>,
     pub bookmarks_row: Rect,
     pub bookmarks_vertical: bool,
+    pub bookmark_splitter: Rect,
     pub bookmarks_title: Rect,
     pub bookmarks: Vec<Rect>,
     pub bookmark_overflow: Rect,
@@ -273,6 +275,7 @@ pub enum Hit {
     Bookmark(usize),
     BookmarkOverflow,
     BookmarksBar,
+    BookmarkSplitter,
     Splitter,
     PaneSplitter,
     PaneHeader(usize),
@@ -450,10 +453,12 @@ impl ChromeLayout {
         }
         if right_bookmarks{
             let available=layout.browser;
-            let bookmark_width=s(210).min((available.width-s(160)).max(s(100))).min(available.width);
+            let bookmark_width=input.bookmarks_width.clamp(s(120),s(600)).min((available.width-s(160)).max(s(100))).min(available.width);
             layout.bookmarks_vertical=true;
             layout.bookmarks_row=Rect::clamped(available.right()-bookmark_width,layout.top,bookmark_width,content_h);
-            layout.browser.width=(available.width-bookmark_width).max(0);
+            let splitter_width=s(SPLITTER_W).min((available.width-bookmark_width).max(0));
+            layout.bookmark_splitter=Rect::clamped(layout.bookmarks_row.x-splitter_width,layout.top,splitter_width,content_h);
+            layout.browser.width=(available.width-bookmark_width-splitter_width).max(0);
             let bar=layout.bookmarks_row;
             layout.bookmarks_title=Rect::clamped(bar.x+s(8),(bar.y+s(4)).min(bar.bottom()),bar.width-s(16),s(28).min((bar.height-s(8)).max(0)));
             let row=s(32);let top=(layout.bookmarks_title.bottom()+s(4)).min(bar.bottom());
@@ -489,7 +494,7 @@ impl ChromeLayout {
             layout.new_tab=Rect::clamped(x+inset_left+s(6),(layout.tab_panel.bottom()-row-s(4)).max(layout.tab_panel.y),panel_width-inset_left-inset_right-s(12),row);
             layout.set_tab_viewport(input.tab_count,first);
             for rect in [&mut layout.nav_row,&mut layout.back,&mut layout.forward,&mut layout.up,&mut layout.refresh,&mut layout.address,&mut layout.search,
-                &mut layout.command_row,&mut layout.command_toggle,&mut layout.bookmarks_row,&mut layout.bookmarks_title,&mut layout.bookmark_overflow,&mut layout.tree,&mut layout.splitter,&mut layout.browser,
+                &mut layout.command_row,&mut layout.command_toggle,&mut layout.bookmarks_row,&mut layout.bookmarks_title,&mut layout.bookmark_overflow,&mut layout.bookmark_splitter,&mut layout.tree,&mut layout.splitter,&mut layout.browser,
                 &mut layout.status,&mut layout.status_details,&mut layout.status_tiles,&mut layout.status_dual_pane]{rect.x+=content_offset;}
             for (_,rect) in &mut layout.commands{rect.x+=content_offset;}
             for rect in layout.bookmarks.iter_mut().chain(layout.separators.iter_mut()){rect.x+=content_offset;}
@@ -540,6 +545,7 @@ impl ChromeLayout {
             if self.bookmark_overflow.contains(x, y) { return Hit::BookmarkOverflow; }
             return Hit::BookmarksBar;
         }
+        if self.bookmark_splitter.contains(x,y){return Hit::BookmarkSplitter;}
         if self.splitter.contains(x, y) { return Hit::Splitter; }
         if self.pane_splitter.contains(x, y) { return Hit::PaneSplitter; }
         for (index, rect) in self.pane_headers.iter().enumerate() {
@@ -617,7 +623,7 @@ fn first_visible(count: usize, active: usize, visible: usize) -> usize {
 /// Explorer-style size text ("1.20 MB").
 pub fn format_size(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["字节", "KB", "MB", "GB", "TB"];
-    if bytes < 1024 { return format!("{bytes} 字节"); }
+    if bytes < 1024 { return zsdesk_core::tr_format!("{bytes} 字节" , bytes=bytes); }
     let mut value = bytes as f64;
     let mut unit = 0;
     while value >= 1024.0 && unit + 1 < UNITS.len() { value /= 1024.0; unit += 1; }
@@ -634,8 +640,31 @@ mod tests {
 
     fn input(width: i32, tabs: usize, active: usize, dpi: u32) -> ChromeInput<'static> {
         ChromeInput { tab_placement:zsdesk_core::model::explorer::TabPlacement::Top, side_tabs_width:210,side_tabs_compact:true,width, height: 800, dpi, caption_width: scale(138, dpi), caption_button: None,
-            tab_count: tabs, active_tab: active, show_tab_list:true, show_tree: true, tree_width: scale(220, dpi), show_bookmarks: true,bookmarks_on_right:false,
+            tab_count: tabs, active_tab: active, show_tab_list:true, show_tree: true, tree_width: scale(220, dpi), show_bookmarks: true,bookmarks_on_right:false,bookmarks_width:scale(210,dpi),
             command_bar: &DEFAULT_COMMAND_BAR, status_bar: true, bookmark_widths: &[], search_panel_open: false }
+    }
+
+    #[test]fn bookmark_panel_resizes_without_covering_the_view_or_side_tabs(){
+        use zsdesk_core::model::explorer::TabPlacement;
+        for dpi in [96,120,144,192]{for placement in [TabPlacement::Top,TabPlacement::Left,TabPlacement::Right]{
+            let mut previous=0;
+            for width in [120,210,360,600]{
+                let layout=ChromeLayout::new(&ChromeInput{width:scale(1600,dpi),height:scale(900,dpi),
+                    bookmarks_on_right:true,bookmarks_width:scale(width,dpi),tab_placement:placement,..input(scale(1600,dpi),4,0,dpi)});
+                assert!(layout.bookmarks_row.width>previous);previous=layout.bookmarks_row.width;
+                assert_eq!(layout.browser.right(),layout.bookmark_splitter.x);
+                assert_eq!(layout.bookmark_splitter.right(),layout.bookmarks_row.x);
+                assert!(layout.browser.width>=scale(160,dpi));
+                assert_eq!(layout.hit(layout.bookmark_splitter.x+1,layout.bookmark_splitter.y+10),Hit::BookmarkSplitter);
+            }
+            for width in [i32::MIN,i32::MAX]{
+                let layout=ChromeLayout::new(&ChromeInput{bookmarks_on_right:true,bookmarks_width:width,tab_placement:placement,
+                    ..input(scale(800,dpi),4,0,dpi)});
+                assert!(layout.browser.width>=0&&layout.bookmarks_row.width>=0);
+                assert!(layout.bookmarks_row.right()<=scale(800,dpi));
+                assert_eq!(layout.browser.right(),layout.bookmark_splitter.x);
+            }
+        }}
     }
 
     #[test]fn side_tabs_resize_density_and_scroll_keep_every_tab_reachable(){
@@ -660,7 +689,8 @@ mod tests {
         for dpi in [96,144,192]{for placement in [TabPlacement::Top,TabPlacement::Left,TabPlacement::Right]{
             let layout=ChromeLayout::new(&ChromeInput{bookmarks_on_right:true,bookmark_widths:&widths,tab_placement:placement,height:scale(800,dpi),..input(scale(1200,dpi),12,0,dpi)});
             assert!(layout.bookmarks_vertical&&!layout.bookmarks.is_empty()&&!layout.bookmark_overflow.is_empty());
-            assert_eq!(layout.browser.right(),layout.bookmarks_row.x);
+            assert_eq!(layout.browser.right(),layout.bookmark_splitter.x);
+            assert_eq!(layout.bookmark_splitter.right(),layout.bookmarks_row.x);
             assert!(layout.bookmarks_row.right()<=layout.nav_row.right());
             for (index,rect) in layout.bookmarks.iter().enumerate(){
                 assert!(rect.x>=layout.bookmarks_row.x&&rect.right()<=layout.bookmarks_row.right()&&rect.bottom()<=layout.bookmarks_row.bottom());

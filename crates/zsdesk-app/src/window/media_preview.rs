@@ -21,18 +21,18 @@ fn audio_only(path:&Path)->bool{path.extension().is_some_and(|extension|matches!
 fn playback_error(code:Option<HRESULT>)->String{
     let detail=code.map(|code|format!("（0x{:08X}）",code.0 as u32)).unwrap_or_default();
     let message=match code{
-        Some(MF_E_CANNOT_CREATE_SINK)=>"无法创建媒体播放输出，请检查音频输出设备或使用默认播放器",
-        Some(MF_E_AUDIO_PLAYBACK_DEVICE_INVALIDATED)=>"音频输出设备已断开，请连接设备后重新打开预览",
-        Some(MF_E_AUDIO_PLAYBACK_DEVICE_IN_USE)=>"音频输出设备正被占用，请释放设备后重新打开预览",
-        Some(MF_E_TOPO_CODEC_NOT_FOUND|MF_E_UNSUPPORTED_BYTESTREAM_TYPE)=>"当前 Windows 不支持此文件的媒体格式，可使用默认播放器或已安装的 QuickLook",
-        _=>"无法播放此媒体文件，可使用默认播放器或已安装的 QuickLook",
+        Some(MF_E_CANNOT_CREATE_SINK)=>zsdesk_core::i18n::text("无法创建媒体播放输出，请检查音频输出设备或使用默认播放器"),
+        Some(MF_E_AUDIO_PLAYBACK_DEVICE_INVALIDATED)=>zsdesk_core::i18n::text("音频输出设备已断开，请连接设备后重新打开预览"),
+        Some(MF_E_AUDIO_PLAYBACK_DEVICE_IN_USE)=>zsdesk_core::i18n::text("音频输出设备正被占用，请释放设备后重新打开预览"),
+        Some(MF_E_TOPO_CODEC_NOT_FOUND|MF_E_UNSUPPORTED_BYTESTREAM_TYPE)=>zsdesk_core::i18n::text("当前 Windows 不支持此文件的媒体格式，可使用默认播放器或已安装的 QuickLook"),
+        _=>zsdesk_core::i18n::text("无法播放此媒体文件，可使用默认播放器或已安装的 QuickLook"),
     };format!("{message}{detail}")
 }
 fn local_url(path:&Path)->Result<BSTR>{
     use std::os::windows::ffi::OsStrExt;
-    if !path.is_absolute(){bail!("媒体预览需要完整文件路径");}
+    if !path.is_absolute(){bail!("{}", zsdesk_core::tr_format!("媒体预览需要完整文件路径"));}
     let name:Vec<_>=path.as_os_str().encode_wide().collect();
-    if name.len()>32767||name.contains(&0){bail!("媒体路径无效");}
+    if name.len()>32767||name.contains(&0){bail!("{}", zsdesk_core::tr_format!("媒体路径无效"));}
     let name:Vec<_>=name.into_iter().chain(Some(0)).collect();let mut result=vec![0u16;65536];let mut count=result.len()as u32;
     unsafe{UrlCreateFromPathW(PCWSTR(name.as_ptr()),PWSTR(result.as_mut_ptr()),&mut count,0)}?;
     let end=result.iter().position(|unit|*unit==0).unwrap_or(count as usize);
@@ -50,19 +50,19 @@ impl Foundation{
     fn start()->Result<Self>{Self::start_from(windows::core::w!("mfplat.dll"))}
     fn start_from(name:PCWSTR)->Result<Self>{
         let module=Module(unsafe{LoadLibraryExW(name,None,LOAD_LIBRARY_SEARCH_SYSTEM32)}
-            .context("Windows 媒体组件不可用；可使用 QuickLook 或默认播放器")?);
+            .context(zsdesk_core::i18n::text("Windows 媒体组件不可用；可使用 QuickLook 或默认播放器"))?);
         let startup:Startup=unsafe{std::mem::transmute(GetProcAddress(module.0,windows::core::s!("MFStartup"))
-            .context("Windows 媒体组件缺少 MFStartup")?)};
+            .context(zsdesk_core::i18n::text("Windows 媒体组件缺少 MFStartup"))?)};
         let shutdown:Shutdown=unsafe{std::mem::transmute(GetProcAddress(module.0,windows::core::s!("MFShutdown"))
-            .context("Windows 媒体组件缺少 MFShutdown")?)};
+            .context(zsdesk_core::i18n::text("Windows 媒体组件缺少 MFShutdown"))?)};
         let create_attributes:CreateAttributes=unsafe{std::mem::transmute(GetProcAddress(module.0,windows::core::s!("MFCreateAttributes"))
-            .context("Windows 媒体组件缺少 MFCreateAttributes")?)};
-        unsafe{startup(MF_VERSION,MFSTARTUP_FULL)}.ok().context("Windows 媒体组件初始化失败")?;
+            .context(zsdesk_core::i18n::text("Windows 媒体组件缺少 MFCreateAttributes"))?)};
+        unsafe{startup(MF_VERSION,MFSTARTUP_FULL)}.ok().context(zsdesk_core::i18n::text("Windows 媒体组件初始化失败"))?;
         Ok(Self{shutdown,create_attributes,_module:module})
     }
     fn attributes(&self)->Result<IMFAttributes>{
         let mut raw=std::ptr::null_mut();unsafe{(self.create_attributes)(&mut raw,2)}.ok()?;
-        if raw.is_null(){bail!("媒体组件未返回属性对象");}
+        if raw.is_null(){bail!("{}", zsdesk_core::tr_format!("媒体组件未返回属性对象"));}
         Ok(unsafe{IMFAttributes::from_raw(raw)})
     }
 }
@@ -105,7 +105,7 @@ impl State{
         self.repaint();
     }
     fn toggle(&self){if !self.ready.get(){return;}if let Some(engine)=self.engine(){let result=unsafe{if engine.IsPaused().as_bool(){engine.Play()}else{engine.Pause()}};
-        if let Err(error)=result{*self.notice.borrow_mut()=format!("媒体播放失败（0x{:08X}）",error.code().0 as u32);}}
+        if let Err(error)=result{*self.notice.borrow_mut()=zsdesk_core::tr_format!("媒体播放失败（0x{:08X}）", error.code().0 as u32);}}
         self.repaint();
     }
     fn paint(&self){
@@ -116,8 +116,8 @@ impl State{
         let footer=RECT{left:12,top:(rect.bottom-self.footer_height()).max(0),right:(rect.right-12).max(12),bottom:rect.bottom};
         let text=if !self.notice.borrow().is_empty(){self.notice.borrow().clone()}else if let Some(engine)=self.engine(){
             let current=unsafe{engine.GetCurrentTime()};let duration=unsafe{engine.GetDuration()};
-            format!("{}    {} / {}    点击进度区域定位",if unsafe{engine.IsPaused()}.as_bool(){"▶ 播放"}else{"Ⅱ 暂停"},time_text(current),time_text(duration))
-        }else{"媒体已关闭".into()};
+            zsdesk_core::tr_format!("{}    {} / {}    点击进度区域定位", if unsafe{engine.IsPaused()}.as_bool(){zsdesk_core::i18n::text("▶ 播放")}else{zsdesk_core::i18n::text("Ⅱ 暂停")}, time_text(current), time_text(duration))
+        }else{zsdesk_core::i18n::text("媒体已关闭").into()};
         let mut text:Vec<_>=text.encode_utf16().collect();let mut area=if self.notice.borrow().is_empty(){footer}else{RECT{left:12,top:12,right:rect.right-12,bottom:rect.bottom-12}};
         unsafe{DrawTextW(dc,&mut text,&mut area,DT_WORDBREAK|DT_NOPREFIX);SelectObject(dc,old_font);EndPaint(self.hwnd.get(),&ps);}
     }
@@ -137,7 +137,7 @@ impl MediaPreview{
         let instance=HINSTANCE(unsafe{GetModuleHandleW(None)}?.0);
         unsafe{RegisterClassW(&WNDCLASSW{hInstance:instance,lpfnWndProc:Some(procedure),hCursor:LoadCursorW(None,IDC_ARROW)?,lpszClassName:CLASS,..Default::default()});}
         let state=Rc::new(State{hwnd:Cell::new(HWND::default()),video:Cell::new(HWND::default()),engine:RefCell::new(None),alive:Arc::new(AtomicBool::new(true)),
-            token:TOKEN.fetch_add(1,Ordering::Relaxed),ready:Cell::new(false),notice:RefCell::new("正在读取媒体…".into()),dark:Cell::new(dark),started:Instant::now(),_foundation:foundation});
+            token:TOKEN.fetch_add(1,Ordering::Relaxed),ready:Cell::new(false),notice:RefCell::new(zsdesk_core::i18n::text("正在读取媒体…").into()),dark:Cell::new(dark),started:Instant::now(),_foundation:foundation});
         let hwnd=unsafe{CreateWindowExW(WS_EX_NOPARENTNOTIFY,CLASS,PCWSTR::null(),WS_CHILD|WS_CLIPCHILDREN,bounds.left,bounds.top,bounds.right-bounds.left,bounds.bottom-bounds.top,
             Some(parent),None,Some(instance),Some((&state as*const Rc<State>).cast()))}?;state.hwnd.set(hwnd);
         let preview=Self{state};
@@ -167,7 +167,7 @@ unsafe extern "system" fn procedure(hwnd:HWND,message:u32,wp:WPARAM,lp:LPARAM)->
         EVENT if wp.0==state.token=>{state.event(lp.0 as u32);LRESULT(0)},
         WM_SIZE=>{state.layout();LRESULT(0)},
         WM_TIMER if wp.0==TIMER=>{if !state.ready.get()&&state.started.elapsed()>Duration::from_secs(20)&&state.notice.borrow().as_str()=="正在读取媒体…"{
-            *state.notice.borrow_mut()="读取媒体超时，可使用 QuickLook 或默认播放器打开。".into();state.shutdown();let _=unsafe{ShowWindow(state.video.get(),SW_HIDE)};
+            *state.notice.borrow_mut()=zsdesk_core::i18n::text("读取媒体超时，可使用 QuickLook 或默认播放器打开。").into();state.shutdown();let _=unsafe{ShowWindow(state.video.get(),SW_HIDE)};
         }state.repaint();LRESULT(0)},
         WM_LBUTTONUP=>{let y=((lp.0>>16)as u16 as i16)as i32;let x=lp.0 as u16 as i16 as i32;let rect=state.bounds();
             if y>=rect.bottom-state.footer_height(){if x<100{state.toggle();}else if let Some(engine)=state.engine(){let duration=unsafe{engine.GetDuration()};

@@ -34,14 +34,14 @@ fn name(profile: &Path, action: &str) -> Vec<u16> { wide(&format!("Local\\ZSDesk
 pub fn load(profile: &Path) -> Result<Configuration> {
     let path = config_path(profile);
     if !path.try_exists()? { return Ok(Configuration::default()); }
-    if fs::metadata(&path)?.len() > 65536 { bail!("后台搜索配置过大"); }
-    serde_json::from_slice(&fs::read(path)?).context("后台搜索配置格式无效")
+    if fs::metadata(&path)?.len() > 65536 { bail!("{}", zsdesk_core::tr_format!("后台搜索配置过大")); }
+    serde_json::from_slice(&fs::read(path)?).context(zsdesk_core::i18n::text("后台搜索配置格式无效"))
 }
 
 pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::os::windows::ffi::OsStrExt;
     use windows::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH};
-    fs::create_dir_all(path.parent().context("配置目录缺失")?)?;
+    fs::create_dir_all(path.parent().context(zsdesk_core::i18n::text("配置目录缺失"))?)?;
     let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
     fs::write(&temporary, bytes)?;
     let from: Vec<u16> = temporary.as_os_str().encode_wide().chain(Some(0)).collect();
@@ -71,7 +71,7 @@ fn read_startup(profile: &Path) -> Result<Option<String>> {
     let status = unsafe { RegGetValueW(HKEY_CURRENT_USER, RUN, PCWSTR(name.as_ptr()), RRF_RT_REG_SZ, None, None, Some(&mut bytes)) };
     if status.0 == 2 { return Ok(None); }
     status.ok()?;
-    if bytes > 65536 { bail!("登录启动项过大"); }
+    if bytes > 65536 { bail!("{}", zsdesk_core::tr_format!("登录启动项过大")); }
     let mut value = vec![0u16; bytes as usize / 2 + 1];
     unsafe { RegGetValueW(HKEY_CURRENT_USER, RUN, PCWSTR(name.as_ptr()), RRF_RT_REG_SZ, None, Some(value.as_mut_ptr().cast()), Some(&mut bytes)).ok()?; }
     Ok(Some(String::from_utf16_lossy(&value[..value.iter().position(|unit| *unit == 0).unwrap_or(value.len())])))
@@ -90,11 +90,11 @@ fn write_startup(profile: &Path, value: Option<&str>) -> Result<()> {
 }
 
 pub fn validate_hotkey(value: &str) -> Result<String> {
-    if value.len() > 128 { bail!("快捷键过长"); }
+    if value.len() > 128 { bail!("{}", zsdesk_core::tr_format!("快捷键过长")); }
     let chord: ZsAccelerator = value.trim().parse().map_err(|error| anyhow::anyhow!("{error}"))?;
-    if chord.key() == ZsAcceleratorKey::Function(12) { bail!("F12 为系统调试器保留，请选择其它快捷键"); }
+    if chord.key() == ZsAcceleratorKey::Function(12) { bail!("{}", zsdesk_core::tr_format!("F12 为系统调试器保留，请选择其它快捷键")); }
     if !chord.uses_primary() && !chord.uses_alt() && !chord.uses_super() && !matches!(chord.key(), ZsAcceleratorKey::Function(_)) {
-        bail!("全局快捷键需包含 Ctrl、Alt、Win，或使用功能键");
+        bail!("{}", zsdesk_core::tr_format!("全局快捷键需包含 Ctrl、Alt、Win，或使用功能键"));
     }
     Ok(chord.to_string().replace("Primary", "Ctrl").replace("Super", "Win"))
 }
@@ -126,7 +126,7 @@ pub fn apply(profile: &Path, mut preferences: QuickSearchPreferences) -> Result<
     let executable = std::env::current_exe()?;
     let desired = preferences.start_with_windows.then(|| startup_command(profile, &executable));
     if before.is_some() && before != previous.startup_command && before != desired {
-        bail!("同名登录启动项已由其它设置修改，现有值已保留");
+        bail!("{}", zsdesk_core::tr_format!("同名登录启动项已由其它设置修改，现有值已保留"));
     }
     let next = Configuration { preferences, startup_command: desired.clone() };
     write_startup(profile, desired.as_deref())?;
@@ -158,8 +158,8 @@ pub mod main_window_startup {
     }
 
     fn command(profile: &Path, executable: &Path) -> Result<String> {
-        let directory = profile.parent().context("缺少主窗口配置目录")?;
-        anyhow::ensure!(executable.is_absolute() && directory.is_absolute(), "登录启动需要绝对程序路径和配置目录");
+        let directory = profile.parent().context(zsdesk_core::i18n::text("缺少主窗口配置目录"))?;
+        anyhow::ensure!(executable.is_absolute() && directory.is_absolute(), "{}", zsdesk_core::tr_format!("登录启动需要绝对程序路径和配置目录"));
         Ok(format!("{} --profile-dir {}", quote_argument(&executable.to_string_lossy()),
             quote_argument(&directory.to_string_lossy())))
     }
@@ -249,7 +249,7 @@ unsafe impl Sync for Kernel {}
 impl Drop for Kernel { fn drop(&mut self) { let _ = unsafe { CloseHandle(self.0) }; } }
 
 pub fn signal(profile: &Path, action: &str) -> Result<bool> {
-    if !ACTIONS.contains(&action) { bail!("未知后台搜索操作"); }
+    if !ACTIONS.contains(&action) { bail!("{}", zsdesk_core::tr_format!("未知后台搜索操作")); }
     let text = name(profile, action);
     let handle = match unsafe { OpenEventW(EVENT_MODIFY_STATE, false, PCWSTR(text.as_ptr())) } {
         Ok(handle) => Kernel(handle), Err(error) if error.code().0 as u32 == 0x80070002 => return Ok(false), Err(error) => return Err(error.into()),

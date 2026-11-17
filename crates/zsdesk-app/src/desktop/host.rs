@@ -265,6 +265,7 @@ pub struct DesktopHost {
     pub gfx: Gfx,
     icons: HashMap<IconKey, IconSlot>,
     icon_clock: u64,
+    icon_batches:u64,icon_repaint_requests:u64,
     next_icon_request: u64,
     icon_content_active: bool,
     shutting_down: bool,
@@ -308,7 +309,7 @@ impl DesktopHost {
         let loader = IconLoader::spawn(hwnd, WM_ICON_READY);
         let taskbar_created = unsafe { RegisterWindowMessageW(windows::core::w!("TaskbarCreated")) };
         let mut host = Self { hwnd, config_path, explorer_config, config, fences: Vec::new(), desktop_entries: Vec::new(), #[cfg(test)]desktop_test_entries:None,gfx,
-            cut_paths:HashSet::new(),icons: HashMap::new(), icon_clock: 0, next_icon_request: 1, icon_content_active: false, shutting_down: false, desktop_anchor: None, desktop_exposed:false,
+            cut_paths:HashSet::new(),icons: HashMap::new(), icon_clock: 0,icon_batches:0,icon_repaint_requests:0, next_icon_request: 1, icon_content_active: false, shutting_down: false, desktop_anchor: None, desktop_exposed:false,
             loader, desktop_notify: None, guard: None, pending: Vec::new(), known: HashSet::new(),desktop_snapshot_initialized:false, menu_input_started:None,
             modal_holds:HashMap::new(),pending_menu:None,incoming_drag:None,drag_geometry:Vec::new(),drag_anchor:None,last_drop:None,last_drop_route:None,
             taskbar_created, palette: FencePalette::new(Mode::Dark, 55), drop_delegate: None, drop_data: None, internal_drag: None,internal_drag_data:None,drag_is_internal:false, tray: false,tray_version4:false,
@@ -393,13 +394,13 @@ impl DesktopHost {
         let _ = unsafe { KillTimer(Some(self.hwnd), TIMER_SAVE) };
         self.config.normalize();
         if let Err(error) = save_config(&self.config_path, &self.config) {
-            self.notify_error(&format!("无法保存桌面格子布局：{error}"));
+            self.notify_error(&zsdesk_core::tr_format!("无法保存桌面格子布局：{error}", error=error));
         }
     }
 
     fn notify_error(&self, text: &str) {
         let text: Vec<u16> = text.encode_utf16().chain(Some(0)).collect();
-        unsafe { MessageBoxW(Some(self.hwnd), PCWSTR(text.as_ptr()), windows::core::w!("ZSDesk 桌面格子"), MB_OK | MB_ICONWARNING); }
+        unsafe { MessageBoxW(Some(self.hwnd), PCWSTR(text.as_ptr()), windows::core::PCWSTR(zsdesk_core::i18n::wide("ZSDesk 桌面格子").as_ptr()), MB_OK | MB_ICONWARNING); }
     }
 
     // ---- tray --------------------------------------------------------------
@@ -411,7 +412,7 @@ impl DesktopHost {
         data.uCallbackMessage = WM_TRAY;
         let module = unsafe { windows::Win32::System::LibraryLoader::GetModuleHandleW(None) }.unwrap_or_default();
         data.hIcon = unsafe { LoadIconW(Some(windows::Win32::Foundation::HINSTANCE(module.0)), PCWSTR(101usize as *const u16)) }.unwrap_or_default();
-        let tip: Vec<u16> = "ZSDesk 桌面格子".encode_utf16().collect();
+        let tip: Vec<u16> = zsdesk_core::i18n::text("ZSDesk 桌面格子").encode_utf16().collect();
         data.szTip[..tip.len()].copy_from_slice(&tip);
         (self.tray,self.tray_version4)=register_tray(&mut data,|message,data|unsafe{Shell_NotifyIconW(message,data)}.as_bool());
     }
@@ -487,7 +488,7 @@ impl DesktopHost {
     pub fn organize(&mut self) {
         if self.config.settings.organize { self.show_all(); return; }
         if !self.hide_icons() {
-            self.notify_error("无法启动桌面图标恢复进程，已保留系统桌面图标。");
+            self.notify_error(zsdesk_core::i18n::text("无法启动桌面图标恢复进程，已保留系统桌面图标。"));
             return;
         }
         self.config.settings.organize = true;
@@ -530,7 +531,7 @@ impl DesktopHost {
     pub fn restore_desktop(&mut self) {
         if !self.config.settings.organize { return; }
         if !desktop::set_icons_visible(true) {
-            self.notify_error("系统桌面图标尚未恢复，已保留桌面格子和恢复进程，请稍后重试。");return;
+            self.notify_error(zsdesk_core::i18n::text("系统桌面图标尚未恢复，已保留桌面格子和恢复进程，请稍后重试。"));return;
         }
         self.config.settings.organize = false;
         super::update_hook(self.config.settings.double_click_toggle,false);
@@ -550,7 +551,7 @@ impl DesktopHost {
         let id = self.config.take_id();
         let x = unscale(point.x - monitor.work.left, monitor.dpi) - 40;
         let y = unscale(point.y - monitor.work.top, monitor.dpi) - 10;
-        let fence = Fence::new(id, format!("新建格子 {}", self.config.fences.len() + 1), FenceSource::Desktop,
+        let fence = Fence::new(id, zsdesk_core::tr_format!("新建格子 {}", self.config.fences.len() + 1), FenceSource::Desktop,
             Placement { monitor: monitor.name, x: x.max(0), y: y.max(0), width: 320, height: 220 });
         self.config.fences.push(fence);
         self.save_now();
@@ -668,8 +669,7 @@ impl DesktopHost {
             let hidden_desktop=self.config.settings.organize&&failures.iter().any(|(id,_)|
                 self.config.fence(*id).is_some_and(Fence::is_desktop));
             if hidden_desktop {self.restore_desktop();}
-            self.notify_error(&format!("无法显示部分桌面项目：{}{}",failures[0].1,
-                if hidden_desktop&&!self.config.settings.organize{"；已恢复系统桌面图标，原分组布局仍保留。"}else{""}));
+            self.notify_error(&zsdesk_core::tr_format!("无法显示部分桌面项目：{}{}", failures[0].1, if hidden_desktop&&!self.config.settings.organize{zsdesk_core::i18n::text("；已恢复系统桌面图标，原分组布局仍保留。")}else{""}));
         }
         for i in 0..self.config.fences.len() {
             let id = self.config.fences[i].id;
@@ -785,7 +785,7 @@ impl DesktopHost {
         if !self.config.settings.organize || self.config.fence(to).is_none() { return; }
         let previous = self.config.active_tab(to).unwrap_or(to);
         let id = self.config.take_id();
-        self.config.add_tab(to, Fence::new(id, "新建标签", FenceSource::Desktop, Placement::default()));
+        self.config.add_tab(to, Fence::new(id, zsdesk_core::i18n::text("新建标签"), FenceSource::Desktop, Placement::default()));
         self.after_new_tab(previous, id);
         self.refresh_desktop();
         self.begin_rename(id, RenameTarget::Title);
@@ -876,8 +876,8 @@ impl DesktopHost {
     pub fn add_tab_menu(&self) -> MenuSpec {
         let organize = self.config.settings.organize;
         menu(vec![
-            entry(if organize { "桌面分组标签" } else { "桌面分组标签（需先一键整理桌面）" }, "new-tab-desktop", organize, false),
-            entry("映射文件夹标签…", "new-tab-folder", true, false),
+            entry(if organize { zsdesk_core::i18n::text("桌面分组标签") } else { zsdesk_core::i18n::text("桌面分组标签（需先一键整理桌面）") }, "new-tab-desktop", organize, false),
+            entry(zsdesk_core::i18n::text("映射文件夹标签…"), "new-tab-folder", true, false),
         ])
     }
 
@@ -889,7 +889,7 @@ impl DesktopHost {
     }
 
     fn create_window(&mut self, id: u64, require_item:bool) -> Result<(),String> {
-        let Some(fence) = self.config.fence(id) else { return Err("桌面项目配置不存在".into()) };
+        let Some(fence) = self.config.fence(id) else { return Err(zsdesk_core::i18n::text("桌面项目配置不存在").into()) };
         let rect = if self.config.is_released(id) { item_screen_rect(&fence.placement) } else { to_screen(&fence.placement, fence.collapsed) };
         let class: Vec<u16> = FENCE_CLASS.encode_utf16().chain(Some(0)).collect();
         let title: Vec<u16> = fence.title.encode_utf16().chain(Some(0)).collect();
@@ -905,7 +905,7 @@ impl DesktopHost {
         if win.standalone {
             if win.entries.len()!=1 {
                 let _=unsafe{DestroyWindow(hwnd)};
-                return if require_item {Err("桌面项目已移动或不可用".into())}else{Ok(())};
+                return if require_item {Err(zsdesk_core::i18n::text("桌面项目已移动或不可用").into())}else{Ok(())};
             }
             if let Err(error)=unsafe { SetPropW(hwnd, windows::core::w!("ZSDesk.DesktopItem"), Some(windows::Win32::Foundation::HANDLE(1usize as *mut _))) } {
                 let _=unsafe{DestroyWindow(hwnd)};return Err(error.to_string());
@@ -920,7 +920,7 @@ impl DesktopHost {
         super::set_z(hwnd, HWND_BOTTOM);
         if !self.render(id) {
             if let Some(index)=self.win_index(id) {let mut failed=self.fences.remove(index);failed.drop=None;failed.notify=None;}
-            let _=unsafe{DestroyWindow(hwnd)};return Err("桌面图标绘制资源不足".into());
+            let _=unsafe{DestroyWindow(hwnd)};return Err(zsdesk_core::i18n::text("桌面图标绘制资源不足").into());
         }
         if (!self.config.settings.hidden || self.config.is_released(id)) && !fence_hidden_tab(&self.config, id) { let _ = unsafe { ShowWindow(hwnd, SW_SHOWNOACTIVATE) }; }
         Ok(())
@@ -1112,7 +1112,8 @@ impl DesktopHost {
 
     pub fn icons_ready(&mut self) {
         let ready = self.loader.take_ready();
-        let mut accepted = false;
+        let mut changed=HashSet::new();
+        if !ready.is_empty(){self.icon_batches=self.icon_batches.wrapping_add(1);}
         for result in ready {
             let Some(slot) = self.icons.get_mut(&(result.key.clone(), result.size as i32)) else { continue };
             if slot.request != Some(result.token) { continue; }
@@ -1124,10 +1125,27 @@ impl DesktopHost {
             }
             // A slow/failed thumbnail must not erase the already-visible icon.
             slot.retry_after = (result.final_result&&slot.wic.is_none()).then(|| Instant::now() + Duration::from_secs(30));
-            accepted = true;
+            changed.insert((result.key.clone(),result.size as i32));
         }
-        // One repaint per batch also retries visible requests rejected by a full queue.
-        if accepted { self.render_all(); }
+        // Repaint only views affected by this batch, plus visible views whose
+        // requests were deferred by the bounded queue. Hidden/other fences do
+        // not need a full layered-window upload for every thumbnail.
+        if !changed.is_empty(){
+            let now=Instant::now();
+            let repaint=self.fences.iter().filter_map(|win|{
+                if self.config.settings.hidden&&!win.standalone{return None;}
+                let fence=self.config.fence(win.id)?;if win.collapsed(fence)||fence.is_hidden_tab(){return None;}
+                let geometry=win.geometry(fence);let px=if fence.view==FenceView::List{scale(20,win.dpi)}else{geometry.icon_px};
+                geometry.cells.iter().enumerate().any(|(index,cell)|{
+                    if cell.cell.bottom()<geometry.content.y||cell.cell.y>geometry.content.bottom(){return false;}
+                    let Some(entry)=win.entries.get(index)else{return false;};let key=(entry.key.clone(),px);
+                    changed.contains(&key)||self.icons.get(&key).is_none_or(|slot|
+                        (slot.wic.is_none()||!slot.complete)&&slot.request.is_none()&&slot.retry_after.is_none_or(|deadline|now>=deadline))
+                }).then_some(win.id)
+            }).collect::<Vec<_>>();
+            self.icon_repaint_requests=self.icon_repaint_requests.wrapping_add(repaint.len()as u64);
+            for id in repaint{self.render(id);}
+        }
         self.prune_icon_cache();
     }
 
@@ -1207,18 +1225,17 @@ impl DesktopHost {
         }).collect();
         serde_json::json!({"process_id":std::process::id(),"hidden":self.config.settings.hidden,"organize":self.config.settings.organize,
             "fences":self.fences.len(),"windows":windows,"surface_pixel_bytes":self.fences.iter().filter_map(|w|w.surface.as_ref()).map(|s|s.pixel_bytes()).sum::<u64>(),
-            "icon_entries":self.icons.len(),"icon_pixel_bytes":self.icons.values().map(IconSlot::pixel_bytes).sum::<u64>(),
+            "icon_batches":self.icon_batches,"icon_repaint_requests":self.icon_repaint_requests,"icon_entries":self.icons.len(),"icon_pixel_bytes":self.icons.values().map(IconSlot::pixel_bytes).sum::<u64>(),
             "visible_icon_keys":visible.len(),"cold_icon_entries":cold.len(),"cold_icon_pixel_bytes":cold.iter().map(|s|s.pixel_bytes()).sum::<u64>(),
             "cold_entry_limit":MAX_COLD_ICONS,"cold_pixel_limit":MAX_COLD_ICON_BYTES,"pending_icon_requests":queue.pending,"queued_icon_requests":queue.queued,
-            "ready_icon_results":queue.ready,"ready_icon_pixel_bytes":queue.ready_pixel_bytes,"decoder_workers":zsdesk_windows::shell::icons::icon_worker_diagnostics(),"text_formats":formats,"render_target_live":target,"imaging_factory_live":self.gfx.imaging_factory_live(),"context_menu":super::menu_diagnostics(),
+            "ready_icon_results":queue.ready,"ready_icon_pixel_bytes":queue.ready_pixel_bytes,"decoder_workers":zsdesk_windows::shell::icons::icon_worker_diagnostics(),"mouse_observer":super::mouse_observer_diagnostics(),"text_formats":formats,"render_target_live":target,"imaging_factory_live":self.gfx.imaging_factory_live(),"context_menu":super::menu_diagnostics(),
             "saved_loose_items":self.config.released_items.len(),"live_loose_windows":self.fences.iter().filter(|window|window.standalone).count(),"last_drop":self.last_drop,"last_drop_route":self.last_drop_route})
     }
 
     pub fn write_diagnostics(&self, path: &Path) -> anyhow::Result<()> {
         let path = std::path::absolute(path)?;
         let normalize = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf()).to_string_lossy().to_lowercase();
-        anyhow::ensure!(normalize(&path) != normalize(&self.config_path) && normalize(&path) != normalize(&self.explorer_config),
-            "诊断输出不能覆盖程序配置");
+        anyhow::ensure!(normalize(&path) != normalize(&self.config_path) && normalize(&path) != normalize(&self.explorer_config), "{}", zsdesk_core::tr_format!("诊断输出不能覆盖程序配置"));
         if let Some(parent) = path.parent() { std::fs::create_dir_all(parent)?; }
         let temporary = path.with_extension("diagnostics.tmp");
         std::fs::write(&temporary, serde_json::to_vec_pretty(&self.resource_snapshot())?)?;
@@ -1289,7 +1306,7 @@ impl DesktopHost {
                 Ok::<Placement,()>(Placement{monitor:monitor.name.clone(),x:cell.x,y:cell.y,width:cell.w,height:cell.h})
             });
             let Ok(changed)=changed else{
-                if self.config.settings.icons_hidden_by_zsdesk{self.restore_desktop();self.notify_error("桌面空间不足，已恢复系统桌面图标；原格子布局仍保留。");}
+                if self.config.settings.icons_hidden_by_zsdesk{self.restore_desktop();self.notify_error(zsdesk_core::i18n::text("桌面空间不足，已恢复系统桌面图标；原格子布局仍保留。"));}
                 return;
             };
             if changed{self.config=planned;self.schedule_save();self.sync_windows();}
@@ -1329,7 +1346,7 @@ impl DesktopHost {
     /// never deletes, copies or moves filesystem objects.
     pub(super) fn release_desktop_keys(&mut self, keys: &[String], point: POINT) -> Result<usize,String> {
         if !self.config.settings.organize {
-            return if desktop::icons_visible(){Ok(keys.len())}else{Err("系统桌面图标当前不可见，未完成移回桌面。".into())};
+            return if desktop::icons_visible(){Ok(keys.len())}else{Err(zsdesk_core::i18n::text("系统桌面图标当前不可见，未完成移回桌面。").into())};
         }
         let original=self.config.clone();
         let original_ids:HashSet<u64>=self.fences.iter().map(|window|window.id).collect();
@@ -1372,7 +1389,7 @@ impl DesktopHost {
         let Some(positions)=positions else{
             if let Some(drop)=&mut self.last_drop{drop["status"]="no-space".into();}
             if self.config.settings.icons_hidden_by_zsdesk&&keys.iter().any(|key|!self.fences.iter().any(|window|window.entries.iter().any(|entry|&entry.key==key))){self.restore_desktop();}
-            return Err("桌面可用空间不足，无法放置这组图标；文件仍保留在磁盘上。".into());
+            return Err(zsdesk_core::i18n::text("桌面可用空间不足，无法放置这组图标；文件仍保留在磁盘上。").into());
         };
         if let Some(drop)=&mut self.last_drop{drop["positions_dip"]=serde_json::json!(positions.iter().map(|b|[b.x,b.y,b.w,b.h]).collect::<Vec<_>>());}
         let mut planned=Vec::new();let mut unique=HashSet::new();
@@ -1384,7 +1401,7 @@ impl DesktopHost {
                 let unseen=keys.iter().any(|key|!self.fences.iter().any(|window|
                     unsafe{IsWindowVisible(window.hwnd)}.as_bool()&&window.entries.iter().any(|entry|entry.key.eq_ignore_ascii_case(key))));
                 if unseen&&self.config.settings.icons_hidden_by_zsdesk {self.restore_desktop();}
-                return Err("所选项目已移动或不可用，未更改分组。".into());
+                return Err(zsdesk_core::i18n::text("所选项目已移动或不可用，未更改分组。").into());
             }
             let placement = Placement { monitor: monitor.name.clone(), x:position.x, y:position.y,width:position.w,height:position.h };
             planned.push(self.config.release_item_exact(key.clone(), placement));
@@ -1398,14 +1415,14 @@ impl DesktopHost {
             }
             self.place_all();self.refresh_desktop();
             for &id in &planned {
-                let Some(index)=self.win_index(id)else{return Err("桌面图标窗口未能创建".into());};
+                let Some(index)=self.win_index(id)else{return Err(zsdesk_core::i18n::text("桌面图标窗口未能创建").into());};
                 if self.fences[index].entries.len()!=1 || !self.render(id)
                     || !unsafe{IsWindowVisible(self.fences[index].hwnd)}.as_bool() {
-                    return Err("桌面图标未能显示，分组调整已撤回。".into());
+                    return Err(zsdesk_core::i18n::text("桌面图标未能显示，分组调整已撤回。").into());
                 }
             }
             self.config.normalize();
-            save_config(&self.config_path,&self.config).map_err(|error|format!("无法保存桌面布局：{error}"))?;
+            save_config(&self.config_path,&self.config).map_err(|error|zsdesk_core::tr_format!("无法保存桌面布局：{error}", error=error))?;
             Ok(())
         })();
         if let Err(error)=publish {
@@ -1449,7 +1466,7 @@ impl DesktopHost {
                 let mut slots: Vec<_> = entries.into_iter().map(Some).collect();
                 (order.into_iter().map(|i| slots[i].take().unwrap()).collect(), None)
             }
-            Err(_) => (Vec::new(), Some(format!("文件夹不可用：{}", path.display()))),
+            Err(_) => (Vec::new(), Some(zsdesk_core::tr_format!("文件夹不可用：{}", path.display()))),
         };
         let changed = path_changed || entries != win.entries || message != win.message;
         if changed {
@@ -2133,104 +2150,104 @@ impl DesktopHost {
         let mut items = Vec::new();
         // The folder's Shell background menu has no DefView, so it lacks Paste;
         // keep the fence's own Ctrl+V reachable with the mouse.
-        items.push(entry("粘贴\tCtrl+V", "paste", self.target_folder(id).is_some(), false));
-        items.push(entry("文件夹系统菜单…", "folder-system-menu", self.target_folder(id).is_some(), false));
+        items.push(entry(zsdesk_core::i18n::text("粘贴\tCtrl+V"), "paste", self.target_folder(id).is_some(), false));
+        items.push(entry(zsdesk_core::i18n::text("文件夹系统菜单…"), "folder-system-menu", self.target_folder(id).is_some(), false));
         let selected=self.win_index(id).is_some_and(|index|!self.fences[index].selection.is_empty());
-        if selected{items.push(submenu("所选项目",self.item_menu_items(id)));}
+        if selected{items.push(submenu(zsdesk_core::i18n::text("所选项目"),self.item_menu_items(id)));}
         items.push(MenuItemSpec::Separator);
-        if fence.is_desktop() { items.push(entry("新建格子", "new-fence", true, false)); }
-        items.push(entry("新建文件夹映射格子…", "new-folder-fence", true, false));
-        items.push(submenu("新建标签", vec![
-            entry("桌面分组", "new-tab-desktop", s.organize, false),
-            entry("映射文件夹…", "new-tab-folder", true, false),
+        if fence.is_desktop() { items.push(entry(zsdesk_core::i18n::text("新建格子"), "new-fence", true, false)); }
+        items.push(entry(zsdesk_core::i18n::text("新建文件夹映射格子…"), "new-folder-fence", true, false));
+        items.push(submenu(zsdesk_core::i18n::text("新建标签"), vec![
+            entry(zsdesk_core::i18n::text("桌面分组"), "new-tab-desktop", s.organize, false),
+            entry(zsdesk_core::i18n::text("映射文件夹…"), "new-tab-folder", true, false),
         ]));
-        items.push(entry(if tabbed { "重命名标签" } else { "重命名格子" }, "rename", true, false));
-        if tabbed { items.push(entry("移到新格子", "split-tab", true, false)); }
+        items.push(entry(if tabbed { zsdesk_core::i18n::text("重命名标签") } else { zsdesk_core::i18n::text("重命名格子") }, "rename", true, false));
+        if tabbed { items.push(entry(zsdesk_core::i18n::text("移到新格子"), "split-tab", true, false)); }
         items.push(MenuItemSpec::Separator);
-        items.push(submenu("选择", self.selection_menu_items(id)));
-        items.push(entry("撤销文件操作\tCtrl+Z", "history-undo", true, false));
-        items.push(entry("重做文件操作\tCtrl+Y", "history-redo", true, false));
+        items.push(submenu(zsdesk_core::i18n::text("选择"), self.selection_menu_items(id)));
+        items.push(entry(zsdesk_core::i18n::text("撤销文件操作\tCtrl+Z"), "history-undo", true, false));
+        items.push(entry(zsdesk_core::i18n::text("重做文件操作\tCtrl+Y"), "history-redo", true, false));
         items.push(MenuItemSpec::Separator);
-        items.push(submenu("查看", vec![
-            entry("大图标", "icons-large", true, fence.view == FenceView::Icons && fence.icon_size == IconSize::Large),
-            entry("中等图标", "icons-medium", true, fence.view == FenceView::Icons && fence.icon_size == IconSize::Medium),
-            entry("小图标", "icons-small", true, fence.view == FenceView::Icons && fence.icon_size == IconSize::Small),
-            entry("列表", "list", true, fence.view == FenceView::List),
+        items.push(submenu(zsdesk_core::i18n::text("查看"), vec![
+            entry(zsdesk_core::i18n::text("大图标"), "icons-large", true, fence.view == FenceView::Icons && fence.icon_size == IconSize::Large),
+            entry(zsdesk_core::i18n::text("中等图标"), "icons-medium", true, fence.view == FenceView::Icons && fence.icon_size == IconSize::Medium),
+            entry(zsdesk_core::i18n::text("小图标"), "icons-small", true, fence.view == FenceView::Icons && fence.icon_size == IconSize::Small),
+            entry(zsdesk_core::i18n::text("列表"), "list", true, fence.view == FenceView::List),
         ]));
         let mut sorts = Vec::new();
-        sorts.push(entry("手动排列", "sort-manual", true, fence.sort == FenceSort::Manual));
+        sorts.push(entry(zsdesk_core::i18n::text("手动排列"), "sort-manual", true, fence.sort == FenceSort::Manual));
         sorts.extend([
-            entry("名称", "sort-name", true, fence.sort == FenceSort::Name), entry("类型", "sort-type", true, fence.sort == FenceSort::Type),
-            entry("大小", "sort-size", true, fence.sort == FenceSort::Size), entry("修改日期", "sort-modified", true, fence.sort == FenceSort::Modified),
+            entry(zsdesk_core::i18n::text("名称"), "sort-name", true, fence.sort == FenceSort::Name), entry(zsdesk_core::i18n::text("类型"), "sort-type", true, fence.sort == FenceSort::Type),
+            entry(zsdesk_core::i18n::text("大小"), "sort-size", true, fence.sort == FenceSort::Size), entry(zsdesk_core::i18n::text("修改日期"), "sort-modified", true, fence.sort == FenceSort::Modified),
             MenuItemSpec::Separator,
-            entry("递增", "sort-asc", fence.sort != FenceSort::Manual, !fence.descending),
-            entry("递减", "sort-desc", fence.sort != FenceSort::Manual, fence.descending),
+            entry(zsdesk_core::i18n::text("递增"), "sort-asc", fence.sort != FenceSort::Manual, !fence.descending),
+            entry(zsdesk_core::i18n::text("递减"), "sort-desc", fence.sort != FenceSort::Manual, fence.descending),
         ]);
-        items.push(submenu("排序方式", sorts));
+        items.push(submenu(zsdesk_core::i18n::text("排序方式"), sorts));
         if fence.is_desktop() {
             let mut rules: Vec<MenuItemSpec> = Category::ALL.iter().filter(|c| **c != Category::Others)
                 .map(|c| entry(c.title(), &format!("rule-{c:?}"), true, fence.rule == Some(*c))).collect();
             rules.push(MenuItemSpec::Separator);
-            rules.push(entry("不自动收取", "rule-none", true, fence.rule.is_none()&&!fence.catch_all));
-            rules.push(entry("收取未分类项目", "catch-all", true, fence.catch_all));
-            items.push(submenu("自动收取", rules));
+            rules.push(entry(zsdesk_core::i18n::text("不自动收取"), "rule-none", true, fence.rule.is_none()&&!fence.catch_all));
+            rules.push(entry(zsdesk_core::i18n::text("收取未分类项目"), "catch-all", true, fence.catch_all));
+            items.push(submenu(zsdesk_core::i18n::text("自动收取"), rules));
         } else {
-            items.push(entry(if crate::edition::DESKTOP_ONLY{"在系统资源管理器中打开"}else{"在 ZSDesk 中打开"}, "open-explorer", true, false));
-            items.push(entry("返回上一级", "browse-up", fence.browse.is_some(), false));
-            items.push(entry("更改映射的文件夹…", "change-folder", true, false));
-            items.push(entry("刷新", "refresh", true, false));
+            items.push(entry(if crate::edition::DESKTOP_ONLY{zsdesk_core::i18n::text("在系统资源管理器中打开")}else{zsdesk_core::i18n::text("在 ZSDesk 中打开")}, "open-explorer", true, false));
+            items.push(entry(zsdesk_core::i18n::text("返回上一级"), "browse-up", fence.browse.is_some(), false));
+            items.push(entry(zsdesk_core::i18n::text("更改映射的文件夹…"), "change-folder", true, false));
+            items.push(entry(zsdesk_core::i18n::text("刷新"), "refresh", true, false));
         }
         items.push(MenuItemSpec::Separator);
-        items.push(entry("锁定格子", "lock", true, fence.locked));
-        items.push(entry(if fence.collapsed { "展开格子" } else { "折叠格子" }, "collapse", true, false));
-        items.push(entry(if tabbed { "关闭标签" } else { "删除格子" }, "delete", true, false));
+        items.push(entry(zsdesk_core::i18n::text("锁定格子"), "lock", true, fence.locked));
+        items.push(entry(if fence.collapsed { zsdesk_core::i18n::text("展开格子") } else { zsdesk_core::i18n::text("折叠格子") }, "collapse", true, false));
+        items.push(entry(if tabbed { zsdesk_core::i18n::text("关闭标签") } else { zsdesk_core::i18n::text("删除格子") }, "delete", true, false));
         items.push(MenuItemSpec::Separator);
-        items.push(submenu("桌面格子", self.global_items(s)));
+        items.push(submenu(zsdesk_core::i18n::text("桌面格子"), self.global_items(s)));
         menu(items)
     }
 
     fn global_items(&self, s: &zsdesk_core::model::desktop::DesktopSettings) -> Vec<MenuItemSpec> {
         let autostart=super::startup_enabled(&self.config_path).unwrap_or(false);
         let transparency = |opacity: u8| {
-            let label = if opacity >= 100 { "不透明".to_string() } else { format!("透明度 {}%", 100 - u32::from(opacity)) };
+            let label = if opacity >= 100 { zsdesk_core::i18n::text("不透明").to_string() } else { zsdesk_core::tr_format!("透明度 {}%", 100 - u32::from(opacity)) };
             entry(&label, &format!("opacity-{opacity}"), true, s.opacity == opacity)
         };
         vec![
-            entry(if s.organize { "重新整理桌面" } else { "一键整理桌面" }, "organize", true, false),
-            entry("还原系统桌面图标", "restore", s.organize, false),
+            entry(if s.organize { zsdesk_core::i18n::text("重新整理桌面") } else { zsdesk_core::i18n::text("一键整理桌面") }, "organize", true, false),
+            entry(zsdesk_core::i18n::text("还原系统桌面图标"), "restore", s.organize, false),
             MenuItemSpec::Separator,
-            entry("锁定全部格子", "lock-all", !self.config.fences.is_empty(), !self.config.fences.is_empty() && self.config.fences.iter().all(|f| f.locked)),
-            entry(if s.hidden { "显示全部格子" } else { "隐藏全部格子" }, "toggle-hidden", true, false),
-            entry("双击桌面空白处隐藏/显示格子", "double-click", true, s.double_click_toggle),
-            submenu("外观", vec![
-                entry("显示文件数量", "show-counts", true, s.show_counts),
+            entry(zsdesk_core::i18n::text("锁定全部格子"), "lock-all", !self.config.fences.is_empty(), !self.config.fences.is_empty() && self.config.fences.iter().all(|f| f.locked)),
+            entry(if s.hidden { zsdesk_core::i18n::text("显示全部格子") } else { zsdesk_core::i18n::text("隐藏全部格子") }, "toggle-hidden", true, false),
+            entry(zsdesk_core::i18n::text("双击桌面空白处隐藏/显示格子"), "double-click", true, s.double_click_toggle),
+            submenu(zsdesk_core::i18n::text("外观"), vec![
+                entry(zsdesk_core::i18n::text("显示文件数量"), "show-counts", true, s.show_counts),
                 MenuItemSpec::Separator,
-                entry("深色", "theme-dark", true, s.theme == FenceTheme::Dark),
-                entry("浅色", "theme-light", true, s.theme == FenceTheme::Light),
-                entry("跟随系统", "theme-system", true, s.theme == FenceTheme::System),
+                entry(zsdesk_core::i18n::text("深色"), "theme-dark", true, s.theme == FenceTheme::Dark),
+                entry(zsdesk_core::i18n::text("浅色"), "theme-light", true, s.theme == FenceTheme::Light),
+                entry(zsdesk_core::i18n::text("跟随系统"), "theme-system", true, s.theme == FenceTheme::System),
                 MenuItemSpec::Separator,
-                entry("毛玻璃效果", "blur", true, s.blur),
+                entry(zsdesk_core::i18n::text("毛玻璃效果"), "blur", true, s.blur),
                 MenuItemSpec::Separator,
                 // The setting stores the background opacity; the menu shows transparency.
                 transparency(100), transparency(85), transparency(70), transparency(55),
                 transparency(45), transparency(30), transparency(15),
             ]),
-            entry("文件夹格子内打开子文件夹", "browse-inside", true, s.browse_inside),
-            entry("鼠标悬停展开折叠的格子", "hover-expand", true, s.hover_expand),
-            entry("隐藏托盘图标", "hide-tray", true, s.hide_tray),
+            entry(zsdesk_core::i18n::text("文件夹格子内打开子文件夹"), "browse-inside", true, s.browse_inside),
+            entry(zsdesk_core::i18n::text("鼠标悬停展开折叠的格子"), "hover-expand", true, s.hover_expand),
+            entry(zsdesk_core::i18n::text("隐藏托盘图标"), "hide-tray", true, s.hide_tray),
             // Only the fences: the file manager window has its own login switch
             // in its settings menu, so the two can be chosen independently.
-            entry("登录 Windows 时启动桌面格子", "autostart", true, autostart),
+            entry(zsdesk_core::i18n::text("登录 Windows 时启动桌面格子"), "autostart", true, autostart),
             MenuItemSpec::Separator,
-            entry(if crate::edition::DESKTOP_ONLY{"打开系统资源管理器"}else{"打开 ZSDesk 文件管理器"}, "open-zsdesk", true, false),
-            entry("退出桌面格子", "quit", true, false),
+            entry(if crate::edition::DESKTOP_ONLY{zsdesk_core::i18n::text("打开系统资源管理器")}else{zsdesk_core::i18n::text("打开 ZSDesk 文件管理器")}, "open-zsdesk", true, false),
+            entry(zsdesk_core::i18n::text("退出桌面格子"), "quit", true, false),
         ]
     }
 
     pub fn tray_menu(&self) -> MenuSpec {
         let mut items = vec![
-            entry("新建格子", "new-fence", true, false),
-            entry("新建文件夹映射格子…", "new-folder-fence", true, false),
+            entry(zsdesk_core::i18n::text("新建格子"), "new-fence", true, false),
+            entry(zsdesk_core::i18n::text("新建文件夹映射格子…"), "new-folder-fence", true, false),
             MenuItemSpec::Separator,
         ];
         items.extend(self.global_items(&self.config.settings));
@@ -2295,12 +2312,12 @@ impl DesktopHost {
                     self.config.settings.hide_tray = true;
                     self.remove_tray();
                     self.schedule_save();
-                    return After::Notice("托盘图标已隐藏。\n\n右键任意格子 → 桌面格子 可取消隐藏；也可在文件管理器 ≡ → 桌面格子 → 显示托盘图标。");
+                    return After::Notice(zsdesk_core::i18n::text("托盘图标已隐藏。\n\n右键任意格子 → 桌面格子 可取消隐藏；也可在文件管理器 ≡ → 桌面格子 → 显示托盘图标。"));
                 }
             }
             "autostart" => {
-                let current=match super::startup_enabled(&self.config_path){Ok(value)=>value,Err(error)=>{self.notify_error(&format!("无法读取登录启动：{error:#}"));return After::Nothing;}};
-                if let Err(error)=super::set_startup_enabled(&self.config_path,!current){self.notify_error(&format!("登录启动未完成：{error:#}"));}
+                let current=match super::startup_enabled(&self.config_path){Ok(value)=>value,Err(error)=>{self.notify_error(&zsdesk_core::tr_format!("无法读取登录启动：{error:#}", error=error));return After::Nothing;}};
+                if let Err(error)=super::set_startup_enabled(&self.config_path,!current){self.notify_error(&zsdesk_core::tr_format!("登录启动未完成：{error:#}", error=error));}
             }
             "open-zsdesk" => self.open_explorer_args(&[]),
             "quit" => return After::Quit,
@@ -2370,23 +2387,23 @@ impl DesktopHost {
         let mut items = Vec::new();
         let focused = self.focused_entry(id);
         if !self.config.is_released(id) {
-            items.push(entry("移回桌面", "return-desktop", !self.selected_keys(id).is_empty(), false));
+            items.push(entry(zsdesk_core::i18n::text("移回桌面"), "return-desktop", !self.selected_keys(id).is_empty(), false));
         }
         if focused.is_some_and(|e| e.is_container() && e.path.is_some()) {
-            if !fence.is_desktop() { items.push(entry("在格子中打开", "open-in-fence", true, false)); }
-            items.push(entry(if crate::edition::DESKTOP_ONLY{"在系统资源管理器中打开"}else{"在 ZSDesk 中打开"}, "open-in-zsdesk", true, false));
+            if !fence.is_desktop() { items.push(entry(zsdesk_core::i18n::text("在格子中打开"), "open-in-fence", true, false)); }
+            items.push(entry(if crate::edition::DESKTOP_ONLY{zsdesk_core::i18n::text("在系统资源管理器中打开")}else{zsdesk_core::i18n::text("在 ZSDesk 中打开")}, "open-in-zsdesk", true, false));
         }
         if fence.is_desktop() {
             let mut targets: Vec<MenuItemSpec> = self.config.fences.iter().filter(|f| f.is_desktop() && f.id != id)
                 .map(|f| entry(&f.title.replace('&', "&&"), &format!("move-to-{}", f.id), true, false)).collect();
-            if targets.is_empty() { targets.push(entry("（没有其他格子）", "none", false, false)); }
-            items.push(submenu("移动到格子", targets));
+            if targets.is_empty() { targets.push(entry(zsdesk_core::i18n::text("（没有其他格子）"), "none", false, false)); }
+            items.push(submenu(zsdesk_core::i18n::text("移动到格子"), targets));
             let keys = self.selected_keys(id);
             let manual = fence.members.iter().any(|m| keys.contains(m));
-            items.push(entry("交给自动收取", "unassign", manual, false));
+            items.push(entry(zsdesk_core::i18n::text("交给自动收取"), "unassign", manual, false));
         }
         if !items.is_empty() { items.push(MenuItemSpec::Separator); }
-        items.push(submenu("选择", self.selection_menu_items(id)));
+        items.push(submenu(zsdesk_core::i18n::text("选择"), self.selection_menu_items(id)));
         items
     }
 
@@ -2394,9 +2411,9 @@ impl DesktopHost {
         let window = self.win_index(id).map(|index| &self.fences[index]);
         let has_items = window.is_some_and(|window| !window.entries.is_empty());
         let has_selection = window.is_some_and(|window| !window.selection.is_empty());
-        vec![entry("全选\tCtrl+A", "select-all", has_items, false),
-            entry("全部取消", "select-none", has_selection, false),
-            entry("反向选择\tCtrl+Shift+A", "select-invert", has_items, false)]
+        vec![entry(zsdesk_core::i18n::text("全选\tCtrl+A"), "select-all", has_items, false),
+            entry(zsdesk_core::i18n::text("全部取消"), "select-none", has_selection, false),
+            entry(zsdesk_core::i18n::text("反向选择\tCtrl+Shift+A"), "select-invert", has_items, false)]
     }
 
     pub fn selected_keys(&self, id: u64) -> Vec<String> {
@@ -2521,13 +2538,13 @@ impl DesktopHost {
     fn open_explorer_args(&self, args: &[std::ffi::OsString]) {
         if crate::edition::DESKTOP_ONLY{
             let target=args.first().cloned().unwrap_or_else(||"shell:MyComputerFolder".into());
-            if let Err(error)=crate::app::open_original_explorer(target){self.notify_error(&format!("无法打开文件夹：{error:#}"));}
+            if let Err(error)=crate::app::open_original_explorer(target){self.notify_error(&zsdesk_core::tr_format!("无法打开文件夹：{error:#}", error=error));}
             return;
         }
         match crate::runtime::enqueue_local(&self.explorer_config,args.to_vec()) {
             Ok(true)=>return,
             Ok(false)=>{},
-            Err(error)=>{self.notify_error(&format!("无法打开文件管理器：{error:#}"));return;}
+            Err(error)=>{self.notify_error(&zsdesk_core::tr_format!("无法打开文件管理器：{error:#}", error=error));return;}
         }
         let Ok(exe) = std::env::current_exe() else { return };
         let mut command = std::process::Command::new(exe);

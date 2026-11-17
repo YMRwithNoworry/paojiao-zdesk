@@ -111,6 +111,7 @@ pub struct ExplorerBrowserHost {
     modern: Rc<Cell<bool>>,
     pub(crate) selection_revision: Rc<Cell<u64>>,
     pub(crate) selection_size: RefCell<super::commands::SelectionSizeCache>,
+    drop_registration:Rc<RefCell<Option<super::view_drop::Registration>>>,
     browser: Rc<IExplorerBrowser>,
     events: IExplorerBrowserEvents,
     site: IServiceProvider,
@@ -194,6 +195,7 @@ impl ExplorerBrowserHost {
         let navigation_pending=Rc::new(Cell::new(true));
         let theme_generation=Rc::new(Cell::new(0u64));
         let this_pc = Rc::new(Cell::new(false));
+        let drop_registration=Rc::new(RefCell::new(None));
         let picker=Rc::new(RefCell::new(None));
         let dark=crate::theme::menus_dark();
         let background=Rc::new(Cell::new(view_background::Colors{
@@ -215,11 +217,9 @@ impl ExplorerBrowserHost {
 
         let existing_containers=browser_containers(parent);
         unsafe {
-            // The application supplies its own navigation, commands and status
-            // row. A wrapper frame would add another native status row to each
-            // pane. Retain frames only for an explicitly requested native pane.
-            let frames=if panes.get().details||panes.get().preview {EBO_SHOWFRAMES}else{windows::Win32::UI::Shell::EXPLORER_BROWSER_OPTIONS(0)};
-            browser.SetOptions(frames | EBO_ALWAYSNAVIGATE | EBO_NOBORDER)?;
+            // Keep the native browser frame responsible for view activation
+            // and OLE drop routing. Pane visibility hides the duplicate chrome.
+            browser.SetOptions(EBO_SHOWFRAMES | EBO_ALWAYSNAVIGATE | EBO_NOBORDER)?;
             browser.Initialize(parent, &rect, None)?;
         }
         let theme_container=browser.cast::<IOleWindow>().ok().and_then(|window|unsafe{window.GetWindow()}.ok())
@@ -227,6 +227,7 @@ impl ExplorerBrowserHost {
             .or_else(||{let created=browser_containers(parent).into_iter().filter(|window|!existing_containers.contains(window)).collect::<Vec<_>>();(created.len()==1).then(||created[0])});
 
         let events: IExplorerBrowserEvents = BrowserEvents {
+            drop_registration:drop_registration.clone(),
             picker:picker.clone(),
             hwnd: parent.0 as isize,
             source,
@@ -244,6 +245,7 @@ impl ExplorerBrowserHost {
         let advise_cookie = unsafe { browser.Advise(&events)? };
 
         let host = Self {
+            drop_registration,
             picker,
             panes,
             modern,
@@ -583,6 +585,7 @@ impl ExplorerBrowserHost {
     /// Must be called exactly once on the STA/UI thread that created this host,
     /// before its parent window or COM apartment is destroyed.
     pub unsafe fn destroy(&self) {
+        let registration=self.drop_registration.borrow_mut().take();drop(registration);
         if self.destroyed.replace(true) { return; }
         let trace=|stage:&str|if std::env::var_os("ZSDESK_RUNTIME_TRACE").is_some(){eprintln!("Shell host {} teardown: {stage}",self.source);};
         // Block reentrant service queries while this particular browser is
@@ -864,6 +867,7 @@ impl ICommDlgBrowser2_Impl for BrowserSite_Impl {
 }
 #[implement(IExplorerBrowserEvents)]
 struct BrowserEvents {
+    drop_registration:Rc<RefCell<Option<super::view_drop::Registration>>>,
     picker:Rc<RefCell<Option<(String,bool,bool)>>>,
     hwnd: isize,
     source: usize,
@@ -884,6 +888,7 @@ impl IExplorerBrowserEvents_Impl for BrowserEvents_Impl {
         &self,
         pidl_folder: *const windows::Win32::UI::Shell::Common::ITEMIDLIST,
     ) -> Result<()> {
+        let previous=self.drop_registration.borrow_mut().take();drop(previous);
         self.navigation_pending.set(true);
         self.theme_generation.set(self.theme_generation.get().wrapping_add(1));
         let generation=self.theme_generation.get();
@@ -927,6 +932,10 @@ impl IExplorerBrowserEvents_Impl for BrowserEvents_Impl {
                     .zip(view.cast::<IUnknown>().ok()).is_some_and(|(current,expected)|current==expected);
                 if matches&&still_current&&generation==self.theme_generation.get(){
                     self.navigation_pending.set(false);
+                    {
+                        let registration=super::view_drop::Registration::ensure(&view,self.results_active.get()).ok().flatten();
+                        if generation==self.theme_generation.get(){*self.drop_registration.borrow_mut()=registration;}
+                    }
                     view_background::install(&view,self.background.clone(),view_background::ThemePermit::new(self.navigation_pending.clone(),self.theme_generation.clone()));
                 }
             }
