@@ -102,6 +102,7 @@ const TIMER_PLACEMENT:usize=9;
 const TIMER_FOLDER_SIZES:usize=10;
 const WM_FAST_SEARCH:u32=WM_APP+43;
 const WM_DIAGNOSTIC:u32=WM_APP+44;
+pub(super) const WM_TAB_EMPHASIS_CHANGED:u32=WM_APP+182;
 type Slot = RefCell<Option<WindowState>>;
 #[derive(Clone,Copy,PartialEq,Eq)]
 enum BrowserRole{Fresh,Ordinary,Results}
@@ -1438,6 +1439,11 @@ impl WindowState {
             WM_OPEN_REQUEST => if lp.0 != 0 { unsafe { self.open_requested(*Box::from_raw(lp.0 as *mut crate::instance::OpenRequest)); } },
             WM_FAST_SEARCH => self.poll_pane_searches(),
             WM_DIAGNOSTIC=>if lp.0!=0{let request=unsafe{Box::from_raw(lp.0 as *mut crate::instance::DiagnosticRequest)};let _=self.write_diagnostics(&request);},
+            WM_TAB_EMPHASIS_CHANGED=>if let Ok(saved)=storage::load(&self.config_path){
+                if self.session.ui.tab_selection_emphasis!=saved.ui.tab_selection_emphasis{
+                    self.session.ui.tab_selection_emphasis=saved.ui.tab_selection_emphasis;self.invalidate();
+                }
+            },
             crate::update_check::NOTICE=>if let Some(release)=crate::update_check::take_notice(&self.config_path){
                 if let Err(error)=crate::utility_panel::offer_update(self.hwnd,&self.config_path,release){self.show_message(format!("无法显示更新信息：{error:#}"));}
             },

@@ -18,6 +18,16 @@ fn pixel_aligned_icon(rect: RectF) -> RectF {
     RectF::new(rect.x.round(), rect.y.round(), rect.w.round().max(1.0), rect.h.round().max(1.0))
 }
 
+/// Window-independent tab painting also used by the memory-raster regression.
+fn paint_selected_tab(cv:&Canvas,r:RectF,vertical:bool,dpi:u32,appearance:zsdesk_ui::theme::TabAppearance){
+    let Some(fill)=appearance.fill else{return;};let s=|value:f32|value*dpi as f32/96.0;
+    if let Some(border)=appearance.border{
+        let card=RectF::new(r.x+s(1.0),r.y+s(1.0),(r.w-s(2.0)).max(0.0),(r.h-s(2.0)).max(0.0));
+        cv.round(card,s(6.0),c(fill));cv.stroke_round(card,s(6.0),c(border),s(1.0));
+    }else if vertical{cv.round(r,s(6.0),c(fill));}
+    else{cv.tab_shape(r,s(8.0),s(6.0),c(fill));}
+}
+
 impl WindowState {
     pub(super) fn sf(&self, v: f32) -> f32 { v * self.dpi as f32 / 96.0 }
     pub(super) fn ui_style(&self) -> TextStyle { TextStyle::ui(self.sf(UI_TEXT)) }
@@ -89,8 +99,6 @@ impl WindowState {
         if !self.mica || window_actions::fullscreen(self.hwnd) { cv.fill(strip, c(p.strip)); }
         let text = if self.active { c(p.text) } else { c(p.text_secondary) };
         let active = self.session.active_tab;
-        let radius = self.sf(8.0);
-        let foot = self.sf(6.0);
         if self.layout.vertical_tabs{
             cv.fill(rf(self.layout.tab_panel),c(p.strip));
             if self.hover==Hit::TabSplitter||self.side_tab_resize.is_some(){cv.fill(rf(self.layout.tab_splitter),c(p.hover));}
@@ -105,9 +113,11 @@ impl WindowState {
             let r = rf(slot.rect);
             if self.layout.vertical_tabs { cv.push_clip(r); }
             let is_active = slot.index == active;
+            let appearance=p.tab_appearance(is_active,self.active,self.session.ui.tab_selection_emphasis);
+            let text=c(appearance.text);
             let hovered = matches!(self.hover, Hit::Tab(i) | Hit::TabClose(i) if i == slot.index);
             if is_active {
-                if self.layout.vertical_tabs{cv.round(r,self.sf(6.0),c(p.layer));}else{cv.tab_shape(r, radius, foot, c(p.layer));}
+                paint_selected_tab(cv,r,self.layout.vertical_tabs,self.dpi,appearance);
             } else if hovered {
                 cv.round(RectF::new(r.x + self.sf(2.0), r.y + self.sf(2.0), r.w - self.sf(4.0), r.h - self.sf(6.0)), self.sf(6.0), c(p.hover));
             } else {
@@ -127,7 +137,7 @@ impl WindowState {
             let title_right = if slot.show_close { slot.close.x as f32 - self.sf(2.0) } else { r.right() - self.sf(10.0) };
             let title = self.session.tabs[slot.index].current().title();
             let title_x = icon_rect.right() + self.sf(8.0);
-            cv.text(&title, RectF::new(title_x, r.y, (title_right - title_x).max(0.0), r.h), &self.ui_style(), text);
+            cv.text(&title, RectF::new(title_x, r.y, (title_right - title_x).max(0.0), r.h), &self.ui_style().weight(appearance.weight), text);
             if slot.show_close {
                 let close = rf(slot.close);
                 if self.hover == Hit::TabClose(slot.index) { cv.round(close, self.sf(4.0), c(p.hover)); }

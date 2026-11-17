@@ -678,7 +678,7 @@ impl WindowState {
 
     unsafe fn app_menu(&mut self) {
         self.sync_search_preferences();
-        if let Ok(saved)=storage::load(&self.config_path){self.session.ui.startup_location=saved.ui.startup_location;
+        if let Ok(saved)=storage::load(&self.config_path){self.session.ui.tab_selection_emphasis=saved.ui.tab_selection_emphasis;self.session.ui.startup_location=saved.ui.startup_location;
             self.session.ui.context_menu=saved.ui.context_menu;crate::context_preferences::publish(&self.config_path,&self.session.ui.context_menu);}
         let anchor = Some(self.layout.app_menu);
         let spec=self.app_menu_spec();let hwnd=self.hwnd;
@@ -780,7 +780,26 @@ impl WindowState {
     }
 
     /// Applies an interface preference chosen in ≡ and refreshes what it affects.
+    fn publish_tab_emphasis(&self){
+        struct Target{pid:u32,key:Vec<u16>}
+        unsafe extern "system" fn each(window:HWND,parameter:LPARAM)->windows::core::BOOL{
+            let target=unsafe{&*(parameter.0 as*const Target)};let mut pid=0;
+            unsafe{GetWindowThreadProcessId(window,Some(&mut pid));}
+            if pid==target.pid&&unsafe{GetPropW(window,PCWSTR(target.key.as_ptr()))}.0 as usize==1{
+                let _=unsafe{PostMessageW(Some(window),WM_TAB_EMPHASIS_CHANGED,WPARAM(0),LPARAM(0))};
+            }true.into()
+        }
+        let target=Target{pid:std::process::id(),key:crate::instance::property(&self.config_path)};
+        let _=unsafe{EnumWindows(Some(each),LPARAM(&target as*const Target as isize))};
+    }
     pub(super) fn apply_interface_choice(&mut self, id: &str) {
+        if id=="tab-selection-emphasis"{
+            let current=storage::load(&self.config_path).map(|saved|saved.ui.tab_selection_emphasis).unwrap_or(self.session.ui.tab_selection_emphasis);
+            match storage::save_tab_selection_emphasis(&self.config_path,!current){
+                Ok(())=>{self.session.ui.tab_selection_emphasis=!current;self.invalidate();self.publish_tab_emphasis();},
+                Err(error)=>self.show_message(format!("无法保存标签显示设置：{error:#}")),
+            }return;
+        }
         if !menus::apply_interface_setting(&mut self.session.ui,id) { return; }
         if id.starts_with("tab-placement-"){self.side_tab_first=None;self.side_tab_wheel=0;}
         zsdesk_windows::shell::set_open_archives_externally(self.session.ui.archives_open_externally);

@@ -185,6 +185,7 @@ fn layout_settings(ui: &ExplorerUi) -> MenuItemSpec {
             entry("右侧","bookmarks-placement-right",true,ui.bookmarks_on_right),
         ]),
         entry("显示标签页数量", "show-tab-count", true, ui.tab_count_button_visible()),
+        entry("当前标签增强对比", "tab-selection-emphasis", true, ui.tab_selection_emphasis),
         entry("双栏布局", "dual-pane", true, ui.dual_pane),
         MenuItemSpec::Separator,
         entry("导航窗格", "interface-navigation", true, ui.show_tree),
@@ -302,6 +303,7 @@ pub fn apply_interface_setting(ui: &mut ExplorerUi, choice: &str) -> bool {
         "double-click-blank-up"=>ui.double_click_blank_up=!ui.double_click_blank_up,
         "close-window-last-tab"=>ui.close_window_on_last_tab=!ui.close_window_on_last_tab,
         "show-tab-count"|"show-tab-list"=>{let visible=!ui.tab_count_button_visible();ui.show_tab_count=visible;ui.show_tab_list=visible;},
+        "tab-selection-emphasis"=>ui.tab_selection_emphasis=!ui.tab_selection_emphasis,
         "mouse-gestures" => ui.mouse_gestures = !ui.mouse_gestures,
         "everything-folder-sizes" => ui.everything_folder_sizes = !ui.everything_folder_sizes,
         "tab-placement-top"=>ui.tab_placement=zsdesk_core::model::explorer::TabPlacement::Top,
@@ -619,6 +621,13 @@ mod tests {
         assert!(ui.hover_preview && ui.space_preview);
         assert!(apply_interface_setting(&mut ui,"hover-preview"));
         assert!(!ui.hover_preview && ui.space_preview);
+    }
+    #[test]
+    fn selected_tab_emphasis_is_explicit_and_defaults_off(){
+        let mut ui=ExplorerUi::default();let original=ui.clone();assert!(!ui.tab_selection_emphasis);
+        assert!(nested_ids(&interface_settings_menu(&ui)).contains(&"tab-selection-emphasis".to_owned()));
+        assert!(apply_interface_setting(&mut ui,"tab-selection-emphasis"));assert!(ui.tab_selection_emphasis);
+        assert!(apply_interface_setting(&mut ui,"tab-selection-emphasis"));assert_eq!(ui,original);
     }
     #[test]
     fn preview_sources_are_explicit_and_default_to_builtin(){

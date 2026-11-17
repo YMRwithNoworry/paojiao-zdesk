@@ -339,6 +339,8 @@ pub struct ExplorerUi {
     pub close_window_on_last_tab: bool,
     pub show_tab_count: bool,
     pub show_tab_list: bool,
+    /// Opt-in stronger selected-tab appearance; legacy profiles keep the existing style.
+    pub tab_selection_emphasis: bool,
     pub mouse_gestures: bool,
     /// Show view-local totals; native calculation is available without an index.
     pub everything_folder_sizes: bool,
@@ -396,7 +398,7 @@ impl Default for ExplorerUi {
     fn default() -> Self {
         Self { startup_location:StartupLocation::default(),new_tab_location:NewTabLocation::default(), tab_placement:TabPlacement::Top, side_tabs_width:210,side_tabs_compact:true,dual_pane:false, pane_ratio:500,
             double_click_close_tab:true, mouse_gestures:true, everything_folder_sizes:false,
-            close_window_on_last_tab:true,double_click_blank_up:true,show_tab_count:true,show_tab_list:true,
+            close_window_on_last_tab:true,double_click_blank_up:true,show_tab_count:true,show_tab_list:true,tab_selection_emphasis:false,
             show_tree: true, tree_width: 220, show_bookmarks: true, bookmarks_on_right:false, show_preview: false, show_details: false,
             command_bar: CommandBarPreferences::default(), context_menu: ContextMenuPreferences::default(),
             search_all_files: true, search_backend: SearchBackendPreference::NativeNtfs, space_preview: true,
