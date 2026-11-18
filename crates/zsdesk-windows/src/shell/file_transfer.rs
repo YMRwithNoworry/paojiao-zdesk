@@ -571,13 +571,27 @@ impl ProgressState{
         self.cancelled|=is_cancelled(error);
         if self.failure.is_none()||self.failure.is_some_and(is_cancelled)&&!is_cancelled(error){self.failure=Some(error);}
     }
-    fn for_request(request:&Request)->Self{
-        let mut state=Self{new_folder:matches!(request.operation,Operation::NewFolder),
-            track_outputs:matches!(request.operation,Operation::Copy|Operation::Move|Operation::NewFolder),..Default::default()};
-        for path in &request.paths{
-            let exact=exact_completion_key(path);state.expected.insert(exact.clone());
-            state.aliases.entry(completion_key(path)).and_modify(|entry|{if entry.as_ref()!=Some(&exact){*entry=None;}}).or_insert(Some(exact));
-        }state
+    fn new(operation:Operation)->Self{
+        Self{new_folder:operation==Operation::NewFolder,
+            track_outputs:matches!(operation,Operation::Copy|Operation::Move|Operation::NewFolder),..Default::default()}
+    }
+    fn expect_source(&mut self,requested:&Path,shell_path:&Path){
+        // Bind before the operation: a moved or deleted source may no longer
+        // exist when Shell reports its long filesystem name to the callback.
+        let exact=exact_completion_key(shell_path);
+        self.expected.insert(exact.clone());
+        let mut alias=|path:&Path|{
+            self.aliases.entry(completion_key(path)).and_modify(|entry|{
+                if entry.as_ref()!=Some(&exact){*entry=None;}
+            }).or_insert_with(||Some(exact.clone()));
+        };
+        alias(shell_path);
+        if requested!=shell_path{alias(requested);}
+    }
+    #[cfg(test)]fn for_request(request:&Request)->Self{
+        let mut state=Self::new(request.operation);
+        for path in &request.paths{state.expect_source(path,path);}
+        state
     }
     fn record_completed(&mut self,path:&Path)->bool{
         let exact=exact_completion_key(path);
@@ -688,15 +702,20 @@ fn perform_inner(request:&Request,quiet:bool,cancel_before:bool)->Result<Outcome
         request.paths.iter().all(|path|path.parent().is_some_and(|parent|parent==destination||
             std::fs::canonicalize(parent).ok().zip(std::fs::canonicalize(destination).ok()).is_some_and(|(a,b)|a==b)))){flags|=FOF_RENAMEONCOLLISION;}
     unsafe{operation.SetOperationFlags(flags)?;}
-    let progress=Arc::new(Mutex::new(ProgressState::for_request(request)));
+    let mut state=ProgressState::new(request.operation);
+    let mut identities=Vec::with_capacity(request.paths.len());
+    for path in &request.paths{
+        let item:IShellItem=unsafe{SHCreateItemFromParsingName(PCWSTR(wide(path).as_ptr()),None)?};
+        let shell_path=item_path(&item).ok();
+        state.expect_source(path,shell_path.as_deref().unwrap_or(path));
+        identities.push(super::pidl::item_pidl(&item).ok_or_else(||invalid("无法创建文件标识"))?);
+    }
+    let progress=Arc::new(Mutex::new(state));
     let sink:IFileOperationProgressSink=Progress{state:progress.clone(),cancel_before}.into();
     let cookie=unsafe{operation.Advise(&sink)}?;
     struct Advisory<'a>{operation:&'a IFileOperation,cookie:u32}impl Drop for Advisory<'_>{fn drop(&mut self){let _=unsafe{self.operation.Unadvise(self.cookie)};}}let _advisory=Advisory{operation:&operation,cookie};
     let owner=HWND(request.owner as*mut _);
     if unsafe{IsWindow(Some(owner))}.as_bool()&&unsafe{GetWindowThreadProcessId(owner,None)}==request.thread{unsafe{operation.SetOwnerWindow(owner)?;}}
-    let mut identities=Vec::with_capacity(request.paths.len());
-    for path in &request.paths{let item:IShellItem=unsafe{SHCreateItemFromParsingName(PCWSTR(wide(path).as_ptr()),None)?};
-        identities.push(super::pidl::item_pidl(&item).ok_or_else(||invalid("无法创建文件标识"))?);}
     let pointers=identities.iter().map(|pidl|pidl.as_ptr().cast::<ITEMIDLIST>()).collect::<Vec<_>>();
     let items=if pointers.is_empty(){None}else{Some(unsafe{SHCreateShellItemArrayFromIDLists(&pointers)?})};
     match request.operation{

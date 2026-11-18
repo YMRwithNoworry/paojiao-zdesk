@@ -45,6 +45,16 @@ use super::*;
     assert_eq!(completion_key(Path::new(r"\\?\UNC\server\share\目录")),completion_key(Path::new(r"\\server\share\目录")));
     assert_ne!(completion_key(Path::new(r"C:\Ä")),completion_key(Path::new(r"C:\ä")));
 }
+#[test]fn shell_reports_a_short_path_source_by_its_long_name(){
+    let short=Path::new(r"C:\RUNNER~1\A.TXT");
+    let long=Path::new(r"C:\Runner Admin\A.txt");
+    let mut state=ProgressState::new(Operation::Move);
+    state.expect_source(short,long);
+    assert!(state.record_completed(long));
+    assert!(state.record_completed(short));
+    assert_eq!(state.completed.len(),1);
+    assert!(!state.record_completed(Path::new(r"C:\Runner Admin\other.txt")));
+}
 #[test]fn transfer_dependencies_serialize_only_overlapping_files(){
     let a=Access::new(&[r"E:\source\a.txt".into()],Some(Path::new(r"E:\destination")),Operation::Copy);
     let b=Access::new(&[r"D:\other\b.txt".into()],Some(Path::new(r"E:\destination")),Operation::Copy);
@@ -445,7 +455,8 @@ fn ordinary_fence_copy_and_move_preserve_the_expected_source() -> anyhow::Result
         let source=root.join(name);std::fs::write(&source,b"fixture data")?;
         let job=request(HWND::default(),vec![source.clone()],Some(dest.clone()),operation,None);
         let result=perform(&job,true)?;
-        assert!(!result.aborted && result.error.is_none());
+        assert!(!result.aborted && result.error.is_none(),"{operation:?} aborted={}, error={:?}, completed={}, outputs={:?}",result.aborted,result.error,result.completed,result.outputs);
+        assert_eq!(result.completed,1);
         assert_eq!(std::fs::read(dest.join(name))?,b"fixture data");
         assert_eq!(source.exists(),operation==Operation::Copy);
     }
