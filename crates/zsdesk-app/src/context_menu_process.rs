@@ -188,7 +188,7 @@ fn redacted_error(value:&str)->String{
 }
 #[link(name="user32")]unsafe extern "system"{fn GetThreadDesktop(thread:u32)->*mut core::ffi::c_void;}
 #[derive(Clone,Copy,Debug,Serialize,Deserialize,PartialEq,Eq)]
-pub enum Mode{More,Properties,Open,Paste,Background,New,CatalogSelection,CatalogBackground}
+pub enum Mode{More,Properties,Open,Copy,Cut,Delete,Paste,BackgroundPaste,Background,New,CatalogSelection,CatalogBackground}
 #[derive(Clone,Debug,Default,Serialize,Deserialize)]
 pub struct MenuViewContext{
     pub folder:Option<Vec<u8>>,
@@ -329,7 +329,7 @@ fn validate(request:&Request)->Result<()>{
     ensure!(request.pidls.len()<=MAX_ITEMS&&request.pidls.iter().all(|pidl|valid_pidl(pidl)),"菜单选择数据无效或过多");
     ensure!(request.pidls.iter().map(Vec::len).sum::<usize>()<=3*1024*1024,"菜单选择标识总量过大");
     ensure!(!request.pidls.is_empty()||request.folder.is_some(),"没有可用的系统菜单目标");
-    ensure!(!matches!(request.mode,Mode::Background|Mode::New|Mode::CatalogBackground)||request.pidls.len()==1,"背景菜单需要一个文件夹标识");
+    ensure!(!matches!(request.mode,Mode::Background|Mode::BackgroundPaste|Mode::New|Mode::CatalogBackground)||request.pidls.len()==1,"背景菜单需要一个文件夹标识");
     ensure!(request.folder.as_ref().is_none_or(|folder|folder.is_absolute()),"菜单目录必须是绝对路径");
     if let Some(context)=&request.view_context{ensure!(context.folder.as_ref().is_none_or(|pidl|valid_pidl(pidl)),"菜单源文件夹标识无效");}
     for keys in [&request.options.hidden_verbs,&request.options.shown_verbs]{ensure!(keys.len()<=1024&&keys.iter().all(|verb|verb.len()<=512&&!verb.contains('\0')),"菜单设置无效");}
@@ -803,11 +803,16 @@ fn run_request(path:&Path,request:Request,events:&EventSet,com_us:u64,fault_repo
             return Ok(MenuOutcome::ShellInvoked);
         }
         state.state("binding")?;let started=Instant::now();
-        let is_background=matches!(request.mode,Mode::Background|Mode::New|Mode::CatalogBackground)||(request.mode==Mode::Paste&&request.pidls.is_empty());
+        let is_background=matches!(request.mode,Mode::Background|Mode::BackgroundPaste|Mode::New|Mode::CatalogBackground)||(request.mode==Mode::Paste&&request.pidls.is_empty());
         let background=if is_background{
             Some(if let Some(pidl)=request.pidls.first(){zsdesk_windows::shell::pidl::item_from_pidl(pidl)?}
                 else{unsafe{zsdesk_windows::shell::shell_item(&zsdesk_core::model::explorer::ShellLocation::Path(request.folder.clone().context("粘贴目标缺失")?))}?})
         }else{None};
+        if request.mode==Mode::BackgroundPaste{
+            let item=background.as_ref().context("后台菜单目标缺失")?;
+            let attributes=unsafe{item.GetAttributes(windows::Win32::System::SystemServices::SFGAO_FOLDER)}?;
+            ensure!(attributes.0&windows::Win32::System::SystemServices::SFGAO_FOLDER.0!=0,"后台菜单目标不是文件夹");
+        }
         let effective_options=zsdesk_windows::shell::menu::context_menu_options();
         let classic_selection=zsdesk_windows::theme::os_build()<22000&&!effective_options.modern&&!effective_options.drawn
             &&!request.pidls.is_empty()&&!is_background;
@@ -835,7 +840,7 @@ fn run_request(path:&Path,request:Request,events:&EventSet,com_us:u64,fault_repo
         if let Some(context)=&request.view_context{menu.set_input_context(context.keyboard,context.f10);}
         // Creation selection feedback is optional for generic background
         // handlers. A missing site must not make their entire menu unusable.
-        let creation=if let Some(host)=background_view.as_ref().filter(|_|is_background&&request.folder.is_some()){
+        let creation=if let Some(host)=background_view.as_ref().filter(|_|matches!(request.mode,Mode::Background|Mode::New)&&request.folder.is_some()){
             match zsdesk_windows::shell::new_menu::CreationCapture::attach(&menu,&host.view){
                 Ok(capture)=>Some(capture),
                 Err(error) if request.mode!=Mode::New&&matches!(error.code().0 as u32,0x80004002|0x80004001)=>None,
@@ -843,9 +848,9 @@ fn run_request(path:&Path,request:Request,events:&EventSet,com_us:u64,fault_repo
             }
         }else{None};
         state.status.bind_microseconds=started.elapsed().as_micros()as u64;state.state("populating")?;let started=Instant::now();
-        if matches!(request.mode,Mode::Open|Mode::Paste){
+        if matches!(request.mode,Mode::Open|Mode::Copy|Mode::Cut|Mode::Delete|Mode::Paste|Mode::BackgroundPaste){
             menu.populate_for_invoke(request.extended)?;state.status.populate_microseconds=started.elapsed().as_micros()as u64;
-            let verb=if request.mode==Mode::Paste{"paste"}else{"open"};
+            let verb=match request.mode{Mode::Open=>"open",Mode::Copy=>"copy",Mode::Cut=>"cut",Mode::Delete=>"delete",Mode::Paste|Mode::BackgroundPaste=>"paste",_=>unreachable!()};
             state.allow(true)?;menu.invoke_verb(window,verb,false)?;return Ok(MenuOutcome::ShellInvoked);
         }
         if effective_options.modern&&!effective_options.drawn&&matches!(request.mode,Mode::More|Mode::Background){
@@ -1093,6 +1098,13 @@ pub fn run_worker_if_requested()->Option<Result<()>>{
         assert!(validate(&request).is_ok());
         for value in ["",r"..\escape","bad/session","bad\0session"]{request.session=value.into();assert!(validate(&request).is_err());}
         request.session="session-1".into();for ordinal in [0,MAX_SESSION_REQUESTS+1]{request.ordinal=ordinal;assert!(validate(&request).is_err());}
+    }
+    #[test]fn direct_background_paste_requires_one_frozen_folder_identity(){
+        let mut request=Request{token:"request-1".into(),session:"session-1".into(),ordinal:1,parent:1,parent_created:1,owner:1,
+            point:[0,0],pidls:Vec::new(),folder:Some(PathBuf::from(r"C:\target")),options:Default::default(),rename:false,open:false,
+            file_actions:false,mode:Mode::BackgroundPaste,extended:false,layout:None,view_context:None,probe:None};
+        assert!(validate(&request).is_err());
+        request.pidls=vec![vec![0,0]];assert!(validate(&request).is_ok());
     }
     #[test]fn filesystem_action_interception_is_opt_in_on_the_wire()->Result<()>{
         let request=Request{token:"request-1".into(),session:"session-1".into(),ordinal:1,parent:1,parent_created:1,owner:1,

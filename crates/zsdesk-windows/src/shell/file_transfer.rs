@@ -252,6 +252,19 @@ pub fn paths_from_pidls(pidls:&[Vec<u8>])->Result<Vec<PathBuf>>{
     for pidl in pidls{paths.push(item_path(&super::pidl::item_from_pidl(pidl)?)?);}check_paths(&paths)?;Ok(paths)
 }
 pub fn copy_items(owner:HWND,pidls:&[Vec<u8>],cut:bool)->Result<()>{copy_paths(owner,&paths_from_pidls(pidls)?,cut)}
+pub fn copy_items_from_view(view:&IShellView,owner:HWND,pidls:&[Vec<u8>],cut:bool,still_selected:&dyn Fn()->bool)->Result<()>{
+    let paths=paths_from_pidls(pidls)?;
+    if !still_selected(){return Err(invalid("文件选区已改变，请重新打开菜单"));}
+    if cut{
+        let folder:IFolderView2=view.cast()?;let items:IShellItemArray=unsafe{folder.Items(SVGIO_SELECTION)?};
+        let count=unsafe{items.GetCount()?};let mut current=Vec::with_capacity(count as usize);
+        for index in 0..count{let item=unsafe{items.GetItemAt(index)?};
+            current.push(super::pidl::item_pidl(&item).ok_or_else(||invalid("无法读取当前剪切选区"))?);}
+        if !super::menu::same_item_identities(pidls,&current)||!still_selected(){return Err(invalid("剪切选区已改变，请重新打开菜单"));}
+        if let Ok(shell_view)=view.cast::<IShellFolderView>(){return unsafe{shell_view.SetClipboard(true)};}
+    }
+    copy_paths(owner,&paths,cut)
+}
 
 fn clipboard_files()->Result<(Vec<PathBuf>,u32,u32)>{
     // Keep sequence and move intent from one locked clipboard snapshot.
