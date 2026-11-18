@@ -167,12 +167,16 @@ pub fn group(label: &str, id: &str, items: Vec<MenuItemSpec>) -> MenuItemSpec {
 /// Every entry is a checkable state or a radio choice; actions that open a
 /// window end with "…".
 pub fn interface_settings_menu(ui: &ExplorerUi) -> MenuSpec {
+    menu(vec![layout_settings(ui),tab_settings(ui),preview_settings(ui),search_settings(ui),language_menu(ui.language)])
+}
+
+pub fn language_menu(preference:zsdesk_core::i18n::LanguagePreference)->MenuItemSpec{
     use zsdesk_core::i18n::LanguagePreference;
-    menu(vec![layout_settings(ui), tab_settings(ui), preview_settings(ui), search_settings(ui),submenu(zsdesk_core::i18n::text("语言 / Language"),vec![
-        entry(zsdesk_core::i18n::text("跟随系统 / System default"),"language-system",true,ui.language==LanguagePreference::System),
-        entry(zsdesk_core::i18n::text("简体中文"),"language-zh",true,ui.language==LanguagePreference::Chinese),
-        entry("English","language-en",true,ui.language==LanguagePreference::English),
-    ])])
+    submenu(zsdesk_core::i18n::text("语言 / Language"),vec![
+        entry(zsdesk_core::i18n::text("跟随系统 / System default"),"language-system",true,preference==LanguagePreference::System),
+        entry(zsdesk_core::i18n::text("简体中文"),"language-zh",true,preference==LanguagePreference::Chinese),
+        entry("English","language-en",true,preference==LanguagePreference::English),
+    ])
 }
 
 fn layout_settings(ui: &ExplorerUi) -> MenuItemSpec {
@@ -362,6 +366,7 @@ pub fn context_menu_settings_menu_for(options: &ContextMenuPreferences, _modern_
         modern,
         entry(zsdesk_core::i18n::text("自绘 Windows 11"), "context-menu-drawn-windows11", true, options.mode==ContextMenuMode::DrawnWindows11),
         entry(zsdesk_core::i18n::text("Windows 10 经典风格"), "context-menu-original", true, original),
+        entry(zsdesk_core::i18n::text("优先显示常用命令"), "context-menu-quick-first", true, options.quick_first),
         item(zsdesk_core::i18n::text("管理此处的完整右键菜单…"),"manage-context-commands"),
         MenuItemSpec::Separator,
         submenu(zsdesk_core::i18n::text("显示的命令"), vec![
@@ -381,6 +386,7 @@ pub fn apply_context_menu_setting(options: &mut ContextMenuPreferences, choice: 
     match choice {
         "context-menu-original" => options.mode = ContextMenuMode::Original,
         "context-menu-windows11" => options.mode = ContextMenuMode::Windows11,
+        "context-menu-quick-first" => options.quick_first = !options.quick_first,
         "context-menu-drawn-windows11" => options.mode = ContextMenuMode::DrawnWindows11,
         "context-menu-defaults" => *options = ContextMenuPreferences::default(),
         "context-action-cut-copy-paste" => options.show_cut_copy_paste = !options.show_cut_copy_paste,
@@ -424,6 +430,11 @@ pub fn app_menu_with_capabilities(state: AppMenuState, ui: &ExplorerUi, themed: 
         MenuItemSpec::Separator,
     ];
     items.extend(interface_settings_menu(ui).items);
+    items.push(submenu(zsdesk_core::i18n::text("配置目录"),vec![
+        item(zsdesk_core::i18n::text("打开当前配置目录"),"profile-open"),
+        item(zsdesk_core::i18n::text("选择默认配置目录…"),"profile-folder"),
+        item(zsdesk_core::i18n::text("恢复默认配置目录"),"profile-default"),
+    ]));
     items.push(group(zsdesk_core::i18n::text("右键菜单"), "settings-context-menu",
         context_menu_settings_menu_for(&ui.context_menu, !state.modern_menu_unavailable).items));
     if themed { items.push(group(zsdesk_core::i18n::text("主题与材质"), "settings-appearance", appearance_menu(&ui.appearance).items)); }

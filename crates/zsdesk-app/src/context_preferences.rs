@@ -16,7 +16,7 @@ pub fn native(options:&ContextMenuPreferences)->ContextMenuOptions {
         (options.show_new,&["new"][..]),
     ] {if !show {hidden.extend(verbs.iter().map(|v|(*v).to_string()));}}
     hidden.extend(options.hidden_commands.iter().cloned());
-    ContextMenuOptions{modern:modern(options),drawn:options.mode==ContextMenuMode::DrawnWindows11,hidden_verbs:hidden,shown_verbs:options.shown_commands.clone(),show_seven_zip:options.show_seven_zip,show_wps:options.show_wps}
+    ContextMenuOptions{quick_first:options.quick_first,modern:modern(options),drawn:options.mode==ContextMenuMode::DrawnWindows11,hidden_verbs:hidden,shown_verbs:options.shown_commands.clone(),show_seven_zip:options.show_seven_zip,show_wps:options.show_wps}
 }
 /// Visual style is independent of registered commands and customization rules.
 pub fn modern(options:&ContextMenuPreferences)->bool{

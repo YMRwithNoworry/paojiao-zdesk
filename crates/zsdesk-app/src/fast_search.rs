@@ -59,6 +59,7 @@ fn any_active_query(profile:&Path)->bool{
         clients.iter().filter_map(Weak::upgrade).any(|client|!client.stop.load(Ordering::Acquire)&&client.query_active.load(Ordering::Acquire))))
 }
 impl Shared{
+    fn clear_page(&self){self.native_page.lock().unwrap_or_else(|e|e.into_inner()).take();}
     fn current(&self,generation:u64)->bool{!self.stop.load(Ordering::Acquire)&&self.generation.load(Ordering::Acquire)==generation}
     fn cancelled(&self)->bool{self.stop.load(Ordering::Acquire)||self.engine_stop.load(Ordering::Acquire)}
     fn notify(&self){
@@ -78,7 +79,7 @@ pub fn settings_changed(profile:&Path){
     if let Some(clients)=CLIENTS.get(){let mut clients=clients.lock().unwrap_or_else(|e|e.into_inner());
         if let Some(clients)=clients.get_mut(&profile.to_path_buf()){clients.retain(|client|{let Some(client)=client.upgrade()else{return false;};
             client.engine_stop.store(true,Ordering::Release);client.generation.fetch_add(1,Ordering::AcqRel);
-            let mut control=client.control.lock().unwrap_or_else(|e|e.into_inner());control.request=None;control.settings_changed=true;control.release_idle=true;drop(control);client.wake.notify_all();true});}
+            let mut control=client.control.lock().unwrap_or_else(|e|e.into_inner());client.query_active.store(false,Ordering::Release);client.clear_page();control.request=None;control.settings_changed=true;control.release_idle=true;drop(control);client.wake.notify_all();true});}
     }
     let profile=profile.to_path_buf();
     let _=thread::Builder::new().name("zsdesk-search-release".into()).spawn(move||{
@@ -109,7 +110,11 @@ impl FastSearch{
         let path=std::path::absolute(path)?;let profile=profile.unwrap_or_else(||path.with_file_name("explorer-session.json"));
         let shared=Arc::new(Shared{control:Mutex::new(Control::default()),wake:Condvar::new(),stop:AtomicBool::new(false),engine_stop:AtomicBool::new(false),
             generation:AtomicU64::new(0),notified:AtomicBool::new(false),hwnd:hwnd.0 as isize,message,notifier,maintenance_role:AtomicU64::new(0),query_active:AtomicBool::new(false),native_page:Mutex::new(None),network_io:Mutex::new(None)});
-        CLIENTS.get_or_init(Default::default).lock().unwrap_or_else(|e|e.into_inner()).entry(profile.clone()).or_default().push(Arc::downgrade(&shared));
+        {
+            let mut registry=CLIENTS.get_or_init(Default::default).lock().unwrap_or_else(|e|e.into_inner());
+            registry.retain(|_,clients|{clients.retain(|client|client.strong_count()!=0);!clients.is_empty()});
+            registry.entry(profile.clone()).or_default().push(Arc::downgrade(&shared));
+        }
         let (sender,events)=mpsc::sync_channel(4);let state=shared.clone();
         let permit=WorkerPermit::new();
         let worker=thread::Builder::new().name("zsdesk-search".into()).spawn(move||{let _permit=permit;worker_loop(path,profile,options,roots,state,sender)})?;
@@ -137,7 +142,7 @@ impl FastSearch{
     pub fn poll(&self)->Vec<SearchEvent>{self.shared.notified.store(false,Ordering::Release);let generation=self.shared.generation.load(Ordering::Acquire);let mut events=Vec::new();let mut drained=0;
         for _ in 0..4{let Ok(event)=self.events.try_recv()else{break;};drained+=1;if event.generation==generation{events.push(event);}}
         if drained==4{self.shared.notify();}events}
-    fn discard_events(&self){self.shared.notified.store(false,Ordering::Release);for _ in 0..4{if self.events.try_recv().is_err(){break;}}}
+    fn discard_events(&self){self.shared.clear_page();self.shared.notified.store(false,Ordering::Release);for _ in 0..4{if self.events.try_recv().is_err(){break;}}}
 }
 impl Drop for FastSearch{fn drop(&mut self){self.shared.query_active.store(false,Ordering::Release);self.shared.stop.store(true,Ordering::Release);self.shared.engine_stop.store(true,Ordering::Release);network::cancel(&self.shared);self.shared.wake.notify_all();if let Some(worker)=self.worker.take(){if worker.is_finished(){let _=worker.join();}}}}
 
@@ -159,6 +164,7 @@ fn worker_loop(path:PathBuf,profile:PathBuf,initial:SearchOptions,roots:Option<V
             }
             if shared.stop.load(Ordering::Acquire){break;}std::mem::take(&mut *guard)
         };
+        if core.is_none()&&control.request.is_none()&&control.action==ScanAction::None&&!control.settings_changed{continue;}
         let options=if roots.is_some(){initial}else{match initial.effective(&profile){Ok(options)=>options,Err(error)=>{
             core=None;if let Some(request)=control.request{emit(&shared,&sender,failure(request.generation,if initial.backend.is_builtin(){BackendKind::DirectoryScan}else{BackendKind::Everything},format!("{error:#}")));}continue;
         }}};

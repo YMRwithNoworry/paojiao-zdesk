@@ -12,16 +12,43 @@ use zsdesk_core::model::explorer::{Bookmark,ExplorerSession,SearchPreferences};
 static SAVE_LOCK: Mutex<()> = Mutex::new(());
 static SAVE_SERIAL: AtomicU64 = AtomicU64::new(1);
 
-pub fn config_path() -> PathBuf {
-    if let Ok(exe)=std::env::current_exe() {
-        if let Some(dir)=exe.parent() {
-            if dir.join("portable.flag").exists() { return dir.join("data").join("explorer-session.json"); }
-        }
-    }
-    dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(crate::edition::profile_name())
-        .join("explorer-session.json")
+fn profile_home()->PathBuf{
+    dirs::config_dir().unwrap_or_else(||PathBuf::from(".")).join(crate::edition::profile_name())
+}
+fn portable_dir()->Option<PathBuf>{
+    std::env::current_exe().ok().and_then(|exe|exe.parent().map(Path::to_path_buf))
+        .filter(|dir|dir.join("portable.flag").is_file()).map(|dir|dir.join("data"))
+}
+fn default_profile(home:&Path,portable:Option<PathBuf>)->PathBuf{
+    let dir=portable.unwrap_or_else(||{
+        let selector=home.join("profile-location.json");
+        fs::metadata(&selector).ok().filter(|m|m.len()<=128*1024)
+            .and_then(|_|fs::read(selector).ok()).and_then(|bytes|serde_json::from_slice::<PathBuf>(&bytes).ok())
+            .filter(|dir|dir.is_absolute()).unwrap_or_else(||home.to_path_buf())
+    });
+    dir.join("explorer-session.json")
+}
+pub fn config_path()->PathBuf{
+    static DEFAULT:std::sync::OnceLock<PathBuf>=std::sync::OnceLock::new();
+    DEFAULT.get_or_init(||default_profile(&profile_home(),portable_dir())).clone()
+}
+pub fn choose_profile_directory(destination:Option<&Path>)->Result<()>{
+    anyhow::ensure!(portable_dir().is_none(),"{}",zsdesk_core::i18n::text("便携模式使用程序旁的 data 目录"));
+    save_profile_location(&profile_home(),destination)
+}
+fn save_profile_location(home:&Path,destination:Option<&Path>)->Result<()>{
+    let selector=home.join("profile-location.json");
+    let Some(directory)=destination else{
+        return match fs::remove_file(selector){Ok(())=>Ok(()),Err(e) if e.kind()==io::ErrorKind::NotFound=>Ok(()),Err(e)=>Err(e.into())};
+    };
+    anyhow::ensure!(directory.is_absolute()&&directory.is_dir(),"{}",zsdesk_core::i18n::text("目标文件夹无效"));
+    let session=directory.join("explorer-session.json");
+    if session.try_exists()?{load(&session)?;}
+    fs::create_dir_all(home)?;
+    let temp=selector.with_extension(format!("{}-{}.tmp",std::process::id(),SAVE_SERIAL.fetch_add(1,Ordering::Relaxed)));
+    let bytes=serde_json::to_vec(directory)?;
+    if let Err(e)=fs::write(&temp,&bytes).and_then(|_|replace_file(&temp,&selector)){let _=fs::remove_file(&temp);return Err(e.into());}
+    Ok(())
 }
 
 pub fn load(path: &Path) -> Result<ExplorerSession> {
@@ -325,4 +352,22 @@ fn replace_file(temporary: &Path, destination: &Path) -> io::Result<()> {
             .map_err(|e|io::Error::other(e.to_string()))
     }
     #[cfg(not(windows))] { fs::rename(temporary,destination) }
+}
+
+#[cfg(test)]mod profile_location_tests{
+    use super::*;
+    #[test]fn selected_profile_round_trips_and_respects_portable_and_reset()->Result<()>{
+        let root=std::env::temp_dir().join(format!("zsdesk-profile-location-{}",std::process::id()));
+        fs::create_dir(&root)?;
+        struct Guard(PathBuf);impl Drop for Guard{fn drop(&mut self){let _=fs::remove_dir_all(&self.0);}}
+        let _guard=Guard(root.clone());let home=root.join("initial");let selected=root.join("中文 folder");
+        fs::create_dir(&selected)?;save_profile_location(&home,Some(&selected))?;
+        assert_eq!(default_profile(&home,None),selected.join("explorer-session.json"));
+        assert_eq!(default_profile(&home,Some(root.join("data"))),root.join("data/explorer-session.json"));
+        fs::write(selected.join("explorer-session.json"),"invalid")?;
+        assert!(save_profile_location(&home,Some(&selected)).is_err());
+        save_profile_location(&home,None)?;
+        assert_eq!(default_profile(&home,None),home.join("explorer-session.json"));
+        Ok(())
+    }
 }

@@ -13,7 +13,7 @@ impl WindowState{
         Ok((results,crate::context_preferences::native(&self.session.ui.context_menu)))
     }
 }
-struct Session{generation:u64,identity:super::pane_input::Identity,view_window:HWND,foreground:HWND,view:IShellView,pidls:Vec<Vec<u8>>,folder:Option<PathBuf>,background:Option<Vec<u8>>,client:Client,catalog:bool,input:Option<super::global_search::InputWatch>,visual:Option<VisualSelection>,invocation_authorized:bool,point:POINT,started:std::time::Instant,loading_notified:bool,mode:WorkerMode,extended:bool}
+struct Session{generation:u64,identity:super::pane_input::Identity,view_window:HWND,foreground:HWND,view:IShellView,pidls:Vec<Vec<u8>>,folder:Option<PathBuf>,background:Option<Vec<u8>>,client:Client,quick_first:bool,catalog:bool,input:Option<super::global_search::InputWatch>,visual:Option<VisualSelection>,invocation_authorized:bool,point:POINT,started:std::time::Instant,loading_notified:bool,mode:WorkerMode,extended:bool}
 thread_local!{static ACTIVE:RefCell<HashMap<isize,Session>>=RefCell::new(HashMap::new());}
 thread_local!{static GENERATIONS:RefCell<HashMap<isize,u64>>=RefCell::new(HashMap::new());static NEXT:Cell<u64>=const{Cell::new(1)};}
 fn generation(owner:HWND)->Option<u64>{GENERATIONS.with(|generations|generations.borrow().get(&(owner.0 as isize)).copied())}
@@ -148,15 +148,17 @@ fn start(owner:HWND,window:HWND,view:&IShellView,identity:super::pane_input::Ide
     let extended=unsafe{GetKeyState(VK_SHIFT.0 as i32)}<0;
     // Repeated clicks on an unchanged target must not cancel a slow first
     // request and restart Shell/XAML initialization from scratch.
+    let input=super::global_search::InputWatch::new();
+    let pidls=if new||background_click{Vec::new()}else{snapshot(view)?};
+    let source_folder=background_pidl(view)?;
+    let background=pidls.is_empty().then(||source_folder.clone());
     let repeated=if !new&&!catalog&&!keyboard{
-        let targets=if background_click{Vec::new()}else{snapshot(view)?};
-        let background=if targets.is_empty(){Some(background_pidl(view)?)}else{None};
         ACTIVE.with(|active|{
             let mut active=active.borrow_mut();let Some(session)=active.get_mut(&(owner.0 as isize))else{return false;};
             if session.identity!=identity||session.view_window!=window||session.catalog||session.invocation_authorized
                 ||!matches!(session.mode,WorkerMode::More|WorkerMode::Background)||session.extended!=extended
                 ||session.point.x!=point.x||session.point.y!=point.y||!session.client.preparing()
-                ||session.background!=background||session.pidls!=targets{return false;}
+                ||session.background!=background||session.pidls!=pidls{return false;}
             session.input=super::global_search::InputWatch::new();session.foreground=unsafe{GetForegroundWindow()};true
         })
     }else{false};
@@ -166,10 +168,8 @@ fn start(owner:HWND,window:HWND,view:&IShellView,identity:super::pane_input::Ide
     // Restore its visual selection only while the same source has had no input
     // and before any command is authorized. Frozen targets alone are not proof
     // that the visible selection still agrees with the command.
-    let input=super::global_search::InputWatch::new();
-    let pidls=if new||background_click{Vec::new()}else{snapshot(view)?};let folder=file_transfer::folder_path(view).ok();
+    let folder=file_transfer::folder_path(view).ok();
     let visual=if !pidls.is_empty()&&input.is_some(){VisualSelection::capture(view,&pidls).ok()}else{None};
-    let background=if pidls.is_empty(){Some(background_pidl(view)?)}else{None};
     let options=if let Some((_,options))=&captured{options.clone()}else{
         let pointer=unsafe{GetWindowLongPtrW(owner,GWLP_USERDATA)}as*const Slot;
         let profile=if pointer.is_null(){None}else{unsafe{&*pointer}.try_borrow().ok().and_then(|slot|slot.as_ref().map(|state|state.config_path.clone()))};
@@ -181,13 +181,14 @@ fn start(owner:HWND,window:HWND,view:&IShellView,identity:super::pane_input::Ide
     let pointer=unsafe{GetWindowLongPtrW(owner,GWLP_USERDATA)}as*const Slot;
     let results=captured.as_ref().map(|(results,_)|*results).or_else(||if pointer.is_null(){None}else{unsafe{&*pointer}.try_borrow().ok().and_then(|slot|slot.as_ref().and_then(|state|state.menu_source_is_results(identity.source)))})
         .ok_or_else(||failure(zsdesk_core::i18n::text("菜单源视图已改变")))?;
-    let view_context=crate::context_menu_process::MenuViewContext{folder:Some(background_pidl(view)?),results,keyboard,
+    let view_context=crate::context_menu_process::MenuViewContext{folder:Some(source_folder),results,keyboard,
         f10:keyboard&&unsafe{GetKeyState(VK_F10.0 as i32)}<0};
-    let file_actions=!new&&!catalog&&if pidls.is_empty(){file_transfer::filesystem_folder_path(view).ok().flatten().is_some()}else{file_transfer::paths_from_pidls(&pidls).is_ok()};
+    let file_actions=!new&&!catalog&&if pidls.is_empty(){file_transfer::filesystem_folder_path(view).ok().flatten().is_some()}else{true};
+    let quick_first=options.quick_first;
     let client=Client::spawn_with_context(owner,point,targets,folder.clone(),options,MenuInterceptions{rename:true,open:true,file_actions},mode,unsafe{GetKeyState(VK_SHIFT.0 as i32)}<0,layout,Some(view_context))
         .map_err(|error|failure(&zsdesk_core::tr_format!("无法启动系统菜单：{error:#}", error=error)))?;
     if !current(owner,generation){return Ok(());}
-    ACTIVE.with(|active|{active.borrow_mut().insert(owner.0 as isize,Session{generation,identity,view_window:window,foreground,view:view.clone(),pidls,folder,background,client,catalog,input,visual,invocation_authorized:false,point,started:std::time::Instant::now(),loading_notified:false,mode,extended});});
+    ACTIVE.with(|active|{active.borrow_mut().insert(owner.0 as isize,Session{generation,identity,view_window:window,foreground,view:view.clone(),pidls,folder,background,client,quick_first,catalog,input,visual,invocation_authorized:false,point,started:std::time::Instant::now(),loading_notified:false,mode,extended});});
     unsafe{SetTimer(Some(owner),TIMER,50,None)};Ok(())
 }
 
@@ -227,9 +228,11 @@ pub(super) fn poll(owner:HWND){
         current(owner,generation)&&live_source(owner,window,identity)&&input.as_ref().is_some_and(|watch|!watch.changed())
     }));
     if !*invocation_authorized&&!preserve(){return;}
+    let worker=session.quick_first.then(||session.client.pid()).flatten();
     let result=session.client.poll(&mut|before_invoke|{
         let source_valid=current(owner,generation)&&live_source(owner,window,identity);
-        let focus_valid=before_invoke||unsafe{GetForegroundWindow()}==foreground;
+        let focus_valid=before_invoke||unsafe{GetForegroundWindow()}==foreground
+            ||crate::context_menu_process::foreground_is_menu_worker(worker,owner);
         let selection_valid=source_valid&&focus_valid&&(*invocation_authorized||preserve())
             &&same_selection(&view,pidls,folder,background,input.as_ref());
         #[cfg(test)]if !(source_valid&&focus_valid&&selection_valid){
@@ -269,7 +272,10 @@ pub(super) fn poll(owner:HWND){
             file_transfer::note_user_input(window);
             let destination=if action==MenuOutcome::Paste{paste_destination(&session)}else{None};
             if action==MenuOutcome::Paste&&(!file_transfer::has_filesystem_clipboard()||destination.is_none()){
-                match Client::spawn(owner,POINT::default(),session.pidls.clone(),session.folder.clone(),menu::context_menu_options(),MenuInterceptions::default(),WorkerMode::Paste){
+                let (targets,mode)=if session.pidls.is_empty(){
+                    (session.background.clone().into_iter().collect(),WorkerMode::PasteBackground)
+                }else{(session.pidls.clone(),WorkerMode::Paste)};
+                match Client::spawn(owner,POINT::default(),targets,session.folder.clone(),menu::context_menu_options(),MenuInterceptions::default(),mode){
                     Ok(client)=>{session.client=client;ACTIVE.with(|active|{active.borrow_mut().insert(owner.0 as isize,session);});unsafe{SetTimer(Some(owner),TIMER,50,None);}},
                     Err(error)=>{super::pane_input::post(owner,identity,super::pane_input::Intent::TransferMessage(zsdesk_core::tr_format!("无法启动系统粘贴：{error:#}", error=error)));},
                 }

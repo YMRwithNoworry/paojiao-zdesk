@@ -512,6 +512,21 @@ impl ChromeLayout {
         self.hit(x,y)
     }
 
+    /// A tab owns its whole header. Unoccupied strip space before the utility
+    /// buttons acts on the current tab; system caption buttons lie beyond it.
+    pub fn top_tab_right_target(&self, x:i32, y:i32, extend:bool, active:usize)->Option<usize>{
+        if self.vertical_tabs || !self.strip.contains(x,y){return None;}
+        match self.hit_with_top_edge(x,y,extend){
+            Hit::Tab(index)|Hit::TabClose(index)=>Some(index),
+            Hit::Caption=>{
+                let utility_x=if self.tab_list.is_empty(){self.app_menu.x}else{self.tab_list.x};
+                let above_new=x>=self.new_tab.x && x<self.new_tab.right();
+                (x<utility_x && !above_new).then_some(active)
+            }
+            _=>None,
+        }
+    }
+
     /// Classifies a client point.
     pub fn hit(&self, x: i32, y: i32) -> Hit {
         if self.strip.contains(x, y)||self.tab_panel.contains(x,y) {
@@ -817,6 +832,26 @@ mod tests {
         let (id, r) = l.commands[0];
         assert_eq!(l.hit(r.x + 1, r.y + 1), Hit::Command(id));
         assert_eq!(l.hit(l.splitter.x + 1, l.splitter.y + 10), Hit::Splitter);
+    }
+
+    #[test]
+    fn right_click_targets_the_pointed_tab_or_the_active_tab_in_empty_space() {
+        for dpi in [96,144,192] {
+            let mut layout=ChromeLayout::new(&input(scale(1400,dpi),3,1,dpi));
+            let target=|x,y|layout.top_tab_right_target(x,y,true,1);
+            for tab in &layout.tabs {
+                assert_eq!(target(tab.rect.x+2,tab.rect.y+2),Some(tab.index));
+                assert_eq!(target(tab.close.x+1,tab.close.y+1),Some(tab.index));
+                assert_eq!(target(tab.rect.x+2,0),Some(tab.index));
+            }
+            assert_eq!(target(layout.new_tab.right()+2,layout.strip.bottom()-2),Some(1));
+            for control in [layout.new_tab,layout.tab_list,layout.app_menu,layout.address] {
+                if !control.is_empty(){assert_eq!(target(control.x+1,control.y+1),None);}
+            }
+            assert_eq!(target(layout.strip.right()-2,layout.strip.bottom()-2),None);
+            layout.vertical_tabs=true;
+            assert_eq!(layout.top_tab_right_target(layout.tabs[0].rect.x+2,0,true,1),None);
+        }
     }
 
     #[test]

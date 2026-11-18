@@ -260,6 +260,7 @@ pub enum ContextMenuMode {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct ContextMenuPreferences {
+    pub quick_first:bool,
     pub hidden_commands:Vec<String>,
     pub shown_commands:Vec<String>,
     pub mode: ContextMenuMode,
@@ -276,7 +277,7 @@ pub struct ContextMenuPreferences {
 
 impl Default for ContextMenuPreferences {
     fn default() -> Self {
-        Self { hidden_commands:Vec::new(),shown_commands:Vec::new(),mode: ContextMenuMode::Windows11, show_cut_copy_paste: true, show_copy_path: true,
+        Self { quick_first:false,hidden_commands:Vec::new(),shown_commands:Vec::new(),mode: ContextMenuMode::Windows11, show_cut_copy_paste: true, show_copy_path: true,
             show_rename: true, show_delete: true, show_properties: true, show_share: true,
             show_new: true, show_seven_zip: true, show_wps: true }
     }

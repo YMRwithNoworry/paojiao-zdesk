@@ -51,6 +51,7 @@ impl WindowState {
     }
 
     pub(super) fn paint(&mut self) {
+        if unsafe{IsIconic(self.hwnd)}.as_bool(){return;}
         let (width, height) = self.client_size();
         if Surface::ensure(&mut self.surface, width, height).is_none() { return; }
         // Collect icons first: uploading needs `&mut self`, drawing only `&self`.

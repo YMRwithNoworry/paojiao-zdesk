@@ -59,7 +59,7 @@ pub(super) fn execute(view: &IShellView, owner: HWND, action: FileShortcut) -> R
     // (or another virtual folder), a zip as paste target and a clipboard that
     // holds only virtual file contents have none: the folder's own Shell verb
     // handles those, exactly as the toolbar buttons already do.
-    if matches!(action,FileShortcut::Copy|FileShortcut::Cut|FileShortcut::Delete{..})&&file_transfer::filesystem_selection(view)?{
+    if matches!(action,FileShortcut::Copy|FileShortcut::Cut|FileShortcut::Delete{..})&&file_transfer::filesystem_selection(view).unwrap_or(false){
         return match action{
             FileShortcut::Copy=>file_transfer::copy_view(view,owner,false),
             FileShortcut::Cut=>file_transfer::copy_view(view,owner,true),
@@ -68,7 +68,7 @@ pub(super) fn execute(view: &IShellView, owner: HWND, action: FileShortcut) -> R
         };
     }
     if action==FileShortcut::Paste&&file_transfer::has_filesystem_clipboard(){
-        if let Some(path)=file_transfer::filesystem_folder_path(view)?{return file_transfer::paste(unsafe{view.GetWindow()?},&path);}
+        if let Some(path)=file_transfer::filesystem_folder_path(view).ok().flatten(){if file_transfer::try_paste_files(unsafe{view.GetWindow()?},&path)?{return Ok(());}}
     }
     if action == FileShortcut::InvertSelection { return zsdesk_windows::shell::commands::invert_view_selection(view); }
     if matches!(action, FileShortcut::Undo | FileShortcut::Redo) {

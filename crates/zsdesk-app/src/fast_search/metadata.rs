@@ -141,7 +141,9 @@ impl Index {
     pub fn delete(&mut self,row:u32){if row!=0{self.flags[row as usize]|=DEAD;}}
     pub fn delete_id(&mut self,id:u64){for row in self.rows_for_id(id){self.delete(row);}}
     pub fn reindex(&mut self){
-        self.order=(0..self.len()as u32).filter(|row|self.live(*row)).collect();let ids=&self.ids;
+        self.order.clear();
+        self.order.extend(self.flags.iter().enumerate().filter(|(_,flags)|**flags&DEAD==0).map(|(row,_)|row as u32));
+        let ids=&self.ids;
         self.order.sort_unstable_by_key(|row|ids[*row as usize]);self.order.shrink_to_fit();self.delta.clear();self.delta.shrink_to_fit();self.building=false;
     }
     pub fn link_parents(&mut self,parents:&[u64])->Result<()>{
@@ -162,7 +164,21 @@ impl Index {
     pub fn invalidate_id(&mut self,id:u64){for row in self.rows_for_id(id){self.set_attributes(row,None,None);}}
     pub fn apply_exclusions(&mut self,enabled:bool){for row in 1..self.len(){self.flags[row]&=!EXCLUDED;if enabled&&self.flags[row]&DIRECTORY!=0&&excluded_name(self.names.folded(self.name[row])){self.flags[row]|=EXCLUDED;}}}
     pub fn compact(&mut self)->Result<()>{
-        let keep:Vec<_>=(0..self.len()as u32).filter(|row|*row==0||self.searchable(*row)).collect();
+        let end=self.len() as u32;
+        let first_removed=(1..end).find(|row|!self.searchable(*row));
+        // Most snapshots contain only live rows and names. Keep their existing
+        // string pool instead of temporarily allocating a second full copy.
+        if first_removed.is_none(){
+            let mut referenced=vec![false;self.names.len()];
+            for &name in &self.name{referenced[name as usize]=true;}
+            if referenced.into_iter().all(|used|used){
+                self.name.shrink_to_fit();
+                self.shrink_columns();
+                return Ok(());
+            }
+        }
+        let first=first_removed.unwrap_or(end);
+        let keep:Vec<_>=(0..first).chain((first.saturating_add(1)..end).filter(|row|self.searchable(*row))).collect();
         let mut remap=vec![NONE;self.len()];for (next,old) in keep.iter().enumerate(){remap[*old as usize]=next as u32;}
         let mut names=Names::new();let mut name_ids=Vec::with_capacity(keep.len());
         for row in &keep{name_ids.push(names.intern_units(self.names.get(self.name[*row as usize]))?);}
@@ -170,8 +186,13 @@ impl Index {
             self.parent[next]=self.parent.get(old).filter(|p|**p!=NONE).map_or(NONE,|p|remap[*p as usize]);
             if let Some(attrs)=&mut self.attributes{attrs.size[next]=attrs.size[old];attrs.modified[next]=attrs.modified[old];}}
         self.ids.truncate(keep.len());self.flags.truncate(keep.len());self.parent.truncate(keep.len());self.name=name_ids;self.names=names;
-        if let Some(attrs)=&mut self.attributes{attrs.size.truncate(keep.len());attrs.modified.truncate(keep.len());attrs.size.shrink_to_fit();attrs.modified.shrink_to_fit();}
-        self.ids.shrink_to_fit();self.flags.shrink_to_fit();self.parent.shrink_to_fit();self.names.shrink();self.reindex();self.rebuild_children();Ok(())
+        if let Some(attrs)=&mut self.attributes{attrs.size.truncate(keep.len());attrs.modified.truncate(keep.len());}
+        self.shrink_columns();
+        Ok(())
+    }
+    fn shrink_columns(&mut self){
+        if let Some(attrs)=&mut self.attributes{attrs.size.shrink_to_fit();attrs.modified.shrink_to_fit();}
+        self.ids.shrink_to_fit();self.flags.shrink_to_fit();self.parent.shrink_to_fit();self.names.shrink();self.reindex();self.rebuild_children();
     }
     pub fn validate(&mut self)->Result<()>{
         let n=self.len();ensure!(n>0&&n<=MAX_ROWS&&self.parent.len()==n&&self.name.len()==n&&self.flags.len()==n,"快照索引列长度无效");

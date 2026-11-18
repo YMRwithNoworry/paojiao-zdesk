@@ -516,6 +516,7 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             }
             return LRESULT(0);
         }
+        crate::language::CHANGED=>{with_host(|host|host.render_all());return LRESULT(0);}
         WM_DISPLAYCHANGE => { outside_selection::cancel();with_host(|h| h.place_all()); return LRESULT(0); }
         WM_THEMECHANGED|WM_DWMCOMPOSITIONCHANGED|WM_SYSCOLORCHANGE => {
             with_host(|host|{host.update_palette();for window in &host.fences{fence::apply_glass(window.hwnd);}host.render_all();});return LRESULT(0);
@@ -723,6 +724,17 @@ fn run_after(after: After) {
                 if let Err(error) = desktop::rename(hwnd, &pidl, &name) { file_action_error(hwnd, &error); }
             }
             refresh_fence(fence);
+        }
+        After::ProfileDirectory{reset}=>{
+            let owner=with_host(|h|h.hwnd).unwrap_or_default();
+            let dir=if reset{None}else{
+                let Some(path)=desktop::pick_folder(owner,zsdesk_core::i18n::text("选择默认配置目录"))else{return;};Some(path)
+            };
+            let message=match crate::storage::choose_profile_directory(dir.as_deref()){
+                Ok(())=>zsdesk_core::i18n::text(if reset{"下次普通启动使用默认配置目录"}else{"已保存默认配置目录。下次普通启动使用所选目录；空目录使用初始设置。"}).to_string(),
+                Err(error)=>error.to_string(),
+            };
+            unsafe{MessageBoxW(Some(owner),PCWSTR(wide(&message).as_ptr()),PCWSTR(zsdesk_core::i18n::wide("配置目录").as_ptr()),MB_OK);}
         }
         After::PickFolder { replace } => {
             let owner = with_host(|h| h.hwnd).unwrap_or_default();
@@ -980,7 +992,9 @@ fn drag(fence: u64) {
     let Some((hwnd, owner, pidls, keys, entries)) = with_host(|h| h.win_index(fence).map(|i| (h.fences[i].hwnd, h.hwnd, h.selected_pidls(fence), h.selected_keys(fence),
         h.selected_entries_owned(fence)))).flatten() else { return };
     if pidls.is_empty() { return; }
-    let Ok(data) = desktop::data_object(hwnd, &pidls) else { return };
+    let data=match desktop::data_object(hwnd,&pidls){
+        Ok(data)=>data,Err(error)=>{file_action_error(hwnd,&error);return;}
+    };
     with_host(|h| h.begin_internal_drag(fence,keys,&data));
     let surfaces = return_to_desktop::DesktopDropSurfaces::new(owner, fence, &data, entries);
     let result = unsafe { SHDoDragDrop(Some(hwnd), &data, None, DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK) };
@@ -1164,9 +1178,20 @@ impl DropHandler for FenceDrop {
         let mut effect = allowed;
         match target {
             // The Shell target runs the copy/move (with its progress UI) outside the host borrow.
-            host::PreparedDrop::Shell(target) => if unsafe { target.Drop(data, MODIFIERKEYS_FLAGS(keys), POINTL { x: point.x, y: point.y }, &mut effect) }.is_err() { effect = DROPEFFECT_NONE; },
+            host::PreparedDrop::Shell(target,drop_keys) => if unsafe { target.Drop(data, MODIFIERKEYS_FLAGS(drop_keys), POINTL { x: point.x, y: point.y }, &mut effect) }.is_err() { effect = DROPEFFECT_NONE; },
             host::PreparedDrop::FileSystem{owner,fence,paths,destination,moving}=>{
-                match zsdesk_windows::shell::file_transfer::transfer_drop(owner,paths,destination,moving){
+                // Desktop items already in the destination only change fence membership.
+                let (present,transfer):(Vec<_>,Vec<_>)=paths.into_iter().partition(|p|
+                    moving&&p.parent().is_some_and(|parent|crate::explorer_forwarder::same_path(parent,&destination)));
+                if !present.is_empty(){with_host(|host|host.adopt_completed_paths(fence,&present));}
+                if transfer.is_empty(){
+                    refresh_fence(self.fence);
+                    let (value,performed,logical)=drop_effects(moving,true);
+                    let _=publish_drop_effect(data,windows::Win32::UI::Shell::CFSTR_PERFORMEDDROPEFFECT,performed);
+                    let _=publish_drop_effect(data,windows::Win32::UI::Shell::CFSTR_LOGICALPERFORMEDDROPEFFECT,logical);
+                    return value;
+                }
+                match zsdesk_windows::shell::file_transfer::transfer_drop(owner,transfer,destination,moving){
                     Ok(completion)=>{
                         if completion.origin.as_ref().is_some_and(|origin|with_host(|host|host.operation_current(fence,origin))==Some(true)){
                             let accepted=with_host(|host|host.adopt_completed_paths(fence,&completion.outputs)).unwrap_or_default();refresh_fence(fence);

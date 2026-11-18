@@ -353,6 +353,28 @@ impl WindowState {
         self.mouse_down(p);
     }
 
+    pub(super) fn top_tab_right_button(&mut self,p:POINT,down:bool)->bool {
+        let target=self.layout.top_tab_right_target(p.x,p.y,screen_edge_window(self.hwnd),self.session.active_tab);
+        let tab=target.and_then(|i|self.session.tabs.get(i).map(|tab|(i,tab.id,tab.locked)));
+        if down{
+            self.right_tab_press=tab.map(|(_,id,_)|(id,p));
+            return tab.is_some();
+        }
+        let press=self.right_tab_press.take();
+        if let (Some((id,start)),Some((index,current,locked)))=(press,tab){
+            let dx=unsafe{GetSystemMetricsForDpi(SM_CXDRAG,self.dpi)}.max(1);
+            let dy=unsafe{GetSystemMetricsForDpi(SM_CYDRAG,self.dpi)}.max(1);
+            if id==current && (start.x-p.x).abs()<dx && (start.y-p.y).abs()<dy {
+                if locked || unsafe{GetKeyState(VK_SHIFT.0 as i32)}<0 {
+                    unsafe{self.tab_menu(index);}
+                }else{
+                    unsafe{self.close_tab(index);}
+                }
+            }
+        }
+        press.is_some() || tab.is_some()
+    }
+
     pub(super) fn right_click(&mut self, p: POINT) {
         match self.chrome_hit(p.x, p.y) {
             Hit::Tab(i) | Hit::TabClose(i) => unsafe { self.tab_menu(i) },
@@ -649,7 +671,7 @@ impl WindowState {
         };
         // The menu shows the effective navigation expansion (system default included).
         let mut menu_ui=self.session.ui.clone();
-        if let Ok(saved)=storage::load(&self.config_path){menu_ui.file_dialog_takeover=saved.ui.file_dialog_takeover;}
+        if let Ok(saved)=storage::load(&self.config_path){menu_ui.language=saved.ui.language;menu_ui.file_dialog_takeover=saved.ui.file_dialog_takeover;}
         menu_ui.navigation_auto_expand=Some(self.navigation_auto_expand());
         menus::app_menu_with_capabilities(state, &menu_ui, crate::edition::THEMED)
     }
@@ -695,6 +717,21 @@ impl WindowState {
         match choice.as_deref() {
             Some("new-tab") => unsafe { self.new_default_tab() },
             Some("new-window")=>self.new_window(),
+            Some("profile-open")=>{
+                if let Some(directory)=self.config_path.parent(){unsafe{self.new_tab(ShellLocation::Path(directory.to_path_buf()));}}
+            },
+            Some("profile-folder")=>{
+                if let Some(directory)=zsdesk_windows::desktop::pick_folder(self.hwnd,zsdesk_core::i18n::text("选择默认配置目录")){
+                    match storage::choose_profile_directory(Some(&directory)){
+                        Ok(())=>self.show_message(zsdesk_core::i18n::text("已保存默认配置目录。下次普通启动使用所选目录；空目录使用初始设置。").into()),
+                        Err(error)=>self.show_message(error.to_string()),
+                    }
+                }
+            },
+            Some("profile-default")=>match storage::choose_profile_directory(None){
+                Ok(())=>self.show_message(zsdesk_core::i18n::text("下次普通启动使用默认配置目录").into()),
+                Err(error)=>self.show_message(error.to_string()),
+            },
             Some("diagnostics")=>if let Err(error)=diagnostics::show(self.hwnd){self.show_message(zsdesk_core::tr_format!("无法打开诊断日志：{error}", error=error));},
             Some("quick-search-settings") => unsafe { self.search_settings_menu(); },
             Some("quick-search-open")=>if let Err(error)=crate::quick_search::launch(&self.config_path,false){self.show_message(zsdesk_core::tr_format!("无法打开快速搜索：{error:#}", error=error));},
@@ -808,10 +845,9 @@ impl WindowState {
                 Err(error)=>self.show_message(zsdesk_core::tr_format!("无法保存标签显示设置：{error:#}", error=error)),
             }return;
         }
-        let language=match id{"language-system"=>Some(zsdesk_core::i18n::LanguagePreference::System),"language-zh"=>Some(zsdesk_core::i18n::LanguagePreference::Chinese),"language-en"=>Some(zsdesk_core::i18n::LanguagePreference::English),_=>None};
-        if let Some(language)=language{
-            match storage::save_language(&self.config_path,language){
-                Ok(())=>{self.session.ui.language=language;self.show_message(zsdesk_core::i18n::text("语言设置已保存，重启后生效。 / Restart ZSDesk to apply the language.").into());},
+        if let Some(language)=crate::language::choice(id){
+            match crate::language::save_and_apply(&self.config_path,language){
+                Ok(())=>{self.session.ui.language=language;self.show_message(zsdesk_core::i18n::text("界面语言已切换").into());},
                 Err(error)=>self.show_message(zsdesk_core::tr_format!("无法保存语言设置：{error:#}", error=error)),
             }return;
         }
@@ -954,7 +990,7 @@ impl WindowState {
 
 }
 
-pub(super) const SHORTCUTS: &str = "文件管理器\nCtrl+T 新建标签　Ctrl+W / Ctrl+F4 关闭标签　Ctrl+Shift+T 恢复标签\nCtrl+Tab / Ctrl+Shift+Tab 切换标签　Ctrl+1…9 第 N 个标签\nAlt+← / Backspace 后退　Alt+→ 前进　Alt+↑ 上一级　F5 刷新\nCtrl+L / Alt+D / F4 地址栏　Ctrl+F / Ctrl+E / F3 搜索（输入即搜）\nCtrl+Shift+N 新建文件夹　Ctrl+Shift+C 复制路径　Ctrl+D 收藏\nAlt+P 预览窗格　Alt+Shift+P 详细信息窗格　Ctrl+F1 展开/收起命令栏\nF2 重命名　Del 删除　Shift+Del 永久删除　Alt+Enter 属性　Ctrl+A 全选\n标签：中键关闭，拖动排序；收藏：中键在新标签打开\n\n桌面格子\n鼠标悬停 展开折叠的格子　双击标题 折叠/展开　拖动标题 移动　拖动边缘 调整大小\nEnter 打开　F2 重命名　Del 删除　Ctrl+A / C / X / V 全选/复制/剪切/粘贴\n方向键 选择　Backspace 返回上一级（文件夹格子）　F5 刷新\n双击桌面空白处 隐藏/显示全部格子";
+pub(super) const SHORTCUTS: &str = "文件管理器\nCtrl+T 新建标签　Ctrl+W / Ctrl+F4 关闭标签　Ctrl+Shift+T 恢复标签\nCtrl+Tab / Ctrl+Shift+Tab 切换标签　Ctrl+1…9 第 N 个标签\nAlt+← / Backspace 后退　Alt+→ 前进　Alt+↑ 上一级　F5 刷新\nCtrl+L / Alt+D / F4 地址栏　Ctrl+F / Ctrl+E / F3 搜索（输入即搜）\nCtrl+Shift+N 新建文件夹　Ctrl+Shift+C 复制路径　Ctrl+D 收藏\nAlt+P 预览窗格　Alt+Shift+P 详细信息窗格　Ctrl+F1 展开/收起命令栏\nF2 重命名　Del 删除　Shift+Del 永久删除　Alt+Enter 属性　Ctrl+A 全选\n顶部标签：右键关闭所点标签，右键空白处关闭当前标签，Shift+右键打开菜单\n标签中键关闭，拖动排序；收藏中键在新标签打开\n\n桌面格子\n鼠标悬停 展开折叠的格子　双击标题 折叠/展开　拖动标题 移动　拖动边缘 调整大小\nEnter 打开　F2 重命名　Del 删除　Ctrl+A / C / X / V 全选/复制/剪切/粘贴\n方向键 选择　Backspace 返回上一级（文件夹格子）　F5 刷新\n双击桌面空白处 隐藏/显示全部格子";
 
 fn desktop_host_running() -> bool {
     unsafe { FindWindowW(windows::core::w!("ZSDesk.Native.DesktopHost"), PCWSTR::null()) }.is_ok_and(|h| !h.0.is_null())

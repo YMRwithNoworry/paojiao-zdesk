@@ -90,7 +90,7 @@ impl Completion{pub fn message(&self)->String{
 }
     pub fn result_code(&self)->u32{self.error.map_or(if self.aborted{0x800704c7}else{0},|error|error.0 as u32)}
 }
-fn invalid(message:&str)->Error{Error::new(HRESULT(0x80070057u32 as i32),message)}
+fn invalid(message:&str)->Error{Error::new(HRESULT(0x80070057u32 as i32),zsdesk_core::i18n::text(message))}
 fn wide(path:&Path)->Vec<u16>{use std::os::windows::ffi::OsStrExt;path.as_os_str().encode_wide().chain(Some(0)).collect()}
 pub fn result_message()->u32{static ID:OnceLock<u32>=OnceLock::new();*ID.get_or_init(||unsafe{RegisterWindowMessageW(w!("ZSDesk.FileTransfer.Result.v1"))})}
 /// Shell and Win32 use different HRESULTs for the same explicit cancellation.
@@ -107,11 +107,12 @@ pub fn error_message(error:&Error)->String{
         _ if code==COPYENGINE_E_FILE_TOO_LARGE=>"文件超过目标文件系统允许的大小".into(),
         _=>error.message(),
     };
-    format!("{text}（0x{:08X}）",code.0 as u32)
+    format!("{} (0x{:08X})",zsdesk_core::i18n::text(&text),code.0 as u32)
 }
 pub fn has_filesystem_clipboard()->bool{unsafe{IsClipboardFormatAvailable(15)}.is_ok()}
-pub fn has_paste_content()->bool{
-    has_filesystem_clipboard()||[CFSTR_SHELLIDLIST,CFSTR_FILEDESCRIPTORW,CFSTR_FILEDESCRIPTORA].iter().any(|name|{
+pub fn has_paste_content()->bool{has_filesystem_clipboard()||has_shell_payload()}
+fn has_shell_payload()->bool{
+    [CFSTR_SHELLIDLIST,CFSTR_FILEDESCRIPTORW,CFSTR_FILEDESCRIPTORA].iter().any(|name|{
         let id=unsafe{RegisterClipboardFormatW(*name)};id!=0&&unsafe{IsClipboardFormatAvailable(id)}.is_ok()
     })
 }
@@ -160,7 +161,13 @@ fn hdrop_bytes(paths:&[PathBuf])->Result<Vec<u8>>{
     bytes.extend([0,0]);Ok(bytes)
 }
 pub fn copy_paths(owner:HWND,paths:&[PathBuf],cut:bool)->Result<()>{
+    publish_paths(owner,paths,cut,None)
+}
+fn publish_paths(owner:HWND,paths:&[PathBuf],cut:bool,expected:Option<u32>)->Result<()>{
     let data=file_data_object(owner,paths,cut)?;
+    if expected.is_some_and(|seq|seq!=unsafe{GetClipboardSequenceNumber()}){
+        return Err(invalid(zsdesk_core::i18n::text("剪贴板已改变，请重新剪切")));
+    }
     unsafe{windows::Win32::System::Ole::OleSetClipboard(&data)}
 }
 fn file_data_object(owner:HWND,paths:&[PathBuf],cut:bool)->Result<windows::Win32::System::Com::IDataObject>{
@@ -236,13 +243,35 @@ pub fn filesystem_folder_path(view:&IShellView)->Result<Option<PathBuf>>{
         ||attributes&windows::Win32::System::SystemServices::SFGAO_STREAM.0!=0{return Ok(None);}
     item_path(&item).map(Some)
 }
+fn move_intent(effect:u32)->bool{effect&7==2}
+fn same_cut_selection(a:&[PathBuf],b:&[PathBuf])->bool{
+    if a.len()!=b.len(){return false;}
+    if a==b{return true;}
+    let keys=|paths:&[PathBuf]|{let mut keys:Vec<_>=paths.iter().map(|p|completion_key(p)).collect();keys.sort_unstable();keys};
+    keys(a)==keys(b)
+}
 pub fn copy_view(view:&IShellView,owner:HWND,cut:bool)->Result<()>{
     let paths=selected_paths(view)?;if paths.is_empty(){return Ok(());}
     if cut{
-        // DefView owns both the clipboard data object and the cut visual state.
-        // SetClipboard(TRUE) preserves that relationship, including restoring
-        // the icons when another application replaces the clipboard.
-        if let Ok(folder)=view.cast::<IShellFolderView>(){return unsafe{folder.SetClipboard(true)};}
+        if let Ok(folder)=view.cast::<IShellFolderView>(){
+            let before=unsafe{GetClipboardSequenceNumber()};
+            let native=unsafe{folder.SetClipboard(true)};
+            let after=unsafe{GetClipboardSequenceNumber()};
+            if after!=before{
+                // A different application may have taken the clipboard while
+                // Shell pumped messages. Never replace its newer selection.
+                if let Ok((published,effect,_))=clipboard_files(){
+                    if move_intent(effect)&&same_cut_selection(&published,&paths){return Ok(());}
+                }
+                if !owned_clipboard_on_current_thread()||unsafe{GetClipboardSequenceNumber()}!=after{
+                    native?;
+                    return Err(invalid(zsdesk_core::i18n::text("剪贴板已改变，请重新剪切")));
+                }
+            }
+            // Some hosted views only mark the selection visually, or return
+            // E_NOTIMPL. Publish the actual paths and explicit MOVE intent.
+            return publish_paths(owner,&paths,true,Some(after));
+        }
     }
     copy_paths(owner,&paths,cut)
 }
@@ -262,7 +291,7 @@ fn clipboard_files()->Result<(Vec<PathBuf>,u32,u32)>{
 pub fn cut_clipboard_paths()->Result<Vec<PathBuf>>{
     if unsafe{IsClipboardFormatAvailable(15)}.is_err(){return Ok(Vec::new());}
     let (paths,effect,_)=clipboard_files()?;
-    Ok(if effect&2!=0{paths}else{Vec::new()})
+    Ok(if move_intent(effect){paths}else{Vec::new()})
 }
 fn clipboard_files_locked()->Result<(Vec<PathBuf>,u32,u32)>{
     let sequence=unsafe{GetClipboardSequenceNumber()};
@@ -283,7 +312,7 @@ fn clipboard_files_locked()->Result<(Vec<PathBuf>,u32,u32)>{
 
 /// Scan the bounded path list once. Repeated DragQueryFileW(index) rescans all
 /// preceding strings and becomes quadratic for large multi-file selections.
-fn parse_hdrop(bytes:&[u8])->Result<Vec<PathBuf>>{
+pub(crate) fn parse_hdrop(bytes:&[u8])->Result<Vec<PathBuf>>{
     use std::os::windows::ffi::OsStringExt;
     use windows::Win32::Globalization::{MultiByteToWideChar,CP_ACP,MB_ERR_INVALID_CHARS};
     if bytes.len()<22||bytes.len()>MAX_PATH_BYTES+22{return Err(invalid("剪贴板文件清单长度无效"));}
@@ -355,8 +384,25 @@ impl Drop for ReplySignal{fn drop(&mut self){let _=unsafe{CloseHandle(HANDLE(sel
 pub fn paste(owner:HWND,destination:&Path)->Result<()>{
     // An opened .zip reports its own file path; only its Shell folder can paste into it.
     if !destination.is_absolute()||!destination.is_dir(){return Err(invalid("目标文件夹无效"));}
-    let (paths,effect,sequence)=clipboard_files()?;let moving=effect&2!=0;
-    submit(owner,paths,Some(destination.into()),if moving{Operation::Move}else{Operation::Copy},Some(sequence))
+    if try_paste_files(owner,destination)?{return Ok(());}
+    // Providers may advertise both a path list and a virtual Shell payload.
+    // Delegate only before any filesystem job has been submitted.
+    let folder=crate::desktop::folder_for_path(destination)?;
+    let menu=super::menu::ShellMenu::for_folder_background(owner,&folder)?;
+    menu.populate_for_invoke(false)?;
+    menu.invoke_verb(owner,"paste",false)
+}
+pub fn try_paste_files(owner:HWND,destination:&Path)->Result<bool>{
+    if !has_filesystem_clipboard() || !destination.is_absolute() || !destination.is_dir(){return Ok(false);}
+    let sequence_before=unsafe{GetClipboardSequenceNumber()};
+    let (paths,effect,sequence)=match clipboard_files(){
+        Ok(packet)=>packet,
+        Err(e) if e.code()==HRESULT(0x80070057u32 as i32)&&has_shell_payload()&&unsafe{GetClipboardSequenceNumber()}==sequence_before=>return Ok(false),
+        Err(error)=>return Err(error),
+    };
+    if effect==4{return Ok(false);} // Preferred shell link.
+    submit(owner,paths,Some(destination.into()),if move_intent(effect){Operation::Move}else{Operation::Copy},Some(sequence))?;
+    Ok(true)
 }
 pub fn paste_view(view:&IShellView,owner:HWND)->Result<()>{paste(owner,&folder_path(view)?)}
 pub fn delete_view(view:&IShellView,owner:HWND,permanent:bool)->Result<()>{

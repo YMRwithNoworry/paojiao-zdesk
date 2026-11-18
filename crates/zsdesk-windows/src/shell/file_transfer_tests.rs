@@ -433,3 +433,28 @@ fn native_file_transfers_are_batched_bounded_and_clipboard_safe()->anyhow::Resul
     fs::write(root.join("verification.current.json"),serde_json::to_vec_pretty(&report)?)?;println!("{report}");
     result?;ensure!(restored&&desktop_closed&&station_closed,"window station cleanup failed");Ok(())
 }
+
+#[test]
+fn ordinary_fence_copy_and_move_preserve_the_expected_source() -> anyhow::Result<()> {
+    let root=std::env::temp_dir().join(format!("zsdesk-fence-move-{}",std::process::id()));
+    std::fs::create_dir(&root)?;
+    struct Fixture(PathBuf);impl Drop for Fixture{fn drop(&mut self){let _=std::fs::remove_dir_all(&self.0);}}
+    let _fixture=Fixture(root.clone());
+    let dest=root.join("目标格子");std::fs::create_dir(&dest)?;
+    for (operation,name) in [(Operation::Copy,"copy.bin"),(Operation::Move,"move.bin")]{
+        let source=root.join(name);std::fs::write(&source,b"fixture data")?;
+        let job=request(HWND::default(),vec![source.clone()],Some(dest.clone()),operation,None);
+        let result=perform(&job,true)?;
+        assert!(!result.aborted && result.error.is_none());
+        assert_eq!(std::fs::read(dest.join(name))?,b"fixture data");
+        assert_eq!(source.exists(),operation==Operation::Copy);
+    }
+    Ok(())
+}
+
+#[test]fn explicit_move_and_reordered_cut_selection_are_distinct_from_copy_permissions(){
+    assert!(move_intent(2));for mask in [0,1,3,4,5,7]{assert!(!move_intent(mask));}
+    let a=PathBuf::from(r"C:\first");let b=PathBuf::from(r"C:\second");
+    assert!(same_cut_selection(&[a.clone(),b.clone()],&[b.clone(),a.clone()]));
+    assert!(!same_cut_selection(&[a.clone(),b.clone()],&[a.clone(),a]));
+}

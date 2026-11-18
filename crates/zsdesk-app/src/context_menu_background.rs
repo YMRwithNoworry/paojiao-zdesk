@@ -131,24 +131,19 @@ fn parsing_key(item:&IShellItem)->Option<Vec<u16>>{
 
 struct SelectionSet{
     items:Vec<IShellItem>,
-    by_pidl:HashMap<Vec<u8>,Vec<usize>>,
-    by_name:HashMap<Vec<u16>,Vec<usize>>,
+    by_pidl:HashMap<Vec<u8>,usize>,
+    by_name:std::cell::OnceCell<HashMap<Vec<u16>,Vec<usize>>>,
 }
 impl SelectionSet{
     fn new(pidls:&[Vec<u8>],request:&Request,events:&EventSet,deadline:Instant)->Result<Self>{
         ensure!(!pidls.is_empty()&&pidls.len()<=MAX_ITEMS,"菜单选区数量无效");
-        let mut result=Self{items:Vec::with_capacity(pidls.len()),by_pidl:HashMap::new(),by_name:HashMap::new()};
-        let mut bytes=0usize;let mut name_bytes=0usize;
+        let mut result=Self{items:Vec::with_capacity(pidls.len()),by_pidl:HashMap::new(),by_name:Default::default()};
+        let mut bytes=0usize;
         for (index,pidl) in pidls.iter().enumerate(){
             checkpoint(request,events,deadline)?;
             bytes=bytes.saturating_add(pidl.len());ensure!(bytes<=MAX_REQUEST as usize, "{}", zsdesk_core::tr_format!("菜单选区标识过大"));
             let item=zsdesk_windows::shell::pidl::item_from_pidl(pidl).context("读取菜单选区标识")?;
-            ensure!(!result.by_pidl.contains_key(pidl),"菜单选区包含重复项目");
-            result.by_pidl.entry(pidl.clone()).or_default().push(index);
-            if let Some(key)=parsing_key(&item){
-                name_bytes=name_bytes.saturating_add(key.len()*2);ensure!(name_bytes<=MAX_REQUEST as usize,"菜单选区名称过大");
-                result.by_name.entry(key).or_default().push(index);
-            }
+            ensure!(result.by_pidl.insert(pidl.clone(),index).is_none(),"菜单选区包含重复项目");
             result.items.push(item);
         }
         Ok(result)
@@ -159,10 +154,30 @@ impl SelectionSet{
         if let Some(pidl)=zsdesk_windows::shell::pidl::item_pidl(item){
             // Identical complete absolute PIDLs are already the same identity;
             // provider metadata changes take the canonical-comparison path.
-            if let Some(indices)=self.by_pidl.get(&pidl){for &index in indices{if !used[index]{checkpoint(request,events,deadline)?;return Ok(Some(index));}}}
+            if let Some(&index)=self.by_pidl.get(&pidl){
+                if !used[index]{checkpoint(request,events,deadline)?;return Ok(Some(index));}
+            }
         }
+        if self.items.len()==1{return Ok(matches(0)?.then_some(0));}
         if let Some(key)=parsing_key(item){
-            if let Some(indices)=self.by_name.get(&key){for &index in indices{if matches(index)?{return Ok(Some(index));}}}
+            // Absolute PIDLs usually match directly. Ask namespace providers
+            // for parsing names only when a mismatch needs disambiguation.
+            if self.by_name.get().is_none(){
+                let mut names=HashMap::<Vec<u16>,Vec<usize>>::new();
+                let mut bytes=0usize;
+                for (index,expected) in self.items.iter().enumerate(){
+                    checkpoint(request,events,deadline)?;
+                    if let Some(name)=parsing_key(expected){
+                        bytes+=name.len()*2;
+                        ensure!(bytes<=MAX_REQUEST as usize,"菜单选区名称过大");
+                        names.entry(name).or_default().push(index);
+                    }
+                }
+                let _=self.by_name.set(names);
+            }
+            if let Some(indices)=self.by_name.get().and_then(|names|names.get(&key)){
+                for &index in indices{if matches(index)?{return Ok(Some(index));}}
+            }
         }
         // Some namespaces expose unstable or unavailable parsing names. Keep
         // those opaque providers usable; the deadline bounds this fallback.
@@ -336,7 +351,11 @@ pub(super) fn for_selection(pidls:&[Vec<u8>],origin:SelectionOrigin<'_>,request:
         };
         // Layout applies before selection, so restoration cannot later clear a
         // selection which the menu has already accepted as ready.
-        if let Some(layout)=&request.layout{zsdesk_windows::shell::restore_view_layout(&host.view,layout);}
+        if let Some(layout)=&request.layout{
+            if !reused() || zsdesk_windows::shell::capture_view_layout(&host.view).as_ref()!=Some(layout){
+                zsdesk_windows::shell::restore_view_layout(&host.view,layout);
+            }
+        }
         let mut children=match &namespace{
             SelectionNamespace::Folder(parent)=>direct_children(pidls,&selection,parent,request,events,deadline)?,
             SelectionNamespace::Results=>fill_results(&host,pidls,request,events,deadline)?,

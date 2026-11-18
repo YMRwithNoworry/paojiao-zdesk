@@ -4,9 +4,9 @@ Windows 多标签文件管理器与桌面格子。可以在一个窗口里浏览
 
 [下载安装](https://github.com/qiu7824/zsdesk/releases/latest) · [使用说明](docs/user-guide.md) · [更新日志](CHANGELOG.md) · [问题反馈](https://github.com/qiu7824/zsdesk/issues)
 
-适用于 Windows 10 / 11，64 位。当前版本为 **0.3.17**，支持简体中文和英文界面。
+适用于 Windows 10 / 11，64 位。当前版本为 **0.3.18**，支持简体中文和英文界面。
 
-English UI is available. Non-Chinese Windows systems use English by default. Choose **≡ → Language → English**, then restart ZSDesk to change the language. Each package includes `README.en.txt`.
+English UI is available. Non-Chinese Windows systems use English by default. Choose **≡ → Language → English** to change the application language immediately. Each package includes `README.en.txt`.
 
 ## 选哪个版本
 
@@ -34,6 +34,7 @@ English UI is available. Non-Chinese Windows systems use English by default. Cho
 | 操作 | 快捷键或入口 |
 |---|---|
 | 新建、关闭、恢复标签 | Ctrl+T / Ctrl+W / Ctrl+Shift+T |
+| 顶部标签栏 | 右键关闭所点标签，右键空白处关闭当前标签，Shift+右键打开标签菜单 |
 | 在新标签打开文件夹 | 鼠标中键点击文件夹 |
 | 后退、前进、上一级 | Alt+← / Alt+→ / Alt+↑，支持鼠标侧键 |
 | 调整图标大小 | Ctrl+滚轮 |
@@ -49,6 +50,14 @@ English UI is available. Non-Chinese Windows systems use English by default. Cho
 - **预览**：内置预览与 QuickLook 可选择。Office 文档预览需要相应的已安装组件；图片、音视频格式取决于系统解码器。
 - **右键**：Windows 10 使用经典系统菜单；Windows 11 按系统能力选择已验证的原生呈现或公共 Shell 命令兼容呈现。Shift 右键可直接使用经典菜单。
 - **Listary**：安装和连接方式见[详细使用说明](docs/user-guide.md)及 `integrations/listary`。
+
+## 0.3.18 更新
+
+- 右键顶部标签关闭所点页，右键标签栏空白处关闭当前页，Shift+右键打开标签菜单。
+
+- “右键菜单 → 优先显示常用命令”可在加载扩展前显示常用操作，完整菜单仍可从末项打开。
+- 快捷键列表支持滚轮和键盘翻页，搜索快捷键设置在当前面板打开。
+- 内置搜索降低大结果集分页和索引快照的峰值内存。安装包和便携包含 Listary 6、7.0 的当前目录插件。
 
 ## 0.3.17 更新
 

@@ -12,6 +12,7 @@ use zsdesk_windows::shell::menu::{ContextMenuOptions,MenuInterceptions,MenuOutco
 use zsdesk_core::model::explorer::ShellViewState;
 #[path="context_menu_background.rs"]mod background_view;
 #[path="context_menu_child.rs"]mod child;
+#[path="context_menu_common.rs"]mod common;
 use child::OwnedChild as Child;
 
 const MAX_REQUEST:u64=16*1024*1024;
@@ -188,7 +189,7 @@ fn redacted_error(value:&str)->String{
 }
 #[link(name="user32")]unsafe extern "system"{fn GetThreadDesktop(thread:u32)->*mut core::ffi::c_void;}
 #[derive(Clone,Copy,Debug,Serialize,Deserialize,PartialEq,Eq)]
-pub enum Mode{More,Properties,Open,Paste,Background,New,CatalogSelection,CatalogBackground}
+pub enum Mode{More,Properties,Open,Paste,PasteBackground,Background,New,CatalogSelection,CatalogBackground}
 #[derive(Clone,Debug,Default,Serialize,Deserialize)]
 pub struct MenuViewContext{
     pub folder:Option<Vec<u8>>,
@@ -201,6 +202,7 @@ struct Request{
     token:String,parent:u32,parent_created:u64,owner:isize,point:[i32;2],pidls:Vec<Vec<u8>>,folder:Option<PathBuf>,
     #[serde(default)]session:String,
     #[serde(default)]ordinal:u32,
+    #[serde(default)]english:Option<bool>,
     options:ContextMenuOptions,rename:bool,open:bool,mode:Mode,extended:bool,
     #[serde(default)]file_actions:bool,
     #[serde(default)]layout:Option<ShellViewState>,
@@ -329,7 +331,7 @@ fn validate(request:&Request)->Result<()>{
     ensure!(request.pidls.len()<=MAX_ITEMS&&request.pidls.iter().all(|pidl|valid_pidl(pidl)),"菜单选择数据无效或过多");
     ensure!(request.pidls.iter().map(Vec::len).sum::<usize>()<=3*1024*1024,"菜单选择标识总量过大");
     ensure!(!request.pidls.is_empty()||request.folder.is_some(),"没有可用的系统菜单目标");
-    ensure!(!matches!(request.mode,Mode::Background|Mode::New|Mode::CatalogBackground)||request.pidls.len()==1,"背景菜单需要一个文件夹标识");
+    ensure!(!matches!(request.mode,Mode::Background|Mode::New|Mode::CatalogBackground|Mode::PasteBackground)||request.pidls.len()==1,"背景菜单需要一个文件夹标识");
     ensure!(request.folder.as_ref().is_none_or(|folder|folder.is_absolute()),"菜单目录必须是绝对路径");
     if let Some(context)=&request.view_context{ensure!(context.folder.as_ref().is_none_or(|pidl|valid_pidl(pidl)),"菜单源文件夹标识无效");}
     for keys in [&request.options.hidden_verbs,&request.options.shown_verbs]{ensure!(keys.len()<=1024&&keys.iter().all(|verb|verb.len()<=512&&!verb.contains('\0')),"菜单设置无效");}
@@ -414,7 +416,7 @@ impl Client{
         let item_count=pidls.len();
         let mut owner_name=[0u16;128];let owner_length=unsafe{GetClassNameW(owner,&mut owner_name)}.max(0)as usize;
         let owner_class=String::from_utf16_lossy(&owner_name[..owner_length]);
-        let request=Request{token:token.clone(),session:session.clone(),ordinal,parent:std::process::id(),parent_created,owner:owner.0 as isize,
+        let request=Request{english:Some(zsdesk_core::i18n::is_english()),token:token.clone(),session:session.clone(),ordinal,parent:std::process::id(),parent_created,owner:owner.0 as isize,
             point:[point.x,point.y],pidls,folder,options,rename:intercept.rename,open:intercept.open,file_actions:intercept.file_actions,mode,extended,layout:origin.layout,view_context:origin.view_context,
             #[cfg(test)]probe:origin.probe,};
         let write_started=Instant::now();
@@ -684,6 +686,16 @@ impl Worker<'_>{
         })();result.map_err(|error|windows::core::Error::new(windows::core::HRESULT(0x80004004u32 as i32),error.to_string()))
     }
 }
+pub(crate) fn foreground_is_menu_worker(worker:Option<u32>,owner:HWND)->bool{
+    let Some(pid)=worker else{return false;};
+    let foreground=unsafe{GetForegroundWindow()};
+    let mut actual=0;
+    unsafe{GetWindowThreadProcessId(foreground,Some(&mut actual));}
+    if actual!=pid || unsafe{GetWindow(foreground,GW_OWNER)}.ok()!=Some(unsafe{GetAncestor(owner,GA_ROOT)}){return false;}
+    let mut class=[0u16;64];
+    let count=unsafe{GetClassNameW(foreground,&mut class)}.max(0)as usize;
+    class[..count].iter().copied().eq("ZSDesk.ExtensionMenu.Worker".encode_utf16())
+}
 fn owner_alive(request:&Request)->bool{
     let mut pid=0;let owner=HWND(request.owner as*mut _);unsafe{GetWindowThreadProcessId(owner,Some(&mut pid));}
     pid==request.parent&&unsafe{IsWindow(Some(owner))}.as_bool()
@@ -709,7 +721,8 @@ fn classic_menu_visible()->bool{
 impl Watch{
     fn observe_open(&self,hwnd:HWND){
         if self.menu_open.get(){return;}
-        let observation=if zsdesk_windows::shell::menu::drawn_menu_window().is_some_and(|window|unsafe{IsWindowVisible(window)}.as_bool()){Some("drawn-win11-menu")}
+        let observation=if zsdesk_windows::flyout::is_open(){Some("common-command-flyout")}
+            else if zsdesk_windows::shell::menu::drawn_menu_window().is_some_and(|window|unsafe{IsWindowVisible(window)}.as_bool()){Some("drawn-win11-menu")}
             else if self.request.options.modern&&unsafe{zs_menu_is_open(hwnd)}!=0{Some("native-presenter-open")}
             else if classic_menu_visible(){Some("visible-classic-menu")}else{None};
         #[cfg(test)]let observation=observation.or_else(||(self.classic_loop.get()&&self.request.probe.as_deref()==Some("modern-owner-copy")).then_some("classic-menu-entered"));
@@ -735,7 +748,7 @@ unsafe extern "system" fn procedure(hwnd:HWND,msg:u32,wp:WPARAM,lp:LPARAM)->LRES
         }
         #[cfg(test)]if msg==WM_TIMER&&wp.0==2{let _=unsafe{KillTimer(Some(hwnd),2)};let _=zsdesk_windows::shell::menu::dismiss_active_menu(hwnd);let _=unsafe{EndMenu()};return LRESULT(0);}
         if msg==WM_TIMER{
-            if !owner_alive(&state.request)||EventSet::signaled(state.cancel_event){let _=zsdesk_windows::shell::menu::dismiss_active_menu(hwnd);let _=unsafe{EndMenu()};}
+            if !owner_alive(&state.request)||EventSet::signaled(state.cancel_event){zsdesk_windows::flyout::cancel();let _=zsdesk_windows::shell::menu::dismiss_active_menu(hwnd);let _=unsafe{EndMenu()};}
             state.observe_open(hwnd);
             #[cfg(test)]if matches!(state.request.probe.as_deref(),Some("modern-expand"|"modern-expand-copy"))&&state.menu_open.get()&&!state.expanded_requested.replace(true){
                 unsafe{SetTimer(Some(hwnd),2,2000,None);}
@@ -764,6 +777,7 @@ unsafe extern "system" fn procedure(hwnd:HWND,msg:u32,wp:WPARAM,lp:LPARAM)->LRES
     unsafe{DefWindowProcW(hwnd,msg,wp,lp)}
 }
 fn run_request(path:&Path,request:Request,events:&EventSet,com_us:u64,fault_report_available:bool)->Result<bool>{
+    let _language=request.english.map(zsdesk_core::i18n::Scope::english);
     let setup=Instant::now();let worker_started=monotonic_us();
     let mut state=Box::new(Worker{status:Status{token:request.token.clone(),pid:std::process::id(),window:0,phase:"starting".into(),validation:0,before_invoke:false,outcome:None,error:None,error_hresult:None,error_phase:None,bind_microseconds:0,populate_microseconds:0,
         reusable:false,layout:None,layout_sort_changed:false,created:Vec::new(),catalog:Vec::new(),timing:MenuTimings{worker_thread:unsafe{windows::Win32::System::Threading::GetCurrentThreadId()},fault_report_available,com_microseconds:com_us,..Default::default()},native_menu:serde_json::Value::Null,
@@ -795,7 +809,29 @@ fn run_request(path:&Path,request:Request,events:&EventSet,com_us:u64,fault_repo
             state.allow(false)?;state.allow(true)?;
             return Ok(MenuOutcome::NativeHandled);
         }
-        if request.mode==Mode::Properties{
+        let mut properties=request.mode==Mode::Properties;
+        if common::enabled(&request){
+            let first=common::specification(&request);
+            state.allow(false)?;
+            unsafe{let _=ShowWindow(window,SW_SHOWNOACTIVATE);let _=SetForegroundWindow(window);}
+            if unsafe{GetForegroundWindow()}!=window{return Ok(MenuOutcome::Dismissed);}
+            watch.tracking_started.set(monotonic_us());
+            let anchor=crate::flyout_menu::MenuAnchor::Point{x:request.point[0],y:request.point[1]};
+            let choice=crate::flyout_menu::show(window,&first,anchor,zsdesk_windows::theme::menus_dark());
+            match choice.as_deref(){
+                Some("more")=>{},
+                Some("properties")=>properties=true,
+                Some(id)=>{
+                    if let Some(action)=common::outcome(id){
+                        state.allow(true)?;
+                        return Ok(action);
+                    }
+                    return Ok(MenuOutcome::Dismissed);
+                },
+                None=>return Ok(MenuOutcome::Dismissed),
+            }
+        }
+        if properties{
             state.allow(true)?;
             let pidls=if request.pidls.is_empty(){vec![zsdesk_windows::shell::pidl::location_pidl(&zsdesk_core::model::explorer::ShellLocation::Path(request.folder.clone().context("目录缺失")?)).context("目录标识无效")?]}else{request.pidls.clone()};
             let data=zsdesk_windows::desktop::data_object(window,&pidls)?;
@@ -803,7 +839,7 @@ fn run_request(path:&Path,request:Request,events:&EventSet,com_us:u64,fault_repo
             return Ok(MenuOutcome::ShellInvoked);
         }
         state.state("binding")?;let started=Instant::now();
-        let is_background=matches!(request.mode,Mode::Background|Mode::New|Mode::CatalogBackground)||(request.mode==Mode::Paste&&request.pidls.is_empty());
+        let is_background=matches!(request.mode,Mode::Background|Mode::New|Mode::CatalogBackground|Mode::PasteBackground)||(request.mode==Mode::Paste&&request.pidls.is_empty());
         let background=if is_background{
             Some(if let Some(pidl)=request.pidls.first(){zsdesk_windows::shell::pidl::item_from_pidl(pidl)?}
                 else{unsafe{zsdesk_windows::shell::shell_item(&zsdesk_core::model::explorer::ShellLocation::Path(request.folder.clone().context("粘贴目标缺失")?))}?})
@@ -843,9 +879,9 @@ fn run_request(path:&Path,request:Request,events:&EventSet,com_us:u64,fault_repo
             }
         }else{None};
         state.status.bind_microseconds=started.elapsed().as_micros()as u64;state.state("populating")?;let started=Instant::now();
-        if matches!(request.mode,Mode::Open|Mode::Paste){
+        if matches!(request.mode,Mode::Open|Mode::Paste|Mode::PasteBackground){
             menu.populate_for_invoke(request.extended)?;state.status.populate_microseconds=started.elapsed().as_micros()as u64;
-            let verb=if request.mode==Mode::Paste{"paste"}else{"open"};
+            let verb=if matches!(request.mode,Mode::Paste|Mode::PasteBackground){"paste"}else{"open"};
             state.allow(true)?;menu.invoke_verb(window,verb,false)?;return Ok(MenuOutcome::ShellInvoked);
         }
         if effective_options.modern&&!effective_options.drawn&&matches!(request.mode,Mode::More|Mode::Background){
@@ -903,13 +939,15 @@ fn run_request(path:&Path,request:Request,events:&EventSet,com_us:u64,fault_repo
         }else{None};
         #[cfg(not(test))]let probe_outcome:Option<MenuOutcome>=None;
         watch.tracking_started.set(monotonic_us());
+        let file_actions=request.file_actions&&(is_background||
+            zsdesk_windows::shell::file_transfer::paths_from_pidls(&request.pidls).is_ok());
         let outcome=if let Some(outcome)=probe_outcome{outcome}
             else if request.mode==Mode::New{menu.track_new(window,point,&mut||state.allow(true))?}
-            else if let (Some(item),Some(host))=(&background,&background_view){menu.track_background_view_with_interceptions(window,point,item,&host.browser,MenuInterceptions{file_actions:request.file_actions,..Default::default()},&mut||state.allow(true))?}
-            else if request.pidls.is_empty(){menu.track_folder_background_with_interceptions(window,point,request.folder.as_deref().unwrap(),0,MenuInterceptions{file_actions:request.file_actions,..Default::default()},&mut||state.allow(true))?}
+            else if let (Some(item),Some(host))=(&background,&background_view){menu.track_background_view_with_interceptions(window,point,item,&host.browser,MenuInterceptions{file_actions,..Default::default()},&mut||state.allow(true))?}
+            else if request.pidls.is_empty(){menu.track_folder_background_with_interceptions(window,point,request.folder.as_deref().unwrap(),0,MenuInterceptions{file_actions,..Default::default()},&mut||state.allow(true))?}
             else if let Some(host)=&background_view{menu.track_selected_in_view_before(window,point,&request.pidls,&host.browser,
-                MenuInterceptions{rename:request.rename,open:request.open,file_actions:request.file_actions},&mut||state.allow(true))?}
-            else{menu.track_selected_before(window,point,&request.pidls,0,MenuInterceptions{rename:request.rename,open:request.open,file_actions:request.file_actions},&mut||state.allow(true))?};
+                MenuInterceptions{rename:request.rename,open:request.open,file_actions},&mut||state.allow(true))?}
+            else{menu.track_selected_before(window,point,&request.pidls,0,MenuInterceptions{rename:request.rename,open:request.open,file_actions},&mut||state.allow(true))?};
         if matches!(outcome,MenuOutcome::ShellInvoked|MenuOutcome::NativeHandled){
             pump(150);
             // ShellNew can open a modeless shortcut/template wizard. Its site
@@ -956,7 +994,9 @@ fn run_request(path:&Path,request:Request,events:&EventSet,com_us:u64,fault_repo
             Err(_)=>break false,
         }
     };
-    if state.status.before_invoke{
+    let host_action=matches!(state.status.outcome,Some(MenuOutcome::Application(_)|MenuOutcome::Rename|MenuOutcome::Open|
+        MenuOutcome::Explore|MenuOutcome::Copy|MenuOutcome::Cut|MenuOutcome::Paste|MenuOutcome::Delete{..}));
+    if state.status.before_invoke&&!host_action{
         // Property sheets and similar command UI appear asynchronously; let
         // them become visible before deciding whether this process is idle.
         pump(150);
@@ -1088,14 +1128,14 @@ pub fn run_worker_if_requested()->Option<Result<()>>{
         for invalid in [vec![],vec![1,0,0,0],vec![4,0,1],vec![0,0,9],vec![0;65537]]{assert!(!valid_pidl(&invalid));}
     }
     #[test]fn menu_protocol_rejects_unbounded_or_path_like_sessions(){
-        let mut request=Request{token:"request-1".into(),session:"session-1".into(),ordinal:1,parent:1,parent_created:1,owner:1,
+        let mut request=Request{english:None,token:"request-1".into(),session:"session-1".into(),ordinal:1,parent:1,parent_created:1,owner:1,
             point:[0,0],pidls:vec![vec![0,0]],folder:None,options:Default::default(),rename:false,open:false,file_actions:false,mode:Mode::More,extended:false,layout:None,view_context:None,probe:None};
         assert!(validate(&request).is_ok());
         for value in ["",r"..\escape","bad/session","bad\0session"]{request.session=value.into();assert!(validate(&request).is_err());}
         request.session="session-1".into();for ordinal in [0,MAX_SESSION_REQUESTS+1]{request.ordinal=ordinal;assert!(validate(&request).is_err());}
     }
     #[test]fn filesystem_action_interception_is_opt_in_on_the_wire()->Result<()>{
-        let request=Request{token:"request-1".into(),session:"session-1".into(),ordinal:1,parent:1,parent_created:1,owner:1,
+        let request=Request{english:None,token:"request-1".into(),session:"session-1".into(),ordinal:1,parent:1,parent_created:1,owner:1,
             point:[0,0],pidls:Vec::new(),folder:Some(PathBuf::from(r"E:\destination")),options:Default::default(),rename:false,open:false,
             file_actions:true,mode:Mode::Paste,extended:false,layout:None,view_context:None,probe:None};
         ensure!(validate(&request).is_ok(),"background paste target rejected");

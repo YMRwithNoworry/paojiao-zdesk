@@ -278,6 +278,8 @@ pub(crate) fn public_menu_timings()->(u64,u64){(PUBLIC_BIND_MICROS.with(Cell::ge
 /// retain Shell command identities while hiding the selected functions.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ContextMenuOptions {
+    #[serde(default)]
+    pub quick_first:bool,
     pub modern: bool,
     #[serde(default)]
     pub drawn:bool,
@@ -288,7 +290,7 @@ pub struct ContextMenuOptions {
     pub show_wps: bool,
 }
 impl Default for ContextMenuOptions {
-    fn default() -> Self { Self { modern: true,drawn:false, hidden_verbs: Vec::new(), shown_verbs:Vec::new(), show_seven_zip: true, show_wps: true } }
+    fn default() -> Self { Self { quick_first:false,modern: true,drawn:false, hidden_verbs: Vec::new(), shown_verbs:Vec::new(), show_seven_zip: true, show_wps: true } }
 }
 /// SHA-256 of the only `Windows.UI.FileExplorer.dll` build whose private
 /// presenter ABI `native/shell_menu.cpp` supports (`kExpectedMenuSha256`).
@@ -585,7 +587,7 @@ impl ShellMenu {
     pub fn populate_compact(&self,rename:bool,extended:bool)->Result<()> {
         if extended||!context_menu_options().modern{return self.populate(rename,extended);}
         self.optimized.set(Some(rename));self.extended.set(false);
-        let flags=(if self.background{CMF_NODEFAULT}else{CMF_ITEMMENU})|CMF_EXPLORE|CMF_OPTIMIZEFORINVOKE|if rename{CMF_CANRENAME}else{CMF_NORMAL};
+        let flags=(if self.background{CMF_NODEFAULT}else{CMF_ITEMMENU})|CMF_EXPLORE|CMF_ASYNCVERBSTATE|CMF_OPTIMIZEFORINVOKE|if rename{CMF_CANRENAME}else{CMF_NORMAL};
         unsafe{self.menu.QueryContextMenu(self.hmenu,0,SHELL_FIRST,SHELL_LAST,flags)}.ok()
     }
     fn ensure_classic(&self)->Result<()> {
@@ -854,6 +856,10 @@ fn canonical_verb(context: &IContextMenu, id: u32) -> Option<String> {
     unsafe { context.GetCommandString((id - SHELL_FIRST) as usize, GCS_VERBW, None, PSTR(buffer.as_mut_ptr().cast()), buffer.len() as u32) }.ok()?;
     let end = buffer.iter().position(|&c| c == 0)?;
     if end==0{return None;}String::from_utf16(&buffer[..end]).ok()
+}
+
+pub fn common_command_visible(options:&ContextMenuOptions,verb:&str,label:&str)->bool{
+    !should_hide(Some(verb),label,options)
 }
 
 /// Hides the preference-controlled entries of a context menu's top level.
@@ -1255,18 +1261,24 @@ unsafe fn ui_object<T: Interface>(parent: &IShellFolder, owner: HWND, children: 
 /// Sibling UI objects, or a complete cross-folder IDataObject for drag and drop.
 pub fn items_ui_object<T: Interface>(owner: HWND, pidls: &[Vec<u8>]) -> Result<T> {
     let offsets = item_offsets(pidls)?;
+    let bind_data_object=||{
+        let pointers:Vec<_>=pidls.iter().map(|pidl|pidl.as_ptr().cast()).collect();
+        let array=unsafe{SHCreateShellItemArrayFromIDLists(&pointers)?};
+        unsafe{array.BindToHandler(None,&BHID_DataObject)}
+    };
     if !same_item_parent(pidls, &offsets) {
         if T::IID == IDataObject::IID {
-            let pointers: Vec<_> = pidls.iter().map(|pidl| pidl.as_ptr().cast()).collect();
-            let array = unsafe { SHCreateShellItemArrayFromIDLists(&pointers)? };
-            return unsafe { array.BindToHandler(None, &BHID_DataObject) };
+            return bind_data_object();
         }
         return Err(windows::core::Error::from_hresult(windows::core::HRESULT(0x80004002u32 as i32)));
     }
     let first = &pidls[0];
     let parent: IShellFolder = unsafe { SHBindToParent(first.as_ptr().cast(), None)? };
     let children: Vec<*const ITEMIDLIST> = pidls.iter().zip(offsets).map(|(pidl, offset)| unsafe { pidl.as_ptr().add(offset).cast() }).collect();
-    unsafe { ui_object(&parent, owner, &children) }
+    match unsafe{ui_object(&parent,owner,&children)}{
+        Err(err) if T::IID==IDataObject::IID && matches!(err.code().0 as u32,0x80004002|0x80004001)=>bind_data_object(),
+        result=>result,
+    }
 }
 
 fn last_item_offset(pidl: &[u8]) -> Option<usize> {

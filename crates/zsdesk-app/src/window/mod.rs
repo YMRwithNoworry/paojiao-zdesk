@@ -26,7 +26,7 @@ pub(crate) mod picker;
 mod global_search;
 mod search_panel;
 mod integrated_search;
-mod startup_settings;
+pub(crate) mod startup_settings;
 mod context_menu;
 mod context_manager;
 #[cfg(test)]mod context_menu_regression;
@@ -434,6 +434,7 @@ struct WindowState {
     hover_crumb: Option<CrumbPart>,
     pressed: Option<Hit>,
     tracking_mouse: bool,
+    right_tab_press: Option<(u64,POINT)>,
     tab_drag: Option<TabDrag>,
     bookmark_drag:Option<BookmarkDrag>,
     splitter_drag: Option<(i32, i32)>,
@@ -496,7 +497,7 @@ impl WindowState {
             tooltip: HWND::default(), tooltip_text: vec![0], font: HFONT::default(), gfx: None, surface: None,
             palette: Palette::light(), dark: false, mica: false, active: true, layout: ChromeLayout::default(),
             crumbs: Vec::new(), crumb_slots: Vec::new(), crumbs_for: None, address_editing: false, open_chevron: None,
-            hover: Hit::None, hover_crumb: None, pressed: None, tracking_mouse: false, tab_drag: None,bookmark_drag:None, splitter_drag: None,bookmark_resize:None,
+            hover: Hit::None, hover_crumb: None, pressed: None, tracking_mouse: false, right_tab_press:None, tab_drag: None,bookmark_drag:None, splitter_drag: None,bookmark_resize:None,
             side_tab_resize:None,side_tab_scroll_drag:None,side_tab_first:None,side_tab_wheel:0,
             icons: HashMap::new(), view_status: ViewStatus::default(), view_mode: (0, 0), bookmark_widths: Vec::new(),bookmark_order:Vec::new(),
             drop_registration: None, drop_zones: Rc::new(Cell::new(DropZones::default())), last_focus: HWND::default(),
@@ -702,7 +703,12 @@ impl WindowState {
         }
         // Keep native panes at their normal dimensions while the main window
         // is iconic; a zero-sized Shell view can retain stale layout on restore.
-        if unsafe { IsIconic(self.hwnd) }.as_bool() { return; }
+        if unsafe { IsIconic(self.hwnd) }.as_bool() {
+            self.surface=None;
+            self.icons.clear();
+            if let Some(gfx)=&self.gfx{gfx.release_device_resources();}
+            return;
+        }
         self.relayout();
         self.position_children();
     }
@@ -1067,7 +1073,8 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
     track_caption_buttons(hwnd, msg, wp);
     // DWM draws and hit-tests the caption buttons in the extended frame.
     let mut dwm_result = LRESULT(0);
-    if !caption_message && unsafe { DwmDefWindowProc(hwnd, msg, wp, lp, &mut dwm_result) }.as_bool() {
+    let strip_right_button=wp.0 as u32==HTCAPTION && matches!(msg,WM_NCRBUTTONDOWN|WM_NCRBUTTONDBLCLK|WM_NCRBUTTONUP);
+    if !caption_message && !strip_right_button && unsafe { DwmDefWindowProc(hwnd, msg, wp, lp, &mut dwm_result) }.as_bool() {
         return dwm_result;
     }
     match msg {
@@ -1238,6 +1245,7 @@ fn track_caption_buttons(hwnd: HWND, msg: u32, wp: WPARAM) {
 /// Messages that arrive while a modal loop holds the state.
 unsafe fn reentrant(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
+        crate::language::CHANGED=>{defer_message(hwnd,msg,wp,lp);LRESULT(0)},
         WM_SETCURSOR if (lp.0 & 0xFFFF) as u32 == HTCLIENT && !text_input_window(HWND(wp.0 as *mut _)) => {
             if let Ok(cursor)=unsafe{LoadCursorW(None,IDC_ARROW)} {unsafe{SetCursor(Some(cursor));}}
             LRESULT(1)
@@ -1358,6 +1366,7 @@ impl WindowState {
             WM_EXITSIZEMOVE => { self.remember_placement(); self.save(); unsafe { self.resize(); } }
             WM_LAYOUT => unsafe { self.resize() },
             WM_ACTIVATE => {
+                if wp.0&0xffff==0{self.right_tab_press=None;}
                 let activation = (wp.0 & 0xFFFF) as u32;
                 let active = activation != WA_INACTIVE;
                 if !active {
@@ -1407,13 +1416,23 @@ impl WindowState {
             WM_LBUTTONUP => self.mouse_up(point()),
             WM_LBUTTONDBLCLK => self.double_click(point()),
             WM_MBUTTONUP => self.middle_click(point()),
-            WM_RBUTTONUP => self.right_click(point()),
+            WM_RBUTTONDOWN | WM_RBUTTONDBLCLK => {
+                if !self.top_tab_right_button(point(),true){return None;}
+            }
+            WM_RBUTTONUP => {
+                if !self.top_tab_right_button(point(),false){self.right_click(point());}
+            }
+            WM_NCRBUTTONDOWN | WM_NCRBUTTONDBLCLK | WM_NCRBUTTONUP if wp.0 as u32==HTCAPTION => {
+                let mut p=point();
+                if !unsafe{ScreenToClient(self.hwnd,&mut p)}.as_bool() || !self.top_tab_right_button(p,msg!=WM_NCRBUTTONUP){return None;}
+            }
             WM_CANCELMODE => {
+                self.right_tab_press=None;
                 self.tab_drag = None;self.bookmark_drag=None; self.splitter_drag = None; self.bookmark_resize=None;self.pane_splitter_drag=None;self.side_tab_resize=None;self.side_tab_scroll_drag=None; self.pressed = None;
                 if unsafe { GetCapture() } == self.hwnd { let _ = unsafe { ReleaseCapture() }; }
                 self.set_hover(Hit::None, None); self.invalidate();
             }
-            WM_CAPTURECHANGED => { self.tab_drag = None;self.bookmark_drag=None; self.splitter_drag = None; self.bookmark_resize=None;self.pane_splitter_drag=None;self.side_tab_resize=None;self.side_tab_scroll_drag=None; self.pressed = None; self.invalidate(); }
+            WM_CAPTURECHANGED => { self.right_tab_press=None;self.tab_drag = None;self.bookmark_drag=None; self.splitter_drag = None; self.bookmark_resize=None;self.pane_splitter_drag=None;self.side_tab_resize=None;self.side_tab_scroll_drag=None; self.pressed = None; self.invalidate(); }
             WM_SETCURSOR => {
                 if (lp.0 & 0xFFFF) as u32 == HTCLIENT {
                     let mut p = POINT::default();
@@ -1471,6 +1490,11 @@ impl WindowState {
             WM_OPEN_REQUEST => if lp.0 != 0 { unsafe { self.open_requested(*Box::from_raw(lp.0 as *mut crate::instance::OpenRequest)); } },
             WM_FAST_SEARCH => self.poll_pane_searches(),
             WM_DIAGNOSTIC=>if lp.0!=0{let request=unsafe{Box::from_raw(lp.0 as *mut crate::instance::DiagnosticRequest)};let _=self.write_diagnostics(&request);},
+            crate::language::CHANGED=>{
+                if let Ok(saved)=storage::load(&self.config_path){self.session.ui.language=saved.ui.language;}
+                self.crumbs_for=None;self.measure_bookmarks();self.relayout();self.position_children();
+                unsafe{self.update_address();}self.refresh_status();self.invalidate();
+            },
             WM_TAB_EMPHASIS_CHANGED=>if let Ok(saved)=storage::load(&self.config_path){
                 if self.session.ui.tab_selection_emphasis!=saved.ui.tab_selection_emphasis{
                     self.session.ui.tab_selection_emphasis=saved.ui.tab_selection_emphasis;self.invalidate();

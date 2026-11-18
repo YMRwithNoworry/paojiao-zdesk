@@ -13,6 +13,7 @@ param(
     [string]$RuntimeDir,
     [string]$EverythingDir = $env:ZSDESK_EVERYTHING_DIR,
     [string]$InnoCompiler,
+    [string]$ListaryBuildRoot,
     [switch]$SkipBuild,
     [string]$BinaryPath
 )
@@ -133,6 +134,14 @@ function Assert-Payload([string]$Directory,$Manifest) {
 }
 
 try {
+    if (@($Editions | Where-Object { $_ -ne 'desktop-box' }).Count) {
+        if (-not $ListaryBuildRoot) { $ListaryBuildRoot=Join-Path $WorkDir 'listary-build' }
+        $ListaryBuildRoot=[IO.Path]::GetFullPath($ListaryBuildRoot)
+        $project=Join-Path $root 'native\listary\Listary.FileAppPlugin.ZSDesk.csproj'
+        & dotnet build $project --configuration Release "-p:ZSDeskBuildRoot=$ListaryBuildRoot" '-p:RestoreLockedMode=true' '-p:DebugType=None'
+        if ($LASTEXITCODE) { throw 'Listary folder provider build failed' }
+        $pluginOutput=Join-Path $ListaryBuildRoot 'Listary.FileAppPlugin.ZSDesk\bin\Release\net48'
+    }
     foreach ($edition in $Editions) {
         $definition=$definitions[$edition]
         $name="ZSDesk-$version-$edition-x64"
@@ -169,6 +178,12 @@ try {
         if (-not $definition.DesktopOnly) {
             $listaryStage=Join-Path $stage 'integrations\listary'
             [IO.Directory]::CreateDirectory($listaryStage) | Out-Null
+            $provider=Join-Path $listaryStage 'FileAppPlugins\ZSDesk'
+            [IO.Directory]::CreateDirectory($provider) | Out-Null
+            # The file manager host supplies the FileAppPlugin contract.
+            foreach ($file in @('Listary.FileAppPlugin.ZSDesk.dll','ListaryPluginManifest.json','Icon.png')) {
+                Copy-Item -LiteralPath (Join-Path $pluginOutput $file) -Destination $provider
+            }
             Copy-Item -LiteralPath (Join-Path $root 'native\listary\Prepare-Listary7.ps1') -Destination (Join-Path $listaryStage 'Prepare-Listary7.ps1')
             Copy-Item -LiteralPath (Join-Path $root 'native\listary\README.md') -Destination (Join-Path $listaryStage 'README.md')
         }
@@ -206,11 +221,11 @@ try {
             'Everything 快速全盘索引需要兼容服务或管理员权限；未配置可用索引时会显示设置提示。',
             'Everything 版权与完整许可位于 engines\everything\License.txt。')
         }
-        $readme+=@('portable.flag 使用程序旁 data 目录；--profile-dir 指定独立配置。','安装包与便携包不包含用户路径、桌面布局、搜索索引或系统接管记录。','源码与许可证：https://github.com/qiu7824/zsdesk')
+        $readme+=@('配置目录菜单可为下次普通启动指定位置，空目录从初始设置开始。','portable.flag 使用程序旁 data 目录；--profile-dir 指定独立配置。','安装包与便携包不包含用户路径、桌面布局、搜索索引或系统接管记录。','源码与许可证：https://github.com/qiu7824/zsdesk')
         $readme -join "`r`n" | Set-Content -LiteralPath (Join-Path $stage '说明.txt') -Encoding utf8BOM
         $english=@("ZSDesk $version ($edition) — Windows x64",'',
             'Language: non-Chinese Windows systems use English by default.',
-            'File manager: menu → Interface settings → Language. Restart ZSDesk after changing the language.',
+            'File manager: menu → Language. Application text switches immediately.',
             'File names and Windows Shell labels retain their original language.',
             'Run ZSDesk.exe. Ctrl+F searches files; Alt+P toggles the preview pane; Space opens quick preview.',
             'Network share searches stay within the selected UNC folder or existing mapped network folder.',
