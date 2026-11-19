@@ -4,7 +4,7 @@ Windows 多标签文件管理器与桌面格子。可以在一个窗口里浏览
 
 [下载安装](https://github.com/qiu7824/zsdesk/releases/latest) · [使用说明](docs/user-guide.md) · [更新日志](CHANGELOG.md) · [问题反馈](https://github.com/qiu7824/zsdesk/issues)
 
-适用于 Windows 10 / 11，64 位。当前版本为 **0.3.18**，支持简体中文和英文界面。
+适用于 Windows 10 / 11，64 位。当前版本为 **0.4.0**，支持简体中文和英文界面。
 
 English UI is available. Non-Chinese Windows systems use English by default. Choose **≡ → Language → English** to change the application language immediately. Each package includes `README.en.txt`.
 
@@ -50,6 +50,11 @@ English UI is available. Non-Chinese Windows systems use English by default. Cho
 - **预览**：内置预览与 QuickLook 可选择。Office 文档预览需要相应的已安装组件；图片、音视频格式取决于系统解码器。
 - **右键**：Windows 10 使用经典系统菜单；Windows 11 按系统能力选择已验证的原生呈现或公共 Shell 命令兼容呈现。Shift 右键可直接使用经典菜单。
 - **Listary**：安装和连接方式见[详细使用说明](docs/user-guide.md)及 `integrations/listary`。
+
+## 0.4.0 更新
+
+- 安装首页可展开“选择安装位置”，分别选择登录 Windows 时打开文件管理主窗口或启动桌面格子。各版本仅显示支持的选项，新装默认关闭，升级保留原设置。
+- Windows 10 的“此电脑”恢复系统常用文件夹，左侧按根节点分组并提供“库”入口。文件视图使用系统状态栏显示项目数、选中数和视图切换按钮。
 
 ## 0.3.18 更新
 

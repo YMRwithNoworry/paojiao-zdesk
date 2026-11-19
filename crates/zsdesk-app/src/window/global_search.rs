@@ -372,7 +372,8 @@ impl WindowState{
             self.restore_fast_selection();
             self.search_progress=Some(progress_text(&event,self.fast_found));
             self.record_search_progress(&event);
-            self.refresh_status();self.relayout();self.position_children();self.invalidate_rect(self.layout.status);
+            self.refresh_status();self.relayout();self.position_children();
+            self.invalidate_rect(if self.layout.status.is_empty() { self.layout.command_row } else { self.layout.status });
         }
         // Drain small batches after yielding to keyboard, painting and menus.
         if !self.fast_events.is_empty(){post(self.hwnd,WM_FAST_SEARCH,0,0);}

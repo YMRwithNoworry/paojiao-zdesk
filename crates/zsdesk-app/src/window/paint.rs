@@ -401,12 +401,15 @@ impl WindowState {
         let folder_progress=self.folder_sizes.progress();
         if l.status.is_empty() {
             // Transient messages sit at the right end of the command bar.
-            if self.status.is_empty()&&folder_progress.is_none() || l.command_row.is_empty() { return; }
+            let message = if self.status.is_empty() {
+                self.search_progress.as_deref().or(folder_progress.as_deref()).unwrap_or("")
+            } else { &self.status };
+            if message.is_empty() || l.command_row.is_empty() { return; }
             let row = rf(l.command_row);
             let panes = [CommandId::PreviewPane, CommandId::DetailsPane];
             let left = l.commands.iter().filter(|(id, _)| !panes.contains(id)).map(|(_, r)| r.right()).max().unwrap_or(0) as f32 + self.sf(16.0);
             let right = l.commands.iter().filter(|(id, _)| panes.contains(id)).map(|(_, r)| r.x).min().map_or(row.right() - self.sf(12.0), |x| x as f32 - self.sf(12.0));
-            cv.text(if self.status.is_empty(){folder_progress.as_deref().unwrap_or("")}else{&self.status}, RectF::new(left, row.y, (right - left).max(0.0), row.h), &self.ui_style().align(Align::End),
+            cv.text(message, RectF::new(left, row.y, (right - left).max(0.0), row.h), &self.ui_style().align(Align::End),
                 c(if status_is_error(&self.status) { p.danger } else { p.text_secondary }));
             return;
         }

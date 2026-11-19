@@ -41,8 +41,10 @@ fn stale_startup_for_profile(current:&str,expected:&str)->bool{
         &&old_exe.try_exists().is_ok_and(|exists|!exists)
 }
 pub fn startup_enabled(config: &std::path::Path) -> anyhow::Result<bool> {
-    let executable = std::env::current_exe()?;
-    let expected = host::fence_startup_command(&executable, config)
+    startup_enabled_for(config, &std::env::current_exe()?)
+}
+pub(crate) fn startup_enabled_for(config:&std::path::Path, executable:&std::path::Path) -> anyhow::Result<bool> {
+    let expected = host::fence_startup_command(executable, config)
         .ok_or_else(|| anyhow::anyhow!("{}", zsdesk_core::tr_format!("无法确定桌面格子的程序和配置目录")))?;
     for name in [startup_value(config),crate::edition::desktop_startup_value().into()]{
         if zsdesk_windows::desktop::autostart_command(&name)?.as_deref().is_some_and(|current|zsdesk_windows::desktop::autostart_owned(current,&expected)){return Ok(true);}

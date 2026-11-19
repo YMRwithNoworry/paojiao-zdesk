@@ -783,10 +783,12 @@ impl IExplorerPaneVisibility_Impl for BrowserSite_Impl {
         let panes = self.panes.get();
         let on = (EPS_DEFAULT_ON.0 | EPS_FORCE.0) as u32;
         let off = (EPS_DEFAULT_OFF.0 | EPS_FORCE.0) as u32;
-        // ZSDesk draws its own navigation tree, command bar and status bar.
+        if pane == EP_StatusBar {
+            return Ok(if crate::theme::windows10_shell(crate::theme::os_build()) { on } else { off });
+        }
         if pane == EP_PreviewPane { Ok(if panes.preview { on } else { off }) }
         else if pane == EP_DetailsPane { Ok(if panes.details { on } else { off }) }
-        else if [EP_NavPane, EP_StatusBar, EP_Commands, EP_Ribbon].contains(&pane) { Ok(off) }
+        else if [EP_NavPane, EP_Commands, EP_Ribbon].contains(&pane) { Ok(off) }
         else { Ok(EPS_DONTCARE.0 as u32) }
     }
 }
@@ -833,8 +835,8 @@ impl ICommDlgBrowser_Impl for BrowserSite_Impl {
         Ok(())
     }
     fn IncludeObject(&self,view:Ref<IShellView>,child:*const windows::Win32::UI::Shell::Common::ITEMIDLIST)->Result<()>{
-        // This PC shows drives, devices and network locations, like Windows 11;
-        // the user's folders are in Quick access.
+        // Windows 11 keeps user folders in Quick access. Windows 10 enumerates
+        // them in the native Folders group above Devices and drives.
         if child.is_null(){return Ok(());}
         use windows::Win32::UI::Shell::{IFolderView,IShellFolder,IShellItem,SHCreateItemWithParent};
         let item=view.as_ref().and_then(|view|view.cast::<IFolderView>().ok())
@@ -896,7 +898,7 @@ impl IExplorerBrowserEvents_Impl for BrowserEvents_Impl {
             if generation==self.theme_generation.get()&&self.navigation_pending.get(){view_background::install_pending(&view,self.background.clone());}
         }}
         // Decided before the new view is created and asks for its view flags.
-        let this_pc=!pidl_folder.is_null()&&unsafe{windows::Win32::UI::Shell::SHCreateItemFromIDList::<windows::Win32::UI::Shell::IShellItem>(pidl_folder)}
+        let this_pc=!crate::theme::windows10_shell(crate::theme::os_build()) && !pidl_folder.is_null()&&unsafe{windows::Win32::UI::Shell::SHCreateItemFromIDList::<windows::Win32::UI::Shell::IShellItem>(pidl_folder)}
             .is_ok_and(|folder|super::shell_item::is_this_pc_item(&folder));
         self.this_pc.set(this_pc);
         Ok(())

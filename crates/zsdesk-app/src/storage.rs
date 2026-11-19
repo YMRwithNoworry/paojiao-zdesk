@@ -16,8 +16,13 @@ fn profile_home()->PathBuf{
     dirs::config_dir().unwrap_or_else(||PathBuf::from(".")).join(crate::edition::profile_name())
 }
 fn portable_dir()->Option<PathBuf>{
-    std::env::current_exe().ok().and_then(|exe|exe.parent().map(Path::to_path_buf))
-        .filter(|dir|dir.join("portable.flag").is_file()).map(|dir|dir.join("data"))
+    std::env::current_exe().ok().and_then(|exe|exe.parent().and_then(portable_dir_at))
+}
+fn portable_dir_at(dir:&Path)->Option<PathBuf>{
+    dir.join("portable.flag").is_file().then(||dir.join("data"))
+}
+pub(crate) fn profile_for_install_dir(dir:&Path)->PathBuf{
+    default_profile(&profile_home(),portable_dir_at(dir))
 }
 fn default_profile(home:&Path,portable:Option<PathBuf>)->PathBuf{
     let dir=portable.unwrap_or_else(||{

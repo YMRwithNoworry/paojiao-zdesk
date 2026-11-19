@@ -28,6 +28,7 @@ mod folder_dde;
 mod runtime;
 mod explorer_tray;
 mod update_shutdown;
+mod installer_startup;
 mod context_menu_process;
 mod utility_panel;
 mod update_check;
@@ -55,6 +56,12 @@ impl Drop for ApplicationLifetime {
 }
 
 fn main() {
+    if let Some(result) = installer_startup::run() {
+        match result {
+            Ok(code) => std::process::exit(code),
+            Err(error) => { eprintln!("{error:#}"); std::process::exit(1); }
+        }
+    }
     language::initialize_environment();
     if let Some(result)=update_shutdown::run_if_requested(){if let Err(error)=result{eprintln!("{error:#}");std::process::exit(1);}return;}
     if let Some(result)=zsdesk_windows::shell::icons::maybe_handle_icon_worker(&std::env::args_os().skip(1).collect::<Vec<_>>()){

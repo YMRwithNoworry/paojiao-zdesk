@@ -39,7 +39,7 @@ use windows::{
                 NTSCS2_NOSINGLETONAUTOEXPAND,
                 SHCONTF_FOLDERS, SHCONTF_NAVIGATION_ENUM, SHFILEINFOW, SHGFI_OPENICON, SHGFI_PIDL, SHGFI_SMALLICON, SHGFI_SYSICONINDEX,
                 FOLDERID_Desktop, FOLDERID_Downloads, FOLDERID_Documents, FOLDERID_Pictures,
-                FOLDERID_Music, FOLDERID_Videos, FOLDERID_RecycleBinFolder, FOLDERID_NetworkFolder,
+                FOLDERID_Music, FOLDERID_Videos, FOLDERID_RecycleBinFolder, FOLDERID_NetworkFolder, FOLDERID_Libraries,
                 KF_FLAG_DEFAULT,
             },
             WindowsAndMessaging::{EnumChildWindows, FindWindowExW, GetClassNameW, GetWindowRect, MoveWindow,
@@ -154,8 +154,7 @@ impl NamespaceTreeHost {
             // A bare namespace control has no root separation by default.
             // Ask the Shell to supply its own group padding instead of adding
             // application-owned blank rows or pixel offsets between roots.
-            let mut styles = NSTCS2_INTERRUPTNOTIFICATIONS | NTSCS2_NOSINGLETONAUTOEXPAND;
-            if crate::theme::os_build() >= 22000 { styles |= NSTCS2_DISPLAYPADDING; }
+            let styles = NSTCS2_INTERRUPTNOTIFICATIONS | NTSCS2_NOSINGLETONAUTOEXPAND | NSTCS2_DISPLAYPADDING;
             let _ = unsafe { extended.SetControlStyle2(styles, styles) };
         }
 
@@ -171,7 +170,8 @@ impl NamespaceTreeHost {
             // shows drives only; keep its pinned folders visible at startup.
             unsafe { tree.AppendRoot(&item, enum_flags, (NSTCRS_VISIBLE.0 | NSTCRS_EXPANDED.0) as u32, &filter) }.is_ok()
         });
-        if !quick_access_added {
+        let windows10 = crate::theme::windows10_shell(crate::theme::os_build());
+        if !quick_access_added && !windows10 {
             for folder in [&FOLDERID_Desktop, &FOLDERID_Downloads, &FOLDERID_Documents,
                 &FOLDERID_Pictures, &FOLDERID_Music, &FOLDERID_Videos] {
                 if let Ok(item) = unsafe { SHGetKnownFolderItem::<IShellItem>(folder, KF_FLAG_DEFAULT, None) } {
@@ -183,6 +183,11 @@ impl NamespaceTreeHost {
         let this_pc_style=options.expand_this_pc.map_or_else(||root_style(InitialRoot::ThisPc,initial),|expanded|
             (NSTCRS_VISIBLE.0 | if expanded{NSTCRS_EXPANDED.0}else{0})as u32);
         unsafe { tree.AppendRoot(&this_pc, enum_flags, this_pc_style, &filter)?; }
+        if windows10 {
+            if let Ok(libraries) = unsafe { SHGetKnownFolderItem::<IShellItem>(&FOLDERID_Libraries, KF_FLAG_DEFAULT, None) } {
+                let _ = unsafe { tree.AppendRoot(&libraries, enum_flags, NSTCRS_VISIBLE.0 as u32, None) };
+            }
+        }
         for (folder,visible) in [(&FOLDERID_RecycleBinFolder,options.show_recycle_bin),(&FOLDERID_NetworkFolder,options.show_network)] {
             if !visible{continue;}
             if let Ok(item) = unsafe { SHGetKnownFolderItem::<IShellItem>(folder, KF_FLAG_DEFAULT, None) } {
@@ -584,8 +589,8 @@ impl IShellItemFilter_Impl for FolderFilter_Impl {
     fn IncludeItem(&self, item: Ref<IShellItem>) -> Result<()> {
         let Some(item) = item.as_ref() else { return Err(Error::from_hresult(S_FALSE)) };
         let stream=unsafe { item.GetAttributes(SFGAO_STREAM) }.is_ok_and(|attrs|attrs.0 & SFGAO_STREAM.0 != 0);
-        // Quick access already lists the user's folders; This PC keeps its drives.
-        if stream || super::shell_item::hidden_in_this_pc(item) { Err(Error::from_hresult(S_FALSE)) } else { Ok(()) }
+        let drive_only = !crate::theme::windows10_shell(crate::theme::os_build());
+        if stream || (drive_only && super::shell_item::hidden_in_this_pc(item)) { Err(Error::from_hresult(S_FALSE)) } else { Ok(()) }
     }
     fn GetEnumFlagsForItem(&self, _item: Ref<IShellItem>) -> Result<u32> { Ok(navigation_enum_flags()) }
 }
@@ -902,8 +907,7 @@ mod tests {
             assert!(actual_metrics[0]>=scale(24,unsafe{GetDpiForWindow(actual)})as isize,"Windows 11 reverted to bare TreeView density");
         }
         let padding=unsafe{host.tree.cast::<INameSpaceTreeControl2>()?.GetControlStyle2(NSTCS2_DISPLAYPADDING)?};
-        if crate::theme::os_build()>=22000 {assert_eq!(padding,NSTCS2_DISPLAYPADDING,"Shell root separation was not enabled");}
-        else {assert_eq!(padding,unsafe{native.cast::<INameSpaceTreeControl2>()?.GetControlStyle2(NSTCS2_DISPLAYPADDING)?},"legacy Shell root padding was changed");}
+        assert_eq!(padding,NSTCS2_DISPLAYPADDING,"Shell root separation was not enabled");
         for dark in [false,true,false] {
             crate::theme::theme_control(raw,dark);crate::theme::theme_control(baseline,dark);
             host.apply_theme(dark,0xffffff,0);unsafe{host.resize(rect);}

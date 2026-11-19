@@ -437,10 +437,12 @@ impl ChromeLayout {
         let status_h = if input.status_bar { s(STATUS_H) } else { 0 };
         let status_y = (height - status_h).max(layout.top);
         layout.status = Rect::clamped(0, status_y, width, height - status_y);
-        let toggle = Rect::clamped(0, status_y + (status_h - s(22)) / 2, s(28), s(22));
-        layout.status_tiles = Rect { x: width - s(8) - toggle.width, ..toggle };
-        layout.status_details = Rect { x: layout.status_tiles.x - s(2) - toggle.width, ..toggle };
-        layout.status_dual_pane = Rect { x: layout.status_details.x - s(2) - toggle.width, ..toggle };
+        if input.status_bar {
+            let toggle = Rect::clamped(0, status_y + (status_h - s(22)) / 2, s(28), s(22));
+            layout.status_tiles = Rect { x: width - s(8) - toggle.width, ..toggle };
+            layout.status_details = Rect { x: layout.status_tiles.x - s(2) - toggle.width, ..toggle };
+            layout.status_dual_pane = Rect { x: layout.status_details.x - s(2) - toggle.width, ..toggle };
+        }
         let content_h = (status_y - layout.top).max(0);
         if input.show_tree && width > s(MIN_TREE_W) * 2 {
             let tree_w = input.tree_width.clamp(s(MIN_TREE_W), (width / 2).max(s(MIN_TREE_W)));
@@ -657,6 +659,19 @@ mod tests {
         ChromeInput { tab_placement:zsdesk_core::model::explorer::TabPlacement::Top, side_tabs_width:210,side_tabs_compact:true,width, height: 800, dpi, caption_width: scale(138, dpi), caption_button: None,
             tab_count: tabs, active_tab: active, show_tab_list:true, show_tree: true, tree_width: scale(220, dpi), show_bookmarks: true,bookmarks_on_right:false,bookmarks_width:scale(210,dpi),
             command_bar: &DEFAULT_COMMAND_BAR, status_bar: true, bookmark_widths: &[], search_panel_open: false }
+    }
+
+    #[test]
+    fn shell_owned_status_has_no_duplicate_buttons_or_hit_targets() {
+        for dpi in [96, 144, 192] {
+            let mut options = input(1200, 1, 0, dpi);
+            options.status_bar = false;
+            let layout = ChromeLayout::new(&options);
+            for area in [layout.status, layout.status_details, layout.status_tiles, layout.status_dual_pane] {
+                assert!(area.is_empty());
+            }
+            assert!(!matches!(layout.hit(1185, 799), Hit::Status | Hit::StatusDetails | Hit::StatusTiles | Hit::StatusDualPane));
+        }
     }
 
     #[test]fn bookmark_panel_resizes_without_covering_the_view_or_side_tabs(){

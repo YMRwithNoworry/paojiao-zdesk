@@ -165,7 +165,11 @@ pub mod main_window_startup {
     }
 
     pub fn enabled(profile: &Path) -> Result<bool> {
-        let expected = command(profile, &std::env::current_exe()?)?;
+        enabled_for(profile, &std::env::current_exe()?)
+    }
+
+    pub(crate) fn enabled_for(profile: &Path, executable: &Path) -> Result<bool> {
+        let expected = command(profile, executable)?;
         Ok(autostart_command(&value_name(profile))?.as_deref()
             .is_some_and(|current| autostart_owned(current, &expected)))
     }
