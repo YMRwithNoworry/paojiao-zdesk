@@ -55,7 +55,7 @@ fn parse(args: impl IntoIterator<Item=OsString>) -> Result<Options> {
         let quick = match arg.to_str() {
             Some("--quick-search") => Some(crate::quick_search::Action::Open),
             Some("--quick-search-settings") => Some(crate::quick_search::Action::Settings),
-            Some("--background") => Some(crate::quick_search::Action::Resident),
+            Some("--background"|"--window-background") => Some(crate::quick_search::Action::Resident),
             Some("--background-stop") => Some(crate::quick_search::Action::Stop),
             Some("--background-status") => Some(crate::quick_search::Action::Status),
             Some("--background-enable") => Some(crate::quick_search::Action::EnableAtLogin),
@@ -209,7 +209,7 @@ pub fn is_import_cli() -> bool {
         || arg == "--background-stop" || arg == "--background-status" || arg == "--background-enable" || arg == "--background-disable" || arg == "--integration-refresh" || arg=="--integration-enable")
 }
 
-pub fn is_background_mode() -> bool { std::env::args_os().any(|arg| arg == "--background") }
+pub fn is_background_mode() -> bool { std::env::args_os().any(|arg| arg == "--background" || arg=="--window-background") }
 pub fn is_win_e() -> bool {std::env::args_os().skip(1).any(|arg|arg=="--win-e")}
 
 pub fn open_original_explorer(target:OsString)->std::io::Result<()> {

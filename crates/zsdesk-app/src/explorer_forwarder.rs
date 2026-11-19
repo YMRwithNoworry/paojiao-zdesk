@@ -12,6 +12,70 @@ use visibility_guard::{Connection,Event,Lease};
 /// normal single-instance/runtime lifecycle.
 pub(crate) fn run_guard_if_requested()->Option<Result<()>>{visibility_guard::run_if_requested()}
 
+static SYSTEM_SELECTIONS:std::sync::Mutex<Vec<(PathBuf,Instant)>>=std::sync::Mutex::new(Vec::new());
+pub(crate) fn show_start_pin_target(pidls:&[Vec<u8>],completed:impl FnOnce(Result<()>)+Send+'static)->Result<()>{
+    ensure!(pidls.len()==1,"需要选中一个文件夹");
+    let paths=zsdesk_windows::shell::file_transfer::paths_from_pidls(pidls)?;
+    let path=paths.into_iter().next().context("固定目标已改变")?;
+    thread::Builder::new().name("zsdesk-start-folder".into()).spawn(move||completed(open_system_pin_folder(&path)))?;
+    Ok(())
+}
+fn open_system_pin_folder(path:&Path)->Result<()>{
+    use std::os::windows::ffi::OsStrExt;
+    use windows::{core::BSTR,Win32::{Foundation::VARIANT_TRUE,System::{Com::{CoAllowSetForegroundWindow,IDispatch},Variant::InitVariantFromBuffer},
+        UI::Shell::{ShellBrowserWindow,SVSI_SELECT,SVSI_FOCUSED,SVSI_ENSUREVISIBLE,SVSI_DESELECTOTHERS}}};
+    ensure!(path.is_dir(),"固定目标已改变");
+    let parent=path.parent().context("无法打开父目录")?;
+    let name=BSTR::from_wide(&path.file_name().context("固定目标已改变")?.encode_wide().collect::<Vec<_>>());
+    unsafe{CoInitializeEx(None,COINIT_APARTMENTTHREADED)}.ok()?;
+    let _apartment=Apartment;
+    let pidl=zsdesk_windows::shell::pidl::location_pidl(&zsdesk_core::model::explorer::ShellLocation::Path(parent.into())).context("目录标识无效")?;
+    let browser:IWebBrowser2=unsafe{CoCreateInstance(&ShellBrowserWindow,None,CLSCTX_LOCAL_SERVER)}?;
+    let _=unsafe{CoAllowSetForegroundWindow(&browser,None)};
+    // Open a dedicated system browser. The default folder/reveal registration
+    // can point straight back to this file manager.
+    let folder=unsafe{InitVariantFromBuffer(pidl.as_ptr().cast(),u32::try_from(pidl.len())?)}?;
+    let prepare=(||->Result<()>{
+        // The out-of-process Shell proxy requires valid pointers for the
+        // optional VARIANT arguments, including when their value is VT_EMPTY.
+        let empty=VARIANT::default();
+        unsafe{browser.Navigate2(&folder,Some(&empty),Some(&empty),Some(&empty),Some(&empty))}?;
+        let deadline=Instant::now()+Duration::from_secs(4);
+        loop{
+            if let Ok(view)=unsafe{browser.Document()}.and_then(|d|d.cast::<IShellFolderViewDual>()){
+                if let Ok(current)=unsafe{view.Folder()}.and_then(|f|f.cast::<Folder2>()){
+                    if unsafe{current.Self_().and_then(|i|i.Path())}.is_ok_and(|p|same_path(Path::new(&p.to_string()),parent)){
+                        let item=unsafe{current.ParseName(&name)}?;
+                        ensure!(same_path(Path::new(&unsafe{item.Path()}?.to_string()),path),"固定目标已改变");
+                        let item=VARIANT::from(item.cast::<IDispatch>()?);
+                        unsafe{view.SelectItem(&item,SVSI_SELECT.0|SVSI_FOCUSED.0|SVSI_ENSUREVISIBLE.0|SVSI_DESELECTOTHERS.0)}?;
+                        break;
+                    }
+                }
+            }
+            ensure!(Instant::now()<deadline,"系统资源管理器未能打开目标目录");
+            thread::sleep(Duration::from_millis(30));
+        }
+        Ok(())
+    })();
+    if let Err(error)=prepare{let _=unsafe{browser.Quit()};return Err(error);}
+    {
+        let mut selections=SYSTEM_SELECTIONS.lock().unwrap_or_else(|e|e.into_inner());
+        selections.retain(|(_,at)|at.elapsed()<Duration::from_secs(10));
+        if selections.len()>=8{selections.remove(0);}
+        selections.push((path.to_owned(),Instant::now()));
+    }
+    if let Err(error)=unsafe{browser.SetVisible(VARIANT_TRUE)}{let _=unsafe{browser.Quit()};return Err(error.into());}
+    Ok(())
+}
+fn explicit_system_selection(s:&Snapshot)->bool{
+    let mut selections=SYSTEM_SELECTIONS.lock().unwrap_or_else(|e|e.into_inner());
+    selections.retain(|(_,at)|at.elapsed()<Duration::from_secs(10));
+    if let Some(index)=selections.iter().position(|(path,_)|s.selected.len()==1&&same_path(&s.selected[0],path)){
+        selections.swap_remove(index);true
+    }else{false}
+}
+
 pub(crate) fn same_path(a:&Path,b:&Path)->bool{
     use std::os::windows::ffi::OsStrExt;
     let units=|p:&Path|p.as_os_str().encode_wide().map(|v|if v==47{92}else{v}).collect::<Vec<_>>();
@@ -39,11 +103,14 @@ impl Snapshot{
     fn equivalent(&self,other:&Self)->bool{self.window==other.window&&self.pid==other.pid&&self.this_pc==other.this_pc&&same_path(&self.folder,&other.folder)
         && self.selected.len()==other.selected.len()&&self.selected.iter().all(|a|other.selected.iter().any(|b|same_path(a,b)))}
 }
-struct Snapshots{views:Vec<Snapshot>,multiple:HashSet<isize>}
+struct Snapshots{views:Vec<Snapshot>,multiple:HashSet<isize>,recycle_bins:HashSet<isize>}
 fn read_snapshot(browser:&IWebBrowser2,window:HWND,pid:u32)->windows::core::Result<Snapshot>{
     let view=unsafe{browser.Document()?}.cast::<IShellFolderViewDual>()?;
     let folder=unsafe{view.Folder()?}.cast::<Folder2>()?;
     let folder=PathBuf::from(unsafe{folder.Self_()?.Path()?}.to_string());
+    if zsdesk_windows::shell::is_recycle_bin_name(&folder.to_string_lossy()){
+        return Ok(Snapshot{window,pid,folder,selected:Vec::new(),browser:browser.clone(),this_pc:false});
+    }
     let items=unsafe{view.SelectedItems()?};let count=unsafe{items.Count()?};
     if !(0..=128).contains(&count){return Err(windows::core::Error::from_hresult(windows::core::HRESULT(0x80070057u32 as i32)));}
     let mut selected=Vec::with_capacity(count as usize);
@@ -55,7 +122,7 @@ fn snapshots(shell:&IShellWindows)->Result<Snapshots>{
     snapshots_for(shell,None)
 }
 fn snapshots_for(shell:&IShellWindows,requested:Option<&HashSet<isize>>)->Result<Snapshots>{
-    let mut result=Vec::new();let mut counts=HashMap::new();
+    let mut result=Vec::new();let mut counts=HashMap::new();let mut recycle_bins=HashSet::new();
     for index in 0..unsafe{shell.Count()?}.clamp(0,128){
         let Ok(dispatch)=(unsafe{shell.Item(&VARIANT::from(index))})else{continue;};
         let Ok(browser)=dispatch.cast::<IWebBrowser2>()else{continue;};
@@ -68,10 +135,13 @@ fn snapshots_for(shell:&IShellWindows,requested:Option<&HashSet<isize>>)->Result
         if !unsafe{browser.FullName()}.is_ok_and(|name|same_path(Path::new(&name.to_string()),&expected)){continue;}
         let mut pid=0;unsafe{GetWindowThreadProcessId(window,Some(&mut pid));}if pid==0{continue;}
         let snapshot=read_snapshot(&browser,window,pid);
-        if let Ok(snapshot)=snapshot{if (snapshot.this_pc&&snapshot.selected.is_empty())||(snapshot.folder.is_absolute()&&snapshot.selected.iter().all(|p|p.parent().is_some_and(|parent|same_path(parent,&snapshot.folder)))){result.push(snapshot);}}
+        if let Ok(snapshot)=snapshot{
+            if zsdesk_windows::shell::is_recycle_bin_name(&snapshot.folder.to_string_lossy()){recycle_bins.insert(window.0 as isize);}
+            else if (snapshot.this_pc&&snapshot.selected.is_empty())||(snapshot.folder.is_absolute()&&snapshot.selected.iter().all(|p|p.parent().is_some_and(|parent|same_path(parent,&snapshot.folder)))){result.push(snapshot);}
+        }
     }
     let multiple=counts.iter().filter_map(|(window,count)|(*count>1).then_some(*window)).collect();
-    result.retain(|snapshot|counts.get(&(snapshot.window.0 as isize))==Some(&1));Ok(Snapshots{views:result,multiple})
+    result.retain(|snapshot|counts.get(&(snapshot.window.0 as isize))==Some(&1));Ok(Snapshots{views:result,multiple,recycle_bins})
 }
 #[cfg(test)]fn windows(shell:&IShellWindows)->Result<Vec<Snapshot>>{Ok(snapshots(shell)?.views)}
 fn find_target(profile:&Path)->Option<HWND>{
@@ -167,6 +237,7 @@ fn update_candidate(profile:&Path,guard:&Connection,candidate:&mut Candidate,sna
         return Ok(());
     }
     ensure!(guard.active(&candidate.lease),"来源窗口隐藏租约已结束");
+    if explicit_system_selection(snapshot){guard.restore(candidate.lease.id);return Ok(());}
     ensure!(snapshot.pid==candidate.lease.identity.pid&&snapshot.window.0 as isize==candidate.lease.identity.window
         &&visibility_guard::matches_identity(&candidate.lease.identity),"来源窗口身份已改变");
     ensure!(unsafe{IsWindowEnabled(snapshot.window)}.as_bool()&&!visibility_guard::shift_down(),"来源窗口已中断接管");
@@ -264,6 +335,7 @@ impl Bridge{
                                     let mut cancel=Vec::new();
                                     for(id,candidate)in &mut candidates{
                                         if candidate.hidden&&!guard.active(&candidate.lease){continue;}
+                                        if batch.recycle_bins.contains(&candidate.lease.identity.window){cancel.push((*id,"Recycle Bin".to_owned()));continue;}
                                         if batch.multiple.contains(&candidate.lease.identity.window){cancel.push((*id,"多标签系统窗口保持独立".to_owned()));continue;}
                                         if let Some(snapshot)=batch.views.iter().find(|view|view.window.0 as isize==candidate.lease.identity.window){
                                             if let Err(error)=update_candidate(&profile,guard,candidate,snapshot){cancel.push((*id,format!("{error:#}")));}

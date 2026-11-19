@@ -17,7 +17,7 @@ pub(super) fn retiring_count()->usize{
 }
 pub(super) const READY:u32=super::protocol::Message::MenuReady as u32;
 #[derive(Clone)]
-pub(super) enum Target{Items{pidls:Vec<Vec<u8>>,key:Option<String>},Background{folder:Option<PathBuf>}}
+pub(super) enum Target{Items{pidls:Vec<Vec<u8>>,key:Option<String>},Background{folder:Option<PathBuf>,desktop:bool}}
 #[derive(Clone)]
 pub(super) struct Request{
     pub fence:u64,pub owner:isize,pub point:POINT,pub profile:PathBuf,pub items:Vec<MenuItemSpec>,pub target:Target,pub extended:bool,
@@ -212,8 +212,8 @@ fn legacy_probe(shared:&Shared,state:&WindowState,owner:HWND,request:&Request,ti
     let started=Instant::now();
     let shell=match &request.target{
         Target::Items{pidls,..}=>Some(ShellMenu::for_items(owner,pidls)?),
-        Target::Background{folder:Some(path)}=>{let folder=zsdesk_windows::desktop::folder_for_path(path)?;Some(ShellMenu::for_folder_background(owner,&folder)?)},
-        Target::Background{folder:None}=>None,
+        Target::Background{folder:Some(path),desktop}=>{let folder=if *desktop{unsafe{windows::Win32::UI::Shell::SHGetDesktopFolder()}?}else{zsdesk_windows::desktop::folder_for_path(path)?};Some(ShellMenu::for_folder_background(owner,&folder)?)},
+        Target::Background{folder:None,..}=>None,
     };
     timing.bind_microseconds=micros(started.elapsed());
     if let Some(menu)=&shell{
@@ -232,7 +232,7 @@ fn legacy_probe(shared:&Shared,state:&WindowState,owner:HWND,request:&Request,ti
     unsafe{let _=SetWindowPos(owner,None,request.point.x,request.point.y,0,0,SWP_NOZORDER|SWP_NOACTIVATE);let _=ShowWindow(owner,SW_SHOWNOACTIVATE);let _=SetForegroundWindow(owner);let _=SetActiveWindow(owner);let _=SetFocus(Some(owner));SetTimer(Some(owner),CANCEL_TIMER,100,None);}
     let result=match (&shell,&request.target){
         (Some(menu),Target::Items{pidls,key})=>menu.track_selected_before(owner,request.point,pidls,ids.len(),MenuInterceptions{rename:key.is_some(),open:pidls.len()==1&&key.is_some(),..Default::default()},&mut||validate(shared,request,true)),
-        (Some(menu),Target::Background{folder:Some(path)})=>menu.track_folder_background(owner,request.point,path,ids.len(),&mut||validate(shared,request,true)),
+        (Some(menu),Target::Background{folder:Some(path),..})=>menu.track_folder_background(owner,request.point,path,ids.len(),&mut||validate(shared,request,true)),
         _=>{let spec=MenuSpec{items:request.items.clone(),..Default::default()};let selected=super::popup(owner,&spec,request.point);*ids=selected.clone().into_iter().collect();Ok(selected.map_or(MenuOutcome::Dismissed,|_|MenuOutcome::Application(zsdesk_windows::shell::menu::APP_FIRST)))},
     };
     let _=unsafe{KillTimer(Some(owner),CANCEL_TIMER)};
@@ -258,16 +258,16 @@ fn perform(shared:&Shared,state:&WindowState,owner:HWND,request:&Request,timing:
     let(pidls,folder,intercept,mode)=match &request.target{
         Target::Items{pidls,key}=>(pidls.clone(),None,MenuInterceptions{rename:key.is_some(),open:pidls.len()==1&&key.is_some(),file_actions:pidls.iter().all(|pidl|
             zsdesk_windows::shell::pidl::item_from_pidl(pidl).is_ok_and(|item|unsafe{item.GetAttributes(windows::Win32::System::SystemServices::SFGAO_FILESYSTEM)}.is_ok_and(|value|value.0&windows::Win32::System::SystemServices::SFGAO_FILESYSTEM.0!=0)))},request.mode),
-        Target::Background{folder:Some(folder)} if request.mode==crate::context_menu_process::Mode::Paste=>(Vec::new(),Some(folder.clone()),MenuInterceptions::default(),request.mode),
-        Target::Background{folder:Some(folder)}=>{
-            let identity=zsdesk_windows::shell::pidl::location_pidl(&zsdesk_core::model::explorer::ShellLocation::Path(folder.clone())).ok_or_else(error_abort)?;
-            let file_actions=zsdesk_windows::shell::pidl::item_from_pidl(&identity).is_ok_and(|item|{
+        Target::Background{folder:Some(folder),..} if request.mode==crate::context_menu_process::Mode::Paste=>(Vec::new(),Some(folder.clone()),MenuInterceptions::default(),request.mode),
+        Target::Background{folder:Some(folder),desktop}=>{
+            let identity=if *desktop{vec![0,0]}else{zsdesk_windows::shell::pidl::location_pidl(&zsdesk_core::model::explorer::ShellLocation::Path(folder.clone())).ok_or_else(error_abort)?};
+            let file_actions=*desktop||zsdesk_windows::shell::pidl::item_from_pidl(&identity).is_ok_and(|item|{
                 use windows::Win32::System::SystemServices::{SFGAO_FILESYSTEM,SFGAO_FOLDER,SFGAO_STREAM};
                 unsafe{item.GetAttributes(SFGAO_FILESYSTEM|SFGAO_FOLDER|SFGAO_STREAM)}.is_ok_and(|value|value.0&(SFGAO_FILESYSTEM.0|SFGAO_FOLDER.0)==(SFGAO_FILESYSTEM.0|SFGAO_FOLDER.0)&&value.0&SFGAO_STREAM.0==0)
             });
             (vec![identity],Some(folder.clone()),MenuInterceptions{file_actions,..Default::default()},crate::context_menu_process::Mode::Background)
         },
-        Target::Background{folder:None}=>(Vec::new(),None,MenuInterceptions::default(),request.mode),
+        Target::Background{folder:None,..}=>(Vec::new(),None,MenuInterceptions::default(),request.mode),
     };
     timing.request_snapshot_microseconds=micros(stage.elapsed());
     let input_to_client=micros(request.input_started.elapsed());
@@ -277,7 +277,7 @@ fn perform(shared:&Shared,state:&WindowState,owner:HWND,request:&Request,timing:
     timing.extension_process=client.pid();
     let worker=quick_first.then_some(timing.extension_process).flatten();
     loop{
-        if !shared.current(request.generation){client.cancel();return Err(error_abort());}
+        if !shared.current(request.generation){client.finish_dismissal();return Err(error_abort());}
         if let Some(result)=client.poll(&mut|before|validate(shared,request,before).is_ok()&&(before||foreground_allowed(request.foreground)||crate::context_menu_process::foreground_is_menu_worker(worker,HWND(request.owner as *mut _)))){
             effects.created=client.created_items();effects.layout=client.result_layout();effects.sort_changed=client.result_sort_changed();
             if let Some((bind,populate))=client.timings(){timing.bind_microseconds=bind;timing.populate_microseconds=populate;}

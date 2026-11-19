@@ -6,6 +6,9 @@ license.workspace = true
 rust-version.workspace = true
 description = "ZSDesk Win32 / Shell / COM / Direct2D / DWM platform layer."
 
+[features]
+menu-visual-qa = []
+
 [dependencies]
 zsdesk-core = { path = "../zsdesk-core" }
 zsdesk-platform = { path = "../zsdesk-platform" }

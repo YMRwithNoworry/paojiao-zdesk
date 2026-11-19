@@ -2,6 +2,9 @@ use super::*;
 use zsdesk_ui::{chrome::{CommandId, SearchPanelHit}, menus::{self, MenuItemSpec, MenuSpec, ShowState, SortKey}};
 use zsdesk_windows::shell::commands::{folder_settings, set_folder_settings, Column};
 
+#[derive(Clone,Copy,PartialEq,Eq)]
+pub(super) enum TabRightAction { Menu(u64), Close(u64) }
+
 impl WindowState {
     unsafe fn new_default_tab(&mut self){
         if let Ok(saved)=storage::load(&self.config_path){self.session.ui.new_tab_location=saved.ui.new_tab_location;}
@@ -353,22 +356,24 @@ impl WindowState {
         self.mouse_down(p);
     }
 
-    pub(super) fn top_tab_right_button(&mut self,p:POINT,down:bool)->bool {
-        let target=self.layout.top_tab_right_target(p.x,p.y,screen_edge_window(self.hwnd),self.session.active_tab);
-        let tab=target.and_then(|i|self.session.tabs.get(i).map(|tab|(i,tab.id,tab.locked)));
+    pub(super) fn tab_strip_right_button(&mut self,p:POINT,down:bool)->bool {
+        let tab=match self.layout.tab_strip_right_hit(p.x,p.y,screen_edge_window(self.hwnd)){
+            Some(Hit::Tab(i))=>self.session.tabs.get(i).map(|tab|(i,TabRightAction::Menu(tab.id))),
+            Some(Hit::Caption)=>self.session.tabs.get(self.session.active_tab).map(|tab|(self.session.active_tab,TabRightAction::Close(tab.id))),
+            _=>None,
+        };
         if down{
-            self.right_tab_press=tab.map(|(_,id,_)|(id,p));
+            self.right_tab_press=tab.map(|(_,action)|(action,p));
             return tab.is_some();
         }
         let press=self.right_tab_press.take();
-        if let (Some((id,start)),Some((index,current,locked)))=(press,tab){
+        if let (Some((pressed,start)),Some((index,action)))=(press,tab){
             let dx=unsafe{GetSystemMetricsForDpi(SM_CXDRAG,self.dpi)}.max(1);
             let dy=unsafe{GetSystemMetricsForDpi(SM_CYDRAG,self.dpi)}.max(1);
-            if id==current && (start.x-p.x).abs()<dx && (start.y-p.y).abs()<dy {
-                if locked || unsafe{GetKeyState(VK_SHIFT.0 as i32)}<0 {
-                    unsafe{self.tab_menu(index);}
-                }else{
-                    unsafe{self.close_tab(index);}
+            if pressed==action && (start.x-p.x).abs()<dx && (start.y-p.y).abs()<dy {
+                match action{
+                    TabRightAction::Menu(_)=>unsafe{self.tab_menu(index)},
+                    TabRightAction::Close(_)=>unsafe{self.close_tab(index)},
                 }
             }
         }
@@ -527,7 +532,7 @@ impl WindowState {
         let choice = popup(self.hwnd, &menus::view_menu(mode, icon, show), anchor);
         match choice.as_deref() {
             Some("show-nav") => {
-                self.session.ui.show_tree = !show.navigation; self.save(); unsafe { self.resize(); }
+                self.session.ui.show_tree = !show.navigation;self.rebuild_navigation_tree();self.save();unsafe{self.resize();}
                 // A hidden tree is not synced while navigating; catch up when shown again.
                 if let Some(tree) = self.tree.as_ref().filter(|_| self.session.ui.show_tree) {
                     let current = self.current_location().clone();
@@ -667,7 +672,7 @@ impl WindowState {
             forward_unhandled_windows:self.session.ui.forward_unhandled_windows,
             desktop_running: crate::edition::DESKTOP.then(desktop_host_running),
             integration: match integration::current() { Integration::Off => 0, Integration::ContextMenu => 1, Integration::Default => 2 },
-            modern_menu_unavailable: zsdesk_windows::shell::menu::modern_presenter_supported()==Some(false),
+            modern_menu_unavailable: false,
         };
         // The menu shows the effective navigation expansion (system default included).
         let mut menu_ui=self.session.ui.clone();
@@ -736,6 +741,7 @@ impl WindowState {
             Some("quick-search-settings") => unsafe { self.search_settings_menu(); },
             Some("quick-search-open")=>if let Err(error)=crate::quick_search::launch(&self.config_path,false){self.show_message(zsdesk_core::tr_format!("无法打开快速搜索：{error:#}", error=error));},
             Some("manage-context-commands")=>self.load_context_catalog(),
+            Some("manage-native-first-page")=>self.load_native_apps(),
             Some(id @ ("startup-restore"|"startup-this-pc"|"startup-folder")) => {
                 use zsdesk_core::model::explorer::StartupLocation;
                 let location=match id {
@@ -860,7 +866,7 @@ impl WindowState {
         zsdesk_windows::shell::set_open_archives_externally(self.session.ui.archives_open_externally);
         if (id.starts_with("search-backend-")||id.starts_with("search-native-")||id=="everything-folder-sizes"||id=="search-everything-auto")&&!self.persist_search_preferences(){return;}
         if id=="everything-folder-sizes" {self.cancel_folder_sizes();}
-        if id=="navigation-recycle-bin" || id=="navigation-network" || id.starts_with("navigation-this-pc-") {self.rebuild_navigation_tree();}
+        if id=="interface-navigation" || id=="navigation-recycle-bin" || id=="navigation-network" || id.starts_with("navigation-this-pc-") {self.rebuild_navigation_tree();}
         self.crumbs_for=None;
         if id=="search-all-files" || id=="search-current-folder"{
             let scope=if self.session.ui.search_all_files{None}else{
@@ -990,7 +996,7 @@ impl WindowState {
 
 }
 
-pub(super) const SHORTCUTS: &str = "文件管理器\nCtrl+T 新建标签　Ctrl+W / Ctrl+F4 关闭标签　Ctrl+Shift+T 恢复标签\nCtrl+Tab / Ctrl+Shift+Tab 切换标签　Ctrl+1…9 第 N 个标签\nAlt+← / Backspace 后退　Alt+→ 前进　Alt+↑ 上一级　F5 刷新\nCtrl+L / Alt+D / F4 地址栏　Ctrl+F / Ctrl+E / F3 搜索（输入即搜）\nCtrl+Shift+N 新建文件夹　Ctrl+Shift+C 复制路径　Ctrl+D 收藏\nAlt+P 预览窗格　Alt+Shift+P 详细信息窗格　Ctrl+F1 展开/收起命令栏\nF2 重命名　Del 删除　Shift+Del 永久删除　Alt+Enter 属性　Ctrl+A 全选\n顶部标签：右键关闭所点标签，右键空白处关闭当前标签，Shift+右键打开菜单\n标签中键关闭，拖动排序；收藏中键在新标签打开\n\n桌面格子\n鼠标悬停 展开折叠的格子　双击标题 折叠/展开　拖动标题 移动　拖动边缘 调整大小\nEnter 打开　F2 重命名　Del 删除　Ctrl+A / C / X / V 全选/复制/剪切/粘贴\n方向键 选择　Backspace 返回上一级（文件夹格子）　F5 刷新\n双击桌面空白处 隐藏/显示全部格子";
+pub(super) const SHORTCUTS: &str = "文件管理器\nCtrl+T 新建标签　Ctrl+W / Ctrl+F4 关闭标签　Ctrl+Shift+T 恢复标签\nCtrl+Tab / Ctrl+Shift+Tab 切换标签　Ctrl+1…9 第 N 个标签\nAlt+← / Backspace 后退　Alt+→ 前进　Alt+↑ 上一级　F5 刷新\nCtrl+L / Alt+D / F4 地址栏　Ctrl+F / Ctrl+E / F3 搜索（输入即搜）\nCtrl+Shift+N 新建文件夹　Ctrl+Shift+C 复制路径　Ctrl+D 收藏\nAlt+P 预览窗格　Alt+Shift+P 详细信息窗格　Ctrl+F1 展开/收起命令栏\nF2 重命名　Del 删除　Shift+Del 永久删除　Alt+Enter 属性　Ctrl+A 全选\n右键标签打开菜单，右键标签栏空白处关闭当前标签\n标签中键关闭，拖动排序；收藏中键在新标签打开\n\n桌面格子\n鼠标悬停 展开折叠的格子　双击标题 折叠/展开　拖动标题 移动　拖动边缘 调整大小\nEnter 打开　F2 重命名　Del 删除　Ctrl+A / C / X / V 全选/复制/剪切/粘贴\n方向键 选择　Backspace 返回上一级（文件夹格子）　F5 刷新\n双击桌面空白处 隐藏/显示全部格子";
 
 fn desktop_host_running() -> bool {
     unsafe { FindWindowW(windows::core::w!("ZSDesk.Native.DesktopHost"), PCWSTR::null()) }.is_ok_and(|h| !h.0.is_null())

@@ -50,10 +50,22 @@ impl WindowState {
         entry.bitmap.as_ref().map(|(_, b)| b.clone())
     }
 
-    pub(super) fn paint(&mut self) {
+    #[cfg(test)]
+    pub(super) fn paint(&mut self) { self.paint_to(None); }
+
+    pub(super) fn paint_update(&mut self,dc:HDC,dirty:RECT){self.paint_to(Some((dc,dirty)));}
+
+    fn paint_to(&mut self,destination:Option<(HDC,RECT)>) {
         if unsafe{IsIconic(self.hwnd)}.as_bool(){return;}
         let (width, height) = self.client_size();
-        if Surface::ensure(&mut self.surface, width, height).is_none() { return; }
+        if width<=0||height<=0{return;}
+        let client=RECT{left:0,top:0,right:width,bottom:height};
+        let dirty=destination.map_or(client,|(_,r)|RECT{left:r.left.max(0),top:r.top.max(0),right:r.right.min(width),bottom:r.bottom.min(height)});
+        if dirty.left>=dirty.right||dirty.top>=dirty.bottom{return;}
+        // The Shell child paints its own file list. Keep a short reusable DIB
+        // for the surrounding chrome instead of backing the whole client twice.
+        let band_height=if destination.is_some(){height.min(96)}else{height};
+        if Surface::ensure(&mut self.surface, width, band_height).is_none() { return; }
         // Collect icons first: uploading needs `&mut self`, drawing only `&self`.
         let tab_icons: Vec<Option<ID2D1Bitmap>> = self.layout.tabs.clone().iter()
             .map(|slot| { let l = self.session.tabs[slot.index].current().clone(); self.icon_for(&l) }).collect();
@@ -62,17 +74,29 @@ impl WindowState {
         let bookmark_icons: Vec<Option<ID2D1Bitmap>> = (0..self.layout.bookmarks.len())
             .map(|i| {let index=self.bookmark_index(i)?;if self.session.bookmarks[index].is_folder{return None;}let t=self.session.bookmarks[index].target.clone();self.icon_for(&t)}).collect();
         let (Some(gfx), Some(surface)) = (self.gfx.as_ref(), self.surface.as_ref()) else { return };
-        let result = gfx.draw(surface, |cv| {
-            self.paint_strip(cv, &tab_icons);
-            self.paint_nav(cv, address_icon.as_ref());
-            self.paint_commands(cv);
-            self.paint_search_panel(cv);
-            self.paint_content(cv);
-            self.paint_bookmarks(cv, &bookmark_icons);
-            self.paint_status(cv);
-            self.paint_picker(cv);
-        });
-        if result.is_err() { self.icons.values_mut().for_each(|e| e.bitmap = None); }
+        let mut top=dirty.top/band_height*band_height;
+        while top<dirty.bottom{
+            let area=RECT{left:dirty.left,top:top.max(dirty.top),right:dirty.right,bottom:(top+band_height).min(dirty.bottom)};
+            if destination.is_none_or(|(dc,_)|unsafe{windows::Win32::Graphics::Gdi::RectVisible(dc,&area)}.as_bool()){
+                let touches=|r:LayoutRect|!r.is_empty()&&r.y<top+band_height&&r.bottom()>top;
+                let l=&self.layout;
+                let result=gfx.draw_band(surface,top,|cv|{
+                    if touches(l.strip)||touches(l.tab_panel)||touches(l.tab_splitter){self.paint_strip(cv,&tab_icons);}
+                    if touches(l.nav_row){self.paint_nav(cv,address_icon.as_ref());}
+                    if touches(l.command_row)||touches(l.command_toggle){self.paint_commands(cv);}
+                    if touches(l.search_panel.card){self.paint_search_panel(cv);}
+                    self.paint_content(cv);
+                    if touches(l.bookmarks_row)||touches(l.bookmark_splitter){self.paint_bookmarks(cv,&bookmark_icons);}
+                    if touches(l.status){self.paint_status(cv);}
+                    self.paint_picker(cv);
+                });
+                if result.is_err(){self.icons.values_mut().for_each(|e|e.bitmap=None);return;}
+                if let Some((dc,_))=destination{
+                    let _=unsafe{BitBlt(dc,area.left,area.top,area.right-area.left,area.bottom-area.top,Some(surface.dc),area.left,area.top-top,SRCCOPY)};
+                }
+            }
+            top+=band_height;
+        }
     }
 
     fn button_fill(&self, cv: &Canvas, rect: LayoutRect, hit: Hit, radius: f32) {

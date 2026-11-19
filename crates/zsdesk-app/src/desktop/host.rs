@@ -349,10 +349,16 @@ impl DesktopHost {
             self.config.settings.organize = false;
         }
         self.register_desktop_notify();
-        self.refresh_desktop();
-        self.sync_windows();
-        for i in 0..self.fences.len() { let id = self.fences[i].id; if self.config.fence(id).is_some_and(|f| !f.is_desktop()) { self.refresh_folder(id); } }
+        self.initialize_contents();
         self.render_all();
+    }
+
+    fn initialize_contents(&mut self) {
+        self.refresh_desktop_entries();
+        self.sync_windows();
+        // Saved desktop groups need a window before their first inventory can
+        // be assigned. Folder-backed groups are initialized by sync_windows.
+        self.redistribute_desktop_entries();
     }
 
     pub fn shutdown(&mut self) {
@@ -414,7 +420,7 @@ impl DesktopHost {
         }
     }
 
-    fn notify_error(&self, text: &str) {
+    pub(super) fn notify_error(&self, text: &str) {
         let text: Vec<u16> = text.encode_utf16().chain(Some(0)).collect();
         unsafe { MessageBoxW(Some(self.hwnd), PCWSTR(text.as_ptr()), windows::core::PCWSTR(zsdesk_core::i18n::wide("ZSDesk 桌面格子").as_ptr()), MB_OK | MB_ICONWARNING); }
     }
@@ -1932,6 +1938,12 @@ impl DesktopHost {
                 After::FenceMenu { fence: tab, point: screen }
             }
             _ if win.standalone => After::Nothing,
+            FenceHit::Empty => {
+                if !win.selection.is_empty()||win.focus.is_some(){
+                    win.selection.clear();win.focus=None;win.anchor=None;self.render(id);
+                }
+                After::FolderSystemMenu { fence: id, point: screen }
+            }
             _ => After::FenceMenu { fence: id, point: screen },
         }
     }
@@ -1985,7 +1997,9 @@ impl DesktopHost {
             let window=&self.fences[index];let geometry=window.geometry(&fence);
             let mut point=keyboard_menu_anchor(window,&geometry);
             let _=unsafe{windows::Win32::Graphics::Gdi::ClientToScreen(window.hwnd,&mut point)};
-            return if window.selection.is_empty(){After::FenceMenu{fence:id,point}}else{After::ItemMenu{fence:id,point}};
+            return if !window.selection.is_empty(){After::ItemMenu{fence:id,point}}
+                else if window.collapsed(&fence)||window.standalone{After::FenceMenu{fence:id,point}}
+                else{After::FolderSystemMenu{fence:id,point}};
         }
         if self.config.is_released(id)&&key==VK_ESCAPE.0 {
             let changed:Vec<_>=self.fences.iter_mut().filter(|window|window.standalone&&!window.selection.is_empty())

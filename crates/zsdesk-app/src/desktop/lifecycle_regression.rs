@@ -39,7 +39,24 @@ fn setup(root:&Path)->Result<(Fixture,Vec<PathBuf>)>{
         config.fences.push(fence);
     }
     let mut host=DesktopHost::new(hwnd,root.join("profile/desktop-fences.json"),root.join("profile/explorer-session.json"),config,Gfx::new("Segoe UI")?);
-    host.desktop_test_entries=Some(entries);host.sync_windows();host.refresh_desktop();
+    host.desktop_test_entries=Some(entries);host.initialize_contents();
+    ensure!(host.fences[host.win_index(1).context("manual group")?].entries.len()==1
+        &&host.fences[host.win_index(2).context("automatic group")?].entries.len()==2,
+        "saved desktop members were missing from the initial windows");
+    for id in [1,3] {
+        host.config.fence_mut(id).unwrap().collapsed=false;host.place_all();
+        let window=&host.fences[host.win_index(id).unwrap()];
+        let g=window.geometry(host.config.fence(id).unwrap());
+        let blank=POINT{x:g.content.x+12,y:g.content.bottom()-10};
+        ensure!(matches!(host.right_click(id,blank),After::FolderSystemMenu{..}),"blank content used fence management");
+        ensure!(matches!(host.right_click(id,POINT{x:g.more.x+2,y:g.more.y+2}),After::FenceMenu{..}),"fence controls lost their menu");
+        if id==1{
+            let cell=g.cells.at(0).cell;
+            ensure!(matches!(host.right_click(id,POINT{x:cell.x+4,y:cell.y+4}),After::ItemMenu{..}),"file used background menu");
+            ensure!(matches!(host.right_click(id,blank),After::FolderSystemMenu{..})&&host.selected_pidls(id).is_empty(),"blank click retained the previous file");
+        }
+        host.config.fence_mut(id).unwrap().collapsed=true;host.place_all();
+    }
     for id in 1..=3{ensure!(host.win_index(id).is_some(),"fixture fence missing");}
     HOST.with(|slot|*slot.borrow_mut()=Some(host));HOST_HWND.with(|slot|slot.set(hwnd.0 as isize));Ok((owned,paths))
 }

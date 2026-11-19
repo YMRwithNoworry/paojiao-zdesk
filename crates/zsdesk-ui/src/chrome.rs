@@ -514,19 +514,31 @@ impl ChromeLayout {
         self.hit(x,y)
     }
 
-    /// A tab owns its whole header. Unoccupied strip space before the utility
-    /// buttons acts on the current tab; system caption buttons lie beyond it.
-    pub fn top_tab_right_target(&self, x:i32, y:i32, extend:bool, active:usize)->Option<usize>{
-        if self.vertical_tabs || !self.strip.contains(x,y){return None;}
+    /// A tab, including its close glyph, opens the tab menu. Only empty space
+    /// in the tab strip closes the active tab. Caption controls stay separate.
+    pub fn tab_strip_right_hit(&self,x:i32,y:i32,extend:bool)->Option<Hit>{
+        if self.vertical_tabs {
+            if !self.tab_panel.contains(x,y){return None;}
+            return match self.hit(x,y){
+                Hit::Tab(i)|Hit::TabClose(i)=>Some(Hit::Tab(i)),
+                Hit::None=>Some(Hit::Caption),
+                _=>None,
+            };
+        }
+        if !self.strip.contains(x,y){return None;}
         match self.hit_with_top_edge(x,y,extend){
-            Hit::Tab(index)|Hit::TabClose(index)=>Some(index),
+            Hit::Tab(index)|Hit::TabClose(index)=>Some(Hit::Tab(index)),
             Hit::Caption=>{
                 let utility_x=if self.tab_list.is_empty(){self.app_menu.x}else{self.tab_list.x};
                 let above_new=x>=self.new_tab.x && x<self.new_tab.right();
-                (x<utility_x && !above_new).then_some(active)
+                (x<utility_x && !above_new).then_some(Hit::Caption)
             }
             _=>None,
         }
+    }
+    pub fn top_tab_right_target(&self,x:i32,y:i32,extend:bool,active:usize)->Option<usize>{
+        if self.vertical_tabs{return None;}
+        match self.tab_strip_right_hit(x,y,extend)?{Hit::Tab(i)=>Some(i),Hit::Caption=>Some(active),_=>None}
     }
 
     /// Classifies a client point.

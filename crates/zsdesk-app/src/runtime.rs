@@ -11,6 +11,13 @@ const DONE:u32=WM_APP+111;
 const POOL_WAKE:u32=WM_APP+112;
 const REFRESH_TRAY:u32=WM_APP+113;
 static EXIT_REQUESTED:std::sync::atomic::AtomicBool=std::sync::atomic::AtomicBool::new(false);
+static WINDOW_BACKGROUND_IDLE:std::sync::atomic::AtomicBool=std::sync::atomic::AtomicBool::new(false);
+static WINDOW_BACKGROUND_STOPPED:std::sync::atomic::AtomicBool=std::sync::atomic::AtomicBool::new(false);
+pub(crate) fn stop_unowned_background()->bool{
+    use std::sync::atomic::Ordering;
+    if !WINDOW_BACKGROUND_IDLE.load(Ordering::Acquire)||crate::file_dialog_takeover::has_active_dialog(){return false;}
+    WINDOW_BACKGROUND_STOPPED.store(true,Ordering::Release);true
+}
 pub fn exiting()->bool{EXIT_REQUESTED.load(std::sync::atomic::Ordering::Acquire)}
 pub fn refresh_tray(){if let Some((_,window))=LOCAL.get(){let _=unsafe{PostMessageW(Some(HWND(*window as*mut _)),REFRESH_TRAY,WPARAM(0),LPARAM(0))};}}
 const MAX_PACKET:usize=128*1024;
@@ -217,6 +224,7 @@ pub fn run(profile:PathBuf,args:Vec<OsString>)->Result<()>{
     ingress.tx.try_send(Request{args}).context("初始启动请求失败")?;
     let (finished_tx,finished_rx)=mpsc::channel::<Notice>();let mut workers:Vec<Worker>=Vec::new();let mut pool:Vec<WindowWorker>=Vec::new();
     let mut queued:VecDeque<WindowJob>=VecDeque::new();let mut last_error=None;let mut serial=0u64;let mut shutting_down=false;let mut previous_status=None;let mut accepted_request=None;let mut quit_started=false;
+    let mut explicit_resident=false;
     loop{
         if ingress.quit.get()&&!quit_started{
             quit_started=true;EXIT_REQUESTED.store(true,std::sync::atomic::Ordering::Release);ingress.accepting.set(false);
@@ -230,7 +238,8 @@ pub fn run(profile:PathBuf,args:Vec<OsString>)->Result<()>{
             // profile permanently rejecting new file windows. Retiring workers
             // remain retired; the new request gets a live/fresh worker.
             shutting_down=false;
-            let kind=if request.args.iter().any(|a|a=="--desktop"){"desktop"}else if request.args.iter().any(|a|a=="--background"||a=="--quick-search"||a=="--quick-search-settings"){"background"}else{"window"};
+            if request.args.iter().any(|a|a=="--background"){explicit_resident=true;}
+            let kind=if request.args.iter().any(|a|a=="--desktop"){"desktop"}else if request.args.iter().any(|a|a=="--background"||a=="--window-background"||a=="--quick-search"||a=="--quick-search-settings"){"background"}else{"window"};
             let destination=hwnd.0 as isize;let finished=finished_tx.clone();serial+=1;let id=serial;
             if kind=="window"{queued.push_back(WindowJob{id,args:request.args});continue;}
             let worker=thread::Builder::new().name(format!("zsdesk-{kind}")).spawn(move||{
@@ -276,6 +285,13 @@ pub fn run(profile:PathBuf,args:Vec<OsString>)->Result<()>{
                     Ok(worker)=>pool.push(worker),Err(error)=>last_error=Some(format!("无法创建文件窗口线程：{error:#}")),
                 }
             }else{break;}
+        }
+        let background_owned=explicit_resident||ingress.tray.borrow().enabled()||workers.iter().any(|w|w.kind=="desktop"&&!w.ending)
+            ||!queued.is_empty()||pool.iter().any(|w|w.job.is_some()&&!w.ending);
+        WINDOW_BACKGROUND_IDLE.store(!background_owned,std::sync::atomic::Ordering::Release);
+        if !quit_started && !workers.iter().any(|w|w.kind=="background") &&
+            WINDOW_BACKGROUND_STOPPED.swap(false,std::sync::atomic::Ordering::AcqRel) && background_owned{
+            let _=crate::quick_search::start_if_enabled(&profile);
         }
         let idle=pool.iter().enumerate().filter(|(_,worker)|worker.job.is_none()&&!worker.ending)
             .filter_map(|(index,worker)|worker.idle_since.map(|since|(index,since.elapsed()))).collect();

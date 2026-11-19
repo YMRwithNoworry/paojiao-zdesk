@@ -6,6 +6,46 @@ use zsdesk_windows::shell::{file_transfer,menu::{self,MenuInterceptions,MenuOutc
 use crate::context_menu_process::{AsyncClient as Client,Mode as WorkerMode};
 
 pub(super) const TIMER:usize=19;
+pub(super) const PREWARM_TIMER:usize=0x5a71;
+pub(super) fn schedule_prewarm(owner:HWND){
+    if crate::context_menu_process::prewarm::needed(){
+        unsafe{SetTimer(Some(owner),PREWARM_TIMER,crate::context_menu_process::prewarm::SETTLE_MS,None);}
+    }
+}
+pub(super) fn prewarm(owner:HWND){
+    let _=unsafe{KillTimer(Some(owner),PREWARM_TIMER)};
+    if unsafe{GetForegroundWindow()}==owner{prewarm_active_view(owner);}
+}
+pub(super) fn prewarm_active_view(owner:HWND){
+    if !crate::context_menu_process::prewarm::needed() ||
+        ACTIVE.with(|active|active.borrow().contains_key(&(owner.0 as isize))){return;}
+    let slot=unsafe{GetWindowLongPtrW(owner,GWLP_USERDATA)} as *const Slot;
+    if slot.is_null(){return;}
+    let (window,identity,folder,options)={
+        let Ok(state)=unsafe{&*slot}.try_borrow()else{return;};
+        let Some(state)=state.as_ref()else{return;};
+        if state.destroyed || state.pending.is_some() || state.picker.is_some(){return;}
+        let ShellLocation::Path(folder)=state.current_location()else{return;};
+        let Some(identity)=state.identity_for_source(state.browser_source)else{return;};
+        let prefs=crate::context_preferences::current(&state.config_path).unwrap_or_else(||state.session.ui.context_menu.clone());
+        (state.view_hwnd,identity,folder.clone(),crate::context_preferences::native(&prefs))
+    };
+    if options.drawn || !options.modern || options.quick_first{return;}
+    let Ok(view)=menu::attached_menu_view(window)else{return;};
+    let Ok(items)=view.cast::<IFolderView2>()else{return;};
+    let Ok(count)=(unsafe{items.ItemCount(SVGIO_SELECTION)})else{return;};
+    if !(0..=1).contains(&count){return;}
+    let Ok(parent)=background_pidl(&view)else{return;};
+    let target=if count==0{parent.clone()}else{
+        let Ok(selected)=(unsafe{items.Items::<IShellItemArray>(SVGIO_SELECTION)})else{return;};
+        if unsafe{selected.GetCount()}.ok()!=Some(1){return;}
+        let Ok(item)=(unsafe{selected.GetItemAt(0)})else{return;};
+        let Some(pidl)=zsdesk_windows::shell::pidl::item_pidl(&item)else{return;};pidl
+    };
+    if !live_source(owner,window,identity){return;}
+    let context=crate::context_menu_process::MenuViewContext{folder:Some(parent),..Default::default()};
+    crate::context_menu_process::prewarm::start(owner,target,folder,count==0,options,Some(context));
+}
 pub(super) type SourcePreferences=(bool,menu::ContextMenuOptions);
 impl WindowState{
     pub(super) fn menu_source_preferences(&self,source:usize)->windows::core::Result<SourcePreferences>{
@@ -251,7 +291,7 @@ pub(super) fn poll(owner:HWND){
     let created=session.client.take_created();
     let catalog=session.client.take_catalog();
     let created_any=!created.is_empty();
-    let valid=if layout.is_some()||!created.is_empty()||matches!(&result,Some(Ok(MenuOutcome::Rename|MenuOutcome::Open|MenuOutcome::Explore|MenuOutcome::Copy|MenuOutcome::Cut|MenuOutcome::Paste|MenuOutcome::Delete{..}))){
+    let valid=if layout.is_some()||!created.is_empty()||matches!(&result,Some(Ok(MenuOutcome::Rename|MenuOutcome::Open|MenuOutcome::Explore|MenuOutcome::Copy|MenuOutcome::Cut|MenuOutcome::Paste|MenuOutcome::PinInExplorer|MenuOutcome::Delete{..}))){
         same_selection(&session.view,&session.pidls,&session.folder,&session.background,session.input.as_ref())
             &&current(owner,generation)&&live_source(owner,window,identity)
     }else{true};
@@ -267,6 +307,14 @@ pub(super) fn poll(owner:HWND){
             }
             ACTIVE.with(|active|{active.borrow_mut().insert(owner.0 as isize,session);});
         },
+        Some(Ok(MenuOutcome::PinInExplorer)) if valid=>{
+            let owner_id=owner.0 as isize;
+            let result=crate::explorer_forwarder::show_start_pin_target(&session.pidls,move|result|{
+                let text=result.map_or_else(|e|e.to_string(),|()|zsdesk_core::i18n::text("请在系统资源管理器中右键所选文件夹，确认开始菜单固定操作。").to_owned());
+                super::pane_input::post(HWND(owner_id as *mut _),identity,super::pane_input::Intent::TransferMessage(text));
+            });
+            if let Err(e)=result{super::pane_input::post(owner,identity,super::pane_input::Intent::TransferMessage(e.to_string()));}
+        }
         Some(Ok(action @ (MenuOutcome::Copy|MenuOutcome::Cut|MenuOutcome::Paste|MenuOutcome::Delete{..}))) if valid=>{
             if session.input.as_ref().is_some_and(|watch|watch.changed()){return;}
             file_transfer::note_user_input(window);

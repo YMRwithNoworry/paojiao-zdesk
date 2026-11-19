@@ -103,6 +103,7 @@ impl From<&Registration> for WireRegistration {
 impl WireRegistration {
     fn registration(&self) -> Result<Registration> {
         Ok(Registration {
+            display_name:None,
             package_family: self.family.clone(),
             package_full_name: self.full_name.clone(),
             application_id: self.application.clone(),
@@ -1848,6 +1849,7 @@ mod client {
             }
             let _drain = Drain;
             let registration = Registration {
+                display_name:None,
                 package_family: "ZSDesk.UnregisteredFixture".into(),
                 package_full_name: "ZSDesk.UnregisteredFixture_1.0.0.0_x64__fixture".into(),
                 application_id: "App".into(), verb_id: "Fixture".into(),

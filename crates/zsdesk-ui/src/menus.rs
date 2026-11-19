@@ -361,13 +361,12 @@ pub fn context_menu_settings_menu(options: &ContextMenuPreferences) -> MenuSpec 
 /// Both visual styles retain the same registered command sources and rules.
 pub fn context_menu_settings_menu_for(options: &ContextMenuPreferences, _modern_available: bool) -> MenuSpec {
     let original = options.mode == ContextMenuMode::Original;
-    let modern = entry(zsdesk_core::i18n::text("Windows 11（自动兼容）"), "context-menu-windows11", true, options.mode==ContextMenuMode::Windows11);
+    let modern = entry(zsdesk_core::i18n::text("自绘 Windows 11"), "context-menu-windows11", true, !original);
     menu(vec![
         modern,
-        entry(zsdesk_core::i18n::text("自绘 Windows 11"), "context-menu-drawn-windows11", true, options.mode==ContextMenuMode::DrawnWindows11),
         entry(zsdesk_core::i18n::text("Windows 10 经典风格"), "context-menu-original", true, original),
         entry(zsdesk_core::i18n::text("优先显示常用命令"), "context-menu-quick-first", true, options.quick_first),
-        item(zsdesk_core::i18n::text("管理此处的完整右键菜单…"),"manage-context-commands"),
+        item(zsdesk_core::i18n::text("管理应用扩展…"),"manage-native-first-page"),
         MenuItemSpec::Separator,
         submenu(zsdesk_core::i18n::text("显示的命令"), vec![
             entry(zsdesk_core::i18n::text("剪切、复制和粘贴"), "context-action-cut-copy-paste", true, options.show_cut_copy_paste),
@@ -718,12 +717,12 @@ mod tests {
         assert_eq!(checked, ["context-menu-windows11"]);
         assert_eq!(options.mode,ContextMenuMode::Windows11);
         let available=nested_ids(&spec);
-        for style in ["context-menu-windows11","context-menu-drawn-windows11","context-menu-original"]{assert!(available.contains(&style.to_string()));}
+        for style in ["context-menu-windows11","context-menu-original"]{assert!(available.contains(&style.to_string()));}
         let mut customized=options.clone();customized.hidden_commands.push("keep-this-rule".into());
         for (action,mode) in [("context-menu-drawn-windows11",ContextMenuMode::DrawnWindows11),("context-menu-original",ContextMenuMode::Original),("context-menu-windows11",ContextMenuMode::Windows11)]{
             assert!(apply_context_menu_setting(&mut customized,action));assert_eq!(customized.mode,mode);assert_eq!(customized.hidden_commands,["keep-this-rule"]);
         }
-        assert!(nested_ids(&spec).contains(&"manage-context-commands".to_string()), "registered command visibility stays editable");
+        assert!(nested_ids(&spec).contains(&"manage-native-first-page".to_string()), "extensions are configurable without opening a file menu");
     }
 
     #[test]

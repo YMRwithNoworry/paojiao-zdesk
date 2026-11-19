@@ -11,6 +11,371 @@ use crate::context_menu_process::isolation_tests::{Environment,sparse};
 }
 struct Apartment;impl Drop for Apartment{fn drop(&mut self){unsafe{OleUninitialize();}}}
 struct Runner{hwnd:HWND,slot:Box<Slot>}
+
+#[test]
+#[ignore="Exercises tab menus and empty-strip closure on an unswitched private desktop"]
+fn tab_menu_and_empty_strip_have_distinct_right_clicks()->Result<()>{
+    use zsdesk_core::model::explorer::TabPlacement;
+    let out=PathBuf::from(std::env::var_os("ZSDESK_NATIVE_TEST_OUTPUT").context("test output")?);
+    let name=wide(&format!("ZSDesk.TabRight.{}",std::process::id()));
+    let desktop=unsafe{CreateDesktopW(name.as_ptr(),std::ptr::null(),std::ptr::null(),0,0x000f00ff,std::ptr::null())};
+    ensure!(!desktop.is_null(),"private desktop");let handle=desktop as usize;
+    let result=thread::spawn(move||->Result<()>{
+        ensure!(unsafe{SetThreadDesktop(handle as *mut c_void)}!=0,"private desktop attachment");
+        unsafe{OleInitialize(None)}?;let _com=Apartment;
+        let files=out.join("files");fs::create_dir_all(&files)?;
+        for name in ["one.txt","two.txt","three.txt"]{fs::write(files.join(name),b"tab menu check")?;}
+        let runner=create(&out,&files,true)?;let owner=runner.hwnd.0 as isize;
+        let packed=|p:POINT|LPARAM(((p.y as u16 as u32)<<16|p.x as u16 as u32)as isize);
+        let click=|mut p:POINT|->Result<()>{
+            let client=packed(p);let _=unsafe{ClientToScreen(runner.hwnd,&mut p)};let screen=packed(p);
+            let ht=unsafe{SendMessageW(runner.hwnd,WM_NCHITTEST,None,Some(screen))}.0 as u32;
+            let(down,up,wp,lp)=if ht==HTCAPTION{(WM_NCRBUTTONDOWN,WM_NCRBUTTONUP,WPARAM(ht as usize),screen)}
+                else{ensure!(ht==HTCLIENT,"unexpected hit {ht}");(WM_RBUTTONDOWN,WM_RBUTTONUP,WPARAM(0),client)};
+            unsafe{SendMessageW(runner.hwnd,down,Some(wp),Some(lp));SendMessageW(runner.hwnd,up,Some(wp),Some(lp));}Ok(())
+        };
+        for placement in [TabPlacement::Top,TabPlacement::Left,TabPlacement::Right]{
+            let(tab,blank)={
+                let mut slot=runner.slot.borrow_mut();let state=slot.as_mut().unwrap();
+                state.session.tabs=(1..=3).map(|i|ExplorerTab::new(i,ShellLocation::Path(files.clone()))).collect();
+                state.session.active_tab=0;state.session.next_id=4;state.session.ui.tab_placement=placement;
+                unsafe{state.rebuild_tabs();}let l=&state.layout;
+                let r=l.tabs.iter().find(|s|s.index==1).context("inactive tab")?.rect;
+                let area=if l.vertical_tabs{l.tab_panel}else{l.strip};
+                let blank=(area.y+8..area.bottom()-3).find_map(|y|(area.x+5..area.right()-5).find(|&x|
+                    l.tab_strip_right_hit(x,y,false)==Some(Hit::Caption) && (l.vertical_tabs||x>l.new_tab.right())
+                ).map(|x|POINT{x,y})).context("empty tab strip")?;
+                (POINT{x:r.x+r.width/2,y:r.y+r.height/2},blank)
+            };
+            let observer=thread::spawn(move||->Result<()>{
+                ensure!(unsafe{SetThreadDesktop(handle as *mut c_void)}!=0,"observe private desktop");
+                let owner=HWND(owner as *mut _);let deadline=Instant::now()+Duration::from_secs(4);
+                loop{
+                    if let Ok(menu)=unsafe{FindWindowExW(None,None,windows::core::w!("ZSDesk.Win11Flyout"),None)}{
+                        if unsafe{GetWindow(menu,GW_OWNER)}.ok()==Some(owner)&&unsafe{IsWindowVisible(menu)}.as_bool(){
+                            for key in [VK_HOME,VK_DOWN,VK_DOWN,VK_DOWN,VK_RETURN]{unsafe{PostMessageW(Some(menu),WM_KEYDOWN,WPARAM(key.0 as usize),LPARAM(0))}?;}
+                            return Ok(());
+                        }
+                    }
+                    if Instant::now()>=deadline{let _=unsafe{PostMessageW(Some(owner),WM_KEYDOWN,WPARAM(VK_ESCAPE.0 as usize),LPARAM(0))};anyhow::bail!("tab menu did not appear");}
+                    thread::sleep(Duration::from_millis(5));
+                }
+            });
+            click(tab)?;observer.join().map_err(|_|anyhow::anyhow!("menu observation failed"))??;
+            {let slot=runner.slot.borrow();let state=slot.as_ref().unwrap();
+                ensure!(state.session.tabs.len()==3&&state.session.active_tab().id==1&&state.session.tabs[1].locked,"menu command targeted wrong tab: {placement:?}");
+            }
+            click(blank)?;pump(40);
+            {let slot=runner.slot.borrow();let state=slot.as_ref().unwrap();
+                ensure!(state.session.tabs.iter().map(|t|t.id).eq([2,3])&&state.session.tabs[0].locked,"blank click did not close only the active tab: {placement:?}");
+            }
+        }
+        Ok(())
+    }).join().map_err(|_|anyhow::anyhow!("tab test panicked")).and_then(|r|r);
+    ensure!(unsafe{CloseDesktop(desktop)}!=0,"private desktop retained");result
+}
+
+#[test]
+#[ignore="Compares the complete window chrome against 96-pixel bands on an isolated desktop"]
+fn bounded_chrome_surface_matches_full_raster()->Result<()>{
+    use zsdesk_core::model::explorer::TabPlacement;
+    use windows::Win32::Graphics::Gdi::GdiFlush;
+    let root=PathBuf::from(std::env::var_os("ZSDESK_NATIVE_TEST_OUTPUT").context("test output")?);
+    let name=wide(&format!("ZSDesk.BandedPaint.{}",std::process::id()));
+    let desktop=unsafe{CreateDesktopW(name.as_ptr(),std::ptr::null(),std::ptr::null(),0,0x000f00ff,std::ptr::null())};
+    ensure!(!desktop.is_null(),"private desktop");let handle=desktop as usize;
+    let result=thread::spawn(move||->Result<()>{
+        ensure!(unsafe{SetThreadDesktop(handle as *mut _)}!=0,"attach private desktop");
+        unsafe{OleInitialize(None)}?;let _apartment=Apartment;
+        let files=root.join("files");fs::create_dir_all(&files)?;
+        for name in ["one.txt","two.txt","three.txt"]{fs::write(files.join(name),b"window chrome")?;}
+        let runner=create(&root,&files,true)?;
+        let mut slot=runner.slot.borrow_mut();let state=slot.as_mut().unwrap();
+        ensure!(state.tree.is_none(),"hidden navigation tree was created");
+        state.apply_interface_choice("interface-navigation");
+        ensure!(state.tree.is_some()&&state.session.ui.show_tree,"navigation tree did not open");
+        state.apply_interface_choice("interface-navigation");
+        ensure!(state.tree.is_none()&&!state.session.ui.show_tree,"navigation tree was retained after hiding it");
+        for placement in [TabPlacement::Top,TabPlacement::Left,TabPlacement::Right]{
+            state.session.ui.tab_placement=placement;
+            state.relayout();state.paint();
+            let reference=state.surface.as_ref().context("full raster")?;
+            let(w,h)=(reference.width,reference.height);let bytes=(w*h*4)as usize;
+            let _=unsafe{GdiFlush()};
+            let expected=unsafe{std::slice::from_raw_parts(reference.bits,bytes)}.to_vec();
+            let output=Surface::new(w,h).context("destination DIB")?;
+            state.paint_update(output.dc,RECT{left:0,top:0,right:w,bottom:h});
+            let _=unsafe{GdiFlush()};
+            let actual=unsafe{std::slice::from_raw_parts(output.bits,bytes)};
+            let changed=actual.chunks_exact(4).zip(expected.chunks_exact(4)).filter(|(a,b)|a!=b).count();
+            ensure!(changed==0,"{placement:?}: {changed} differing pixels in {w}x{h}");
+            ensure!(state.surface.as_ref().is_some_and(|s|s.height<=96),"full backing store retained");
+            let clip=RECT{left:7,top:83,right:w-11,bottom:h.min(213)};
+            unsafe{std::ptr::write_bytes(output.bits,0x6c,bytes);}
+            state.paint_update(output.dc,clip);let _=unsafe{GdiFlush()};
+            let pixels=unsafe{std::slice::from_raw_parts(output.bits,bytes)};
+            for (i,pixel) in pixels.chunks_exact(4).enumerate(){
+                let(x,y)=((i%w as usize)as i32,(i/w as usize)as i32);
+                let inside=x>=clip.left&&x<clip.right&&y>=clip.top&&y<clip.bottom;
+                let target=if inside{&expected[4*i..4*i+4]}else{&[0x6c;4]};
+                ensure!(pixel==target,"{placement:?}: incorrect partial repaint at {x},{y}");
+            }
+        }
+        Ok(())
+    }).join().map_err(|_|anyhow::anyhow!("paint test panicked")).and_then(|r|r);
+    ensure!(unsafe{CloseDesktop(desktop)}!=0,"private desktop retained");result
+}
+
+#[test]
+#[ignore="Real shell contexts and opt-in archive provider on an isolated desktop"]
+fn drawn_pages_and_registered_submenus()->Result<()>{
+    use crate::context_menu_process as worker;
+    let out=PathBuf::from(std::env::var_os("ZSDESK_NATIVE_TEST_OUTPUT").context("test output")?);
+    let name=format!("ZSDesk.DrawnPages.{}",std::process::id());
+    let desktop=unsafe{CreateDesktopW(wide(&name).as_ptr(),std::ptr::null(),std::ptr::null(),0,0x000f00ff,std::ptr::null())};
+    ensure!(!desktop.is_null(),"private test desktop");let raw=desktop as usize;
+    let result=thread::spawn(move||->Result<()>{
+        ensure!(unsafe{SetThreadDesktop(raw as *mut c_void)}!=0,"attach test desktop");
+        let _desktop=Environment::set("ZSDESK_MENU_TEST_DESKTOP",&name);
+        let workers=out.join("workers");fs::create_dir_all(&workers)?;
+        let _root=Environment::set("ZSDESK_MENU_ROOT",&workers);
+        unsafe{OleInitialize(None)}?;let _com=Apartment;
+        struct Workers;impl Drop for Workers{fn drop(&mut self){worker::shutdown_idle_worker();let until=Instant::now()+Duration::from_secs(6);while worker::pending_workers()>0&&Instant::now()<until{pump(8);}}}let _workers=Workers;
+        let files=out.join("files");fs::create_dir_all(files.join("folder"))?;fs::write(files.join("one.txt"),b"ZSDesk archive selection trial")?;fs::write(files.join("two.txt"),b"second target")?;
+        let runner=create(&out,&files,true)?;
+        let(profile,mut prefs,view,window)={let state=runner.slot.borrow();let state=state.as_ref().unwrap();let b=state.browser.as_ref().unwrap();
+            (state.config_path.clone(),state.session.ui.context_menu.clone(),unsafe{b.current_view()?},b.view_window().context("view")?)};
+        let registrations=zsdesk_windows::shell::menu::native_app_registrations()?;
+        let extension=registrations.iter().find(|(id,_)|id.starts_with("pkg:")&&id.to_lowercase().contains("local.archivemenu.sevenzip")).context("registered 7-Zip modern provider required")?.0.clone();
+        for (case,selection,depth,enabled) in [
+            ("visual-file",vec!["one.txt"],1,false),("visual-folder",vec!["folder"],1,false),("visual-multi",vec!["one.txt","two.txt"],1,false),
+            ("visual-background",vec![],1,false),("visual-mixed",vec!["one.txt","folder"],1,false),("visual-seven",vec!["one.txt"],2,true),
+            ("visual-more",vec!["one.txt"],2,false),("visual-more-zip",vec!["one.txt"],3,false),
+            ("visual-more-archive",vec!["two.txt"],4,false),("visual-openwith",vec!["one.txt"],2,false),
+            ("visual-deep",vec!["one.txt"],3,true),("visual-legacy",vec!["one.txt"],2,true),("visual-archive",vec!["one.txt"],2,true),("visual-new",vec![],2,false)]{
+            if let Ok(scenes)=std::env::var("ZSDESK_VISUAL_SCENES"){if !scenes.split(',').any(|s|s==case){continue;}}
+            prefs.native_first_page_apps=if case=="visual-legacy"{vec![registrations.iter().find(|(id,_)|id.eq_ignore_ascii_case("legacy:23170F69-40C1-278A-1000-000100020000")).context("registered 7-Zip Shell handler required")?.0.clone()]}else if enabled{vec![extension.clone()]}else{Vec::new()};crate::context_preferences::publish(&profile,&prefs);
+            {let state=runner.slot.borrow();let b=state.as_ref().unwrap().browser.as_ref().unwrap();b.select_all(false);
+                if !selection.is_empty(){b.select_children(&selection.iter().map(|s|std::ffi::OsString::from(s)).collect::<Vec<_>>())?;}}
+            pump(30);let _probe=Environment::set("ZSDESK_MENU_TEST_PROBE",case);
+            let target=if selection.is_empty(){zsdesk_windows::shell::menu::ViewMenuTarget::Background}else{zsdesk_windows::shell::menu::ViewMenuTarget::Selection};
+            super::context_menu::show(window,&view,window,LPARAM(-1),target)?;
+            let deadline=Instant::now()+Duration::from_secs(9);
+            while super::context_menu::request_active(runner.hwnd){if Instant::now()>=deadline{super::context_menu::close(runner.hwnd);anyhow::bail!("timed out: {case}");}pump(5);}
+            let snap:serde_json::Value=serde_json::from_slice(&fs::read(out.join(format!("{case}.json")))?)?;
+            let levels=snap["levels"].as_array().context("painted levels")?;
+            ensure!(snap["renderer"]=="drawn-shell-hmenu"&&levels.len()>=depth&&levels.iter().all(|l|l["native_fallback"]==false),"{case} missing a drawn level");
+            let labels=levels[0]["rows"].as_array().context("rows")?;
+            if case.starts_with("visual-more"){
+                ensure!(levels[0]["visible"]==false&&levels[1]["visible"]==true,"More did not replace the first page");
+                let rows=levels[1]["rows"].as_array().context("more options")?;
+                let mut seen=std::collections::HashSet::new();
+                for row in rows.iter().filter(|r|r["height"].as_f64().unwrap_or(0.)>0.){
+                    if let Some(label)=row["label"].as_str().filter(|s|!s.is_empty()){
+                        ensure!(seen.insert(label.to_lowercase()),"duplicate displayed in More: {label}");
+                    }
+                }
+                if levels.len()>=3{
+                    let variants=levels[2]["rows"].as_array().context("command implementations")?;
+                    let ids:std::collections::HashSet<_>=variants.iter().filter(|r|r["height"].as_f64().unwrap_or(0.)>0.).filter_map(|r|r["id"].as_u64()).collect();
+                    ensure!(ids.len()>=2,"different extension command IDs were lost");
+                }
+            }
+            let has=|name:&str|labels.iter().any(|row|row["label"]==name);
+            match case{
+                "visual-file"=>ensure!(has("打开方式")&&!has("在新标签页中打开"),"file received folder actions"),
+                "visual-folder"=>ensure!(has("在新标签页中打开")&&!has("打开方式"),"folder received file actions"),
+                "visual-multi"|"visual-mixed"=>ensure!(!has("重命名")&&!has("打开方式"),"multi-selection received single-item actions"),
+                "visual-background"=>ensure!(has("查看")&&has("新建")&&!has("显示设置"),"wrong directory background"),
+                _=>{}
+            }
+            ensure!(labels.iter().any(|r|r["label"].as_str().is_some_and(|l|l.to_lowercase().contains("7-zip")))==enabled,"unexpected archive visibility for {case}");
+            if matches!(case,"visual-seven"|"visual-legacy"|"visual-deep"){
+                let children=levels[1]["rows"].as_array().context("7-Zip children")?;
+                ensure!(children.iter().any(|r|r["submenu"]==true&&r["label"].as_str().is_some_and(|s|s.contains("CRC"))),"missing checksum submenu in {case}");
+                ensure!(children.iter().any(|r|r["submenu"]==false&&r["label"].as_str().is_some_and(|s|s.contains("one.7z"))),"missing selection-specific archive command in {case}");
+            }
+            if case=="visual-deep"{
+                let checksums=levels[2]["rows"].as_array().context("checksum commands")?;
+                for algorithm in ["CRC-32","SHA-256"]{
+                    ensure!(checksums.iter().any(|r|r["label"]==algorithm&&r["enabled"]==true&&r["submenu"]==false),"missing checksum command {algorithm}");
+                }
+            }
+            let diagnostic=worker::read_recent_diagnostics()["current"].clone();
+            ensure!(diagnostic["error"].is_null()&&diagnostic["native_menu"]["runtime_initializations"]==0,"{case}: {diagnostic}");
+            fs::write(out.join(format!("{case}-diagnostic.json")),serde_json::to_vec_pretty(&diagnostic)?)?;
+            if case=="visual-archive"{let until=Instant::now()+Duration::from_secs(8);while !files.join("one.7z").is_file(){ensure!(Instant::now()<until,"archive command had no effect");pump(20);}}
+            if case=="visual-more-archive"{let until=Instant::now()+Duration::from_secs(8);while !files.join("two.7z").is_file(){ensure!(Instant::now()<until,"grouped archive command had no effect");pump(20);}}
+        }
+        use zsdesk_windows::shell::{menu::MenuInterceptions,pidl::location_pidl};
+        let bin=ShellLocation::Shell{parsing_name:"::{645FF040-5081-101B-9F08-00AA002F954E}".into(),title:"回收站".into(),pidl:None};
+        let bin=location_pidl(&bin).context("Recycle Bin PIDL")?;
+        let root=files.ancestors().last().context("drive")?.to_path_buf();
+        let drive=location_pidl(&ShellLocation::Path(root)).context("drive PIDL")?;
+        let mut contexts=vec![("visual-desktop",vec![0,0],true),("visual-drive",drive,false),
+            ("visual-bin-icon",bin.clone(),false),("visual-bin-background",bin,true)];
+        if let Some(extra)=std::env::var_os("ZSDESK_CONTEXT_FILE_FIXTURES").map(PathBuf::from){
+            for (scene,path) in [("visual-image",extra.join("three.png")),("visual-zip",extra.join("sample.zip")),
+                ("visual-link",extra.join("sample.lnk")),("visual-executable",std::env::current_exe()?)]{
+                let id=location_pidl(&ShellLocation::Path(path)).context("sample item identity")?;
+                contexts.push((scene,id,false));
+            }
+        }
+        for (case,identity,background) in contexts{
+            if let Ok(scenes)=std::env::var("ZSDESK_VISUAL_SCENES"){if !scenes.split(',').any(|s|s==case){continue;}}
+            let _probe=Environment::set("ZSDESK_MENU_TEST_PROBE",case);
+            prefs.native_first_page_apps.clear();
+            let mut client=worker::Client::spawn(window,POINT{x:180,y:160},vec![identity],None,
+                crate::context_preferences::native(&prefs),MenuInterceptions::default(),if background{worker::Mode::Background}else{worker::Mode::More})?;
+            let until=Instant::now()+Duration::from_secs(12);
+            loop{if let Some(result)=client.poll(&mut |commit|!commit){result?;break;}ensure!(Instant::now()<until,"timed out: {case}");pump(5);}
+            let snapshot:serde_json::Value=serde_json::from_slice(&fs::read(out.join(format!("{case}.json"))).with_context(||case.to_string())?)?;
+            let rows=snapshot["levels"][0]["rows"].as_array().context("rows")?;
+            let has=|fragment:&str|rows.iter().any(|r|r["label"].as_str().is_some_and(|s|s.contains(fragment)));
+            match case{
+                "visual-desktop"=>ensure!(has("显示设置")&&has("个性化")&&has("新建"),"desktop namespace was lost"),
+                "visual-drive"=>ensure!(has("打开")&&!has("固定到“开始”"),"drive received the folder-only pin action"),
+                "visual-image"=>ensure!(has("向右旋转")&&has("设置为桌面背景")&&!has("以管理员身份运行"),"image actions"),
+                "visual-zip"=>ensure!(has("全部解压缩")&&!has("向右旋转"),"archive actions"),
+                "visual-link"=>ensure!(has("打开文件所在的位置"),"shortcut actions"),
+                "visual-executable"=>ensure!(has("以管理员身份运行")&&!has("全部解压缩")&&!has("打开方式"),"executable actions"),
+                _=>ensure!(has("清空")&&!has("新建"),"Recycle Bin received a filesystem menu: {case}"),
+            }
+            fs::write(out.join(format!("{case}-diagnostic.json")),serde_json::to_vec_pretty(&worker::read_recent_diagnostics()["current"])?)?;
+        }
+        Ok(())
+    }).join().map_err(|_|anyhow::anyhow!("menu case panicked")).and_then(|r|r);
+    ensure!(unsafe{CloseDesktop(desktop)}!=0,"test desktop retained");result
+}
+
+#[test]
+#[ignore="On-demand drawn worker across click-away and a 185-second pause on a private desktop"]
+fn drawn_menu_exits_after_dismissal_and_reopens_after_idle()->Result<()>{
+    use crate::context_menu_process as worker;
+    let out=PathBuf::from(std::env::var_os("ZSDESK_NATIVE_TEST_OUTPUT").context("test output")?);
+    let name=format!("ZSDesk.MenuReuse.{}",std::process::id());
+    let desktop=unsafe{CreateDesktopW(wide(&name).as_ptr(),std::ptr::null(),std::ptr::null(),0,0x000f00ff,std::ptr::null())};
+    ensure!(!desktop.is_null(),"test desktop");let raw=desktop as usize;
+    let result=thread::spawn(move||->Result<()>{
+        ensure!(unsafe{SetThreadDesktop(raw as *mut c_void)}!=0,"private desktop attachment");
+        let _desktop=Environment::set("ZSDESK_MENU_TEST_DESKTOP",&name);
+        let workers=out.join("workers");fs::create_dir_all(&workers)?;
+        let _root=Environment::set("ZSDESK_MENU_ROOT",&workers);
+        unsafe{OleInitialize(None)}?;let _ole=Apartment;
+        struct Pool;impl Drop for Pool{fn drop(&mut self){worker::shutdown_idle_worker();let until=Instant::now()+Duration::from_secs(5);
+            while worker::pending_workers()>0&&Instant::now()<until{pump(5);}
+        }}let _pool=Pool;
+        let files=out.join("files");fs::create_dir_all(&files)?;
+        for name in ["one.txt","two.txt","three.txt"]{fs::write(files.join(name),b"native menu selection")?;}
+        let runner=create(&out,&files,true)?;
+        let (window,view)={let slot=runner.slot.borrow();let browser=slot.as_ref().unwrap().browser.as_ref().unwrap();
+            (browser.view_window().context("file view")?,unsafe{browser.current_view()?})};
+        let mut records=Vec::new();
+        for stage in ["first","consecutive","outside","after-outside","other-file","after-idle"]{
+            if stage=="after-idle"{pump(185_000);}
+            let file=if stage=="other-file"{"two.txt"}else{"one.txt"};
+            {let slot=runner.slot.borrow();slot.as_ref().unwrap().browser.as_ref().unwrap().select_children(&[file.into()])?;}
+            let selected=super::context_menu::selected_identities(&view)?;
+            ensure!(zsdesk_windows::shell::file_transfer::paths_from_pidls(&selected)?==[files.join(file)],"wrong new target");
+            let outside=stage=="outside";
+            let _probe=Environment::set("ZSDESK_MENU_TEST_PROBE",if outside{"outside-dismiss"}else{"menu-dismiss"});
+            unsafe{SendMessageW(window,WM_CONTEXTMENU,Some(WPARAM(window.0 as usize)),Some(LPARAM(-1)));}
+            let until=Instant::now()+Duration::from_secs(12);let mut clicked=false;
+            while super::context_menu::request_active(runner.hwnd){
+                pump(2);ensure!(Instant::now()<until,"menu did not finish: {stage}");
+                if !outside||clicked{continue;}
+                for entry in fs::read_dir(&workers)?.flatten(){
+                    let read=|name:&str|fs::read(entry.path().join(name)).ok().and_then(|b|serde_json::from_slice::<serde_json::Value>(&b).ok());
+                    let (Some(request),Some(opened))=(read("request.json"),read("opened.json"))else{continue;};
+                    if opened["token"]!=request["token"] || request["probe"]!="outside-dismiss" || opened["observation"]!="drawn-win11-menu"{continue;}
+                    let mut rc=RECT::default();unsafe{GetClientRect(window,&mut rc)}?;
+                    let xy=LPARAM((15u32|(((rc.bottom-10)as u16 as u32)<<16))as isize);
+                    unsafe{PostMessageW(Some(window),WM_LBUTTONDOWN,WPARAM(1),xy)?;PostMessageW(Some(window),WM_LBUTTONUP,WPARAM(0),xy)?;}
+                    pump(5);super::context_menu::poll(runner.hwnd);clicked=true;break;
+                }
+            }
+            ensure!(!outside||clicked,"outside dismissal not exercised");
+            // The UI is free before the worker acknowledges dismissal. Use the same
+            // short gap as the reproduction, without waiting for pool readiness.
+            pump(70);
+            let released=Instant::now();
+            while worker::pending_workers()>0{ensure!(released.elapsed()<Duration::from_secs(5),"drawn menu child did not exit after {stage}");pump(5);}
+            ensure!(worker::idle_worker_diagnostics().as_array().is_some_and(Vec::is_empty),"drawn menu child was parked");
+            let log=worker::read_recent_diagnostics()["current"].clone();
+            if outside{
+                ensure!(!log["committed"].as_bool().unwrap_or(true),"outside input authorized a command");
+                continue;
+            }
+            let pid=log["worker_pid"].as_u64().context("worker PID")?;
+            ensure!(log["parent_pid"]==std::process::id()&&log["timing"]["menu_open_observation"]=="drawn-win11-menu"&&
+                log["error"].is_null()&&log["committed"]==false,"native presentation failed: {log}");
+            ensure!(log["timing"]["reused_process"]==false,"unexpected idle process at {stage}: {log}");
+            records.push(serde_json::json!({"stage":stage,"pid":pid,"created":log["worker_created"],"timing":log["timing"],"target":file,"parked":0}));
+            fs::write(out.join("drawn-on-demand.json"),serde_json::to_vec_pretty(&records)?)?;
+        }
+        drop(runner);
+        let until=Instant::now()+Duration::from_secs(5);
+        while !worker::idle_worker_diagnostics().as_array().is_some_and(Vec::is_empty){
+            worker::pending_workers();ensure!(Instant::now()<until,"closed owner retained native worker");pump(10);
+        }
+        Ok(())
+    }).join().map_err(|_|anyhow::anyhow!("native reuse test panicked")).and_then(|r|r);
+    let until=Instant::now()+Duration::from_secs(3);
+    while unsafe{CloseDesktop(desktop)}==0{ensure!(Instant::now()<until,"test desktop retained");thread::sleep(Duration::from_millis(20));}
+    result
+}
+
+#[test]
+#[ignore="Native prewarm and a different file selection in an isolated Win32 desktop"]
+fn selecting_files_keeps_drawn_worker_stopped_until_right_click()->Result<()>{
+    use crate::context_menu_process as worker;
+    let output=PathBuf::from(std::env::var_os("ZSDESK_NATIVE_TEST_OUTPUT").context("test output")?);
+    let name=format!("ZSDesk.Prewarm.{}",std::process::id());
+    let desktop=unsafe{CreateDesktopW(wide(&name).as_ptr(),std::ptr::null(),std::ptr::null(),0,0x000f00ff,std::ptr::null())};
+    ensure!(!desktop.is_null(),"create test desktop");
+    let raw=desktop as usize;
+    let result=thread::spawn(move||->Result<()>{
+        ensure!(unsafe{SetThreadDesktop(raw as *mut c_void)}!=0,"attach test desktop");
+        let _desktop=Environment::set("ZSDESK_MENU_TEST_DESKTOP",&name);
+        let workers=output.join("workers");fs::create_dir_all(&workers)?;
+        let _root=Environment::set("ZSDESK_MENU_ROOT",&workers);
+        unsafe{OleInitialize(None)}?;let _apartment=Apartment;
+        struct Pool;impl Drop for Pool{fn drop(&mut self){
+            worker::shutdown_idle_worker();let deadline=Instant::now()+Duration::from_secs(5);
+            while worker::pending_workers()>0 && Instant::now()<deadline{pump(10);}
+        }}let _pool=Pool;
+        let folder=output.join("files");fs::create_dir_all(&folder)?;
+        for name in ["one.txt","two.txt","three.txt"]{fs::write(folder.join(name),b"menu")?;}
+        let runner=create(&output,&folder,true)?;
+        let (view,window)={
+            let slot=runner.slot.borrow();let browser=slot.as_ref().unwrap().browser.as_ref().unwrap();
+            browser.select_children(&["one.txt".into()])?;
+            (unsafe{browser.current_view()?},browser.view_window().context("view window")?)
+        };
+        super::context_menu::prewarm_active_view(runner.hwnd);
+        pump(500);
+        ensure!(worker::idle_worker_diagnostics().as_array().is_some_and(Vec::is_empty)
+            &&worker::pending_workers()==0&&!workers.join("menu-prewarm.json").exists(),"selection started a speculative drawn worker");
+        {
+            let slot=runner.slot.borrow();slot.as_ref().unwrap().browser.as_ref().unwrap().select_children(&["two.txt".into()])?;
+        }
+        let selected=super::context_menu::selected_identities(&view)?;
+        ensure!(zsdesk_windows::shell::file_transfer::paths_from_pidls(&selected)?==[folder.join("two.txt")],"selection did not change");
+        let _probe=Environment::set("ZSDESK_MENU_TEST_PROBE","menu-dismiss");
+        unsafe{SendMessageW(window,WM_CONTEXTMENU,Some(WPARAM(window.0 as usize)),Some(LPARAM(-1)));}
+        let deadline=Instant::now()+Duration::from_secs(10);
+        while super::context_menu::request_active(runner.hwnd){ensure!(Instant::now()<deadline,"native popup did not close");pump(5);}
+        let shown=worker::read_recent_diagnostics()["current"].clone();
+        ensure!(shown["worker_pid"].as_u64().is_some() && shown["timing"]["reused_process"]==false &&
+            shown["timing"]["menu_open_observation"]=="drawn-win11-menu" && shown["committed"]==false &&
+            shown["error"].is_null(),"on-demand drawn popup failed: {shown}");
+        ensure!(super::context_menu::selected_identities(&view)?==selected,"presentation changed its target");
+        Ok(())
+    }).join().map_err(|_|anyhow::anyhow!("menu prewarm test panicked")).and_then(|r|r);
+    let deadline=Instant::now()+Duration::from_secs(3);
+    while unsafe{CloseDesktop(desktop)}==0{ensure!(Instant::now()<deadline,"test desktop retained");thread::sleep(Duration::from_millis(20));}
+    result
+}
 impl Drop for Runner{fn drop(&mut self){let _=unsafe{DestroyWindow(self.hwnd)};}}
 fn pump(ms:u64){let end=Instant::now()+Duration::from_millis(ms);while Instant::now()<end{
     let mut message=MSG::default();for _ in 0..256{if !unsafe{PeekMessageW(&mut message,None,0,0,PM_REMOVE)}.as_bool(){break;}if message.message!=WM_QUIT{unsafe{let _=TranslateMessage(&message);DispatchMessageW(&message);}}}thread::sleep(Duration::from_millis(3));}}

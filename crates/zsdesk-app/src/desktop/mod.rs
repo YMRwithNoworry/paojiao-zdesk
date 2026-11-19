@@ -306,6 +306,7 @@ fn forward(key: &[u16], command: &DesktopCommand) -> Result<()> {
 }
 
 fn run_host(config_path: PathBuf, explorer_config: PathBuf, command: DesktopCommand, key: &[u16]) -> Result<()> {
+    if let Ok(session)=crate::storage::load(&explorer_config){crate::context_preferences::register(&explorer_config,&session.ui.context_menu);}
     let instance = HINSTANCE(unsafe { GetModuleHandleW(None)? }.0);
     let host_class = wide(HOST_CLASS);
     let fence_class = wide(host::FENCE_CLASS);
@@ -319,7 +320,6 @@ fn run_host(config_path: PathBuf, explorer_config: PathBuf, command: DesktopComm
     HOST_HWND.with(|h| h.set(hwnd.0 as isize));
     let (family, _) = zsdesk_windows::gfx::system_ui_font(None);
     let gfx = Gfx::new(&family).context(zsdesk_core::i18n::text("Direct2D 初始化失败"))?;
-    zsdesk_windows::flyout::prepare();
     let config = host::load_config(&config_path);
     HOST.with(|h| *h.borrow_mut() = Some(DesktopHost::new(hwnd, config_path, explorer_config, config, gfx)));
     with_host(|h| h.start());
@@ -567,7 +567,9 @@ unsafe extern "system" fn fence_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
             if let Some(a) = with_host(|h| h.mouse_down(id, point_of(lp), msg == WM_LBUTTONDBLCLK)) { run_after(a); }
             return LRESULT(0);
         }
-        WM_LBUTTONUP => { if let Some(a) = with_host(|h| h.mouse_up(id, point_of(lp))) { run_after(a); } return LRESULT(0); }
+        WM_LBUTTONUP => { if let Some(a) = with_host(|h| h.mouse_up(id, point_of(lp))) { run_after(a); }
+            if crate::context_menu_process::prewarm::needed(){unsafe{SetTimer(Some(hwnd),protocol::FenceTimer::MenuPrewarm as usize,crate::context_menu_process::prewarm::SETTLE_MS,None);}}
+            return LRESULT(0); }
         WM_RBUTTONUP => { if let Some(a) = with_host(|h| h.right_click(id, point_of(lp))) { run_after(a); } return LRESULT(0); }
         WM_CONTEXTMENU => return LRESULT(0),
         WM_MOUSEWHEEL => { with_host(|h| h.wheel(id, ((wp.0 >> 16) as i16) as i32, point_of(lp))); return LRESULT(0); }
@@ -631,6 +633,24 @@ unsafe extern "system" fn fence_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
         WM_TIMER if wp.0 == TIMER_PEEK => { with_host(|h| h.peek_check(id)); return LRESULT(0); }
         WM_TIMER if wp.0==host::TIMER_NOTICE=>{with_host(|host|host.clear_notice(id));return LRESULT(0);}
         WM_TIMER if wp.0==host::TIMER_SELECTION=>{with_host(|host|host.poll_completed_selection(id));return LRESULT(0);}
+        WM_TIMER if wp.0==protocol::FenceTimer::MenuPrewarm as usize=>{
+            let _=unsafe{KillTimer(Some(hwnd),wp.0)};
+            if crate::context_menu_process::prewarm::needed(){
+                let selected=with_host(|host|{
+                    let fence=&host.fences[host.win_index(id)?];
+                    if fence.selection.len()!=1{return None;}
+                    let item=host.focused_entry(id)?;
+                    if !fence.selection.contains(&item.key){return None;}
+                    Some((item.pidl.clone(),item.path.as_ref()?.parent()?.to_owned(),host.explorer_config.clone()))
+                }).flatten();
+                if let Some((pidl,folder,profile))=selected{
+                    if let Some(prefs)=crate::context_preferences::current(&profile){
+                        crate::context_menu_process::prewarm::start(hwnd,pidl,folder,false,crate::context_preferences::native(&prefs),None);
+                    }
+                }
+            }
+            return LRESULT(0);
+        }
         WM_TIMER if wp.0 == TIMER_AUTOSCROLL => { with_host(|h| h.rubber_autoscroll(id)); return LRESULT(0); }
         WM_TIMER if wp.0 == TIMER_FOLDER => {
             let _ = unsafe { KillTimer(Some(hwnd), TIMER_FOLDER) };
@@ -797,7 +817,7 @@ fn menu_target_current(request:&menu_worker::Request)->bool{
         if host.fences[index].hwnd.0 as isize!=request.owner||!unsafe{IsWindowVisible(host.fences[index].hwnd)}.as_bool(){return None;}
         Some(match &request.target{
             menu_worker::Target::Items{..}=>menu_worker::Target::Items{pidls:host.selected_pidls(request.fence),key:None},
-            menu_worker::Target::Background{..}=>menu_worker::Target::Background{folder:host.target_folder(request.fence)},
+            menu_worker::Target::Background{..}=>background_target(host,request.fence),
         })
     }).flatten();
     let Some(before)=snapshot()else{return false;};
@@ -805,13 +825,13 @@ fn menu_target_current(request:&menu_worker::Request)->bool{
     // and reject a request replaced or changed while those calls were running.
     let matches=match (&request.target,&before){
         (menu_worker::Target::Items{pidls,..},menu_worker::Target::Items{pidls:current,..})=>zsdesk_windows::shell::menu::same_item_identities(pidls,current),
-        (menu_worker::Target::Background{folder},menu_worker::Target::Background{folder:current})=>folder==current,
+        (menu_worker::Target::Background{folder,desktop},menu_worker::Target::Background{folder:current,desktop:current_desktop})=>folder==current&&desktop==current_desktop,
         _=>false,
     };
     if !matches||!menu_request_current(request.generation){return false;}
     match (before,snapshot()){
         (menu_worker::Target::Items{mut pidls,..},Some(menu_worker::Target::Items{pidls:mut current,..}))=>{pidls.sort();current.sort();pidls==current},
-        (menu_worker::Target::Background{folder},Some(menu_worker::Target::Background{folder:current}))=>folder==current,
+        (menu_worker::Target::Background{folder,desktop},Some(menu_worker::Target::Background{folder:current,desktop:current_desktop}))=>folder==current&&desktop==current_desktop,
         _=>false,
     }
 }
@@ -833,11 +853,21 @@ fn finish_menu_work(){
             let owner=HWND(request.owner as*mut _);
             // Shell commands already ran against their captured PIDLs. Only
             // application actions require the current selection to still match.
-            let actionable=matches!(&outcome,Ok(MenuOutcome::Application(_)|MenuOutcome::Rename|MenuOutcome::Open|MenuOutcome::Explore|MenuOutcome::Copy|MenuOutcome::Cut|MenuOutcome::Paste|MenuOutcome::Delete{..}));
+            let actionable=matches!(&outcome,Ok(MenuOutcome::Application(_)|MenuOutcome::Rename|MenuOutcome::Open|MenuOutcome::Explore|MenuOutcome::Copy|MenuOutcome::Cut|MenuOutcome::Paste|MenuOutcome::PinInExplorer|MenuOutcome::Delete{..}));
             // A superseded construction can fail after another menu was
             // requested. Its error must not interrupt the newer interaction.
             if outcome.is_err()&&!menu_request_current(request.generation){continue;}
             if actionable&&(!menu_request_current(request.generation)||!menu_target_current(&request)){continue;}
+            if matches!(outcome,Ok(MenuOutcome::PinInExplorer)){
+                if let menu_worker::Target::Items{pidls,..}=&request.target{
+                    let owner_id=owner.0 as isize;
+                    let result=crate::explorer_forwarder::show_start_pin_target(pidls,move|result|{
+                        if let Err(e)=result{file_action_error(HWND(owner_id as *mut _),&windows::core::Error::new(windows::Win32::Foundation::E_FAIL,e.to_string()));}
+                    });
+                    if let Err(e)=result{with_host(|host|host.notify_error(&e.to_string()));}
+                }
+                continue;
+            }
             if let Ok(action @ (MenuOutcome::Copy|MenuOutcome::Cut|MenuOutcome::Paste|MenuOutcome::Delete{..}))=outcome{
                 if let Err(error)=dispatch_menu_file_action(&request,action){file_action_error(owner,&error);}continue;
             }
@@ -863,7 +893,7 @@ fn dispatch_menu_file_action(request:&menu_worker::Request,action:MenuOutcome)->
         MenuOutcome::Delete{permanent}=>file_transfer::delete_paths(owner,paths,permanent),
         MenuOutcome::Paste=>{
             let destination=match &request.target{
-                menu_worker::Target::Background{folder}=>folder.clone(),
+                menu_worker::Target::Background{folder,..}=>folder.clone(),
                 menu_worker::Target::Items{pidls,..} if pidls.len()==1=>{
                     use windows::Win32::System::SystemServices::{SFGAO_FOLDER,SFGAO_STREAM};
                     let item=zsdesk_windows::shell::pidl::item_from_pidl(&pidls[0])?;
@@ -910,12 +940,15 @@ fn fence_menu(fence: u64, point: POINT) {
     tab_popup(fence,point,|host|host.fence_menu(fence));
 }
 
+fn background_target(host:&DesktopHost,fence:u64)->menu_worker::Target{
+    menu_worker::Target::Background{folder:host.target_folder(fence),desktop:host.config.fence(fence).is_some_and(|f|f.is_desktop())}
+}
 fn folder_system_menu(fence:u64,point:POINT){
     let input_started=std::time::Instant::now();
-    let Some((hwnd,folder,profile))=with_host(|host|host.win_index(fence).map(|index|
-        (host.fences[index].hwnd,host.target_folder(fence),host.explorer_config.clone()))).flatten()else{return;};
-    if folder.is_none(){return;}
-    let mut request=menu_worker::Request::new(fence,hwnd,point,profile,Vec::new(),menu_worker::Target::Background{folder},key_down(VK_SHIFT));
+    let Some((hwnd,target,profile))=with_host(|host|host.win_index(fence).map(|index|
+        (host.fences[index].hwnd,background_target(host,fence),host.explorer_config.clone()))).flatten()else{return;};
+    if matches!(target,menu_worker::Target::Background{folder:None,..}){return;}
+    let mut request=menu_worker::Request::new(fence,hwnd,point,profile,Vec::new(),target,key_down(VK_SHIFT));
     request.input_started=input_started;quick_fence_menu(request);
 }
 
@@ -1053,9 +1086,9 @@ fn run_verb(fence: u64, verb: &'static str, background: bool) {
     let Some(hwnd) = fence_hwnd(fence) else { return };
     let shift = key_down(VK_SHIFT);
     if background&&verb=="paste"&&!zsdesk_windows::shell::file_transfer::has_filesystem_clipboard(){
-        if let Some((folder,profile))=with_host(|host|(host.target_folder(fence),host.explorer_config.clone())){
+        if let Some((target,profile))=with_host(|host|(background_target(host,fence),host.explorer_config.clone())){
             let mut point=POINT::default();let _=unsafe{GetCursorPos(&mut point)};
-            let mut request=menu_worker::Request::new(fence,hwnd,point,profile,Vec::new(),menu_worker::Target::Background{folder},false);
+            let mut request=menu_worker::Request::new(fence,hwnd,point,profile,Vec::new(),target,false);
             request.mode=crate::context_menu_process::Mode::Paste;queue_menu(request);
         }return;
     }

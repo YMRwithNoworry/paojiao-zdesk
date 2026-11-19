@@ -174,6 +174,7 @@ try {
         }
         Copy-Item -LiteralPath (Join-Path $root 'packaging\licenses') -Destination (Join-Path $stage 'licenses') -Recurse
         Copy-Item -LiteralPath (Join-Path $root 'LICENSE') -Destination (Join-Path $stage 'LICENSE.txt')
+        Copy-Item -LiteralPath (Join-Path $root 'CHANGELOG.md') -Destination (Join-Path $stage 'CHANGELOG.md')
         Copy-Item -LiteralPath (Join-Path $root 'THIRD-PARTY-NOTICES.txt') -Destination (Join-Path $stage 'THIRD-PARTY-NOTICES.txt')
         if (-not $definition.DesktopOnly) {
             $listaryStage=Join-Path $stage 'integrations\listary'

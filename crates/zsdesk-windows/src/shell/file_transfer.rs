@@ -230,14 +230,19 @@ pub fn filesystem_selection(view:&IShellView)->Result<bool>{
 fn item_path(item:&IShellItem)->Result<PathBuf>{
     let value=unsafe{item.GetDisplayName(SIGDN_FILESYSPATH)?};let text=unsafe{value.to_string()};unsafe{CoTaskMemFree(Some(value.0.cast()));}Ok(text.map(PathBuf::from)?)
 }
-pub fn folder_path(view:&IShellView)->Result<PathBuf>{
+pub(super) fn paste_folder(view:&IShellView)->Result<Option<IShellItem>>{
     let folder:IFolderView2=view.cast()?;let persistent:IPersistFolder2=unsafe{folder.GetFolder()?};
-    let pidl=unsafe{persistent.GetCurFolder()?};let result=unsafe{SHCreateItemFromIDList::<IShellItem>(pidl)};unsafe{CoTaskMemFree(Some(pidl.cast()));}item_path(&result?)
+    let pidl=unsafe{persistent.GetCurFolder()?};
+    if pidl.is_null(){return Err(Error::from_hresult(HRESULT(0x80004005u32 as i32)));}
+    let desktop=unsafe{ILGetSize(Some(pidl))}==2;
+    let result=if desktop{Ok(None)}else{unsafe{SHCreateItemFromIDList::<IShellItem>(pidl)}.map(Some)};
+    unsafe{CoTaskMemFree(Some(pidl.cast()));}result
+}
+pub fn folder_path(view:&IShellView)->Result<PathBuf>{
+    if let Some(item)=paste_folder(view)?{item_path(&item)}else{crate::desktop::user_desktop().ok_or_else(||invalid("Desktop folder unavailable"))}
 }
 pub fn filesystem_folder_path(view:&IShellView)->Result<Option<PathBuf>>{
-    let folder:IFolderView2=view.cast()?;let persistent:IPersistFolder2=unsafe{folder.GetFolder()?};
-    let pidl=unsafe{persistent.GetCurFolder()?};let result=unsafe{SHCreateItemFromIDList::<IShellItem>(pidl)};
-    unsafe{CoTaskMemFree(Some(pidl.cast()));}let item=result?;
+    let Some(item)=paste_folder(view)? else{return Ok(crate::desktop::user_desktop());};
     let attributes=unsafe{item.GetAttributes(windows::Win32::System::SystemServices::SFGAO_FOLDER|SFGAO_FILESYSTEM|windows::Win32::System::SystemServices::SFGAO_STREAM)?}.0;
     if attributes&(SFGAO_FILESYSTEM.0|windows::Win32::System::SystemServices::SFGAO_FOLDER.0)!=(SFGAO_FILESYSTEM.0|windows::Win32::System::SystemServices::SFGAO_FOLDER.0)
         ||attributes&windows::Win32::System::SystemServices::SFGAO_STREAM.0!=0{return Ok(None);}

@@ -61,13 +61,14 @@ impl Drop for CreationCapture {fn drop(&mut self){
     CREATED.with(|created|created.borrow_mut().clear());
 }}
 
-pub fn for_view(view:&IShellView)->Result<ShellMenu>{
+pub(super) fn context_for_view(view:&IShellView)->Result<IContextMenu>{
     let folder:IFolderView2=view.cast()?;let persistent:IPersistFolder2=unsafe{folder.GetFolder()?};
     let pidl=unsafe{persistent.GetCurFolder()?};
     let result=(||{
         let menu:IContextMenu=unsafe{CoCreateInstance(&GUID::from_u128(0xd969a300_e7ff_11d0_a93b_00a0c90f2719),None,CLSCTX_INPROC_SERVER)}?;
         unsafe{menu.cast::<IShellExtInit>()?.Initialize(Some(pidl),None,None)?;}
-        ShellMenu::new_background(menu)
+        Ok(menu)
     })();
     unsafe{windows::Win32::System::Com::CoTaskMemFree(Some(pidl.cast()));}result
 }
+pub fn for_view(view:&IShellView)->Result<ShellMenu>{ShellMenu::new_background(context_for_view(view)?)}

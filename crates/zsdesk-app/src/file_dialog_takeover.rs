@@ -5,6 +5,8 @@ use anyhow::{Context,Result,ensure};
 use windows::{core::{w,BOOL,Interface,PCWSTR},Win32::{Foundation::{HWND,LPARAM,WPARAM},System::{Com::{CoCreateInstance,CoInitializeEx,CoUninitialize,CLSCTX_INPROC_SERVER,COINIT_MULTITHREADED},Variant::VARIANT},UI::{Accessibility::*,Controls::*,Input::KeyboardAndMouse::IsWindowEnabled,WindowsAndMessaging::*}}};
 use crate::window::picker::{Event,FileType,NativeReply,Options,Outcome,SelectionKind};
 pub(crate) mod guard;
+static DIALOG_BUSY:AtomicBool=AtomicBool::new(false);
+pub(crate) fn has_active_dialog()->bool{DIALOG_BUSY.load(Ordering::Acquire)}
 mod watcher;
 mod capabilities;
 #[cfg(test)]#[path="file_dialog_takeover/native_tests.rs"]mod native_tests;
@@ -197,6 +199,7 @@ fn run(profile:&Path,stop:&AtomicBool)->Result<()>{
     let mutex=unsafe{CreateMutexW(None,false,w!("Local\\ZSDesk.CommonFilePicker"))}?;let existing=unsafe{GetLastError()}==ERROR_ALREADY_EXISTS;
     struct Owned(windows::Win32::Foundation::HANDLE);impl Drop for Owned{fn drop(&mut self){let _=unsafe{CloseHandle(self.0)};}}let _owned=Owned(mutex);if existing{return Ok(());}
     unsafe{CoInitializeEx(None,COINIT_MULTITHREADED)}.ok()?;struct Apartment;impl Drop for Apartment{fn drop(&mut self){unsafe{CoUninitialize();}}}let _apartment=Apartment;
+    struct ActiveDialogs;impl Drop for ActiveDialogs{fn drop(&mut self){DIALOG_BUSY.store(false,std::sync::atomic::Ordering::Release);}}let _busy=ActiveDialogs;
     let mut automation:Option<IUIAutomation>=None;
     let(tx,rx)=mpsc::channel();let mut sessions=Vec::<Session>::new();let mut preparing=Vec::<watcher::Claim>::new();let mut contracts=HashMap::<u64,StableContract>::new();
     let mut watcher:Option<watcher::Connection>=None;let mut enabled=false;let mut returning=HashMap::<u64,PendingReturn>::new();
@@ -316,6 +319,7 @@ fn run(profile:&Path,stop:&AtomicBool)->Result<()>{
                 }else{contracts.entry(token).or_default().reset();index+=1;}
             }
         }
+        DIALOG_BUSY.store(!sessions.is_empty()||!returning.is_empty()||!preparing.is_empty(),std::sync::atomic::Ordering::Release);
         let status=serde_json::json!({"pid":std::process::id(),"enabled":enabled,"active_pickers":sessions.len(),"awaiting_caller":returning.len(),"last_kind":last_kind,"last_confirmation":last_confirmation,"completed":completed,"last_error":last_error,"early_masking":watcher.is_some(),"preserved_native":preserved_native,"last_preservation":last_preservation}).to_string();
         if status!=previous{let _=crate::quick_search::control::atomic_write(&profile.with_file_name("file-dialog-takeover-status.json"),status.as_bytes());previous=status;}
         thread::sleep(Duration::from_millis(10));

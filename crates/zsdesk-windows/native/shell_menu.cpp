@@ -902,6 +902,16 @@ extern "C" void zs_menu_shared_host(BOOL enabled) noexcept {
     if(enabled){gSharedHosts.fetch_add(1);}
     else if(gSharedHosts.fetch_sub(1)==1){zs_menu_shutdown();}
 }
+extern "C" HRESULT zs_menu_prepare_runtime(HWND owner,IExplorerBrowser* browser) noexcept {
+    if(!owner || !IsWindow(owner) || IsWindowVisible(owner) || active) return E_INVALIDARG;
+    Microsoft::WRL::ComPtr<Presenter> presenter;
+    HRESULT hr=QueryMenuPresenter(browser,kPresenterSID,kPresenterIID,
+        reinterpret_cast<void**>(presenter.GetAddressOf()),owner);
+    if(SUCCEEDED(hr) && (!presenter || presenter->IsContextMenuOpen())) hr=E_UNEXPECTED;
+    presenter.Reset();
+    zs_menu_shutdown();
+    return hr;
+}
 extern "C" void zs_menu_set_hidden_features(uint32_t hidden) noexcept {
     gHiddenMenuFeatures=hidden;
 }

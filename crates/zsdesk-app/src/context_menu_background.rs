@@ -77,6 +77,45 @@ impl Drop for BackgroundView {fn drop(&mut self){let _=unsafe{self.browser.Destr
 /// current selection happens to contain items from only one disk directory.
 pub(super) enum SelectionOrigin<'a>{Folder(&'a [u8]),Results,Unspecified}
 
+pub(super) fn selection_origin(request:&Request)->SelectionOrigin<'_>{
+    match request.view_context.as_ref(){
+        Some(context) if context.results=>SelectionOrigin::Results,
+        Some(context)=>context.folder.as_deref().map_or(SelectionOrigin::Unspecified,SelectionOrigin::Folder),
+        None=>SelectionOrigin::Unspecified,
+    }
+}
+
+pub(super) fn compact_selection(owner:HWND,request:&Request,options:&ContextMenuOptions)->Result<Option<ShellMenu>>{
+    use windows::Win32::System::SystemServices::SFGAO_FILESYSTEM;
+    if request.mode!=Mode::More || !options.drawn || request.extended || request.pidls.is_empty()
+        || options.native_first_page_apps.as_ref().is_some_and(|apps|!apps.is_empty()){
+        return Ok(None);
+    }
+    match selection_origin(request){
+        SelectionOrigin::Results=>return Ok(None),
+        SelectionOrigin::Folder(id) if id!=[0,0]=>{
+            let physical=zsdesk_windows::shell::pidl::item_from_pidl(id)
+                .and_then(|item|unsafe{item.GetAttributes(SFGAO_FILESYSTEM)}).is_ok_and(|attrs|attrs.contains(SFGAO_FILESYSTEM));
+            if !physical{return Ok(None);}
+        }
+        _=>{}
+    }
+    let snapshot=request.clone();
+    let keep=std::cell::OnceCell::<Rc<BackgroundView>>::new();
+    let bind=move||->windows::core::Result<IShellView>{
+        if let Some(host)=keep.get(){return Ok(host.view.clone());}
+        let load=||->Result<Rc<BackgroundView>>{
+            let events=EventSet::open(&snapshot.session)?;
+            for_selection(&snapshot.pidls,selection_origin(&snapshot),&snapshot,&events)
+        };
+        let host=load().map_err(|e|windows::core::Error::new(failure_code(&e),e.to_string()))?;
+        let view=host.view.clone();
+        let _=keep.set(host);
+        Ok(view)
+    };
+    Ok(ShellMenu::for_compact_selection(owner,&request.pidls,Box::new(bind))?)
+}
+
 #[derive(Clone)]
 enum SelectionNamespace{Folder(IShellItem),Results}
 

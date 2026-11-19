@@ -20,6 +20,7 @@ impl WindowState {
     }
     pub(super) fn rebuild_navigation_tree(&mut self) {
         self.tree=None;
+        if !self.session.ui.show_tree{self.relayout();self.position_children();return;}
         match unsafe{NamespaceTreeHost::create_with_options(self.hwnd,win_rect(self.layout.tree),self.current_location(),self.navigation_tree_options())} {
             Ok(tree)=>{self.tree=Some(tree);self.theme_children();self.relayout();self.position_children();},
             Err(error)=>self.show_message(zsdesk_core::tr_format!("无法更新导航窗格：{error}", error=error)),
