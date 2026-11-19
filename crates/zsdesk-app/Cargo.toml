@@ -22,6 +22,7 @@ pinyin = { version = "=0.11.0", default-features = false, features = ["plain"] }
 zsui = { path = "../../../zsui", default-features = false }
 
 [features]
+menu-visual-qa = ["zsdesk-windows/menu-visual-qa"]
 # Editions: standard, network, desktop, full, and a separate themed edition.
 default = ["network", "desktop"]
 network = []

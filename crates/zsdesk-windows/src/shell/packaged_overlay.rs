@@ -439,13 +439,13 @@ impl IPropertyBag_Impl for ReadOnlyBag_Impl {
     }
 }
 
-struct Bitmap(HBITMAP);
+pub(super) struct Bitmap(pub(super) HBITMAP);
 impl Drop for Bitmap {
     fn drop(&mut self) {
         let _ = unsafe { DeleteObject(self.0.into()) };
     }
 }
-fn bitmap_from_icon(resource: &str, owner: HWND) -> Result<Rc<Bitmap>> {
+pub(super) fn bitmap_from_icon(resource: &str, owner: HWND) -> Result<Rc<Bitmap>> {
     if resource.contains('\0') {
         return Err(error(0x80070057, "invalid icon resource"));
     }
@@ -508,7 +508,21 @@ fn bitmap_from_icon(resource: &str, owner: HWND) -> Result<Rc<Bitmap>> {
         std::ptr::write_bytes(bits.cast::<u8>(), 0, (size * size * 4) as usize);
     }
     let previous = unsafe { SelectObject(dc.0, bitmap.0.into()) };
-    let result = unsafe { DrawIconEx(dc.0, 0, 0, icon.0, size, size, 0, None, DI_NORMAL) };
+    let result=(||->Result<()>{
+        unsafe{DrawIconEx(dc.0,0,0,icon.0,size,size,0,None,DI_NORMAL)?;let _=GdiFlush();}
+        let pixels=unsafe{std::slice::from_raw_parts_mut(bits.cast::<u8>(),(size*size*4)as usize)};
+        if pixels.chunks_exact(4).all(|pixel|pixel[3]==0){
+            // Mask-based icons have no alpha channel. Recover mask coverage
+            // from the same icon drawn on black and white, preserving black ink.
+            let black=pixels.to_vec();pixels.fill(255);
+            unsafe{DrawIconEx(dc.0,0,0,icon.0,size,size,0,None,DI_NORMAL)?;let _=GdiFlush();}
+            for (pixel,dark) in pixels.chunks_exact_mut(4).zip(black.chunks_exact(4)){
+                let uncovered=(0..3).map(|c|pixel[c].saturating_sub(dark[c])).min().unwrap_or(0);
+                pixel[..3].copy_from_slice(&dark[..3]);pixel[3]=255-uncovered;
+            }
+        }
+        Ok(())
+    })();
     unsafe {
         SelectObject(dc.0, previous);
     }
@@ -901,7 +915,9 @@ impl Shared {
         Ok(Some(id))
     }
     fn query(&self, menu: HMENU, index: u32, first: u32, last: u32, flags: u32) -> Result<u32> {
-        let packages = flags & (CMF_DEFAULTONLY | CMF_OPTIMIZEFORINVOKE) == 0;
+        let policy=super::menu::context_menu_options();
+        let allowed=if policy.drawn{policy.native_first_page_apps.as_deref()}else{None};
+        let packages = flags & (CMF_DEFAULTONLY | CMF_OPTIMIZEFORINVOKE) == 0 && allowed.is_none_or(|ids|!ids.is_empty());
         let range = IdRange::new(first, last, packages)?;
         let old = {
             let mut data = self
@@ -964,8 +980,17 @@ impl Shared {
             let mut at = index
                 .saturating_add((after - before) as u32)
                 .min(after as u32);
+            if policy.drawn && allowed.is_some(){
+                for pos in index..at{
+                    let mut item=MENUITEMINFOW{cbSize:size_of::<MENUITEMINFOW>()as u32,fMask:MIIM_ID,..Default::default()};
+                    if unsafe{GetMenuItemInfoW(menu,pos,true,&mut item)}.is_ok()&&item.wID==first+31&&
+                        super::menu::canonical_verb(&self.base,item.wID).as_deref()==Some("zsdesk.more"){
+                        at=pos.saturating_sub(1).max(index);break;
+                    }
+                }
+            }
             let mut separated = false;
-            match packaged_commands::discover() {
+            match packaged_commands::discover_enabled(allowed) {
                 Err(error) => self.issue(
                     None,
                     "package-discovery",
@@ -995,7 +1020,10 @@ impl Shared {
                             true,
                         );
                     }
+                    let mut matched=Vec::new();
+                    let mut distinct=HashSet::new();
                     for registration in discovery.registrations {
+                        if allowed.is_some_and(|ids|!super::menu::native_app_selected(&registration.settings_id(),ids)){continue;}
                         match self.context.matches(&registration) {
                             SelectorMatch::DoesNotMatch => continue,
                             SelectorMatch::Unknown(reason) => {
@@ -1004,6 +1032,28 @@ impl Shared {
                             }
                             SelectorMatch::Matches => (),
                         }
+                        if distinct.insert(command_key(&registration,&[],None).0){matched.push(registration);}
+                    }
+                    // Windows can already expose a manifest verb through the public
+                    // IContextMenu. Only reuse a class identity if it identifies one
+                    // matching verb. Multiple distinct verbs may share the same server.
+                    let mut class_counts=HashMap::new();
+                    for registration in &matched{*class_counts.entry(registration.clsid).or_insert(0usize)+=1;}
+                    let mut native_classes=HashSet::new();
+                    if !matched.is_empty(){
+                        for pos in index..index+(after-before) as u32 {
+                            let mut item=MENUITEMINFOW{cbSize:size_of::<MENUITEMINFOW>() as u32,fMask:MIIM_ID,..Default::default()};
+                            if unsafe{GetMenuItemInfoW(menu,pos,true,&mut item)}.is_err()||item.wID<first||item.wID-first>=used{continue;}
+                            let mut text=[0u16;48];
+                            if unsafe{self.base.GetCommandString((item.wID-first) as usize,GCS_VERBW,None,PSTR(text.as_mut_ptr().cast()),text.len() as u32)}.is_ok(){
+                                if let Some(end)=text.iter().position(|&unit|unit==0){
+                                    if let Ok(id)=GUID::try_from(String::from_utf16_lossy(&text[..end]).trim_matches(['{','}'])){native_classes.insert(id);}
+                                }
+                            }
+                        }
+                    }
+                    for registration in matched{
+                        if class_counts.get(&registration.clsid)==Some(&1)&&native_classes.contains(&registration.clsid){continue;}
                         let command = match packaged_commands::activate(&registration) {
                             Ok(command) => command,
                             Err(error) => {
@@ -1723,7 +1773,7 @@ unsafe fn borrowed_ansi(pointer: *const u8) -> Result<String> {
     }
     Err(error(0x8007007a, "command text exceeds bound"))
 }
-unsafe fn write_command_text(target: PSTR, count: u32, text: &str, unicode: bool) -> Result<()> {
+pub(super) unsafe fn write_command_text(target: PSTR, count: u32, text: &str, unicode: bool) -> Result<()> {
     if target.0.is_null() || count == 0 {
         return Err(error(0x80070057, "invalid command string buffer"));
     }
@@ -2351,6 +2401,7 @@ mod tests {
     }
     fn registration(verb: &str) -> Registration {
         Registration {
+            display_name:None,
             package_family: "test-family".into(),
             package_full_name: "test-full".into(),
             application_id: "App".into(),

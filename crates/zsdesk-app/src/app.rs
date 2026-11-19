@@ -55,7 +55,7 @@ fn parse(args: impl IntoIterator<Item=OsString>) -> Result<Options> {
         let quick = match arg.to_str() {
             Some("--quick-search") => Some(crate::quick_search::Action::Open),
             Some("--quick-search-settings") => Some(crate::quick_search::Action::Settings),
-            Some("--background") => Some(crate::quick_search::Action::Resident),
+            Some("--background"|"--window-background") => Some(crate::quick_search::Action::Resident),
             Some("--background-stop") => Some(crate::quick_search::Action::Stop),
             Some("--background-status") => Some(crate::quick_search::Action::Status),
             Some("--background-enable") => Some(crate::quick_search::Action::EnableAtLogin),
@@ -206,61 +206,57 @@ pub fn shell_open_target() -> Option<OsString> {
 /// Used before parsing succeeds so malformed background commands never show UI.
 pub fn is_import_cli() -> bool {
     std::env::args_os().skip(1).any(|arg| arg == "--import-tencent" || arg == "--import-report" || arg == "--apply-import" || arg == "--diagnostics" || arg == "--diagnostics-main" || arg == "--build-info" || arg == "--uninstall-integration" || arg == "--routing-apply" || arg == "--win-e-agent" || arg == "--win-e-agent-stop"
-        || arg == "--background-stop" || arg == "--background-status" || arg == "--background-enable" || arg == "--background-disable" || arg == "--integration-refresh" || arg == "--integration-enable")
+        || arg == "--background-stop" || arg == "--background-status" || arg == "--background-enable" || arg == "--background-disable" || arg == "--integration-refresh" || arg=="--integration-enable")
 }
 
-pub fn is_background_mode() -> bool { std::env::args_os().any(|arg| arg == "--background") }
+pub fn is_background_mode() -> bool { std::env::args_os().any(|arg| arg == "--background" || arg=="--window-background") }
 pub fn is_win_e() -> bool { std::env::args_os().skip(1).any(|arg| arg == "--win-e") }
 
-pub fn open_original_explorer(target: OsString) -> std::io::Result<()> {
+pub fn open_original_explorer(target:OsString)->std::io::Result<()> {
     use std::os::windows::ffi::OsStringExt;
-    let mut directory = vec![0u16; 32768];
-    let length = unsafe { windows::Win32::System::SystemInformation::GetWindowsDirectoryW(Some(&mut directory)) } as usize;
-    if length == 0 || length >= directory.len() { return Err(std::io::Error::last_os_error()); }
-    let executable = PathBuf::from(OsString::from_wide(&directory[..length])).join("explorer.exe");
-    std::process::Command::new(executable).arg(target).spawn().map(|_| ())
+    let mut directory=vec![0u16;32768];
+    let length=unsafe {windows::Win32::System::SystemInformation::GetWindowsDirectoryW(Some(&mut directory))} as usize;
+    if length==0 || length>=directory.len(){return Err(std::io::Error::last_os_error());}
+    let executable=PathBuf::from(OsString::from_wide(&directory[..length])).join("explorer.exe");
+    std::process::Command::new(executable).arg(target).spawn().map(|_|())
 }
 
 pub fn run() -> Result<()> {
-    run_arguments(std::env::args_os().skip(1).collect(), false)
+    run_arguments(std::env::args_os().skip(1).collect(),false)
 }
-
-fn managed(options: &Options) -> bool {
-    !options.integration_enable && !options.integration_refresh && !options.routing_apply && !options.uninstall_integration
-        && options.diagnostics_main.is_none() && match &options.mode {
-            Mode::Explorer => true,
-            Mode::Desktop(command) => !matches!(command, DesktopCommand::Quit | DesktopCommand::Diagnostics(_)),
-            Mode::QuickSearch(action) => matches!(action, crate::quick_search::Action::Open | crate::quick_search::Action::Settings | crate::quick_search::Action::Resident),
-            _ => false,
+fn managed(options:&Options)->bool{
+    !options.integration_enable&&!options.integration_refresh&&!options.routing_apply&&!options.uninstall_integration
+        &&options.diagnostics_main.is_none()&&match &options.mode{
+            Mode::Explorer=>true,
+            Mode::Desktop(command)=>!matches!(command,DesktopCommand::Quit|DesktopCommand::Diagnostics(_)),
+            Mode::QuickSearch(action)=>matches!(action,crate::quick_search::Action::Open|crate::quick_search::Action::Settings|crate::quick_search::Action::Resident),
+            _=>false,
         }
 }
-
-pub(crate) fn runtime_profile(args: &[OsString]) -> Result<Option<PathBuf>> {
-    let options = parse(edition_arguments(args.to_vec())?)?;
-    if !managed(&options) { return Ok(None); }
-    Ok(Some(std::path::absolute(options.profile.map(|p| p.join("explorer-session.json")).unwrap_or_else(storage::config_path))?))
+pub(crate) fn runtime_profile(args:&[OsString])->Result<Option<PathBuf>>{
+    let options=parse(edition_arguments(args.to_vec())?)?;
+    if !managed(&options){return Ok(None);}
+    Ok(Some(std::path::absolute(options.profile.map(|p|p.join("explorer-session.json")).unwrap_or_else(storage::config_path))?))
 }
-
-fn edition_arguments(mut args: Vec<OsString>) -> Result<Vec<OsString>> {
-    if !crate::edition::DESKTOP_ONLY { return Ok(args); }
-    let options = parse(args.iter().cloned())?;
-    if options.uninstall_integration { return Ok(args); }
-    if options.integration_enable || options.integration_refresh || options.routing_apply || options.win_e || options.focus_search || options.diagnostics_main.is_some()
-        || options.new_window || options.target.is_some() || options.select || matches!(options.mode, Mode::QuickSearch(_)) {
+fn edition_arguments(mut args:Vec<OsString>)->Result<Vec<OsString>>{
+    if !crate::edition::DESKTOP_ONLY{return Ok(args);}
+    let options=parse(args.iter().cloned())?;
+    if options.uninstall_integration{return Ok(args);}
+    if options.integration_enable||options.integration_refresh||options.routing_apply||options.win_e||options.focus_search||options.diagnostics_main.is_some()
+        ||options.new_window||options.target.is_some()||options.select||matches!(options.mode,Mode::QuickSearch(_)){
         bail!("桌面盒子独立版仅提供桌面格子；文件管理与搜索请使用 ZSDesk 文件管理版本");
     }
-    if options.mode == Mode::Explorer { args.push("--desktop".into()); }
+    if options.mode==Mode::Explorer{args.push("--desktop".into());}
     Ok(args)
 }
-
-pub(crate) fn run_arguments(args: Vec<OsString>, in_host: bool) -> Result<()> {
-    if args.first().is_some_and(|arg| arg == "--win-e-agent") {
-        if args.len() != 1 { bail!("--win-e-agent 不能与其它参数混用"); }
+pub(crate) fn run_arguments(args:Vec<OsString>,in_host:bool)->Result<()> {
+    if args.first().is_some_and(|arg|arg=="--win-e-agent") {
+        if args.len()!=1 { bail!("--win-e-agent 不能与其它参数混用"); }
         return crate::win_e_agent::run();
     }
-    if args.first().is_some_and(|arg| arg == "--win-e-agent-stop") {
-        if args.len() != 1 { bail!("--win-e-agent-stop 不能与其它参数混用"); }
-        let _ = crate::win_e_agent::stop()?;
+    if args.first().is_some_and(|arg|arg=="--win-e-agent-stop") {
+        if args.len()!=1 { bail!("--win-e-agent-stop 不能与其它参数混用"); }
+        let _=crate::win_e_agent::stop()?;
         return Ok(());
     }
     if args.first().is_some_and(|arg| arg == "--build-info") {
@@ -299,9 +295,9 @@ pub(crate) fn run_arguments(args: Vec<OsString>, in_host: bool) -> Result<()> {
         desktop::uninstall_owned_startup(&desktop_config, &exe)?;
         crate::quick_search::control::uninstall_owned(&config, &exe)?;
         crate::routing_control::uninstall_owned(&config, &exe)?;
-        zsdesk_windows::integration::restore_owned(&exe, &config.with_file_name("takeover-backup.json"))?;
         let _ = zsdesk_windows::desktop::set_win_e_agent_autostart(None);
         let _ = crate::win_e_agent::stop()?;
+        zsdesk_windows::integration::restore_owned(&exe, &config.with_file_name("takeover-backup.json"))?;
         return Ok(());
     }
     if let Some(report)=opts.diagnostics_main{return crate::instance::diagnose(&config,&std::path::absolute(report)?);}

@@ -52,7 +52,7 @@ fn policy(options:&SearchOptions)->snapshot::Policy{snapshot::Policy{development
 impl Store{
     fn save(&mut self,cancel:&impl Fn()->bool)->Result<()>{
         let result=self.save_inner(cancel);
-        self.snapshot_warning=result.as_ref().err().map(|error|format!("索引快照未能保存：{error:#}；当前结果仍可使用"));result
+        self.snapshot_warning=result.as_ref().err().map(|error|zsdesk_core::tr_format!("索引快照未能保存：{error:#}；当前结果仍可使用",error=error));result
     }
     fn save_inner(&mut self,cancel:&impl Fn()->bool)->Result<()>{
         let Some(volumes)=self.volumes.as_mut()else{return Ok(());};let Some((development,metadata))=self.policy else{return Ok(());};
@@ -278,53 +278,103 @@ pub(super) fn execute_cached(core:&Core,options:&SearchOptions,roots:Option<&[Pa
 fn execute_inner(core:&Core,options:&SearchOptions,roots:Option<&[PathBuf]>,shared:&Shared,sender:&SyncSender<SearchEvent>,request:&Request,cached:bool)->Result<()>{
     let query=Query::parse(&request.query,options.pinyin_initials)?;let mut store=lock(core,shared)?;
     if !cached||store.volumes.is_none()||store.force||store.policy!=Some((options.include_development,options.index_metadata)){store.prepare(options,roots,shared,sender,cached)?;}
-    ensure!(shared.current(request.generation),"搜索已取消");let scanning=store.pending;let volumes=store.volumes.as_mut().unwrap();let mut hits=Vec::<u64>::new();let mut scanned=0u64;
-    for (which,volume) in volumes.iter().enumerate(){
-        let mut memo=vec![0u8;volume.index.names.len()*2];
-        for row in 1..volume.index.len()as u32{
+    ensure!(shared.current(request.generation),"搜索已取消");let scanning=store.pending;let volumes=store.volumes.as_mut().unwrap();let mut candidates=Vec::new();
+    let mut scanned=0;
+    let mut total=0;
+    let mut last_progress=Instant::now();
+    let prefix=(request.offset as usize).saturating_add(request.limit as usize);
+    let trim_at=prefix.saturating_add(prefix.max(4096));
+    for which in 0..volumes.len(){
+        let index=&volumes[which].index;
+        // Two bits encode a probe for each (name, file-or-directory) pair.
+        let mut memo=vec![0u8;index.names.len().div_ceil(2)];
+        for row in 1..index.len() as u32{
             if row%1024==0{ensure!(shared.current(request.generation)&&!shared.cancelled(),"搜索已取消");}
-            if !volume.index.searchable(row){continue;}scanned+=1;let id=volume.index.name[row as usize];let dir=volume.index.is_dir(row);let key=id as usize*2+usize::from(dir);
-            let probe=if memo[key]==0{let value=match query.probe(volume.index.names.folded(id),dir){Probe::No=>1,Probe::Yes=>2,Probe::Path=>3};memo[key]=value;value}else{memo[key]};
-            let matched=probe==2||(probe==3&&volume.index.path(&volume.root,row).is_some_and(|path|query.matches(volume.index.names.folded(id),dir,&path.to_string_lossy().to_lowercase())));
-            if matched{if hits.len()==hits.capacity(){hits.try_reserve(4096)?;}hits.push(((which as u64)<<32)|u64::from(row));}
+            let volume=&mut volumes[which];
+            let index=&volume.index;
+            if !index.searchable(row){continue;}
+            scanned+=1;
+            let id=index.name[row as usize];
+            let dir=index.is_dir(row);
+            let slot=&mut memo[id as usize/2];
+            let shift=(id%2)*4+u32::from(dir)*2;
+            let mut probe=(*slot>>shift)&3;
+            if probe==0{
+                probe=match query.probe(index.names.folded(id),dir){Probe::No=>1,Probe::Yes=>2,Probe::Path=>3};
+                *slot|=probe<<shift;
+            }
+            if probe==1 || (probe==3&&!index.path(&volume.root,row).is_some_and(|path|
+                query.matches(index.names.folded(id),dir,&path.to_string_lossy().to_lowercase()))){continue;}
+            total+=1;
+            let value=match request.sort{
+                everything::SearchSort::NameAsc|everything::SearchSort::NameDesc=>0,
+                sort=>{
+                    ensure!(shared.current(request.generation)&&!shared.cancelled(),"读取结果属性已取消");
+                    let value=sort_attribute(volume,row,sort);
+                    if last_progress.elapsed()>=Duration::from_millis(250){
+                        progress(shared,sender,&volume.root,total as usize,IndexPhase::Attributes,volume.mft);
+                        last_progress=Instant::now();
+                    }
+                    value
+                }
+            };
+            candidates.try_reserve(1)?;
+            candidates.push(RankedRow{hit:((which as u64)<<32)|u64::from(row),value});
+            if candidates.len()>=trim_at{
+                candidates.select_nth_unstable_by(prefix,|a,b|compare_rows(volumes,request.sort,a,b));
+                candidates.truncate(prefix);
+            }
         }
     }
-    let total=hits.len()as u64;let begin=(request.offset as usize).min(hits.len());let end=begin.saturating_add(request.limit as usize).min(hits.len());
-    let page=match request.sort{
-        everything::SearchSort::NameAsc|everything::SearchSort::NameDesc=>{
-            let name_cmp=|a:&u64,b:&u64|{let (av,ar)=decode(*a);let (bv,br)=decode(*b);let ai=&volumes[av].index;let bi=&volumes[bv].index;
-                ai.names.folded(ai.name[ar]).cmp(bi.names.folded(bi.name[br])).then_with(||a.cmp(b))};
-            let descending=request.sort==everything::SearchSort::NameDesc;
-            select_page(&mut hits,begin,end,|a,b|if descending{name_cmp(b,a)}else{name_cmp(a,b)});hits[begin..end].to_vec()
-        },
-        sort=>{
-            let mut keyed=Vec::new();keyed.try_reserve_exact(hits.len())?;let mut last=Instant::now();
-            for hit in hits{ensure!(shared.current(request.generation)&&!shared.cancelled(),"读取结果属性已取消");let(v,row)=decode(hit);let volume=&mut volumes[v];
-                let known=volume.index.attributes.as_ref().map(|a|if sort==everything::SearchSort::SizeDesc{a.size[row]}else{a.modified[row]}).filter(|v|*v!=UNKNOWN);
-                let value=if let Some(value)=known{value}else{let data=volume.index.path(&volume.root,row as u32).and_then(|path|fs::symlink_metadata(path).ok());
-                    let size=data.as_ref().filter(|m|m.is_file()).map(MetadataExt::file_size);let modified=data.as_ref().map(MetadataExt::last_write_time);
-                    volume.index.set_attributes(row as u32,size,modified);if sort==everything::SearchSort::SizeDesc{size}else{modified}.unwrap_or(UNKNOWN)};
-                keyed.push((hit,value));if last.elapsed()>=Duration::from_millis(250){progress(shared,sender,&volume.root,keyed.len(),IndexPhase::Attributes,volume.mft);last=Instant::now();}
-            }
-            select_page(&mut keyed,begin,end,|a,b|match (a.1==UNKNOWN,b.1==UNKNOWN){(true,false)=>std::cmp::Ordering::Greater,(false,true)=>std::cmp::Ordering::Less,_=>b.1.cmp(&a.1).then_with(||a.0.cmp(&b.0))});
-            keyed[begin..end].iter().map(|(row,_)|*row).collect()
-        }
-    };
-    ensure!(shared.current(request.generation),"搜索已取消");let paths:Vec<_>=page.into_iter().filter_map(|hit|{let(v,row)=decode(hit);volumes[v].index.path(&volumes[v].root,row as u32)}).collect();
+    let begin=(request.offset as usize).min(candidates.len());
+    let end=prefix.min(candidates.len());
+    select_page(&mut candidates,begin,end,|a,b|compare_rows(volumes,request.sort,a,b));
+    ensure!(shared.current(request.generation),"搜索已取消");
+    let paths:Vec<_>=candidates[begin..end].iter().filter_map(|item|{
+        let(v,row)=decode(item.hit);volumes[v].index.path(&volumes[v].root,row as u32)
+    }).collect();
+    drop(candidates);
     let mut statuses:Vec<_>=volumes.iter().map(|v|VolumeStatus{root:v.root.clone(),backend:if v.mft{BackendKind::NativeNtfs}else{BackendKind::DirectoryScan},phase:if v.pending_dirs.is_empty(){IndexPhase::Ready}else{IndexPhase::Scanning},indexed:v.index.len().saturating_sub(1)as u64,
-        checkpoint:v.has_journal.then_some(v.checkpoint),warning:if v.denied>0{Some(format!("部分目录暂不可读取（{} 次）",v.denied))}else if !v.has_journal{Some("此位置无可用 USN 日志，搜索时刷新目录".into())}else{None}}).collect();
+        checkpoint:v.has_journal.then_some(v.checkpoint),warning:if v.denied>0{Some(zsdesk_core::tr_format!("部分目录暂不可读取（{} 次）",v.denied))}else if !v.has_journal{Some(zsdesk_core::i18n::text("此位置无可用 USN 日志，搜索时刷新目录").into())}else{None}}).collect();
     let denied=volumes.iter().map(|v|v.denied).sum();let backend=if volumes.iter().all(|v|v.mft){BackendKind::NativeNtfs}else if volumes.iter().any(|v|v.mft){BackendKind::Mixed}else{BackendKind::DirectoryScan};
     for failure in &store.failures{if let Some(status)=statuses.iter_mut().find(|status|same_root(&status.root,&failure.root)){status.phase=IndexPhase::Paused;status.warning=failure.warning.clone();}else{statuses.push(failure.clone());}}
     if let Some(warning)=&store.snapshot_warning{if let Some(status)=statuses.first_mut(){status.warning=Some(warning.clone());}}
-    let error=(!store.failures.is_empty()).then(||"部分位置暂时不可更新，请查看搜索状态".to_owned());store.last_use=Instant::now();
+    let error=(!store.failures.is_empty()).then(||zsdesk_core::i18n::text("部分位置暂时不可更新，请查看搜索状态").to_owned());store.last_use=Instant::now();
     if options.index_metadata&&matches!(request.sort,everything::SearchSort::SizeDesc|everything::SearchSort::ModifiedDesc){store.dirty=true;}
+    drop(store);
     let changed={let mut previous=shared.native_page.lock().unwrap_or_else(|e|e.into_inner());
+        ensure!(shared.current(request.generation),"搜索已取消");
         let changed=previous.as_ref().is_none_or(|(generation,old)|*generation!=request.generation||old!=&paths);
         if changed{*previous=Some((request.generation,paths.clone()));}changed};
     let batches=if changed{paths.len().div_ceil(64).max(1)}else{1};for batch in 0..batches{let start=batch*64;let stop=(start+64).min(paths.len());
         emit(shared,sender,SearchEvent{generation:request.generation,paths:if changed{paths.get(start..stop).unwrap_or_default().to_vec()}else{Vec::new()},scanned,indexed:total,denied,skipped_reparse:0,scanning,finished:!scanning&&batch+1==batches,
             truncated:u64::from(request.offset)+(paths.len()as u64)<total,error:error.clone(),reset:changed&&batch==0,backend,phase:if scanning{IndexPhase::Scanning}else{IndexPhase::Ready},volumes:statuses.clone(),read_only:false});}
     Ok(())
+}
+struct RankedRow{hit:u64,value:u64}
+
+fn sort_attribute(volume:&mut VolumeIndex,row:u32,sort:everything::SearchSort)->u64{
+    let size_sort=sort==everything::SearchSort::SizeDesc;
+    let known=volume.index.attributes.as_ref().map(|a|if size_sort{a.size[row as usize]}else{a.modified[row as usize]});
+    if let Some(value)=known.filter(|v|*v!=UNKNOWN){return value;}
+    let data=volume.index.path(&volume.root,row).and_then(|path|fs::symlink_metadata(path).ok());
+    let size=data.as_ref().filter(|m|m.is_file()).map(MetadataExt::file_size);
+    let modified=data.as_ref().map(MetadataExt::last_write_time);
+    volume.index.set_attributes(row,size,modified);
+    if size_sort{size}else{modified}.unwrap_or(UNKNOWN)
+}
+
+fn compare_rows(volumes:&[VolumeIndex],sort:everything::SearchSort,a:&RankedRow,b:&RankedRow)->std::cmp::Ordering{
+    use everything::SearchSort::*;
+    match sort{
+        NameAsc|NameDesc=>{
+            let name=|hit|{let(v,r)=decode(hit);let index=&volumes[v].index;index.names.folded(index.name[r])};
+            let order=name(a.hit).cmp(name(b.hit)).then_with(||a.hit.cmp(&b.hit));
+            if sort==NameDesc{order.reverse()}else{order}
+        }
+        SizeDesc|ModifiedDesc=>(a.value==UNKNOWN).cmp(&(b.value==UNKNOWN))
+            .then_with(||b.value.cmp(&a.value)).then_with(||a.hit.cmp(&b.hit)),
+    }
 }
 fn decode(hit:u64)->(usize,usize){((hit>>32)as usize,(hit as u32)as usize)}
 fn select_page<T>(values:&mut[T],begin:usize,end:usize,mut compare:impl FnMut(&T,&T)->std::cmp::Ordering){

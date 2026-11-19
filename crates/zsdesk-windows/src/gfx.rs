@@ -192,11 +192,17 @@ impl Gfx {
 
     /// Draws into `surface`, clearing it to fully transparent first.
     pub fn draw(&self, surface: &Surface, paint: impl FnOnce(&Canvas)) -> Result<()> {
+        self.draw_band(surface,0,paint)
+    }
+
+    /// Keeps layout coordinates in client pixels when painting a horizontal band.
+    pub fn draw_band(&self, surface:&Surface, top:i32, paint:impl FnOnce(&Canvas))->Result<()> {
         let (target, brush) = self.target()?;
         let rect = RECT { left: 0, top: 0, right: surface.width, bottom: surface.height };
         unsafe {
             target.BindDC(surface.dc, &rect)?;
             target.BeginDraw();
+            target.SetTransform(&windows_numerics::Matrix3x2::translation(0.,-(top as f32)));
             target.Clear(Some(&Color::TRANSPARENT.d2d()));
         }
         let canvas = Canvas { gfx: self, target: &target, brush: &brush };

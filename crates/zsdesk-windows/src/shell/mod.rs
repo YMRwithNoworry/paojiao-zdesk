@@ -8,6 +8,8 @@ mod explorer_browser;
 pub mod icons;
 pub mod menu;
 mod packaged_commands;
+mod compact_commands;
+mod legacy_commands;
 mod packaged_overlay;
 mod packaged_state_worker;
 pub use packaged_state_worker::maybe_handle_packaged_state_worker;

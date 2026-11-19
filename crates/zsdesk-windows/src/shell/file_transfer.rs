@@ -90,7 +90,7 @@ impl Completion{pub fn message(&self)->String{
 }
     pub fn result_code(&self)->u32{self.error.map_or(if self.aborted{0x800704c7}else{0},|error|error.0 as u32)}
 }
-fn invalid(message:&str)->Error{Error::new(HRESULT(0x80070057u32 as i32),message)}
+fn invalid(message:&str)->Error{Error::new(HRESULT(0x80070057u32 as i32),zsdesk_core::i18n::text(message))}
 fn wide(path:&Path)->Vec<u16>{use std::os::windows::ffi::OsStrExt;path.as_os_str().encode_wide().chain(Some(0)).collect()}
 pub fn result_message()->u32{static ID:OnceLock<u32>=OnceLock::new();*ID.get_or_init(||unsafe{RegisterWindowMessageW(w!("ZSDesk.FileTransfer.Result.v1"))})}
 /// Shell and Win32 use different HRESULTs for the same explicit cancellation.
@@ -107,11 +107,12 @@ pub fn error_message(error:&Error)->String{
         _ if code==COPYENGINE_E_FILE_TOO_LARGE=>"文件超过目标文件系统允许的大小".into(),
         _=>error.message(),
     };
-    format!("{text}（0x{:08X}）",code.0 as u32)
+    format!("{} (0x{:08X})",zsdesk_core::i18n::text(&text),code.0 as u32)
 }
 pub fn has_filesystem_clipboard()->bool{unsafe{IsClipboardFormatAvailable(15)}.is_ok()}
-pub fn has_paste_content()->bool{
-    has_filesystem_clipboard()||[CFSTR_SHELLIDLIST,CFSTR_FILEDESCRIPTORW,CFSTR_FILEDESCRIPTORA].iter().any(|name|{
+pub fn has_paste_content()->bool{has_filesystem_clipboard()||has_shell_payload()}
+fn has_shell_payload()->bool{
+    [CFSTR_SHELLIDLIST,CFSTR_FILEDESCRIPTORW,CFSTR_FILEDESCRIPTORA].iter().any(|name|{
         let id=unsafe{RegisterClipboardFormatW(*name)};id!=0&&unsafe{IsClipboardFormatAvailable(id)}.is_ok()
     })
 }
@@ -160,7 +161,13 @@ fn hdrop_bytes(paths:&[PathBuf])->Result<Vec<u8>>{
     bytes.extend([0,0]);Ok(bytes)
 }
 pub fn copy_paths(owner:HWND,paths:&[PathBuf],cut:bool)->Result<()>{
+    publish_paths(owner,paths,cut,None)
+}
+fn publish_paths(owner:HWND,paths:&[PathBuf],cut:bool,expected:Option<u32>)->Result<()>{
     let data=file_data_object(owner,paths,cut)?;
+    if expected.is_some_and(|seq|seq!=unsafe{GetClipboardSequenceNumber()}){
+        return Err(invalid(zsdesk_core::i18n::text("剪贴板已改变，请重新剪切")));
+    }
     unsafe{windows::Win32::System::Ole::OleSetClipboard(&data)}
 }
 fn file_data_object(owner:HWND,paths:&[PathBuf],cut:bool)->Result<windows::Win32::System::Com::IDataObject>{
@@ -223,26 +230,53 @@ pub fn filesystem_selection(view:&IShellView)->Result<bool>{
 fn item_path(item:&IShellItem)->Result<PathBuf>{
     let value=unsafe{item.GetDisplayName(SIGDN_FILESYSPATH)?};let text=unsafe{value.to_string()};unsafe{CoTaskMemFree(Some(value.0.cast()));}Ok(text.map(PathBuf::from)?)
 }
-pub fn folder_path(view:&IShellView)->Result<PathBuf>{
+pub(super) fn paste_folder(view:&IShellView)->Result<Option<IShellItem>>{
     let folder:IFolderView2=view.cast()?;let persistent:IPersistFolder2=unsafe{folder.GetFolder()?};
-    let pidl=unsafe{persistent.GetCurFolder()?};let result=unsafe{SHCreateItemFromIDList::<IShellItem>(pidl)};unsafe{CoTaskMemFree(Some(pidl.cast()));}item_path(&result?)
+    let pidl=unsafe{persistent.GetCurFolder()?};
+    if pidl.is_null(){return Err(Error::from_hresult(HRESULT(0x80004005u32 as i32)));}
+    let desktop=unsafe{ILGetSize(Some(pidl))}==2;
+    let result=if desktop{Ok(None)}else{unsafe{SHCreateItemFromIDList::<IShellItem>(pidl)}.map(Some)};
+    unsafe{CoTaskMemFree(Some(pidl.cast()));}result
+}
+pub fn folder_path(view:&IShellView)->Result<PathBuf>{
+    if let Some(item)=paste_folder(view)?{item_path(&item)}else{crate::desktop::user_desktop().ok_or_else(||invalid("Desktop folder unavailable"))}
 }
 pub fn filesystem_folder_path(view:&IShellView)->Result<Option<PathBuf>>{
-    let folder:IFolderView2=view.cast()?;let persistent:IPersistFolder2=unsafe{folder.GetFolder()?};
-    let pidl=unsafe{persistent.GetCurFolder()?};let result=unsafe{SHCreateItemFromIDList::<IShellItem>(pidl)};
-    unsafe{CoTaskMemFree(Some(pidl.cast()));}let item=result?;
+    let Some(item)=paste_folder(view)? else{return Ok(crate::desktop::user_desktop());};
     let attributes=unsafe{item.GetAttributes(windows::Win32::System::SystemServices::SFGAO_FOLDER|SFGAO_FILESYSTEM|windows::Win32::System::SystemServices::SFGAO_STREAM)?}.0;
     if attributes&(SFGAO_FILESYSTEM.0|windows::Win32::System::SystemServices::SFGAO_FOLDER.0)!=(SFGAO_FILESYSTEM.0|windows::Win32::System::SystemServices::SFGAO_FOLDER.0)
         ||attributes&windows::Win32::System::SystemServices::SFGAO_STREAM.0!=0{return Ok(None);}
     item_path(&item).map(Some)
 }
+fn move_intent(effect:u32)->bool{effect&7==2}
+fn same_cut_selection(a:&[PathBuf],b:&[PathBuf])->bool{
+    if a.len()!=b.len(){return false;}
+    if a==b{return true;}
+    let keys=|paths:&[PathBuf]|{let mut keys:Vec<_>=paths.iter().map(|p|completion_key(p)).collect();keys.sort_unstable();keys};
+    keys(a)==keys(b)
+}
 pub fn copy_view(view:&IShellView,owner:HWND,cut:bool)->Result<()>{
     let paths=selected_paths(view)?;if paths.is_empty(){return Ok(());}
     if cut{
-        // DefView owns both the clipboard data object and the cut visual state.
-        // SetClipboard(TRUE) preserves that relationship, including restoring
-        // the icons when another application replaces the clipboard.
-        if let Ok(folder)=view.cast::<IShellFolderView>(){return unsafe{folder.SetClipboard(true)};}
+        if let Ok(folder)=view.cast::<IShellFolderView>(){
+            let before=unsafe{GetClipboardSequenceNumber()};
+            let native=unsafe{folder.SetClipboard(true)};
+            let after=unsafe{GetClipboardSequenceNumber()};
+            if after!=before{
+                // A different application may have taken the clipboard while
+                // Shell pumped messages. Never replace its newer selection.
+                if let Ok((published,effect,_))=clipboard_files(){
+                    if move_intent(effect)&&same_cut_selection(&published,&paths){return Ok(());}
+                }
+                if !owned_clipboard_on_current_thread()||unsafe{GetClipboardSequenceNumber()}!=after{
+                    native?;
+                    return Err(invalid(zsdesk_core::i18n::text("剪贴板已改变，请重新剪切")));
+                }
+            }
+            // Some hosted views only mark the selection visually, or return
+            // E_NOTIMPL. Publish the actual paths and explicit MOVE intent.
+            return publish_paths(owner,&paths,true,Some(after));
+        }
     }
     copy_paths(owner,&paths,cut)
 }
@@ -275,7 +309,7 @@ fn clipboard_files()->Result<(Vec<PathBuf>,u32,u32)>{
 pub fn cut_clipboard_paths()->Result<Vec<PathBuf>>{
     if unsafe{IsClipboardFormatAvailable(15)}.is_err(){return Ok(Vec::new());}
     let (paths,effect,_)=clipboard_files()?;
-    Ok(if effect&2!=0{paths}else{Vec::new()})
+    Ok(if move_intent(effect){paths}else{Vec::new()})
 }
 fn clipboard_files_locked()->Result<(Vec<PathBuf>,u32,u32)>{
     let sequence=unsafe{GetClipboardSequenceNumber()};
@@ -296,7 +330,7 @@ fn clipboard_files_locked()->Result<(Vec<PathBuf>,u32,u32)>{
 
 /// Scan the bounded path list once. Repeated DragQueryFileW(index) rescans all
 /// preceding strings and becomes quadratic for large multi-file selections.
-fn parse_hdrop(bytes:&[u8])->Result<Vec<PathBuf>>{
+pub(crate) fn parse_hdrop(bytes:&[u8])->Result<Vec<PathBuf>>{
     use std::os::windows::ffi::OsStringExt;
     use windows::Win32::Globalization::{MultiByteToWideChar,CP_ACP,MB_ERR_INVALID_CHARS};
     if bytes.len()<22||bytes.len()>MAX_PATH_BYTES+22{return Err(invalid("剪贴板文件清单长度无效"));}
@@ -368,8 +402,25 @@ impl Drop for ReplySignal{fn drop(&mut self){let _=unsafe{CloseHandle(HANDLE(sel
 pub fn paste(owner:HWND,destination:&Path)->Result<()>{
     // An opened .zip reports its own file path; only its Shell folder can paste into it.
     if !destination.is_absolute()||!destination.is_dir(){return Err(invalid("目标文件夹无效"));}
-    let (paths,effect,sequence)=clipboard_files()?;let moving=effect&2!=0;
-    submit(owner,paths,Some(destination.into()),if moving{Operation::Move}else{Operation::Copy},Some(sequence))
+    if try_paste_files(owner,destination)?{return Ok(());}
+    // Providers may advertise both a path list and a virtual Shell payload.
+    // Delegate only before any filesystem job has been submitted.
+    let folder=crate::desktop::folder_for_path(destination)?;
+    let menu=super::menu::ShellMenu::for_folder_background(owner,&folder)?;
+    menu.populate_for_invoke(false)?;
+    menu.invoke_verb(owner,"paste",false)
+}
+pub fn try_paste_files(owner:HWND,destination:&Path)->Result<bool>{
+    if !has_filesystem_clipboard() || !destination.is_absolute() || !destination.is_dir(){return Ok(false);}
+    let sequence_before=unsafe{GetClipboardSequenceNumber()};
+    let (paths,effect,sequence)=match clipboard_files(){
+        Ok(packet)=>packet,
+        Err(e) if e.code()==HRESULT(0x80070057u32 as i32)&&has_shell_payload()&&unsafe{GetClipboardSequenceNumber()}==sequence_before=>return Ok(false),
+        Err(error)=>return Err(error),
+    };
+    if effect==4{return Ok(false);} // Preferred shell link.
+    submit(owner,paths,Some(destination.into()),if move_intent(effect){Operation::Move}else{Operation::Copy},Some(sequence))?;
+    Ok(true)
 }
 pub fn paste_view(view:&IShellView,owner:HWND)->Result<()>{paste(owner,&folder_path(view)?)}
 pub fn delete_view(view:&IShellView,owner:HWND,permanent:bool)->Result<()>{
@@ -538,13 +589,27 @@ impl ProgressState{
         self.cancelled|=is_cancelled(error);
         if self.failure.is_none()||self.failure.is_some_and(is_cancelled)&&!is_cancelled(error){self.failure=Some(error);}
     }
-    fn for_request(request:&Request)->Self{
-        let mut state=Self{new_folder:matches!(request.operation,Operation::NewFolder),
-            track_outputs:matches!(request.operation,Operation::Copy|Operation::Move|Operation::NewFolder),..Default::default()};
-        for path in &request.paths{
-            let exact=exact_completion_key(path);state.expected.insert(exact.clone());
-            state.aliases.entry(completion_key(path)).and_modify(|entry|{if entry.as_ref()!=Some(&exact){*entry=None;}}).or_insert(Some(exact));
-        }state
+    fn new(operation:Operation)->Self{
+        Self{new_folder:operation==Operation::NewFolder,
+            track_outputs:matches!(operation,Operation::Copy|Operation::Move|Operation::NewFolder),..Default::default()}
+    }
+    fn expect_source(&mut self,requested:&Path,shell_path:&Path){
+        // Bind before the operation: a moved or deleted source may no longer
+        // exist when Shell reports its long filesystem name to the callback.
+        let exact=exact_completion_key(shell_path);
+        self.expected.insert(exact.clone());
+        let mut alias=|path:&Path|{
+            self.aliases.entry(completion_key(path)).and_modify(|entry|{
+                if entry.as_ref()!=Some(&exact){*entry=None;}
+            }).or_insert_with(||Some(exact.clone()));
+        };
+        alias(shell_path);
+        if requested!=shell_path{alias(requested);}
+    }
+    #[cfg(test)]fn for_request(request:&Request)->Self{
+        let mut state=Self::new(request.operation);
+        for path in &request.paths{state.expect_source(path,path);}
+        state
     }
     fn record_completed(&mut self,path:&Path)->bool{
         let exact=exact_completion_key(path);
@@ -655,15 +720,20 @@ fn perform_inner(request:&Request,quiet:bool,cancel_before:bool)->Result<Outcome
         request.paths.iter().all(|path|path.parent().is_some_and(|parent|parent==destination||
             std::fs::canonicalize(parent).ok().zip(std::fs::canonicalize(destination).ok()).is_some_and(|(a,b)|a==b)))){flags|=FOF_RENAMEONCOLLISION;}
     unsafe{operation.SetOperationFlags(flags)?;}
-    let progress=Arc::new(Mutex::new(ProgressState::for_request(request)));
+    let mut state=ProgressState::new(request.operation);
+    let mut identities=Vec::with_capacity(request.paths.len());
+    for path in &request.paths{
+        let item:IShellItem=unsafe{SHCreateItemFromParsingName(PCWSTR(wide(path).as_ptr()),None)?};
+        let shell_path=item_path(&item).ok();
+        state.expect_source(path,shell_path.as_deref().unwrap_or(path));
+        identities.push(super::pidl::item_pidl(&item).ok_or_else(||invalid("无法创建文件标识"))?);
+    }
+    let progress=Arc::new(Mutex::new(state));
     let sink:IFileOperationProgressSink=Progress{state:progress.clone(),cancel_before}.into();
     let cookie=unsafe{operation.Advise(&sink)}?;
     struct Advisory<'a>{operation:&'a IFileOperation,cookie:u32}impl Drop for Advisory<'_>{fn drop(&mut self){let _=unsafe{self.operation.Unadvise(self.cookie)};}}let _advisory=Advisory{operation:&operation,cookie};
     let owner=HWND(request.owner as*mut _);
     if unsafe{IsWindow(Some(owner))}.as_bool()&&unsafe{GetWindowThreadProcessId(owner,None)}==request.thread{unsafe{operation.SetOwnerWindow(owner)?;}}
-    let mut identities=Vec::with_capacity(request.paths.len());
-    for path in &request.paths{let item:IShellItem=unsafe{SHCreateItemFromParsingName(PCWSTR(wide(path).as_ptr()),None)?};
-        identities.push(super::pidl::item_pidl(&item).ok_or_else(||invalid("无法创建文件标识"))?);}
     let pointers=identities.iter().map(|pidl|pidl.as_ptr().cast::<ITEMIDLIST>()).collect::<Vec<_>>();
     let items=if pointers.is_empty(){None}else{Some(unsafe{SHCreateShellItemArrayFromIDLists(&pointers)?})};
     match request.operation{

@@ -2,6 +2,9 @@ use super::*;
 use zsdesk_ui::{chrome::{CommandId, SearchPanelHit}, menus::{self, MenuItemSpec, MenuSpec, ShowState, SortKey}};
 use zsdesk_windows::shell::commands::{folder_settings, set_folder_settings, Column};
 
+#[derive(Clone,Copy,PartialEq,Eq)]
+pub(super) enum TabRightAction { Menu(u64), Close(u64) }
+
 impl WindowState {
     unsafe fn new_default_tab(&mut self){
         if let Ok(saved)=storage::load(&self.config_path){self.session.ui.new_tab_location=saved.ui.new_tab_location;}
@@ -353,6 +356,30 @@ impl WindowState {
         self.mouse_down(p);
     }
 
+    pub(super) fn tab_strip_right_button(&mut self,p:POINT,down:bool)->bool {
+        let tab=match self.layout.tab_strip_right_hit(p.x,p.y,screen_edge_window(self.hwnd)){
+            Some(Hit::Tab(i))=>self.session.tabs.get(i).map(|tab|(i,TabRightAction::Menu(tab.id))),
+            Some(Hit::Caption)=>self.session.tabs.get(self.session.active_tab).map(|tab|(self.session.active_tab,TabRightAction::Close(tab.id))),
+            _=>None,
+        };
+        if down{
+            self.right_tab_press=tab.map(|(_,action)|(action,p));
+            return tab.is_some();
+        }
+        let press=self.right_tab_press.take();
+        if let (Some((pressed,start)),Some((index,action)))=(press,tab){
+            let dx=unsafe{GetSystemMetricsForDpi(SM_CXDRAG,self.dpi)}.max(1);
+            let dy=unsafe{GetSystemMetricsForDpi(SM_CYDRAG,self.dpi)}.max(1);
+            if pressed==action && (start.x-p.x).abs()<dx && (start.y-p.y).abs()<dy {
+                match action{
+                    TabRightAction::Menu(_)=>unsafe{self.tab_menu(index)},
+                    TabRightAction::Close(_)=>unsafe{self.close_tab(index)},
+                }
+            }
+        }
+        press.is_some() || tab.is_some()
+    }
+
     pub(super) fn right_click(&mut self, p: POINT) {
         match self.chrome_hit(p.x, p.y) {
             Hit::Tab(i) | Hit::TabClose(i) => unsafe { self.tab_menu(i) },
@@ -505,7 +532,7 @@ impl WindowState {
         let choice = popup(self.hwnd, &menus::view_menu(mode, icon, show), anchor);
         match choice.as_deref() {
             Some("show-nav") => {
-                self.session.ui.show_tree = !show.navigation; self.save(); unsafe { self.resize(); }
+                self.session.ui.show_tree = !show.navigation;self.rebuild_navigation_tree();self.save();unsafe{self.resize();}
                 // A hidden tree is not synced while navigating; catch up when shown again.
                 if let Some(tree) = self.tree.as_ref().filter(|_| self.session.ui.show_tree) {
                     let current = self.current_location().clone();
@@ -650,7 +677,7 @@ impl WindowState {
         };
         // The menu shows the effective navigation expansion (system default included).
         let mut menu_ui=self.session.ui.clone();
-        if let Ok(saved)=storage::load(&self.config_path){menu_ui.file_dialog_takeover=saved.ui.file_dialog_takeover;}
+        if let Ok(saved)=storage::load(&self.config_path){menu_ui.language=saved.ui.language;menu_ui.file_dialog_takeover=saved.ui.file_dialog_takeover;}
         menu_ui.navigation_auto_expand=Some(self.navigation_auto_expand());
         menus::app_menu_with_capabilities(state, &menu_ui, crate::edition::THEMED)
     }
@@ -696,10 +723,26 @@ impl WindowState {
         match choice.as_deref() {
             Some("new-tab") => unsafe { self.new_default_tab() },
             Some("new-window")=>self.new_window(),
+            Some("profile-open")=>{
+                if let Some(directory)=self.config_path.parent(){unsafe{self.new_tab(ShellLocation::Path(directory.to_path_buf()));}}
+            },
+            Some("profile-folder")=>{
+                if let Some(directory)=zsdesk_windows::desktop::pick_folder(self.hwnd,zsdesk_core::i18n::text("选择默认配置目录")){
+                    match storage::choose_profile_directory(Some(&directory)){
+                        Ok(())=>self.show_message(zsdesk_core::i18n::text("已保存默认配置目录。下次普通启动使用所选目录；空目录使用初始设置。").into()),
+                        Err(error)=>self.show_message(error.to_string()),
+                    }
+                }
+            },
+            Some("profile-default")=>match storage::choose_profile_directory(None){
+                Ok(())=>self.show_message(zsdesk_core::i18n::text("下次普通启动使用默认配置目录").into()),
+                Err(error)=>self.show_message(error.to_string()),
+            },
             Some("diagnostics")=>if let Err(error)=diagnostics::show(self.hwnd){self.show_message(zsdesk_core::tr_format!("无法打开诊断日志：{error}", error=error));},
             Some("quick-search-settings") => unsafe { self.search_settings_menu(); },
             Some("quick-search-open")=>if let Err(error)=crate::quick_search::launch(&self.config_path,false){self.show_message(zsdesk_core::tr_format!("无法打开快速搜索：{error:#}", error=error));},
             Some("manage-context-commands")=>self.load_context_catalog(),
+            Some("manage-native-first-page")=>self.load_native_apps(),
             Some(id @ ("startup-restore"|"startup-this-pc"|"startup-folder")) => {
                 use zsdesk_core::model::explorer::StartupLocation;
                 let location=match id {
@@ -724,7 +767,7 @@ impl WindowState {
             Some("search-everything-program") => {
                 if self.session.ui.search_backend.is_builtin(){return;}
                 match crate::fast_search::everything::choose_executable(self.hwnd){
-                    Ok(Some(path))=>{self.session.ui.everything_executable=Some(path);self.session.ui.search_backend=zsdesk_core::model::explorer::SearchBackendPreference::Everything;self.session.ui.search_backend_configured=true;if self.persist_search_preferences(){self.search_backend_changed();if let Err(error)=super::diagnostics::show_search(self.hwnd,&self.config_path){self.show_message(zsdesk_core::tr_format!("无法显示搜索引擎状态：{error:#}", error=error));}}},
+                    Ok(Some(path))=>{self.session.ui.everything_executable=Some(path);self.session.ui.search_backend=zsdesk_core::model::explorer::SearchBackendPreference::Everything;if self.persist_search_preferences(){self.search_backend_changed();if let Err(error)=super::diagnostics::show_search(self.hwnd,&self.config_path){self.show_message(zsdesk_core::tr_format!("无法显示搜索引擎状态：{error:#}", error=error));}}},
                     Ok(None)=>{},Err(error)=>self.show_message(error.to_string()),
                 }
             },
@@ -849,10 +892,9 @@ impl WindowState {
                 Err(error)=>self.show_message(zsdesk_core::tr_format!("无法保存标签显示设置：{error:#}", error=error)),
             }return;
         }
-        let language=match id{"language-system"=>Some(zsdesk_core::i18n::LanguagePreference::System),"language-zh"=>Some(zsdesk_core::i18n::LanguagePreference::Chinese),"language-en"=>Some(zsdesk_core::i18n::LanguagePreference::English),_=>None};
-        if let Some(language)=language{
-            match storage::save_language(&self.config_path,language){
-                Ok(())=>{self.session.ui.language=language;self.show_message(zsdesk_core::i18n::text("语言设置已保存，重启后生效。 / Restart ZSDesk to apply the language.").into());},
+        if let Some(language)=crate::language::choice(id){
+            match crate::language::save_and_apply(&self.config_path,language){
+                Ok(())=>{self.session.ui.language=language;self.show_message(zsdesk_core::i18n::text("界面语言已切换").into());},
                 Err(error)=>self.show_message(zsdesk_core::tr_format!("无法保存语言设置：{error:#}", error=error)),
             }return;
         }
@@ -861,12 +903,11 @@ impl WindowState {
             match storage::save_explorer_tray(&self.config_path,enabled){Ok(())=>{self.session.ui.explorer_tray=enabled;crate::runtime::refresh_tray();},Err(error)=>self.show_message(zsdesk_core::tr_format!("无法保存托盘设置：{error:#}", error=error))}return;
         }
         if !menus::apply_interface_setting(&mut self.session.ui,id) { return; }
-        if id.starts_with("search-backend-") { self.session.ui.search_backend_configured=true; }
         if id.starts_with("tab-placement-"){self.side_tab_first=None;self.side_tab_wheel=0;}
         zsdesk_windows::shell::set_open_archives_externally(self.session.ui.archives_open_externally);
         if (id.starts_with("search-backend-")||id.starts_with("search-native-")||id=="everything-folder-sizes"||id=="search-everything-auto")&&!self.persist_search_preferences(){return;}
         if id=="everything-folder-sizes" {self.cancel_folder_sizes();}
-        if id=="navigation-recycle-bin" || id=="navigation-network" || id.starts_with("navigation-this-pc-") {self.rebuild_navigation_tree();}
+        if id=="interface-navigation" || id=="navigation-recycle-bin" || id=="navigation-network" || id.starts_with("navigation-this-pc-") {self.rebuild_navigation_tree();}
         self.crumbs_for=None;
         if id=="search-all-files" || id=="search-current-folder"{
             let scope=if self.session.ui.search_all_files{None}else{
@@ -996,7 +1037,7 @@ impl WindowState {
 
 }
 
-pub(super) const SHORTCUTS: &str = "文件管理器\nCtrl+T 新建标签　Ctrl+W / Ctrl+F4 关闭标签　Ctrl+Shift+T 恢复标签\nCtrl+Tab / Ctrl+Shift+Tab 切换标签　Ctrl+1…9 第 N 个标签\nAlt+← / Backspace 后退　Alt+→ 前进　Alt+↑ 上一级　F5 刷新\nCtrl+L / Alt+D / F4 地址栏　Ctrl+F / Ctrl+E / F3 搜索（输入即搜）\nCtrl+Shift+N 新建文件夹　Ctrl+Shift+C 复制路径　Ctrl+D 收藏\nAlt+P 预览窗格　Alt+Shift+P 详细信息窗格　Ctrl+F1 展开/收起命令栏\nF2 重命名　Del 删除　Shift+Del 永久删除　Alt+Enter 属性　Ctrl+A 全选\n标签：中键关闭，拖动排序；收藏：中键在新标签打开\n\n桌面格子\n鼠标悬停 展开折叠的格子　双击标题 折叠/展开　拖动标题 移动　拖动边缘 调整大小\nEnter 打开　F2 重命名　Del 删除　Ctrl+A / C / X / V 全选/复制/剪切/粘贴\n方向键 选择　Backspace 返回上一级（文件夹格子）　F5 刷新\n双击桌面空白处 隐藏/显示全部格子";
+pub(super) const SHORTCUTS: &str = "文件管理器\nCtrl+T 新建标签　Ctrl+W / Ctrl+F4 关闭标签　Ctrl+Shift+T 恢复标签\nCtrl+Tab / Ctrl+Shift+Tab 切换标签　Ctrl+1…9 第 N 个标签\nAlt+← / Backspace 后退　Alt+→ 前进　Alt+↑ 上一级　F5 刷新\nCtrl+L / Alt+D / F4 地址栏　Ctrl+F / Ctrl+E / F3 搜索（输入即搜）\nCtrl+Shift+N 新建文件夹　Ctrl+Shift+C 复制路径　Ctrl+D 收藏\nAlt+P 预览窗格　Alt+Shift+P 详细信息窗格　Ctrl+F1 展开/收起命令栏\nF2 重命名　Del 删除　Shift+Del 永久删除　Alt+Enter 属性　Ctrl+A 全选\n右键标签打开菜单，右键标签栏空白处关闭当前标签\n标签中键关闭，拖动排序；收藏中键在新标签打开\n\n桌面格子\n鼠标悬停 展开折叠的格子　双击标题 折叠/展开　拖动标题 移动　拖动边缘 调整大小\nEnter 打开　F2 重命名　Del 删除　Ctrl+A / C / X / V 全选/复制/剪切/粘贴\n方向键 选择　Backspace 返回上一级（文件夹格子）　F5 刷新\n双击桌面空白处 隐藏/显示全部格子";
 
 fn desktop_host_running() -> bool {
     unsafe { FindWindowW(windows::core::w!("ZSDesk.Native.DesktopHost"), PCWSTR::null()) }.is_ok_and(|h| !h.0.is_null())

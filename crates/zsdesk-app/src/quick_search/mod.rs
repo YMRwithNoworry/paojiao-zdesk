@@ -18,8 +18,9 @@ pub(crate) fn needs_background(profile:&Path)->bool{
 }
 
 pub fn start_if_enabled(profile: &Path) -> Result<()> {
-    if (!control::load(profile)?.preferences.enabled && !needs_background(profile)) || control::running(profile) { return Ok(()); }
-    spawn_utility(profile,"--background")
+    let prefs=control::load(profile)?.preferences;
+    if (!prefs.enabled && !needs_background(profile)) || control::running(profile) { return Ok(()); }
+    spawn_utility(profile,if prefs.start_with_windows{"--background"}else{"--window-background"})
 }
 
 pub(crate) fn spawn_utility(profile:&Path,action:&str)->Result<()> {

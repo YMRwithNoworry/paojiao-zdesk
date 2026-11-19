@@ -189,7 +189,7 @@ fn exercise(root:&Path,desktop_name:&str)->Result<serde_json::Value>{
         }
     }
     ensure!(rotated,"request-count bound was not exercised");
-    ensure!(IDLE_TIMEOUT==Duration::from_secs(300)&&MAX_IDLE_WORKERS==4&&MAX_SESSION_REQUESTS==32,"warm-worker bounds changed unexpectedly");
+    ensure!(IDLE_TIMEOUT==Duration::from_secs(30)&&MAX_IDLE_WORKERS==1&&MAX_SESSION_REQUESTS==32,"classic worker bounds changed unexpectedly");
     let expired_pid=previous.context("final warm worker")?.0;
     {
         let mut pool=IDLE.lock().unwrap_or_else(|error|error.into_inner());

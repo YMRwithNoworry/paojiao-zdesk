@@ -1,4 +1,4 @@
-#ifndef SourceDir
+﻿#ifndef SourceDir
 #error SourceDir must point to a verified ZSDesk payload
 #endif
 #ifndef OutputDir
@@ -58,10 +58,11 @@ DisableProgramGroupPage=yes
 DisableDirPage=yes
 OutputDir={#OutputDir}
 OutputBaseFilename=ZSDesk-{#MyAppVersion}-{#Edition}-x64-setup
-Compression=lzma2
+Compression=lzma2/ultra64
+MergeDuplicateFiles=yes
 SolidCompression=yes
 WizardStyle=modern
-WizardSizePercent=120,120
+WizardSizePercent=100,100
 WizardResizable=no
 PrivilegesRequired=lowest
 ArchitecturesAllowed=x64compatible
@@ -75,6 +76,7 @@ RestartApplications=no
 ShowLanguageDialog=auto
 LanguageDetectionMethod=uilanguage
 VersionInfoDescription=ZSDesk {#EditionName} Setup
+VersionInfoVersion={#MyAppVersion}
 
 [Languages]
 Name: "chinesesimp"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
@@ -84,12 +86,20 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
 [Files]
-Source: "{#SourceDir}\*"; DestDir: "{app}"; Excludes: "ZSDeskWindowHook-*.dll"; Flags: ignoreversion recursesubdirs createallsubdirs
-Source: "{#SourceDir}\ZSDeskWindowHook-*.dll"; DestDir: "{app}"; Flags: onlyifdoesntexist
+Source: "setup-logo.bmp"; Flags: dontcopy
+Source: "setup-logo-2x.bmp"; Flags: dontcopy
+Source: "setup-button.bmp"; Flags: dontcopy
+Source: "setup-button-2x.bmp"; Flags: dontcopy
 Source: "{#SourceDir}\ZSDesk.exe"; DestName: "ZSDesk-update-helper.exe"; Flags: dontcopy
 Source: "{#SourceDir}\msvcp140.dll"; Flags: dontcopy
 Source: "{#SourceDir}\vcruntime140.dll"; Flags: dontcopy
 Source: "{#SourceDir}\vcruntime140_1.dll"; Flags: dontcopy
+Source: "{#SourceDir}\*"; DestDir: "{app}"; Excludes: "ZSDeskWindowHook-*.dll,\engines\everything\Everything.exe"; Flags: ignoreversion recursesubdirs createallsubdirs
+#if FileExists(SourceDir + "\engines\everything\Everything.exe")
+#define EngineHash GetSHA256OfFile(SourceDir + "\engines\everything\Everything.exe")
+Source: "{#SourceDir}\engines\everything\Everything.exe"; DestDir: "{app}\engines\everything"; Flags: ignoreversion; Check: NeedsSearchEngine
+#endif
+Source: "{#SourceDir}\ZSDeskWindowHook-*.dll"; DestDir: "{app}"; Flags: onlyifdoesntexist
 
 [Icons]
 Name: "{group}\{#ProductName}"; Filename: "{app}\ZSDesk.exe"; AppUserModelID: "{#ProductModelId}"; Check: not WizardNoIcons
@@ -104,20 +114,33 @@ Filename: "{app}\ZSDesk.exe"; Description: "{cm:LaunchProgram,ZSDesk}"; Flags: n
 [CustomMessages]
 chinesesimp.Fences=ZSDesk 桌面格子
 english.Fences=ZSDesk Desktop Fences
+chinesesimp.Options=选择安装位置
+english.Options=Choose install location
+chinesesimp.HideOptions=收起安装位置
+english.HideOptions=Hide install location
+chinesesimp.InProgress=正在安装…
+english.InProgress=Installing…
+chinesesimp.Finishing=正在完成配置…
+english.Finishing=Finishing setup…
+chinesesimp.Complete=安装完成
+english.Complete=Installation complete
+chinesesimp.Launch=启动 ZSDesk
+english.Launch=Launch ZSDesk
+chinesesimp.Done=完成
+english.Done=Finish
+chinesesimp.Edition={#EditionName}
 #if Edition == "desktop-box"
-chinesesimp.LandingTitle=独立桌面盒子，分类整理。
-english.LandingTitle=Standalone desktop fences. Organize your workspace.
-chinesesimp.LandingDetail=文件夹映射 · 格子标签页 · 拖放整理
-english.LandingDetail=Folder mapping · Fence tabs · Drag and drop
-chinesesimp.KeepSettings=保留桌面盒子设置；配置与文件管理版独立。
-english.KeepSettings=Desktop box settings are kept separately from the file manager.
+english.Edition=Desktop Box
+#elif Edition == "themed"
+english.Edition=Theme edition
+#elif Edition == "desktop"
+english.Edition=Desktop edition
+#elif Edition == "network"
+english.Edition=Network edition
+#elif Edition == "standard"
+english.Edition=Standard edition
 #else
-chinesesimp.LandingTitle=原生文件管理，桌面有序。
-english.LandingTitle=Native file management. An organized desktop.
-chinesesimp.LandingDetail=多标签 · 快速搜索 · 文件预览
-english.LandingDetail=Tabs · Fast search · File preview
-chinesesimp.KeepSettings=保留现有个人设置；文件打开方式可在软件内设置。
-english.KeepSettings=Personal settings are kept. Folder integration is configured in the app.
+english.Edition=Full edition
 #endif
 chinesesimp.InstallFolder=安装位置
 english.InstallFolder=Install location
@@ -127,6 +150,14 @@ chinesesimp.InstallNow=立即安装
 english.InstallNow=Install now
 chinesesimp.InvalidFolder=请输入完整的安装路径。
 english.InvalidFolder=Enter a full installation path.
+chinesesimp.MainLogin=登录 Windows 时打开文件管理主窗口
+english.MainLogin=Open the file manager when I sign in to Windows
+chinesesimp.FencesLogin=登录 Windows 时启动桌面格子
+english.FencesLogin=Start desktop fences when I sign in to Windows
+chinesesimp.LoginUnavailable=无法读取自启设置，将保留现有设置。
+english.LoginUnavailable=Sign-in settings could not be read. Existing settings will be kept.
+chinesesimp.LoginFailed=未能保存登录启动设置。请在 ZSDesk 中检查开机启动选项。
+english.LoginFailed=Could not save the sign-in settings. Check the startup options in ZSDesk.
 chinesesimp.CloseFailed=ZSDesk 仍有窗口或文件操作未结束，请完成文件操作并关闭相关窗口后重试。
 english.CloseFailed=ZSDesk still has an open window or file operation. Complete the operation and close the window, then retry.
 chinesesimp.RestoreFailed=当前安装的系统集成还原失败，卸载已停止；请在 ZSDesk 中恢复系统集成后重试。
@@ -135,10 +166,107 @@ chinesesimp.RunningApp=请先退出正在运行的 ZSDesk，再卸载。
 english.RunningApp=Close all running instances of ZSDesk before uninstalling.
 
 [Code]
+const
+  SurfaceWidth = 520;
+  SurfaceHeight = 440;
+  MutedColor = $00706964;
+
 var
   Landing: TWizardPage;
   Location: TNewEdit;
   Shortcut: TNewCheckBox;
+  Surface: TPanel;
+  Logo: TBitmapImage;
+  Brand, EditionLabel, Status: TNewStaticText;
+  Primary, Other: TBitmapButton;
+  Browse: TNewButton;
+  Progress: TNewProgressBar;
+  ArtSuffix, UIFont: String;
+  ArtScale: Integer;
+  Expanded, Loaded: Boolean;
+  MainLogin, FencesLogin: TNewCheckBox;
+  LoginNotice: TNewStaticText;
+  LoginFolder: String;
+  OriginalLogin: Integer;
+  HelperReady: Boolean;
+
+#ifdef EngineHash
+function NeedsSearchEngine: Boolean;
+var
+  Target: String;
+begin
+  Target := ExpandConstant('{app}\engines\everything\Everything.exe');
+  Result := True;
+  if FileExists(Target) then begin
+    Result := CompareText(GetSHA256OfFile(Target), '{#EngineHash}') <> 0;
+    if not Result then Log('Keeping the identical Everything service executable.');
+  end;
+end;
+#endif
+
+procedure ExtractUpdateHelper;
+begin
+  if HelperReady then Exit;
+  ExtractTemporaryFile('ZSDesk-update-helper.exe');
+  ExtractTemporaryFile('msvcp140.dll');
+  ExtractTemporaryFile('vcruntime140.dll');
+  ExtractTemporaryFile('vcruntime140_1.dll');
+  HelperReady := True;
+end;
+
+procedure LoadLoginChoices(Sender: TObject);
+var
+  Folder, QuotedFolder: String;
+  Bits: Integer;
+begin
+  if WizardSilent then Exit;
+  Folder := Trim(Location.Text);
+  if (Folder = '') or (Pos('"', Folder) <> 0) then Exit;
+  Folder := RemoveBackslashUnlessRoot(ExpandFileName(Folder));
+  if CompareText(Folder, LoginFolder) = 0 then Exit;
+  LoginFolder := Folder;
+  Bits := 16;
+  if FileExists(AddBackslash(Folder) + 'ZSDesk.exe') then begin
+    ExtractUpdateHelper;
+    QuotedFolder := Folder;
+    if Copy(Folder, Length(Folder), 1) = '\' then QuotedFolder := Folder + '\';
+    if not Exec(ExpandConstant('{tmp}\ZSDesk-update-helper.exe'),
+      '--installer-startup-status "' + QuotedFolder + '"', ExpandConstant('{tmp}'),
+      SW_HIDE, ewWaitUntilTerminated, Bits) then Bits := -1;
+  end;
+  if (Bits < 16) or (Bits > 19) then OriginalLogin := -1
+  else OriginalLogin := Bits - 16;
+  if MainLogin <> nil then begin
+    MainLogin.Enabled := OriginalLogin >= 0;
+    MainLogin.Checked := MainLogin.Enabled and ((OriginalLogin and 1) <> 0);
+  end;
+  if FencesLogin <> nil then begin
+    FencesLogin.Enabled := OriginalLogin >= 0;
+    FencesLogin.Checked := FencesLogin.Enabled and ((OriginalLogin and 2) <> 0);
+  end;
+  LoginNotice.Visible := Expanded and (OriginalLogin < 0);
+end;
+
+function LoginChoice(Box: TNewCheckBox; Bit: Integer): String;
+begin
+  Result := 'keep';
+  if (Box = nil) or (OriginalLogin < 0) then Exit;
+  if Box.Checked = ((OriginalLogin and Bit) <> 0) then Exit;
+  if Box.Checked then Result := 'on' else Result := 'off';
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+var
+  Choices: String;
+  ExitCode: Integer;
+begin
+  if (CurStep <> ssPostInstall) or WizardSilent or (LoginFolder = '') then Exit;
+  Choices := LoginChoice(MainLogin, 1) + ' ' + LoginChoice(FencesLogin, 2);
+  if Choices = 'keep keep' then Exit;
+  if not Exec(ExpandConstant('{app}\ZSDesk.exe'), '--installer-startup-apply ' + Choices,
+    ExpandConstant('{app}'), SW_HIDE, ewWaitUntilTerminated, ExitCode) or (ExitCode <> 0) then
+    RaiseException(CustomMessage('LoginFailed'));
+end;
 
 function InitializeUninstall: Boolean;
 begin
@@ -153,10 +281,7 @@ begin
   Result := '';
   if FileExists(ExpandConstant('{app}\ZSDesk.exe')) then
   begin
-    ExtractTemporaryFile('ZSDesk-update-helper.exe');
-    ExtractTemporaryFile('msvcp140.dll');
-    ExtractTemporaryFile('vcruntime140.dll');
-    ExtractTemporaryFile('vcruntime140_1.dll');
+    ExtractUpdateHelper;
     if not Exec(ExpandConstant('{tmp}\ZSDesk-update-helper.exe'), '--shutdown-for-update "' + ExpandConstant('{app}\ZSDesk.exe') + '"', ExpandConstant('{tmp}'), SW_HIDE, ewWaitUntilTerminated, ExitCode) then
       Result := CustomMessage('CloseFailed')
     else if ExitCode <> 0 then Result := CustomMessage('CloseFailed');
@@ -173,57 +298,223 @@ begin
     if CompareText(ExtractFileName(RemoveBackslashUnlessRoot(Folder)), '{#ProductDirectory}') <> 0 then
       Folder := AddBackslash(Folder) + '{#ProductDirectory}';
     Location.Text := Folder;
+    LoadLoginChoices(nil);
   end;
 end;
 
-procedure InitializeWizard;
-var
-  Brand, Title, Detail, FolderLabel, Settings: TNewStaticText;
-  Browse: TNewButton;
+procedure Place(Control: TControl; X, Y, W, H: Integer);
 begin
-  Landing := CreateCustomPage(wpWelcome, '{#ProductName}', '{#EditionName}  {#MyAppVersion}');
-  Brand := TNewStaticText.Create(Landing);
-  Brand.Parent := Landing.Surface;
-  Brand.Caption := 'ZSDesk';
+  Control.SetBounds(ScaleX(X), ScaleY(Y), ScaleX(W), ScaleY(H));
+end;
+
+function LabelOnSurface(Size: Integer; Color: Integer): TNewStaticText;
+begin
+  Result := TNewStaticText.Create(Surface);
+  Result.Parent := Surface;
+  Result.AutoSize := False;
+  Result.Alignment := taCenter;
+  Result.Font.Name := UIFont;
+  Result.Font.Size := Size;
+  Result.Font.Color := Color;
+end;
+
+function ActionOnSurface(Click: TNotifyEvent): TBitmapButton;
+begin
+  Result := TBitmapButton.Create(Surface);
+  Result.Parent := Surface;
+  Result.Stretch := True;
+  Result.BackColor := clWhite;
+  Result.Cursor := crHand;
+  Result.OnClick := Click;
+end;
+
+procedure SetAction(Button: TBitmapButton; const Caption: String; IsPrimary: Boolean);
+var
+  B: TBitmap;
+  Bounds: TRect;
+  X, Y: Integer;
+begin
+  if Button.Caption = Caption then Exit;
+  Button.Caption := Caption;
+  B := Button.Bitmap;
+  if IsPrimary then begin
+    B.LoadFromFile(ExpandConstant('{tmp}\setup-button') + ArtSuffix + '.bmp');
+    B.Canvas.Font.Color := clWhite;
+    B.Canvas.Font.Height := -14 * ArtScale;
+  end else begin
+    B.Width := 220 * ArtScale;
+    B.Height := 24 * ArtScale;
+    B.Canvas.Brush.Style := bsSolid;
+    B.Canvas.Brush.Color := clWhite;
+    Bounds.Left := 0;
+    Bounds.Top := 0;
+    Bounds.Right := B.Width;
+    Bounds.Bottom := B.Height;
+    B.Canvas.FillRect(Bounds);
+    B.Canvas.Font.Color := MutedColor;
+    B.Canvas.Font.Height := -13 * ArtScale;
+  end;
+  B.Canvas.Font.Name := UIFont;
+  B.Canvas.Brush.Style := bsClear;
+  X := (B.Width - B.Canvas.TextWidth(Caption)) div 2;
+  Y := (B.Height - B.Canvas.TextHeight(Caption)) div 2;
+  B.Canvas.TextOut(X, Y, Caption);
+end;
+
+{ The bitmap button reserves two physical pixels on each side for keyboard focus. }
+procedure PlaceAction(Button: TBitmapButton; Top, Height: Integer);
+begin
+  Button.SetBounds(ScaleX((SurfaceWidth - 220) div 2) - 2, ScaleY(Top) - 2,
+    ScaleX(220) + 4, ScaleY(Height) + 4);
+end;
+
+procedure LayoutSurface(PageID: Integer);
+var
+  OnLanding, OptionsVisible: Boolean;
+  Row: Integer;
+begin
+  OnLanding := PageID = Landing.ID;
+  OptionsVisible := OnLanding and Expanded;
+  if OptionsVisible then begin
+    Place(Logo, 228, 14, 64, 64);
+    Place(Brand, 20, 82, 480, 41);
+    Place(EditionLabel, 24, 124, 472, 21);
+    PlaceAction(Other, 151, 24);
+  end else begin
+    Place(Logo, 204, 60, 112, 112);
+    Place(Brand, 20, 194, 480, 41);
+    Place(EditionLabel, 24, 235, 472, 21);
+    if OnLanding then PlaceAction(Other, 270, 24) else PlaceAction(Other, 402, 24);
+  end;
+  Place(Location, 70, 185, 290, 26);
+  Place(Browse, 368, 184, 82, 28);
+  Place(Shortcut, 70, 221, 380, 23);
+  Row := 248;
+  if MainLogin <> nil then begin
+    Place(MainLogin, 70, Row, 380, 23);
+    MainLogin.Visible := OptionsVisible;
+    Row := Row + 27;
+  end;
+  if FencesLogin <> nil then begin
+    Place(FencesLogin, 70, Row, 380, 23);
+    FencesLogin.Visible := OptionsVisible;
+    Row := Row + 27;
+  end;
+  Place(LoginNotice, 30, Row, 460, 36);
+  LoginNotice.Visible := OptionsVisible and (OriginalLogin < 0);
+  PlaceAction(Primary, 348, 44);
+  Place(Status, 30, 276, 460, 26);
+  Place(Progress, 110, 308, 300, 6);
+  Location.Visible := OptionsVisible;
+  Browse.Visible := OptionsVisible;
+  Shortcut.Visible := OptionsVisible;
+  Status.Visible := not OnLanding;
+  Progress.Visible := PageID = wpInstalling;
+  Primary.Visible := OnLanding or (PageID = wpFinished);
+  Other.Visible := Primary.Visible;
+  if OnLanding then begin
+    SetAction(Primary, CustomMessage('InstallNow'), True);
+    if Expanded then SetAction(Other, CustomMessage('HideOptions'), False)
+    else SetAction(Other, CustomMessage('Options'), False);
+  end else if PageID = wpFinished then begin
+    Status.Caption := CustomMessage('Complete');
+    SetAction(Primary, CustomMessage('Launch'), True);
+    SetAction(Other, CustomMessage('Done'), False);
+  end else
+    Status.Caption := CustomMessage('InProgress');
+end;
+
+procedure PrimaryClick(Sender: TObject);
+begin
+  if WizardForm.CurPageID = wpFinished then
+    if WizardForm.RunList.Items.Count > 0 then WizardForm.RunList.Checked[0] := True;
+  WizardForm.NextButton.OnClick(WizardForm.NextButton);
+end;
+
+procedure OtherClick(Sender: TObject);
+begin
+  if WizardForm.CurPageID = wpFinished then begin
+    if WizardForm.RunList.Items.Count > 0 then WizardForm.RunList.Checked[0] := False;
+    WizardForm.NextButton.OnClick(WizardForm.NextButton);
+  end else begin
+    Expanded := not Expanded;
+    if Expanded then LoadLoginChoices(nil);
+    LayoutSurface(Landing.ID);
+    if Expanded then WizardForm.ActiveControl := Location;
+  end;
+end;
+
+function LoginCheckBox(const MessageName: String): TNewCheckBox;
+begin
+  Result := TNewCheckBox.Create(Surface);
+  Result.Parent := Surface;
+  Result.Font.Name := UIFont;
+  Result.Caption := CustomMessage(MessageName);
+end;
+
+procedure InitializeWizard;
+begin
+  Landing := CreateCustomPage(wpWelcome, '{#ProductName}', '');
+  WizardForm.Caption := 'ZSDesk · ' + CustomMessage('Edition');
+  WizardForm.ClientWidth := ScaleX(SurfaceWidth);
+  WizardForm.ClientHeight := ScaleY(SurfaceHeight);
+  WizardForm.Position := poScreenCenter;
+  WizardForm.BorderIcons := [biSystemMenu, biMinimize];
+  if ActiveLanguage = 'chinesesimp' then UIFont := 'Microsoft YaHei UI'
+  else UIFont := 'Segoe UI';
+  ArtScale := 1;
+  if ScaleX(100) > 100 then begin
+    ArtScale := 2;
+    ArtSuffix := '-2x';
+  end;
+  ExtractTemporaryFile('setup-logo' + ArtSuffix + '.bmp');
+  ExtractTemporaryFile('setup-button' + ArtSuffix + '.bmp');
+  Surface := TPanel.Create(WizardForm);
+  Surface.Parent := WizardForm;
+  Surface.SetBounds(0,0,WizardForm.ClientWidth,WizardForm.ClientHeight);
+  Surface.Anchors := [akLeft,akRight,akTop,akBottom];
+  Surface.BevelOuter := bvNone;
+  Surface.ParentBackground := False;
+  Surface.Color := clWhite;
+  Surface.Visible := False;
+  Logo := TBitmapImage.Create(Surface);
+  Logo.Parent := Surface;
+  Logo.Stretch := True;
+  Logo.Bitmap.LoadFromFile(ExpandConstant('{tmp}\setup-logo') + ArtSuffix + '.bmp');
+  Brand := LabelOnSurface(24, $00111111);
   Brand.Font.Name := 'Segoe UI';
-  Brand.Font.Size := 28;
   Brand.Font.Style := [fsBold];
-  Brand.Font.Color := $00C56818;
-  Brand.SetBounds(ScaleX(12), ScaleY(4), ScaleX(360), ScaleY(55));
-  Title := TNewStaticText.Create(Landing);
-  Title.Parent := Landing.Surface;
-  Title.Caption := CustomMessage('LandingTitle');
-  Title.Font.Size := 12;
-  Title.SetBounds(ScaleX(14), ScaleY(68), Landing.SurfaceWidth-ScaleX(28), ScaleY(28));
-  Detail := TNewStaticText.Create(Landing);
-  Detail.Parent := Landing.Surface;
-  Detail.Caption := CustomMessage('LandingDetail');
-  Detail.Font.Color := $00707070;
-  Detail.SetBounds(ScaleX(14), ScaleY(102), Landing.SurfaceWidth-ScaleX(28), ScaleY(26));
-  FolderLabel := TNewStaticText.Create(Landing);
-  FolderLabel.Parent := Landing.Surface;
-  FolderLabel.Caption := CustomMessage('InstallFolder');
-  FolderLabel.SetBounds(ScaleX(14), ScaleY(149), ScaleX(200), ScaleY(20));
-  Location := TNewEdit.Create(Landing);
-  Location.Parent := Landing.Surface;
-  Location.Text := WizardDirValue;
-  Location.SetBounds(ScaleX(14), ScaleY(173), Landing.SurfaceWidth-ScaleX(112), ScaleY(24));
-  Browse := TNewButton.Create(Landing);
-  Browse.Parent := Landing.Surface;
-  Browse.Caption := CustomMessage('BrowseFolder');
-  Browse.SetBounds(Landing.SurfaceWidth-ScaleX(88), ScaleY(172), ScaleX(74), ScaleY(26));
+  Brand.Caption := 'ZSDesk';
+  EditionLabel := LabelOnSurface(9, MutedColor);
+  EditionLabel.Caption := CustomMessage('Edition') + '  ·  {#MyAppVersion}';
+  Status := LabelOnSurface(10, $00262626);
+  Other := ActionOnSurface(@OtherClick);
+  Location := TNewEdit.Create(Surface);
+  Location.Parent := Surface;
+  Location.Font.Name := UIFont;
+  Location.OnExit := @LoadLoginChoices;
+  Browse := TNewButton.Create(Surface);
+  Browse.Parent := Surface;
   Browse.OnClick := @ChooseFolder;
-  Shortcut := TNewCheckBox.Create(Landing);
-  Shortcut.Parent := Landing.Surface;
+  Browse.Caption := CustomMessage('BrowseFolder');
+  Browse.Font.Name := UIFont;
+  Shortcut := TNewCheckBox.Create(Surface);
+  Shortcut.Parent := Surface;
+  Shortcut.Font.Name := UIFont;
   Shortcut.Caption := ExpandConstant('{cm:CreateDesktopIcon}');
-  Shortcut.Checked := WizardIsTaskSelected('desktopicon');
-  Shortcut.SetBounds(ScaleX(14), ScaleY(208), Landing.SurfaceWidth-ScaleX(28), ScaleY(24));
-  Settings := TNewStaticText.Create(Landing);
-  Settings.Parent := Landing.Surface;
-  Settings.Caption := CustomMessage('KeepSettings');
-  Settings.Font.Color := $00707070;
-  Settings.WordWrap := True;
-  Settings.SetBounds(ScaleX(14), ScaleY(243), Landing.SurfaceWidth-ScaleX(28), ScaleY(40));
+#if Edition != "desktop-box"
+  MainLogin := LoginCheckBox('MainLogin');
+#endif
+#if Int(HasDesktop) != 0
+  FencesLogin := LoginCheckBox('FencesLogin');
+#endif
+  LoginNotice := LabelOnSurface(9, MutedColor);
+  LoginNotice.Caption := CustomMessage('LoginUnavailable');
+  LoginNotice.WordWrap := True;
+  Primary := ActionOnSurface(@PrimaryClick);
+  Progress := TNewProgressBar.Create(Surface);
+  Progress.Parent := Surface;
+  Progress.Max := 100;
 end;
 
 function NextButtonClick(CurPageID: Integer): Boolean;
@@ -231,27 +522,47 @@ var
   Folder: String;
 begin
   Result := True;
+  if WizardSilent then Exit;
   if CurPageID = Landing.ID then
   begin
     Folder := Trim(Location.Text);
-    if (Length(Folder) < 3) or ((Pos(':\', Folder) <> 2) and (Pos('\\', Folder) <> 1)) then
+    if (Length(Folder) < 3) or (Pos('"', Folder) <> 0) or ((Pos(':\', Folder) <> 2) and (Pos('\\', Folder) <> 1)) then
     begin
+      Expanded := True;
+      LayoutSurface(Landing.ID);
+      WizardForm.ActiveControl := Location;
       MsgBox(CustomMessage('InvalidFolder'), mbError, MB_OK);
       Result := False;
       Exit;
     end;
     WizardForm.DirEdit.Text := Folder;
+    if Expanded or (LoginFolder <> '') then LoadLoginChoices(nil);
     if Shortcut.Checked then WizardSelectTasks('desktopicon') else WizardSelectTasks('!desktopicon');
   end;
 end;
 
 procedure CurPageChanged(CurPageID: Integer);
 begin
-  if CurPageID = Landing.ID then
-  begin
+  Surface.Visible := (CurPageID = Landing.ID) or (CurPageID = wpInstalling) or (CurPageID = wpFinished);
+  if not Surface.Visible then Exit;
+  if (CurPageID = Landing.ID) and not Loaded then begin
     Location.Text := WizardDirValue;
-    WizardForm.NextButton.Caption := CustomMessage('InstallNow');
+    Shortcut.Checked := WizardIsTaskSelected('desktopicon');
+    Loaded := True;
   end;
+  Surface.BringToFront;
+  LayoutSurface(CurPageID);
+  if Primary.Visible and not WizardSilent then WizardForm.ActiveControl := Primary;
+end;
+
+procedure CurInstallProgressChanged(CurProgress, MaxProgress: Integer);
+begin
+  if MaxProgress <= 0 then Exit;
+  Progress.Position := Round(100.0 * CurProgress / MaxProgress);
+  if Progress.Position >= 100 then
+    Status.Caption := CustomMessage('Finishing')
+  else
+    Status.Caption := CustomMessage('InProgress') + ' ' + IntToStr(Progress.Position) + '%';
 end;
 
 function ShouldSkipPage(PageID: Integer): Boolean;

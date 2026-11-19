@@ -95,9 +95,7 @@ pub fn refresh_system() {
     GRAPHICS.with(|slot| *slot.borrow_mut() = None);
 }
 
-/// Release drawing caches when a reusable STA has finished its file window.
-/// Active menus keep their resources until tracking returns; the next window
-/// prepares its own cache before accepting input.
+/// Release this STA's flyout caches after tracking or when closing the window.
 pub fn release_thread_resources() {
     if is_open() { return; }
     GRAPHICS.with(|slot| { slot.borrow_mut().take(); });
@@ -461,7 +459,9 @@ fn mnemonic(levels: &mut Vec<Level>, character: char, gfx: &Gfx, colors: &Palett
 /// clicking elsewhere, Alt, Esc or losing the foreground dismisses it.
 pub fn track(owner: HWND, items: &[FlyoutItem], anchor: Anchor, dark: bool) -> Option<usize> {
     if items.is_empty() || is_open() { return None; }
-    run(owner, items, anchor, dark, &[]).map(|(id, _)| id)
+    let result=run(owner, items, anchor, dark, &[]).map(|(id, _)| id);
+    release_thread_resources();
+    result
 }
 
 /// Like [`track`], but a choice for which `apply` returns new items (a
@@ -472,13 +472,15 @@ pub fn track_persistent(owner: HWND, items: &[FlyoutItem], anchor: Anchor, dark:
     if items.is_empty() || is_open() { return None; }
     let mut current = items.to_vec();
     let mut path = Vec::new();
-    loop {
-        let (id, chosen) = run(owner, &current, anchor, dark, &path)?;
+    let result=loop {
+        let Some((id, chosen))=run(owner, &current, anchor, dark, &path) else{break None;};
         match apply(id) {
             Some(next) if !next.is_empty() => { current = next; path = chosen; }
-            _ => return Some(id),
+            _ => break Some(id),
         }
-    }
+    };
+    release_thread_resources();
+    result
 }
 
 /// Rows of the open submenus, then the highlighted row of the deepest menu.

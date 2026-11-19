@@ -6,11 +6,9 @@ The DLL plugin targets Listary 6 and 7.0. Listary 7.1 uses the folder-opening an
 It exposes the active ZSdesk folder to Quick Switch and Currently Opened Folders.
 It has no background process, filesystem scan, injected code or Explorer identity emulation.
 
-Build the `net48` project with the .NET SDK and pass `-p:ZSDeskBuildRoot=<absolute external cache directory>`.
-Intermediate and output files are separated by project beneath that directory.
-The runtime dependency is the pinned `Listary.FileAppPlugin` 1.0.0 NuGet package.
-Copy the completed plugin directory into `FileAppPlugins/ZSDesk` under an existing Listary installation,
-restart Listary, and enable ZSdesk in **Options → Integration**.
+Copy the packaged `integrations/listary/FileAppPlugins/ZSDesk` folder to `FileAppPlugins/ZSDesk` in the Listary installation.
+Restart Listary and enable ZSDesk in **Options → Integration**.
+Open a folder in ZSDesk, then use the suggested folder or Ctrl+G in a standard Open or Save dialog.
 Listary manages switching the standard Open/Save dialog; ZSdesk never writes into another application's dialog.
 
 Only a completed filesystem navigation is shared. Searches, virtual Shell locations, a newly selected tab

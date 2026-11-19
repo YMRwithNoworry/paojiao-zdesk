@@ -346,3 +346,33 @@ fn scoped_directory_search_uses_names_without_a_local_volume_catalog()->Result<(
     shared.generation.store(2,Ordering::Release);
     assert!(network::execute(&shared,&sender,&request,&fixture.files,false).is_err());assert!(receiver.try_recv().is_err());Ok(())
 }
+
+#[test]
+fn broad_queries_keep_the_correct_page_after_pruning() -> Result<()> {
+    use everything::SearchSort::*;
+    use metadata::{Index,VolumeIndex};
+    let fixture=Fixture::new(&std::env::temp_dir())?;
+    let mut index=Index::new(1,true);
+    index.begin_build();
+    for n in (0..10000u32).rev(){
+        let row=index.append(u64::from(n)+2,0,OsStr::new(&format!("rank-{n:05}")),0)?;
+        index.set_attributes(row,Some(u64::from(n)),Some(u64::from(9999-n)));
+    }
+    index.reindex();
+    let volumes=[VolumeIndex{root:fixture.files.clone(),serial:1,journal_id:0,checkpoint:0,
+        has_journal:false,mft:false,denied:0,index,pending_dirs:Vec::new()}];
+    snapshot::save(&fixture.index,&snapshot::Policy{development:false,metadata:true},&volumes,&||false)?;
+    let core=native::shared(&fixture.index);
+    let options=SearchOptions{index_metadata:true,..Default::default()};
+    for (sort,expected) in [(NameAsc,[80,81]),(NameDesc,[9919,9918]),(SizeDesc,[9919,9918]),(ModifiedDesc,[80,81])]{
+        let shared=shared();
+        let (sender,receiver)=mpsc::sync_channel(8);
+        let request=Request{generation:1,query:"rank".into(),preferred:None,invalid:None,offset:80,limit:2,sort};
+        native::execute_cached(&core,&options,None,&shared,&sender,&request)?;
+        let event=receiver.try_iter().find(|event|event.finished).context("missing page")?;
+        assert_eq!(event.indexed,10000);
+        assert_eq!(event.paths,expected.map(|n|fixture.files.join(format!("rank-{n:05}"))));
+        assert!(event.truncated);
+    }
+    Ok(())
+}

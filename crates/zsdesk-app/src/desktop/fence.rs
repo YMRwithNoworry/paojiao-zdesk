@@ -86,8 +86,48 @@ pub enum Interaction {
     TabDrag { tab: u64, torn: bool },
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct Cell { pub cell: Rect, pub icon: Rect, pub label: Rect }
+
+/// Uniform cells are computed from the first cell and two strides. A mapped
+/// folder can have many more entries than will ever be visible at once.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Cells {
+    first_cell: Cell,
+    count: usize,
+    columns: usize,
+    dx: i32,
+    dy: i32,
+}
+
+impl Cells {
+    pub(super) fn new(first_cell:Cell,count:usize,columns:usize,dx:i32,dy:i32)->Self{
+        Self{first_cell,count,columns:columns.max(1),dx,dy:dy.max(1)}
+    }
+    pub fn len(&self)->usize{self.count}
+    pub fn is_empty(&self)->bool{self.count==0}
+    pub fn at(&self,i:usize)->Cell{
+        debug_assert!(i<self.count);
+        let x=(i%self.columns) as i32*self.dx;
+        let y=(i/self.columns) as i64*i64::from(self.dy);
+        let offset=|r:Rect|Rect::new(r.x+x,(i64::from(r.y)+y).clamp(i64::from(i32::MIN),i64::from(i32::MAX)) as i32,r.width,r.height);
+        Cell{cell:offset(self.first_cell.cell),icon:offset(self.first_cell.icon),label:offset(self.first_cell.label)}
+    }
+    pub fn get(&self,i:usize)->Option<Cell>{(i<self.count).then(||self.at(i))}
+    pub fn first(&self)->Option<Cell>{self.get(0)}
+    pub fn iter(&self)->impl Iterator<Item=Cell>+'_ {(0..self.count).map(|i|self.at(i))}
+    fn rows_between(&self,top:i32,bottom:i32)->std::ops::Range<usize>{
+        if self.count==0||bottom<top{return 0..0;}
+        let first=self.first_cell.cell;
+        let dy=i64::from(self.dy);
+        let start=(i64::from(top)-i64::from(first.bottom())+dy-1).div_euclid(dy).max(0) as usize;
+        let end=((i64::from(bottom)-i64::from(first.y)).div_euclid(dy)+1).max(0) as usize;
+        start.saturating_mul(self.columns).min(self.count)..end.saturating_mul(self.columns).min(self.count)
+    }
+    pub fn visible(self,viewport:Rect)->impl Iterator<Item=(usize,Cell)>{
+        self.rows_between(viewport.y,viewport.bottom()).map(move |i|(i,self.at(i)))
+    }
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct Geometry {
@@ -97,7 +137,7 @@ pub struct Geometry {
     pub more: Rect,
     pub back: Rect,
     pub content: Rect,
-    pub cells: Vec<Cell>,
+    pub cells: Cells,
     pub content_height: i32,
     pub max_scroll: i32,
     pub thumb: Rect,
@@ -118,15 +158,18 @@ impl Geometry {
         let mut geometry = Self { width, height, content: Rect::new(0, 0, width, height), icon_px: scale(size, dpi), ..Default::default() };
         if count != 0 {
             let icon = geometry.icon_px.min(width.saturating_sub(scale(8, dpi))).max(1);
-            geometry.cells.push(Cell {
+            geometry.cells=Cells::new(Cell {
                 cell: Rect::new(0, 0, width, height),
                 icon: Rect::new((width - icon) / 2, scale(4, dpi), icon, icon),
                 label: Rect::new(scale(2, dpi), scale(8, dpi) + icon, (width - scale(4, dpi)).max(0), (height - icon - scale(10, dpi)).max(0)),
-            });
+            },1,1,0,height);
         }
         geometry
     }
     pub fn new(width: i32, height: i32, dpi: u32, fence: &Fence, count: usize, scroll: i32, browsing: bool) -> Self {
+        Self::with_collapse(width,height,dpi,fence,count,scroll,browsing,fence.collapsed)
+    }
+    fn with_collapse(width:i32,height:i32,dpi:u32,fence:&Fence,count:usize,scroll:i32,browsing:bool,collapsed:bool)->Self{
         let s = |v: i32| scale(v, dpi);
         let title_h = s(TITLE_H);
         let mut g = Geometry { width, height, list_view:fence.view==FenceView::List, ..Default::default() };
@@ -135,7 +178,7 @@ impl Geometry {
         g.back = if browsing { Rect::new(s(4), s(3), s(28), title_h - s(6)) } else { Rect::default() };
         g.content = Rect::new(s(4), title_h, (width - s(8)).max(0), (height - title_h - s(4)).max(0));
         g.icon_px = s(fence.icon_size.pixels());
-        if fence.collapsed || g.content.height <= 0 { g.content.height = 0; return g; }
+        if collapsed || g.content.height <= 0 { g.content.height = 0; return g; }
         let pad = s(6);
         let inner_w = (g.content.width - pad * 2).max(1);
         match fence.view {
@@ -146,14 +189,13 @@ impl Geometry {
                 let cell_w = inner_w / columns;
                 let label_h = s(34);
                 let cell_h = icon + s(10) + label_h;
-                for i in 0..count {
-                    let (c, r) = ((i as i32) % columns, (i as i32) / columns);
-                    let x = g.content.x + pad + c * cell_w;
-                    let y = g.content.y + pad + r * cell_h - scroll;
+                {
+                    let x = g.content.x + pad;
+                    let y = g.content.y + pad - scroll;
                     let cell = Rect::new(x + s(2), y, cell_w - s(4), cell_h - s(2));
                     let icon_rect = Rect::new(x + (cell_w - icon) / 2, y + s(4), icon, icon);
                     let label = Rect::new(x + s(4), icon_rect.bottom() + s(3), cell_w - s(8), label_h - s(2));
-                    g.cells.push(Cell { cell, icon: icon_rect, label });
+                    g.cells=Cells::new(Cell {cell,icon:icon_rect,label},count,columns as usize,cell_w,cell_h);
                 }
                 let rows = (count as i32 + columns - 1) / columns;
                 g.content_height = rows * cell_h + pad * 2;
@@ -162,12 +204,12 @@ impl Geometry {
                 let row_h = s(26);
                 let icon = s(20);
                 g.icon_px=icon;
-                for i in 0..count {
-                    let y = g.content.y + pad + i as i32 * row_h - scroll;
+                {
+                    let y = g.content.y + pad - scroll;
                     let cell = Rect::new(g.content.x + pad, y, inner_w, row_h - s(2));
                     let icon_rect = Rect::new(cell.x + s(4), y + (row_h - s(2) - icon) / 2, icon, icon);
                     let label = Rect::new(icon_rect.right() + s(8), y, (cell.right() - icon_rect.right() - s(12)).max(0), row_h - s(2));
-                    g.cells.push(Cell { cell, icon: icon_rect, label });
+                    g.cells=Cells::new(Cell {cell,icon:icon_rect,label},count,1,0,row_h);
                 }
                 g.content_height = count as i32 * row_h + pad * 2;
             }
@@ -249,7 +291,7 @@ impl Geometry {
         }
         if !self.thumb.is_empty() && x >= self.thumb.x - scale(4, dpi) && self.content.contains(x, y) { return FenceHit::Scrollbar; }
         if self.content.contains(x, y) {
-            if let Some(i) = self.cells.iter().position(|c| c.cell.contains(x, y)) { return FenceHit::Item(i); }
+            if let Some(i) = self.cells.rows_between(y,y).find(|&i|self.cells.at(i).cell.contains(x,y)) { return FenceHit::Item(i); }
             return FenceHit::Empty;
         }
         FenceHit::None
@@ -259,19 +301,23 @@ impl Geometry {
     pub fn in_rect(&self, a: POINT, b: POINT) -> Vec<usize> {
         let (l, r) = (a.x.min(b.x), a.x.max(b.x));
         let (t, bo) = (a.y.min(b.y), a.y.max(b.y));
-        self.cells.iter().enumerate().filter(|(_, c)| c.cell.x < r && c.cell.right() > l && c.cell.y < bo && c.cell.bottom() > t).map(|(i, _)| i).collect()
+        self.cells.rows_between(t,bo).filter(|&i|{let c=self.cells.at(i).cell;c.x<r&&c.right()>l&&c.y<bo&&c.bottom()>t}).collect()
     }
 
     /// Insertion index for a drop at `(x, y)` (manual ordering).
     pub fn insertion(&self, x: i32, y: i32) -> usize {
-        if self.list_view{return self.cells.iter().position(|c|y<c.cell.y+c.cell.height/2).unwrap_or(self.cells.len());}
-        self.cells.iter().position(|c| y < c.cell.y || (y < c.cell.bottom() && x < c.cell.x + c.cell.width / 2)).unwrap_or(self.cells.len())
+        let (mut lo,mut hi)=(0,self.cells.len());
+        while lo<hi{
+            let mid=lo+(hi-lo)/2;let c=self.cells.at(mid).cell;
+            let before=if self.list_view{y<c.y+c.height/2}else{y<c.y||(y<c.bottom()&&x<c.x+c.width/2)};
+            if before{hi=mid;}else{lo=mid+1;}
+        }
+        lo
     }
 
     /// Columns in icon view (for keyboard navigation).
     pub fn columns(&self) -> usize {
-        let first_y = self.cells.first().map(|c| c.cell.y);
-        self.cells.iter().take_while(|c| Some(c.cell.y) == first_y).count().max(1)
+        self.cells.columns.min(self.cells.len()).max(1)
     }
 }
 
@@ -346,13 +392,7 @@ impl FenceWin {
     pub fn geometry(&self, fence: &Fence) -> Geometry {
         let r = self.window_rect();
         if self.standalone { return Geometry::desktop_item(r.right-r.left, r.bottom-r.top, self.dpi, fence.icon_size.pixels(), self.entries.len()); }
-        let mut g = if self.peek {
-            let mut open = fence.clone();
-            open.collapsed = false;
-            Geometry::new(r.right - r.left, r.bottom - r.top, self.dpi, &open, self.entries.len(), self.scroll, fence.browse.is_some())
-        } else {
-            Geometry::new(r.right - r.left, r.bottom - r.top, self.dpi, fence, self.entries.len(), self.scroll, fence.browse.is_some())
-        };
+        let mut g=Geometry::with_collapse(r.right-r.left,r.bottom-r.top,self.dpi,fence,self.entries.len(),self.scroll,fence.browse.is_some(),self.collapsed(fence));
         g.layout_tabs(&self.tabs, self.active_index(), self.dpi);
         g.add_hidden = !self.title_hovered() || (self.peek && !self.tabbed());
         g
@@ -392,9 +432,8 @@ impl FenceWin {
         let (w, h) = (rect.right - rect.left, rect.bottom - rect.top);
         if w <= 0 || h <= 0 { return false; }
         let g = self.geometry(fence);
-        let bitmaps: Vec<Option<ID2D1Bitmap>> = g.cells.iter().enumerate().map(|(i, c)| {
-            let visible = c.cell.bottom() >= g.content.y && c.cell.y <= g.content.bottom();
-            if visible { icon(&self.entries[i], if fence.view == FenceView::List { scale(20, self.dpi) } else { g.icon_px }) } else { None }
+        let visible:Vec<_>=g.cells.visible(g.content).map(|(index,cell)|{
+            (index,cell,icon(&self.entries[index],g.icon_px))
         }).collect();
         if Surface::ensure(&mut self.surface, w, h).is_none() { return false; }
         let Some(surface) = self.surface.as_ref() else { return false };
@@ -507,8 +546,8 @@ impl FenceWin {
                     cv.text(&hint, content, &TextStyle::ui(sf(12.0)).align(Align::Center), col(palette.text_secondary));
                 }
                 let label_style = if fence.view == FenceView::List { TextStyle::ui(sf(12.0)) } else { TextStyle::ui(sf(12.0)).align(Align::Center).top().wrapped() };
-                for (i, cell) in g.cells.iter().enumerate() {
-                    if cell.cell.bottom() < g.content.y || cell.cell.y > g.content.bottom() { continue; }
+                for (i,cell,bitmap) in &visible {
+                    let i=*i;
                     let entry = &self.entries[i];
                     let selected = self.selection.contains(&entry.key);
                     let r = rf(cell.cell);
@@ -527,7 +566,7 @@ impl FenceWin {
                     if self.focus == Some(i) && selected { cv.stroke_round(r, sf(4.0), col(palette.selected_border), 1.0); }
                     let icon_rect = rf(cell.icon);
                     let opacity = if entry.ghosted || self.cut_keys.contains(&entry.key) { 0.5 } else { 1.0 };
-                    match &bitmaps[i] {
+                    match bitmap {
                         Some(bitmap) => {
                             let (bw, bh) = bitmap_size(bitmap);
                             cv.image(bitmap, fit(icon_rect, bw, bh), opacity);
@@ -616,6 +655,27 @@ mod tests {
     }
 
     #[test]
+    fn a_million_fence_entries_allocate_only_visible_bitmap_slots(){
+        for view in [FenceView::Icons,FenceView::List]{
+            let mut f=fence();f.view=view;
+            let large=Geometry::new(340,250,96,&f,1_000_000,117_000,false);
+            assert_eq!(large.cells.len(),1_000_000);
+            let visible:Vec<_>=large.cells.visible(large.content).collect();
+            assert!(!visible.is_empty()&&visible.len()<100);
+            let first=visible.first().unwrap().0;
+            assert!(first>0);
+            assert!(large.cells.at(first-1).cell.bottom()<large.content.y);
+            let last=visible.last().unwrap().0;
+            assert!(large.cells.at(last+1).cell.y>large.content.bottom());
+            for (i,cell) in visible{
+                assert!(cell.cell.bottom()>=large.content.y&&cell.cell.y<=large.content.bottom());
+                assert_eq!(cell.cell,large.cells.at(i).cell);
+            }
+            println!("layout {:?}: entries={}, fixed_grid_bytes={}, former_cell_bytes={}, visible_slots={}",view,large.cells.len(),std::mem::size_of::<Cells>(),large.cells.len()*std::mem::size_of::<Cell>(),large.cells.visible(large.content).count());
+        }
+    }
+
+    #[test]
     fn icon_grid_wraps_and_scrolls() {
         let g = Geometry::new(340, 250, 96, &fence(), 30, 0, false);
         assert_eq!(g.cells.len(), 30);
@@ -623,7 +683,7 @@ mod tests {
         assert!(g.max_scroll > 0);
         assert!(g.cells.iter().all(|c| c.cell.x >= g.content.x && c.cell.right() <= g.content.right()));
         let scrolled = Geometry::new(340, 250, 96, &fence(), 30, 40, false);
-        assert_eq!(scrolled.cells[0].cell.y, g.cells[0].cell.y - 40);
+        assert_eq!(scrolled.cells.at(0).cell.y, g.cells.at(0).cell.y - 40);
     }
 
     #[test]
@@ -633,7 +693,7 @@ mod tests {
             assert!(geometry.title.is_empty()&&geometry.more.is_empty()&&geometry.add.is_empty());
             assert!(geometry.tabs.is_empty()&&geometry.thumb.is_empty());
             assert_eq!(geometry.cells.len(),1);
-            let cell=geometry.cells[0];
+            let cell=geometry.cells.at(0);
             assert!(cell.icon.bottom()<=cell.label.y&&cell.label.bottom()<=geometry.height);
             assert_eq!(geometry.hit(cell.icon.x+1,cell.icon.y+1,dpi,true,false),FenceHit::Item(0));
         }
@@ -646,7 +706,7 @@ mod tests {
         assert!(matches!(g.hit(1, 100, 96, false, false), FenceHit::Edge(Edges { left: true, .. })));
         assert_eq!(g.hit(1, 100, 96, true, false), FenceHit::None);
         assert_eq!(g.hit(150, 10, 96, false, false), FenceHit::Title);
-        let c = g.cells[1].cell;
+        let c = g.cells.at(1).cell;
         assert_eq!(g.hit(c.x + 3, c.y + 3, 96, false, false), FenceHit::Item(1));
         assert_eq!(g.hit(150, 190, 96, true, false), FenceHit::Empty);
     }
@@ -715,7 +775,7 @@ mod tests {
     #[test]
     fn insertion_index_follows_reading_order() {
         let g = Geometry::new(340, 400, 96, &fence(), 6, 0, false);
-        let c = g.cells[1].cell;
+        let c = g.cells.at(1).cell;
         assert_eq!(g.insertion(c.x + 2, c.y + 5), 1);
         assert_eq!(g.insertion(c.right() - 2, c.y + 5), 2);
         assert_eq!(g.insertion(5, 399), 6);
@@ -725,7 +785,7 @@ mod tests {
             let mut model=fence();model.view=FenceView::List;
             let g=Geometry::new(scale(340,dpi),scale(400,dpi),dpi,&model,6,scale(20,dpi),false);
             assert_eq!(g.icon_px,scale(20,dpi));
-            let row=g.cells[2].cell;
+            let row=g.cells.at(2).cell;
             for x in [row.x+1,row.x+row.width/2,row.right()-1]{
                 assert_eq!(g.insertion(x,row.y+1),2);assert_eq!(g.insertion(x,row.bottom()-1),3);
             }

@@ -167,12 +167,16 @@ pub fn group(label: &str, id: &str, items: Vec<MenuItemSpec>) -> MenuItemSpec {
 /// Every entry is a checkable state or a radio choice; actions that open a
 /// window end with "…".
 pub fn interface_settings_menu(ui: &ExplorerUi) -> MenuSpec {
+    menu(vec![layout_settings(ui),tab_settings(ui),preview_settings(ui),search_settings(ui),language_menu(ui.language)])
+}
+
+pub fn language_menu(preference:zsdesk_core::i18n::LanguagePreference)->MenuItemSpec{
     use zsdesk_core::i18n::LanguagePreference;
-    menu(vec![layout_settings(ui), tab_settings(ui), preview_settings(ui), search_settings(ui),submenu(zsdesk_core::i18n::text("语言 / Language"),vec![
-        entry(zsdesk_core::i18n::text("跟随系统 / System default"),"language-system",true,ui.language==LanguagePreference::System),
-        entry(zsdesk_core::i18n::text("简体中文"),"language-zh",true,ui.language==LanguagePreference::Chinese),
-        entry("English","language-en",true,ui.language==LanguagePreference::English),
-    ])])
+    submenu(zsdesk_core::i18n::text("语言 / Language"),vec![
+        entry(zsdesk_core::i18n::text("跟随系统 / System default"),"language-system",true,preference==LanguagePreference::System),
+        entry(zsdesk_core::i18n::text("简体中文"),"language-zh",true,preference==LanguagePreference::Chinese),
+        entry("English","language-en",true,preference==LanguagePreference::English),
+    ])
 }
 
 fn layout_settings(ui: &ExplorerUi) -> MenuItemSpec {
@@ -357,12 +361,12 @@ pub fn context_menu_settings_menu(options: &ContextMenuPreferences) -> MenuSpec 
 /// Both visual styles retain the same registered command sources and rules.
 pub fn context_menu_settings_menu_for(options: &ContextMenuPreferences, _modern_available: bool) -> MenuSpec {
     let original = options.mode == ContextMenuMode::Original;
-    let modern = entry(zsdesk_core::i18n::text("Windows 11（自动兼容）"), "context-menu-windows11", true, options.mode==ContextMenuMode::Windows11);
+    let modern = entry(zsdesk_core::i18n::text("自绘 Windows 11"), "context-menu-windows11", true, !original);
     menu(vec![
         modern,
-        entry(zsdesk_core::i18n::text("自绘 Windows 11"), "context-menu-drawn-windows11", true, options.mode==ContextMenuMode::DrawnWindows11),
         entry(zsdesk_core::i18n::text("Windows 10 经典风格"), "context-menu-original", true, original),
-        item(zsdesk_core::i18n::text("管理此处的完整右键菜单…"),"manage-context-commands"),
+        entry(zsdesk_core::i18n::text("优先显示常用命令"), "context-menu-quick-first", true, options.quick_first),
+        item(zsdesk_core::i18n::text("管理应用扩展…"),"manage-native-first-page"),
         MenuItemSpec::Separator,
         submenu(zsdesk_core::i18n::text("显示的命令"), vec![
             entry(zsdesk_core::i18n::text("剪切、复制和粘贴"), "context-action-cut-copy-paste", true, options.show_cut_copy_paste),
@@ -381,6 +385,7 @@ pub fn apply_context_menu_setting(options: &mut ContextMenuPreferences, choice: 
     match choice {
         "context-menu-original" => options.mode = ContextMenuMode::Original,
         "context-menu-windows11" => options.mode = ContextMenuMode::Windows11,
+        "context-menu-quick-first" => options.quick_first = !options.quick_first,
         "context-menu-drawn-windows11" => options.mode = ContextMenuMode::DrawnWindows11,
         "context-menu-defaults" => *options = ContextMenuPreferences::default(),
         "context-action-cut-copy-paste" => options.show_cut_copy_paste = !options.show_cut_copy_paste,
@@ -426,6 +431,11 @@ pub fn app_menu_with_capabilities(state: AppMenuState, ui: &ExplorerUi, themed: 
         MenuItemSpec::Separator,
     ];
     items.extend(interface_settings_menu(ui).items);
+    items.push(submenu(zsdesk_core::i18n::text("配置目录"),vec![
+        item(zsdesk_core::i18n::text("打开当前配置目录"),"profile-open"),
+        item(zsdesk_core::i18n::text("选择默认配置目录…"),"profile-folder"),
+        item(zsdesk_core::i18n::text("恢复默认配置目录"),"profile-default"),
+    ]));
     items.push(group(zsdesk_core::i18n::text("右键菜单"), "settings-context-menu",
         context_menu_settings_menu_for(&ui.context_menu, !state.modern_menu_unavailable).items));
     if themed { items.push(group(zsdesk_core::i18n::text("主题与材质"), "settings-appearance", appearance_menu(&ui.appearance).items)); }
@@ -718,7 +728,8 @@ mod tests {
     fn every_context_setting_has_an_action_and_defaults_preserve_extensions() {
         let options = ContextMenuPreferences { mode: ContextMenuMode::Original, ..Default::default() };
         for id in nested_ids(&context_menu_settings_menu(&options)) {
-            if id=="manage-context-commands"{continue;}
+            // These commands open management dialogs in the application window.
+            if matches!(id.as_str(), "manage-context-commands" | "manage-native-first-page") { continue; }
             assert!(apply_context_menu_setting(&mut options.clone(), &id), "unhandled context setting {id}");
         }
         assert!(options.show_wps);
@@ -734,12 +745,12 @@ mod tests {
         assert_eq!(checked, ["context-menu-windows11"]);
         assert_eq!(options.mode,ContextMenuMode::Windows11);
         let available=nested_ids(&spec);
-        for style in ["context-menu-windows11","context-menu-drawn-windows11","context-menu-original"]{assert!(available.contains(&style.to_string()));}
+        for style in ["context-menu-windows11","context-menu-original"]{assert!(available.contains(&style.to_string()));}
         let mut customized=options.clone();customized.hidden_commands.push("keep-this-rule".into());
         for (action,mode) in [("context-menu-drawn-windows11",ContextMenuMode::DrawnWindows11),("context-menu-original",ContextMenuMode::Original),("context-menu-windows11",ContextMenuMode::Windows11)]{
             assert!(apply_context_menu_setting(&mut customized,action));assert_eq!(customized.mode,mode);assert_eq!(customized.hidden_commands,["keep-this-rule"]);
         }
-        assert!(nested_ids(&spec).contains(&"manage-context-commands".to_string()), "registered command visibility stays editable");
+        assert!(nested_ids(&spec).contains(&"manage-native-first-page".to_string()), "extensions are configurable without opening a file menu");
     }
 
     #[test]

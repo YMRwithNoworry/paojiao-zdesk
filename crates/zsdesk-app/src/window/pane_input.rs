@@ -9,7 +9,7 @@ static BLANK_CONTEXTS:OnceLock<Mutex<HashMap<isize,usize>>>=OnceLock::new();
 
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
 pub(super) struct Identity {pub source:usize,pub tab:u64,pub epoch:u64}
-pub(super) enum Intent {Action(usize),Wheel(i32),OpenFolder(PathBuf),OpenFolders(Vec<PathBuf>),NavigateFolder(ShellLocation),SubmitAddress(String),CreatedItem(zsdesk_windows::shell::new_menu::CreatedItem),ContextCatalog(Vec<zsdesk_windows::shell::menu::MenuCatalogItem>),ContextMenu(POINT),RenameChild(PathBuf),TransferMessage(String)}
+pub(super) enum Intent {Action(usize),Wheel(i32),OpenFolder(PathBuf),OpenFolders(Vec<PathBuf>),NavigateFolder(ShellLocation),SubmitAddress(String),CreatedItem(zsdesk_windows::shell::new_menu::CreatedItem),ContextCatalog(Vec<zsdesk_windows::shell::menu::MenuCatalogItem>),NativeApps(Vec<(String,String)>),ContextMenu(POINT),RenameChild(PathBuf),TransferMessage(String)}
 struct Envelope {owner:isize,identity:Identity,intent:Intent}
 
 pub(super) fn post(owner:HWND,identity:Identity,intent:Intent)->bool {
@@ -241,6 +241,7 @@ impl WindowState {
                 self.defer_selection(vec![name.to_os_string()],true);
             },
             Intent::ContextCatalog(catalog)=>self.manage_context_catalog(catalog),
+            Intent::NativeApps(apps)=>self.manage_native_apps(apps),
             Intent::ContextMenu(_)=>{}, // Dispatched before the WindowState borrow.
             Intent::Action(action)=>self.pane_action(envelope.identity.source,action),
             Intent::Wheel(delta)=>self.pane_wheel(envelope.identity.source,delta),

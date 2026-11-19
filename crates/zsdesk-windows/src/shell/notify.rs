@@ -20,11 +20,17 @@ pub struct ChangeNotify(Vec<u32>);
 impl ChangeNotify {
     /// Registers `hwnd` for changes inside the given folders (absolute PIDL bytes).
     pub fn register(hwnd: HWND, message: u32, folders: &[Vec<u8>], recursive: bool) -> Option<Self> {
-        if folders.is_empty() { return None; }
         let events = SHCNE_CREATE.0 | SHCNE_DELETE.0 | SHCNE_MKDIR.0 | SHCNE_RMDIR.0 | SHCNE_RENAMEITEM.0 | SHCNE_RENAMEFOLDER.0
             | SHCNE_UPDATEDIR.0 | SHCNE_UPDATEITEM.0 | SHCNE_ATTRIBUTES.0 | SHCNE_UPDATEIMAGE.0 | SHCNE_DRIVEADD.0
             | SHCNE_DRIVEREMOVED.0 | SHCNE_MEDIAINSERTED.0 | SHCNE_MEDIAREMOVED.0 | SHCNE_NETSHARE.0 | SHCNE_NETUNSHARE.0
             | SHCNE_SERVERDISCONNECT.0;
+        Self::register_events(hwnd, message, folders, recursive, events as i32)
+    }
+    pub fn renames(hwnd: HWND, message: u32, folder: Vec<u8>) -> Option<Self> {
+        Self::register_events(hwnd, message, &[folder], false, (SHCNE_RENAMEITEM.0 | SHCNE_RENAMEFOLDER.0) as i32)
+    }
+    fn register_events(hwnd: HWND, message: u32, folders: &[Vec<u8>], recursive: bool, events: i32) -> Option<Self> {
+        if folders.is_empty() { return None; }
         let mut sources=SHCNRF_ShellLevel | SHCNRF_InterruptLevel | SHCNRF_NewDelivery;
         if recursive { sources |= SHCNRF_RecursiveInterrupt; }
         // The Shell requires one entry per registration for reliable deregistration.
@@ -32,7 +38,7 @@ impl ChangeNotify {
         let mut registrations=Self(Vec::with_capacity(folders.len()));
         for folder in folders {
             let entry=SHChangeNotifyEntry { pidl:folder.as_ptr().cast_mut().cast(),fRecursive:BOOL::from(recursive) };
-            let id=unsafe { SHChangeNotifyRegister(hwnd,sources,events as i32,message,1,&entry) };
+            let id=unsafe { SHChangeNotifyRegister(hwnd,sources,events,message,1,&entry) };
             if id==0 { return None; }
             registrations.0.push(id);
         }

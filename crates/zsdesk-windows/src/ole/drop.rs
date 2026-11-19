@@ -12,7 +12,7 @@ use windows::{
             Ole::{IDropTarget, IDropTarget_Impl, RegisterDragDrop, ReleaseStgMedium, RevokeDragDrop, CF_HDROP, DROPEFFECT, DROPEFFECT_NONE},
             SystemServices::MODIFIERKEYS_FLAGS,
         },
-        UI::Shell::{CLSID_DragDropHelper, DragQueryFileW, IDropTargetHelper, HDROP},
+        UI::Shell::{CLSID_DragDropHelper, IDropTargetHelper},
     },
 };
 
@@ -95,18 +95,20 @@ pub fn has_hdrop(data: &IDataObject) -> bool { unsafe { data.QueryGetData(&hdrop
 /// File-system paths carried by a data object (`CF_HDROP`).
 pub fn hdrop_paths(data: &IDataObject) -> Vec<PathBuf> {
     let Ok(mut medium) = (unsafe { data.GetData(&hdrop_format()) }) else { return Vec::new() };
-    let hdrop = HDROP(unsafe { medium.u.hGlobal.0 });
-    let count = unsafe { DragQueryFileW(hdrop, u32::MAX, None) };
-    let mut paths = Vec::new();
-    for index in 0..count.min(10_000) {
-        let len = unsafe { DragQueryFileW(hdrop, index, None) };
-        if len == 0 { continue; }
-        let mut buffer = vec![0u16; len as usize + 1];
-        unsafe { DragQueryFileW(hdrop, index, Some(&mut buffer)) };
-        let end = buffer.iter().position(|&c| c == 0).unwrap_or(buffer.len());
-        paths.push(PathBuf::from(String::from_utf16_lossy(&buffer[..end])));
-    }
-    unsafe { ReleaseStgMedium(&mut medium as *mut STGMEDIUM) };
+    use windows::Win32::System::Memory::{GlobalLock,GlobalSize,GlobalUnlock};
+    // Reject an invalid or oversize list as a whole. Truncating it before
+    // reporting a successful move could make a source discard unhandled files.
+    let paths=if medium.tymed==TYMED_HGLOBAL.0 as u32{
+        let memory=unsafe{medium.u.hGlobal};let size=unsafe{GlobalSize(memory)};
+        let pointer=unsafe{GlobalLock(memory)};
+        if pointer.is_null(){Vec::new()}else{
+            let value=if size<=isize::MAX as usize{
+                crate::shell::file_transfer::parse_hdrop(unsafe{std::slice::from_raw_parts(pointer.cast::<u8>(),size)}).unwrap_or_default()
+            }else{Vec::new()};
+            let _=unsafe{GlobalUnlock(memory)};value
+        }
+    }else{Vec::new()};
+    unsafe{ReleaseStgMedium(&mut medium as *mut STGMEDIUM)};
     paths
 }
 

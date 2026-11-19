@@ -7,7 +7,7 @@ static NEXT_BROWSER_SOURCE: AtomicUsize = AtomicUsize::new(1);
 /// Runtime state of the inactive pane. Persisted tabs live in secondary_pane;
 /// bookmarks, settings, next_id and the window frame are deliberately shared.
 pub(super) struct InactivePane {
-    browser: Option<ExplorerBrowserHost>,
+    pub(super) browser: Option<ExplorerBrowserHost>,
     browser_source: usize,
     folder_sizes: folder_sizes::FolderSizes,
     view_hwnd: HWND,

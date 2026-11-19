@@ -4,9 +4,9 @@ Windows 多标签文件管理器与桌面格子。可以在一个窗口里浏览
 
 [下载安装](https://github.com/YMRwithNoworry/paojiao-zdesk/releases/latest) · [使用说明](docs/user-guide.md) · [更新日志](CHANGELOG.md) · [问题反馈](https://github.com/YMRwithNoworry/paojiao-zdesk/issues)
 
-适用于 Windows 10 / 11，64 位。当前版本为 **0.3.17**，支持简体中文和英文界面。
+适用于 Windows 10 / 11，64 位。当前版本为 **0.4.0**，支持简体中文和英文界面。
 
-English UI is available. Non-Chinese Windows systems use English by default. Choose **≡ → Language → English**, then restart ZSDesk to change the language. Each package includes `README.en.txt`.
+English UI is available. Non-Chinese Windows systems use English by default. Choose **≡ → Language → English** to change the application language immediately. Each package includes `README.en.txt`.
 
 ## 选哪个版本
 
@@ -34,6 +34,7 @@ English UI is available. Non-Chinese Windows systems use English by default. Cho
 | 操作 | 快捷键或入口 |
 |---|---|
 | 新建、关闭、恢复标签 | Ctrl+T / Ctrl+W / Ctrl+Shift+T |
+| 标签栏 | 右键标签打开该标签的菜单，右键标签栏空白处关闭当前标签 |
 | 在新标签打开文件夹 | 鼠标中键点击文件夹 |
 | 后退、前进、上一级 | Alt+← / Alt+→ / Alt+↑，支持鼠标侧键 |
 | 调整图标大小 | Ctrl+滚轮 |
@@ -52,10 +53,27 @@ English UI is available. Non-Chinese Windows systems use English by default. Cho
 
 ## 搜索、预览和右键
 
-- **搜索**：可选择自带搜索或 Everything；网络共享及已有映射网络目录使用限定目录遍历搜索。首次建立本地索引需要时间，可在搜索设置中查看引擎、索引就绪状态和范围。
+- **搜索**：新配置默认使用 Everything，已有配置保留所选后端；可切换自带搜索。网络共享及已有映射网络目录使用限定目录遍历搜索。首次建立本地索引需要时间，可在搜索设置中查看引擎、索引就绪状态和范围。
 - **预览**：内置预览与 QuickLook 可选择。Office 文档预览需要相应的已安装组件；图片、音视频格式取决于系统解码器。
-- **右键**：Windows 10 使用经典系统菜单；Windows 11 按系统能力选择已验证的原生呈现或公共 Shell 命令兼容呈现。Shift 右键可直接使用经典菜单。
+- **右键**：支持经典系统菜单和 Windows 11 样式。Windows 11 样式按对象显示常用操作，可勾选首屏应用扩展。Shift+右键可直接使用经典菜单。
 - **Listary**：安装和连接方式见[详细使用说明](docs/user-guide.md)及 `integrations/listary`。
+
+## 0.4.0 更新
+
+- 安装首页可展开“选择安装位置”，分别选择登录 Windows 时打开文件管理主窗口或启动桌面格子。各版本仅显示支持的选项，新装默认关闭，升级保留原设置。
+- Windows 10 的“此电脑”恢复系统常用文件夹，左侧按根节点分组并提供“库”入口。窗口保留 ZSDesk 状态栏的计数、操作提示和视图按钮，去除内层重复底栏。
+- 顶部和侧边标签均支持右键打开标签菜单，右键空白处关闭当前页。桌面格子首次显示即恢复已有成员。
+- Windows 11 样式的右键菜单按需加载，支持管理应用扩展、文件类型命令及动态子菜单。关闭导航树、取消菜单或结束窗口会话时会释放相应资源。
+
+完整变化见[更新日志](CHANGELOG.md)。
+
+## 0.3.18 更新
+
+- 右键顶部标签关闭所点页，右键标签栏空白处关闭当前页，Shift+右键打开标签菜单。
+
+- “右键菜单 → 优先显示常用命令”可在加载扩展前显示常用操作，完整菜单仍可从末项打开。
+- 快捷键列表支持滚轮和键盘翻页，搜索快捷键设置在当前面板打开。
+- 内置搜索降低大结果集分页和索引快照的峰值内存。安装包和便携包含 Listary 6、7.0 的当前目录插件。
 
 ## 0.3.17 更新
 

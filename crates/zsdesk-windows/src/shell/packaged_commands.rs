@@ -39,12 +39,19 @@ const INCOMPLETE_CACHE_TTL: Duration = Duration::from_secs(3);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Registration {
+    pub display_name: Option<String>,
     pub package_family: String,
     pub package_full_name: String,
     pub application_id: String,
     pub verb_id: String,
     pub item_type: String,
     pub clsid: GUID,
+}
+
+impl Registration {
+    pub(super) fn settings_id(&self) -> String {
+        format!("pkg:{:?}:{}/{}", self.clsid, self.package_family, self.application_id)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -234,6 +241,7 @@ struct CachedManifest {
 }
 #[derive(Default)]
 struct Cache {
+    families:Option<Vec<String>>,
     checked: Option<Instant>,
     discovery: Option<Discovery>,
     manifests: HashMap<String, CachedManifest>,
@@ -380,6 +388,9 @@ fn parse_manifest(text: &str, family: &str, full_name: &str) -> (Vec<Registratio
             .children()
             .filter(|node| node.has_tag_name((foundation, "Application")))
         {
+            let display_name=application.children().find(|node|node.is_element()&&node.tag_name().name()=="VisualElements")
+                .and_then(|node|node.attribute("DisplayName")).map(str::trim)
+                .filter(|name|!name.is_empty()&&name.len()<=512&&!name.to_ascii_lowercase().starts_with("ms-resource:"));
             for extensions in application
                 .children()
                 .filter(|node| node.has_tag_name((foundation, "Extensions")))
@@ -442,6 +453,7 @@ fn parse_manifest(text: &str, family: &str, full_name: &str) -> (Vec<Registratio
                                         return Err("null context-menu CLSID".into());
                                     }
                                     Ok(Registration {
+                                        display_name:display_name.map(str::to_owned),
                                         package_family: family.into(),
                                         package_full_name: full_name.into(),
                                         application_id: application_id.clone(),
@@ -475,6 +487,26 @@ fn package_metadata(package: &Package) -> Result<(String, String)> {
 /// Enumerates packages for the calling user only. Global enumeration errors are
 /// errors; partial enumeration and per-manifest failures stay in Discovery.
 pub(super) fn discover() -> Result<Discovery> {
+    discover_families(None)
+}
+
+pub(super) fn discover_enabled(allowed:Option<&[String]>)->Result<Discovery>{
+    let Some(allowed)=allowed else{return discover();};
+    let mut families=Vec::new();
+    for id in allowed{
+        if id.starts_with("legacy:"){continue;}
+        if let Some((family,_))=id.strip_prefix("pkg:").and_then(|id|id.split_once(':')).and_then(|(_,app)|app.split_once('/')){
+            families.push(family.to_owned());
+        }else if GUID::try_from(id.as_str()).is_ok(){
+            // A previous profile stored only CLSIDs and has no family lookup key.
+            return discover();
+        }
+    }
+    families.sort();families.dedup();
+    discover_families(Some(families))
+}
+
+fn discover_families(families:Option<Vec<String>>) -> Result<Discovery> {
     let mut cache = CACHE
         .get_or_init(Default::default)
         .lock()
@@ -486,7 +518,7 @@ pub(super) fn discover() -> Result<Discovery> {
         } else {
             INCOMPLETE_CACHE_TTL
         };
-        if age < ttl {
+        if age < ttl && cache.families==families {
             let mut result = result.clone();
             result.cache_hit = true;
             result.cache_age_ms = age.as_millis().min(u64::MAX as u128) as u64;
@@ -495,112 +527,125 @@ pub(super) fn discover() -> Result<Discovery> {
     }
     let _apartment = Apartment::enter()?;
     let manager = PackageManager::new()?;
-    let packages = manager.FindPackagesByUserSecurityId(&HSTRING::new())?;
-    let iterator = packages.First()?;
     let mut result = Discovery::default();
     let mut manifests = HashMap::new();
-    loop {
-        match iterator.HasCurrent() {
-            Ok(true) => (),
-            Ok(false) => {
-                result.enumeration_complete = true;
-                break;
-            }
-            Err(error) => {
-                result
-                    .failures
-                    .push(com_failure(None, "enumerate-has-current", error));
-                break;
+    let mut complete=true;
+    let mut lists=Vec::new();
+    if let Some(requested)=&families{
+        for family in requested{
+            match manager.FindPackagesByUserSecurityIdPackageFamilyName(&HSTRING::new(),&HSTRING::from(family.as_str())){
+                Ok(list)=>lists.push(list),
+                Err(error)=>{complete=false;result.failures.push(com_failure(Some(family),"enumerate-family",error));}
             }
         }
-        let package = match iterator.Current() {
-            Ok(package) => package,
-            Err(error) => {
-                result
-                    .failures
-                    .push(com_failure(None, "enumerate-current", error));
-                break;
+    }else{lists.push(manager.FindPackagesByUserSecurityId(&HSTRING::new())?);}
+    for packages in lists{
+        let iterator = packages.First()?;
+        loop {
+            match iterator.HasCurrent() {
+                Ok(true) => (),
+                Ok(false) => {
+                    break;
+                }
+                Err(error) => {
+                    complete=false;
+                    result
+                        .failures
+                        .push(com_failure(None, "enumerate-has-current", error));
+                    break;
+                }
             }
-        };
-        result.packages_seen += 1;
-        match package_metadata(&package) {
-            Err(error) => result
-                .failures
-                .push(com_failure(None, "package-identity", error)),
-            Ok((full_name, family)) => {
-                let eligible = (|| -> Result<Option<&'static str>> {
-                    if package.IsFramework()? {
-                        return Ok(Some("framework"));
-                    }
-                    if package.IsResourcePackage()? {
-                        return Ok(Some("resource-package"));
-                    }
-                    if package.IsBundle()? {
-                        return Ok(Some("bundle-container"));
-                    }
-                    if !package.Status()?.VerifyIsOK()? {
-                        return Ok(Some("package-status-not-usable"));
-                    }
-                    Ok(None)
-                })();
-                match eligible {
-                    Err(error) => {
-                        result
-                            .failures
-                            .push(com_failure(Some(&full_name), "package-status", error))
-                    }
-                    Ok(Some(reason)) => result.excluded_packages.push(ExcludedPackage {
-                        package_full_name: full_name,
-                        reason,
-                    }),
-                    Ok(None) => {
-                        let location = package.InstalledLocation().and_then(|folder| folder.Path());
-                        match location {
-                            Err(error) => result.failures.push(com_failure(
-                                Some(&full_name),
-                                "manifest-location",
-                                error,
-                            )),
-                            Ok(location) => {
-                                let root = PathBuf::from(std::ffi::OsString::from_wide(&location));
-                                let path = root.join("AppxManifest.xml");
-                                if !root.is_absolute() {
-                                    result.failures.push(failure(
-                                        Some(&full_name),
-                                        Some(&path),
-                                        "manifest-location",
-                                        "package install location is not absolute",
-                                    ));
-                                } else {
-                                    inspect_manifest(
-                                        &mut result,
-                                        &cache.manifests,
-                                        &mut manifests,
-                                        &family,
-                                        &full_name,
-                                        &path,
-                                    );
+            let package = match iterator.Current() {
+                Ok(package) => package,
+                Err(error) => {
+                    complete=false;
+                    result
+                        .failures
+                        .push(com_failure(None, "enumerate-current", error));
+                    break;
+                }
+            };
+            result.packages_seen += 1;
+            match package_metadata(&package) {
+                Err(error) => result
+                    .failures
+                    .push(com_failure(None, "package-identity", error)),
+                Ok((full_name, family)) => {
+                    let eligible = (|| -> Result<Option<&'static str>> {
+                        if package.IsFramework()? {
+                            return Ok(Some("framework"));
+                        }
+                        if package.IsResourcePackage()? {
+                            return Ok(Some("resource-package"));
+                        }
+                        if package.IsBundle()? {
+                            return Ok(Some("bundle-container"));
+                        }
+                        if !package.Status()?.VerifyIsOK()? {
+                            return Ok(Some("package-status-not-usable"));
+                        }
+                        Ok(None)
+                    })();
+                    match eligible {
+                        Err(error) => {
+                            result
+                                .failures
+                                .push(com_failure(Some(&full_name), "package-status", error))
+                        }
+                        Ok(Some(reason)) => result.excluded_packages.push(ExcludedPackage {
+                            package_full_name: full_name,
+                            reason,
+                        }),
+                        Ok(None) => {
+                            let location = package.InstalledLocation().and_then(|folder| folder.Path());
+                            match location {
+                                Err(error) => result.failures.push(com_failure(
+                                    Some(&full_name),
+                                    "manifest-location",
+                                    error,
+                                )),
+                                Ok(location) => {
+                                    let root = PathBuf::from(std::ffi::OsString::from_wide(&location));
+                                    let path = root.join("AppxManifest.xml");
+                                    if !root.is_absolute() {
+                                        result.failures.push(failure(
+                                            Some(&full_name),
+                                            Some(&path),
+                                            "manifest-location",
+                                            "package install location is not absolute",
+                                        ));
+                                    } else {
+                                        inspect_manifest(
+                                            &mut result,
+                                            &cache.manifests,
+                                            &mut manifests,
+                                            &family,
+                                            &full_name,
+                                            &path,
+                                        );
+                                    }
                                 }
                             }
                         }
                     }
                 }
             }
-        }
-        match iterator.MoveNext() {
-            Ok(true) => (),
-            Ok(false) => {
-                result.enumeration_complete = true;
-                break;
-            }
-            Err(error) => {
-                result
-                    .failures
-                    .push(com_failure(None, "enumerate-move-next", error));
-                break;
+            match iterator.MoveNext() {
+                Ok(true) => (),
+                Ok(false) => {
+                    break;
+                }
+                Err(error) => {
+                    complete=false;
+                    result
+                        .failures
+                        .push(com_failure(None, "enumerate-move-next", error));
+                    break;
+                }
             }
         }
     }
+    result.enumeration_complete=complete;
     result.registrations.sort_by(|a, b| {
         (
             &a.package_full_name,
@@ -627,6 +672,7 @@ pub(super) fn discover() -> Result<Discovery> {
     result.unknown_item_types.sort();
     result.unknown_item_types.dedup();
     cache.checked = Some(Instant::now());
+    cache.families=families;
     cache.manifests = manifests;
     cache.discovery = Some(result.clone());
     Ok(result)
@@ -785,6 +831,7 @@ mod tests {
     }
     fn registration(item_type: &str) -> Registration {
         Registration {
+            display_name:None,
             package_family: "family".into(),
             package_full_name: "package_1".into(),
             application_id: "App".into(),

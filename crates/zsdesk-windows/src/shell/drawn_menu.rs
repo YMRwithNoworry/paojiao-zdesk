@@ -13,17 +13,22 @@ use windows::{core::{w,Error,HRESULT,Interface,PWSTR,Result},Win32::{
 use crate::{flyout_layout::{self as geometry,Anchor,Bounds,LevelLayout,Measured,Metrics,RowKind},
     gfx::{Align,BitmapAlpha,Canvas,Color,Gfx,RectF,Surface,TextStyle}};
 use super::ContextMenuOptions;
+#[path="drawn_menu/command_icons.rs"]
+mod command_icons;
 
 const CLASS:windows::core::PCWSTR=w!("ZSDesk.ShellFlyout");
 const TIMER:usize=0x5a53464c;
-const NATIVE_SUBCLASS:usize=0x5a53464e;
 const MAX_ITEMS:usize=16384;
 const MAX_LEVELS:usize=32;
 const HOVER_DELAY:Duration=Duration::from_millis(300);
 const AIM_DELAY:Duration=Duration::from_millis(450);
 // Independently measured Shell popup metrics. Generic application flyouts keep
 // their own layout; these values describe the Shell's command strip and body.
-const SHELL_TEXT_LEFT_DIP:f32=42.;
+const SHELL_TEXT_LEFT_DIP:f32=44.;
+const SHELL_ROOT_TEXT_LEFT_DIP:f32=43.;
+// DirectWrite samples glyph coverage at a fractional device-pixel origin.
+const SHELL_TEXT_PHASE_PX:f32=0.125;
+const SHELL_VERTICAL_PADDING_DIP:f32=3.;
 const SHELL_SUBMENU_OVERLAP_DIP:f32=8.;
 const SHELL_SEPARATOR_INSET_DIP:f32=6.;
 const TOOLBAR_HEIGHT_DIP:f32=60.;
@@ -33,15 +38,17 @@ const TOOLBAR_LABEL_DIP:f32=12.;
 const TOOLTIP_DELAY:Duration=Duration::from_millis(650);
 thread_local!{
     static ACTIVE:Cell<bool>=const{Cell::new(false)};
+    static TEARING_DOWN:Cell<bool>=const{Cell::new(false)};
     static CANCEL:Cell<bool>=const{Cell::new(false)};
     static ROOT:Cell<HWND>=const{Cell::new(HWND(std::ptr::null_mut()))};
-    static NATIVE_TRACKING:Cell<bool>=const{Cell::new(false)};
     static SNAPSHOT:RefCell<serde_json::Value>=const{RefCell::new(serde_json::Value::Null)};
     static GRAPHICS:RefCell<Option<Rc<Gfx>>>=const{RefCell::new(None)};
 }
 pub(super) fn is_open()->bool{ACTIVE.with(Cell::get)}
+pub(super) fn renderer_ready()->bool{GRAPHICS.with(|slot|slot.borrow().is_some())}
+pub(super) fn prepare()->Result<()>{register_class()?;let _=graphics()?;Ok(())}
 pub(super) fn popup_window()->Option<HWND>{ROOT.with(|root|{let hwnd=root.get();(!hwnd.0.is_null()&&unsafe{IsWindow(Some(hwnd))}.as_bool()&&unsafe{IsWindowVisible(hwnd)}.as_bool()).then_some(hwnd)})}
-pub(super) fn cancel(){if is_open(){CANCEL.with(|flag|flag.set(true));if NATIVE_TRACKING.with(Cell::get){let _=unsafe{EndMenu()};}if let Some(hwnd)=popup_window(){let _=unsafe{PostMessageW(Some(hwnd),WM_NULL,WPARAM(0),LPARAM(0))};}}}
+pub(super) fn cancel(){if is_open(){CANCEL.with(|flag|flag.set(true));if let Some(hwnd)=popup_window(){let _=unsafe{PostMessageW(Some(hwnd),WM_NULL,WPARAM(0),LPARAM(0))};}}}
 pub(super) fn release_thread_resources(){if is_open(){cancel();return;}GRAPHICS.with(|slot|{slot.borrow_mut().take();});SNAPSHOT.with(|slot|*slot.borrow_mut()=serde_json::Value::Null);}
 /// Read-only geometry and opaque Win32 handles for diagnostics and SVG comparison.
 pub(super) fn diagnostic_snapshot()->serde_json::Value{SNAPSHOT.with(|value|value.borrow().clone())}
@@ -49,15 +56,22 @@ pub(super) fn diagnostic_snapshot()->serde_json::Value{SNAPSHOT.with(|value|valu
 fn error(code:u32,message:&str)->Error{Error::new(HRESULT(code as i32),message)}
 fn graphics()->Result<Rc<Gfx>>{GRAPHICS.with(|slot|{
     if let Some(gfx)=slot.borrow().as_ref(){return Ok(gfx.clone());}
-    let gfx=Rc::new(Gfx::new(&crate::gfx::system_ui_font(None).0)?);*slot.borrow_mut()=Some(gfx.clone());Ok(gfx)
+    #[cfg(feature="menu-visual-qa")]let family=std::env::var("ZSDESK_VISUAL_FONT").unwrap_or_else(|_|"Segoe UI".into());
+    #[cfg(not(feature="menu-visual-qa"))]let family="Segoe UI";
+    let gfx=Rc::new(Gfx::new(&family)?);*slot.borrow_mut()=Some(gfx.clone());Ok(gfx)
 })}
 
-struct Palette{background:Color,border:Color,text:Color,secondary:Color,disabled:Color,hover:Color,pressed:Color,divider:Color,shadow:f32}
+struct Palette{background:Color,border:Color,text:Color,secondary:Color,disabled:Color,hover:Color,pressed:Color,divider:Color,ink:Color,accent:Color,shadow:f32}
 fn palette(dark:bool)->Palette{
+    if crate::theme::high_contrast(){
+        let color=|id|{let c=unsafe{GetSysColor(id)};Color::rgba8(c as u8,(c>>8)as u8,(c>>16)as u8,255)};
+        return Palette{background:color(COLOR_MENU),border:color(COLOR_WINDOWFRAME),text:color(COLOR_MENUTEXT),secondary:color(COLOR_MENUTEXT),
+            disabled:color(COLOR_GRAYTEXT),hover:color(COLOR_HIGHLIGHT),pressed:color(COLOR_HIGHLIGHT),divider:color(COLOR_MENUTEXT),ink:color(COLOR_MENUTEXT),accent:color(COLOR_MENUTEXT),shadow:0.};
+    }
     if dark{Palette{background:Color::rgba8(44,44,44,255),border:Color::rgba8(255,255,255,23),text:Color::rgba8(255,255,255,255),
-        secondary:Color::rgba8(255,255,255,197),disabled:Color::rgba8(255,255,255,93),hover:Color::rgba8(255,255,255,15),pressed:Color::rgba8(255,255,255,10),divider:Color::rgba8(255,255,255,21),shadow:0.34}}
+        secondary:Color::rgba8(255,255,255,197),disabled:Color::rgba8(255,255,255,93),hover:Color::rgba8(255,255,255,15),pressed:Color::rgba8(255,255,255,10),divider:Color::rgba8(255,255,255,21),ink:Color::rgba8(222,222,222,255),accent:Color::rgba8(96,205,255,255),shadow:0.34}}
     else{Palette{background:Color::rgba8(252,252,252,255),border:Color::rgba8(0,0,0,16),text:Color::rgba8(0,0,0,228),
-        secondary:Color::rgba8(0,0,0,158),disabled:Color::rgba8(0,0,0,92),hover:Color::rgba8(0,0,0,11),pressed:Color::rgba8(0,0,0,16),divider:Color::rgba8(0,0,0,18),shadow:0.16}}
+        secondary:Color::rgba8(0,0,0,158),disabled:Color::rgba8(0,0,0,92),hover:Color::rgba8(0,0,0,11),pressed:Color::rgba8(0,0,0,16),divider:Color::rgba8(0,0,0,18),ink:Color::rgba8(85,85,85,255),accent:Color::rgba8(0,120,212,255),shadow:0.16}}
 }
 
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]enum Action{Cut,Copy,Rename,Share,Delete}
@@ -68,12 +82,14 @@ impl Action{
 }
 #[derive(Clone)]struct Item{
     position:u32,id:u32,raw_label:String,label:String,mnemonic:Option<char>,accelerator:String,kind:RowKind,enabled:bool,checked:bool,radio:bool,default:bool,
-    submenu:HMENU,item_data:usize,owner_draw:bool,bitmap:HBITMAP,measured:Option<(u32,u32)>,wic:Option<IWICBitmapSource>,image:Option<(u64,ID2D1Bitmap)>,action:Option<Action>,
+    submenu:HMENU,item_data:usize,owner_draw:bool,bitmap:HBITMAP,measured:Option<(u32,u32)>,wic:Option<IWICBitmapSource>,image:Option<(u64,ID2D1Bitmap)>,action:Option<Action>,verb:Option<String>,
+    hidden:bool,variants:bool,
 }
-impl Item{fn cascade(&self)->bool{!self.submenu.is_invalid()}fn selectable(&self)->bool{self.kind==RowKind::Item&&self.enabled}}
-struct Level{menu:HMENU,hwnd:HWND,body:Bounds,metrics:Metrics,layout:LevelLayout,items:Vec<Item>,scroll:f32,
-    toolbar:Vec<usize>,accelerator_width:f32,keyboard_focus:bool,
-    highlight:Option<usize>,pressed:Option<usize>,open_child:Option<usize>,surface:Option<Surface>,initialized:bool,native_only:bool}
+impl Item{fn cascade(&self)->bool{self.variants||!self.submenu.is_invalid()}fn selectable(&self)->bool{self.kind==RowKind::Item&&!self.hidden&&self.enabled}
+    fn opens_on_hover(&self)->bool{self.cascade()&&self.verb.as_deref()!=Some("zsdesk.more")}}
+struct Level{menu:HMENU,hwnd:HWND,frame_id:usize,body:Bounds,metrics:Metrics,layout:LevelLayout,items:Vec<Item>,scroll:f32,
+    toolbar:Vec<usize>,accelerator_width:f32,text_left_dip:f32,keyboard_focus:bool,variant_label:Option<String>,suspended:bool,
+    highlight:Option<usize>,pressed:Option<usize>,open_child:Option<usize>,surface:Option<Surface>,initialized:bool}
 impl Level{
     fn toolbar_height(&self)->f32{if self.toolbar.is_empty(){0.}else{self.metrics.px(TOOLBAR_HEIGHT_DIP)}}
     fn toolbar_rect(&self,slot:usize)->RectF{let m=self.metrics;let pad=m.px(TOOLBAR_PADDING_DIP);let separator=m.px(1.);
@@ -110,6 +126,13 @@ struct Provider{context:IContextMenu,options:ContextMenuOptions,root:HMENU,filte
 impl Provider{
     fn is_new_popup(&self,menu:HMENU)->bool{
         if menu==self.root{return self.new_root;}
+        for index in 0..unsafe{GetMenuItemCount(Some(self.root))}.max(0){
+            if unsafe{GetSubMenu(self.root,index)}==menu{
+                if let Ok((info,_))=read_raw(self.root,index as u32){
+                    if super::canonical_verb(&self.context,info.wID).is_some_and(|v|v.eq_ignore_ascii_case("newfolder")){return true;}
+                }
+            }
+        }
         super::menu_catalog::popup_path(self.root,menu,&self.context)
             .is_some_and(|path|path.len()==1&&path[0]=="verb:newfolder")
     }
@@ -124,7 +147,7 @@ impl Provider{
     fn initialize(&self,menu:HMENU,index:u32){self.message(WM_INITMENUPOPUP,WPARAM(menu.0 as usize),LPARAM(index as isize));self.filter(menu);}
     fn uninitialize(&self,menu:HMENU){self.message(WM_UNINITMENUPOPUP,WPARAM(menu.0 as usize),LPARAM(0));}
     fn selection(&self,level:&Level,row:Option<usize>,mouse:bool){
-        if let Some(item)=row.and_then(|row|level.items.get(row)){
+        if let Some(item)=row.and_then(|row|level.items.get(row)).filter(|item|!item.variants){
             let id=if item.cascade(){item.position}else{item.id};let flags=(if item.cascade(){MF_POPUP.0}else{0})|MF_HILITE.0
                 |if mouse{MF_MOUSESELECT.0}else{0}|if item.enabled{0}else{MF_GRAYED.0};
             self.message(WM_MENUSELECT,WPARAM(((flags as usize)<<16)|(id as usize&0xffff)),LPARAM(level.menu.0 as isize));
@@ -170,39 +193,32 @@ fn same_identity(item:&Item,info:&MENUITEMINFOW,raw:&str)->bool{
         &&item.owner_draw==info.fType.contains(MFT_OWNERDRAW)
         &&(item.kind==RowKind::Separator)==info.fType.contains(MFT_SEPARATOR)
 }
-fn read_items(provider:&Provider,menu:HMENU,gfx:&Gfx,metrics:Metrics)->Result<(Vec<Item>,bool)>{
+fn read_items(provider:&Provider,menu:HMENU,gfx:&Gfx,metrics:Metrics)->Result<Vec<Item>>{
     let count=unsafe{GetMenuItemCount(Some(menu))};if count<0{return Err(Error::from_thread());}
-    if count as usize>MAX_ITEMS{return Ok((Vec::new(),true));}
-    let mut items=Vec::with_capacity(count as usize);let mut native_only=false;let mut label_bytes=0usize;
+    if count as usize>MAX_ITEMS{return Err(error(0x8007000e,"菜单项资源超限"));}
+    let mut items=Vec::with_capacity(count as usize);let mut label_bytes=0usize;
     for position in 0..count as u32{
-        let previously_native_only=native_only;
-        let(info,raw)=match read_raw(menu,position){Ok(value)=>value,Err(error) if error.code().0 as u32==0x8007000e=>return Ok((Vec::new(),true)),Err(error)=>return Err(error)};
-        label_bytes=label_bytes.saturating_add(raw.len());if label_bytes>8*1024*1024{return Ok((Vec::new(),true));}
+        let(info,raw)=read_raw(menu,position)?;
+        label_bytes=label_bytes.saturating_add(raw.len());if label_bytes>8*1024*1024{return Err(error(0x8007000e,"菜单项资源超限"));}
         let (label,mnemonic,accelerator)=shell_label(&raw);
         let kind=if info.fType.contains(MFT_SEPARATOR){RowKind::Separator}else{RowKind::Item};
         let owner_draw=info.fType.contains(MFT_OWNERDRAW);
-        native_only|=info.fType.0&(MFT_MENUBREAK|MFT_MENUBARBREAK|MFT_RIGHTORDER).0!=0;
         let checked=info.fState.contains(MFS_CHECKED);
         let bitmap=bitmap_for(&info);
-        if label.is_empty()&&valid_bitmap(bitmap)&&!owner_draw{native_only=true;}
-        if !bitmap.is_invalid()&&!valid_bitmap(bitmap)&&bitmap!=HBMMENU_CALLBACK{native_only=true;}
         let mut measured=None;
         if owner_draw{let mut measure=MEASUREITEMSTRUCT{CtlType:ODT_MENU,itemID:info.wID,itemWidth:0,itemHeight:0,itemData:info.dwItemData,..Default::default()};
-            if provider.message(WM_MEASUREITEM,WPARAM(0),LPARAM((&mut measure as*mut MEASUREITEMSTRUCT)as isize)).is_none(){native_only=true;}
-            else if measure.itemWidth>8192||measure.itemHeight>8192{native_only=true;}
-            else{measured=Some((measure.itemWidth,measure.itemHeight.max(metrics.px(geometry::ITEM_HEIGHT_DIP)as u32)));}}
+            if provider.message(WM_MEASUREITEM,WPARAM(0),LPARAM((&mut measure as*mut MEASUREITEMSTRUCT)as isize)).is_some()&&measure.itemWidth<=8192&&measure.itemHeight<=8192{measured=Some((measure.itemWidth,measure.itemHeight.max(metrics.px(geometry::ITEM_HEIGHT_DIP)as u32)));}}
         let mut bitmap_info=BITMAP::default();let bounded_bitmap=!valid_bitmap(bitmap)||{
             let bytes=unsafe{GetObjectW(bitmap.into(),std::mem::size_of::<BITMAP>()as i32,Some((&mut bitmap_info as*mut BITMAP).cast()))};
             bytes as usize==std::mem::size_of::<BITMAP>()&&i64::from(bitmap_info.bmWidth).unsigned_abs().saturating_mul(i64::from(bitmap_info.bmHeight).unsigned_abs()).saturating_mul(4)<=8*1024*1024};
         let wic=if valid_bitmap(bitmap)&&bounded_bitmap{gfx.wic_from_hbitmap(bitmap,bitmap_alpha(bitmap))}else{None};
-        if valid_bitmap(bitmap)&&wic.is_none(){native_only=true;}
-        if native_only&&!previously_native_only{eprintln!("drawn-menu native row: position={position} type={} bitmap={} owner_draw={owner_draw} measured={measured:?} bitmap_size={}x{} decoded={}",info.fType.0,bitmap.0 as isize,bitmap_info.bmWidth,bitmap_info.bmHeight,wic.is_some());}
-        let action=if menu==provider.root&&kind==RowKind::Item{super::canonical_verb(&provider.context,info.wID).as_deref().and_then(Action::from_verb)}else{None};
+        let verb=if menu==provider.root&&kind==RowKind::Item{super::canonical_verb(&provider.context,info.wID)}else{None};
+        let action=verb.as_deref().and_then(Action::from_verb);
         items.push(Item{position,id:info.wID,raw_label:raw,label,mnemonic,accelerator,kind,enabled:info.fState.0&(MFS_DISABLED|MFS_GRAYED).0==0,checked,
             radio:info.fType.contains(MFT_RADIOCHECK),default:info.fState.contains(MFS_DEFAULT),submenu:info.hSubMenu,item_data:info.dwItemData,
-            owner_draw,bitmap,measured,wic,image:None,action});
+            owner_draw,bitmap,measured,wic,image:None,action,verb,hidden:false,variants:false});
     }
-    Ok((items,native_only))
+    Ok(items)
 }
 
 fn register_class()->Result<()>{
@@ -213,7 +229,7 @@ fn register_class()->Result<()>{
 }
 unsafe extern "system" fn procedure(hwnd:HWND,msg:u32,wp:WPARAM,lp:LPARAM)->LRESULT{
     match msg{WM_MOUSEACTIVATE=>LRESULT(MA_NOACTIVATE as isize),
-        WM_CAPTURECHANGED|WM_CANCELMODE|WM_CLOSE=>{if !NATIVE_TRACKING.with(Cell::get){cancel();}LRESULT(0)},
+        WM_CAPTURECHANGED|WM_CANCELMODE|WM_CLOSE=>{if !TEARING_DOWN.with(Cell::get){cancel();}LRESULT(0)},
         _=>unsafe{DefWindowProcW(hwnd,msg,wp,lp)},}
 }
 fn monitor_at(point:POINT)->(Bounds,u32){let monitor=unsafe{MonitorFromPoint(point,MONITOR_DEFAULTTONEAREST)};
@@ -222,7 +238,43 @@ fn monitor_at(point:POINT)->(Bounds,u32){let monitor=unsafe{MonitorFromPoint(poi
         else{Bounds::new(0,0,unsafe{GetSystemMetrics(SM_CXSCREEN)},unsafe{GetSystemMetrics(SM_CYSCREEN)})};
     let(mut x,mut y)=(96,96);let dpi=if unsafe{GetDpiForMonitor(monitor,MDT_EFFECTIVE_DPI,&mut x,&mut y)}.is_ok(){x.max(96)}else{96};(work,dpi)}
 enum Place{Root(POINT),Beside{parent:Bounds,top:i32}}
-fn measure_items(items:&[Item],gfx:&Gfx,metrics:Metrics,new_popup:bool)->(LevelLayout,Vec<usize>,f32){
+// Fold equal visible captions in the presentation only. Providers continue
+// to see their original HMENU, positions, child handles and command IDs.
+fn variant_rows(provider:&Provider,menu:HMENU,items:&mut [Item],label:Option<&str>){
+    if let Some(key)=label{
+        let mut captions=std::collections::HashMap::<String,usize>::new();
+        for item in items{
+            item.hidden=item.kind!=RowKind::Item||item.owner_draw||item.bitmap==HBMMENU_CALLBACK||item.label.to_lowercase()!=key;
+            item.action=None;
+            if item.hidden{continue;}
+            let verb=super::canonical_verb(&provider.context,item.id).unwrap_or_default();
+            let name=if verb.is_empty()||windows::core::GUID::try_from(verb.trim_matches(['{','}'])).is_ok(){
+                zsdesk_core::i18n::text("扩展命令").to_owned()
+            }else{verb};
+            let count=captions.entry(name.to_lowercase()).or_default();*count+=1;
+            item.label=if *count==1{name}else{format!("{name} ({count})")};
+            item.mnemonic=None;
+        }
+        return;
+    }
+    let compact=if menu==provider.root{items.iter().any(|item|item.verb.as_deref()==Some("zsdesk.more"))}
+        else{(0..unsafe{GetMenuItemCount(Some(provider.root))}.max(0)).any(|pos|{
+            (unsafe{GetSubMenu(provider.root,pos)})==menu&&read_raw(provider.root,pos as u32).is_ok_and(|(i,_)|
+                super::canonical_verb(&provider.context,i.wID).as_deref()==Some("zsdesk.more"))
+        })};
+    if !compact{return;}
+    let mut groups=std::collections::HashMap::<String,Vec<usize>>::new();
+    for (index,item) in items.iter().enumerate(){
+        if item.kind==RowKind::Item&&!item.label.is_empty()&&!item.owner_draw&&item.bitmap!=HBMMENU_CALLBACK{
+            groups.entry(item.label.to_lowercase()).or_default().push(index);
+        }
+    }
+    for group in groups.values().filter(|group|group.len()>1){
+        let first=group.iter().copied().find(|&i|items[i].enabled).unwrap_or(group[0]);
+        for &index in group{items[index].hidden=index!=first;items[index].variants=index==first;items[index].action=None;}
+    }
+}
+fn measure_items(items:&[Item],gfx:&Gfx,metrics:Metrics,new_popup:bool,text_left_dip:f32)->(LevelLayout,Vec<usize>,f32){
     let style=TextStyle::ui(metrics.px(geometry::TEXT_DIP));let accelerator=TextStyle::ui(metrics.px(geometry::ACCELERATOR_DIP));
     let measured:Vec<_>=items.iter().map(|item|Measured{label:if item.owner_draw{0.}else{gfx.measure(&item.label,&style.weight(if item.default{600}else{400}),4096.).0},
         accelerator:if item.accelerator.is_empty(){0.}else{gfx.measure(&item.accelerator,&accelerator,4096.).0}}).collect();
@@ -231,46 +283,52 @@ fn measure_items(items:&[Item],gfx:&Gfx,metrics:Metrics,new_popup:bool)->(LevelL
     let mut layout=geometry::layout(&kinds,&measured,true,items.iter().any(Item::cascade),metrics);
     let header=if toolbar.is_empty(){0.}else{metrics.px(TOOLBAR_HEIGHT_DIP)};
     let accelerator_width=items.iter().enumerate().filter(|(index,item)|!toolbar.contains(index)&&!item.owner_draw&&item.kind==RowKind::Item).map(|(index,_)|measured[index].accelerator).fold(0.,f32::max);
-    let mut y=header+metrics.px(geometry::PADDING_DIP);let mut width=metrics.px(geometry::MIN_WIDTH_DIP);let mut previous_item=false;
+    let background=items.iter().any(|i|i.verb.as_deref()==Some("view"))&&items.iter().any(|i|i.verb.as_deref()==Some("zsdesk.more"));
+    let mut y=header+metrics.px(if background{4.}else{SHELL_VERTICAL_PADDING_DIP});
+    let mut width=metrics.px(if background{237.}else{geometry::MIN_WIDTH_DIP});let mut previous_item=false;
     for(index,(row,item))in layout.rows.iter_mut().zip(items).enumerate(){row.y=y;
         // Zero-height entries remain in the model at their original positions.
         // Only promoted actions and now-empty separator groups leave the body.
-        if toolbar.contains(&index){row.h=0.;continue;}
+        if item.hidden||toolbar.contains(&index){row.h=0.;continue;}
         if item.kind==RowKind::Separator{
             if new_popup{row.h=0.;continue;}
-            let followed=items.iter().enumerate().skip(index+1).any(|(next,item)|item.kind==RowKind::Item&&!toolbar.contains(&next));
+            let followed=items.iter().enumerate().skip(index+1).any(|(next,item)|!item.hidden&&item.kind==RowKind::Item&&!toolbar.contains(&next));
             if !previous_item||!followed{row.h=0.;continue;}previous_item=false;
         }else{
             previous_item=true;
             let trailing=metrics.px(geometry::CONTENT_RIGHT_DIP+geometry::INSET_DIP)+if item.cascade(){metrics.px(geometry::CHEVRON_DIP)}else{0.};
             let extra=if measured[index].accelerator>0.{metrics.px(geometry::ACCELERATOR_GAP_DIP)+accelerator_width}else{0.};
-            width=width.max(metrics.px(SHELL_TEXT_LEFT_DIP)+measured[index].label+extra+trailing);
+            width=width.max(metrics.px(text_left_dip)+measured[index].label+extra+trailing);
         }
         if let Some((owned_width,height))=item.measured{row.h=row.h.max(height as f32);width=width.max(owned_width as f32+2.*metrics.px(geometry::INSET_DIP));}y+=row.h;
     }
+    // The cascade column includes a one-DIP trailing contour beyond the glyph.
+    if items.iter().any(Item::cascade){width+=metrics.px(1.);}
     layout.width=width.ceil().min(metrics.px(geometry::MAX_WIDTH_DIP));
     if !toolbar.is_empty(){layout.width=layout.width.max(metrics.px(TOOLBAR_BUTTON_DIP)*toolbar.len()as f32+metrics.px(1.)*(toolbar.len()-1)as f32+2.*metrics.px(TOOLBAR_PADDING_DIP));}
-    layout.content_height=y+metrics.px(geometry::PADDING_DIP);(layout,toolbar,accelerator_width)
+    layout.content_height=y+metrics.px(SHELL_VERTICAL_PADDING_DIP);(layout,toolbar,accelerator_width)
 }
-fn open_level(provider:&Provider,gfx:&Gfx,owner:HWND,menu:HMENU,index:u32,place:Place,initialized:bool)->Result<Option<Level>>{
+fn open_level(provider:&Provider,gfx:&Gfx,owner:HWND,menu:HMENU,index:u32,place:Place,initialized:bool,variant_label:Option<String>)->Result<Option<Level>>{
     let reference=match place{Place::Root(point)=>point,Place::Beside{parent,top}=>POINT{x:parent.right,y:top}};
     let(work,dpi)=monitor_at(reference);let metrics=Metrics::new(dpi);
-    if !initialized{provider.initialize(menu,index);}
+    let native_page=variant_label.is_none();
+    if native_page&&!initialized{provider.initialize(menu,index);}
     let result=(||{
-        let(items,mut native_only)=read_items(provider,menu,gfx,metrics)?;
-        if items.is_empty()&&!native_only{return Ok(None);}
-        let(mut layout,toolbar,accelerator_width)=measure_items(&items,gfx,metrics,provider.is_new_popup(menu));
+        let mut items=read_items(provider,menu,gfx,metrics)?;
+        variant_rows(provider,menu,&mut items,variant_label.as_deref());
+        if items.iter().all(|i|i.hidden){return Ok(None);}
+        let text_left_dip=if menu==provider.root&&!provider.new_root{SHELL_ROOT_TEXT_LEFT_DIP}else{SHELL_TEXT_LEFT_DIP};
+        let(mut layout,toolbar,accelerator_width)=measure_items(&items,gfx,metrics,provider.is_new_popup(menu),text_left_dip);
         let width=(layout.width.ceil()as i32).min(work.width().max(1));layout.width=width as f32;let height=geometry::body_height(&layout,work);
-        native_only|=!toolbar.is_empty()&&height<metrics.px(TOOLBAR_HEIGHT_DIP+geometry::ITEM_HEIGHT_DIP+2.*geometry::PADDING_DIP)as i32;
         let(x,y)=match place{Place::Root(point)=>geometry::place_root(Anchor::Point{x:point.x,y:point.y},width,height,work,metrics),
             Place::Beside{parent,top}=>place_shell_submenu(parent,top,width,height,work,metrics)};
         let shadow=metrics.px(geometry::SHADOW_DIP)as i32;let module=unsafe{GetModuleHandleW(None)}?;
-        native_only|=(i64::from(width)+2*i64::from(shadow))*(i64::from(height)+2*i64::from(shadow))*4>64*1024*1024;
+        if (i64::from(width)+2*i64::from(shadow))*(i64::from(height)+2*i64::from(shadow))*4>64*1024*1024{return Err(error(0x8007000e,"菜单画布过大"));}
         let hwnd=unsafe{CreateWindowExW(WS_EX_LAYERED|WS_EX_TOOLWINDOW|WS_EX_TOPMOST|WS_EX_NOACTIVATE,CLASS,windows::core::PCWSTR(zsdesk_core::i18n::wide("右键菜单").as_ptr()),WS_POPUP,
             x-shadow,y-shadow,width+shadow*2,height+shadow*2,Some(owner),None,Some(module.into()),None)}?;
-        Ok(Some(Level{menu,hwnd,body:Bounds::new(x,y,x+width,y+height),metrics,layout,items,toolbar,accelerator_width,keyboard_focus:false,scroll:0.,highlight:None,pressed:None,open_child:None,surface:None,initialized:true,native_only}))
+        Ok(Some(Level{menu,hwnd,frame_id:hwnd.0 as usize,body:Bounds::new(x,y,x+width,y+height),metrics,layout,items,toolbar,accelerator_width,text_left_dip,keyboard_focus:false,variant_label,suspended:false,scroll:0.,highlight:None,pressed:None,open_child:None,surface:None,initialized:native_page}))
     })();
-    if !matches!(result,Ok(Some(_))){provider.uninitialize(menu);}
+    if native_page&&!matches!(result,Ok(Some(_))){provider.uninitialize(menu);}
     result
 }
 
@@ -285,12 +343,13 @@ fn paint_toolbar(cv:&Canvas,level:&Level,colors:&Palette,body:RectF){
         let active=level.highlight==Some(*index);let color=if item.enabled{colors.text}else{colors.disabled};
         if active&&item.enabled{cv.round(plate.inset(m.px(1.),m.px(1.)),m.px(4.),if level.pressed==Some(*index){colors.pressed}else{colors.hover});
             if level.keyboard_focus{cv.stroke_round(plate.inset(m.px(2.),m.px(2.)),m.px(3.),colors.secondary,m.px(1.));}}
-        let side=m.px(geometry::ICON_DIP);let icon=RectF::new((plate.x+(plate.w-side)/2.).round(),body.y+m.px(12.),side,side);
-        if let Some((_,image))=&item.image{cv.image(image,icon,if item.enabled{1.}else{0.45});}
-        else if let Some(action)=item.action{cv.glyph(action.glyph(),icon,side,color);}
+        let side=m.px(geometry::ICON_DIP);let icon=RectF::new((plate.x+(plate.w-side)/2.).round(),body.y+m.px(13.),side,side);
+        if let Some(action)=item.action{
+            command_icons::Icon{cv,rect:icon,ink:if item.enabled{colors.ink}else{colors.disabled},accent:if item.enabled{colors.accent}else{colors.disabled},paper:colors.background}.toolbar(action);
+        }
         if item.checked{let badge=RectF::new(plate.right()-m.px(11.),body.y+m.px(5.),m.px(8.),m.px(8.));
             if item.radio{cv.round(badge.inset(m.px(2.),m.px(2.)),m.px(2.),color);}else{cv.glyph("\u{E73E}",badge,m.px(8.),color);}}
-        cv.text(&action_label(item),RectF::new(plate.x+m.px(2.),body.y+m.px(34.),plate.w-m.px(4.),m.px(20.)),
+        cv.text(&action_label(item),RectF::new(plate.x+m.px(2.),body.y+m.px(33.),plate.w-m.px(4.),m.px(20.)),
             &TextStyle::ui(m.px(TOOLBAR_LABEL_DIP)).align(Align::Center).weight(if item.default{600}else{400}),color);
         if slot+1<level.toolbar.len(){let x=plate.right()+m.px(0.5);cv.line(x,body.y+m.px(12.),x,body.y+m.px(48.),colors.divider,m.px(1.));}
     }
@@ -303,8 +362,11 @@ fn paint(cv:&Canvas,level:&Level,colors:&Palette){
     cv.round(body,radius,colors.background);cv.stroke_round(body.inset(0.5,0.5),(radius-0.5).max(0.),colors.border,1.);
     cv.push_clip(body.inset(1.,1.));paint_toolbar(cv,level,colors,body);cv.pop_clip();
     let header=level.toolbar_height();cv.push_clip(RectF::new(body.x+1.,body.y+header+1.,body.w-2.,(body.h-header-2.).max(0.)));
-    let inset=m.px(geometry::INSET_DIP);let text_left=body.x+m.px(SHELL_TEXT_LEFT_DIP);
+    let inset=m.px(geometry::INSET_DIP);
+    let phase=if level.text_left_dip==SHELL_ROOT_TEXT_LEFT_DIP{0.}else{SHELL_TEXT_PHASE_PX};
+    let text_left=body.x+m.px(level.text_left_dip)+phase;
     let accelerator_left=body.right()-m.px(geometry::CONTENT_RIGHT_DIP+geometry::INSET_DIP)-level.accelerator_width;
+    let compact=level.items.iter().any(|i|i.verb.as_deref()==Some("zsdesk.more"));
     for(index,(row,item))in level.layout.rows.iter().zip(&level.items).enumerate(){let y=body.y+row.y-level.scroll;if row.h<=0.||y+row.h<body.y+header||y>body.bottom(){continue;}
         if item.kind==RowKind::Separator{let line=(y+row.h/2.).floor()+0.5;cv.line(body.x+m.px(SHELL_SEPARATOR_INSET_DIP),line,body.right()-m.px(SHELL_SEPARATOR_INSET_DIP),line,colors.divider,1.);continue;}
         let active=level.highlight==Some(index)||level.open_child==Some(index);let plate=RectF::new(body.x+inset,y+m.px(2.),body.w-2.*inset,row.h-m.px(4.));
@@ -313,13 +375,34 @@ fn paint(cv:&Canvas,level:&Level,colors:&Palette){
         if item.owner_draw{continue;}
         let color=if item.enabled{colors.text}else{colors.disabled};let icon=RectF::new(body.x+inset+m.px(geometry::CONTENT_LEFT_DIP),y,m.px(geometry::ICON_DIP),row.h);
         if item.checked&&item.wic.is_none(){if item.radio{let side=m.px(6.);cv.round(RectF::new(icon.x+(icon.w-side)/2.,y+(row.h-side)/2.,side,side),side/2.,color);}else{cv.glyph("\u{E73E}",icon,m.px(12.),color);}}
+        else if compact && item.verb.as_deref().is_some_and(|verb|{
+            let rect=RectF::new(icon.x,y+(row.h-icon.w)/2.,icon.w,icon.w);
+            command_icons::Icon{cv,rect,ink:if item.enabled{colors.ink}else{colors.disabled},accent:if item.enabled{colors.accent}else{colors.disabled},paper:colors.background}.body(verb)
+        }){}
         else if let Some((_,image))=&item.image{let side=m.px(geometry::ICON_DIP);cv.image(image,RectF::new(icon.x,y+(row.h-side)/2.,side,side),if item.enabled{1.}else{0.45});}
         else if let Some(action)=item.action{cv.glyph(action.glyph(),icon,m.px(geometry::ICON_DIP),color);}
+        else if let Some(glyph)=match item.verb.as_deref(){Some("open")=>Some("\u{E8E5}"),Some("openas")=>Some("\u{E8E5}"),
+            Some("sharewith")=>Some("\u{E72D}"),Some("compressto")=>Some("\u{F012}"),
+            Some("properties")=>Some("\u{E90F}"),Some("copyaspath")=>Some("\u{E71B}"),Some("pintostartscreen")=>Some("\u{E718}"),
+            Some("zsdesk.more")=>Some("\u{E8A7}"),Some("newfolder")=>Some("\u{E710}"),Some("view")=>Some("\u{E8A9}"),
+            Some("arrange")=>Some("\u{E8CB}"),Some("groupby")=>Some("\u{E902}"),Some("refresh")=>Some("\u{E72C}"),Some("paste")=>Some("\u{E77F}"),_=>None}{
+            cv.glyph(glyph,icon,m.px(geometry::ICON_DIP),if item.enabled&&!crate::theme::high_contrast(){Color::rgba8(25,101,149,255)}else{color});
+        }
         let trailing=m.px(geometry::CONTENT_RIGHT_DIP)+if item.cascade(){m.px(geometry::CHEVRON_DIP)}else{0.};let right=plate.right()-trailing;
         let label_right=if item.accelerator.is_empty(){right}else{accelerator_left-m.px(geometry::ACCELERATOR_GAP_DIP)};
-        cv.text(&item.label,RectF::new(text_left,y,(label_right-text_left).max(0.),row.h),&TextStyle::ui(m.px(geometry::TEXT_DIP)).weight(if item.default{600}else{400}),color);
+        // Match the shell's snapped base-font baseline. Pure CJK fallback runs
+        // already use the platform message-font ascent.
+        let latin_baseline=if item.label.bytes().any(|c|c.is_ascii_graphic()){m.px(1.).round()}else{0.};
+        cv.text(&item.label,RectF::new(text_left,y-latin_baseline,(label_right-text_left).max(0.),row.h),&TextStyle::ui(m.px(geometry::TEXT_DIP)).weight(if item.default{600}else{400}),color);
         if !item.accelerator.is_empty(){cv.text(&item.accelerator,RectF::new(accelerator_left,y,(right-accelerator_left).max(0.),row.h),&TextStyle::ui(m.px(geometry::ACCELERATOR_DIP)),if item.enabled{colors.secondary}else{colors.disabled});}
-        if item.cascade(){cv.glyph("\u{E76C}",RectF::new(plate.right()-m.px(geometry::CONTENT_RIGHT_DIP+12.),y,m.px(12.),row.h),m.px(10.),color);}
+        if item.cascade()&&item.verb.as_deref()!=Some("zsdesk.more"){
+            if compact{
+                let tip=body.right()-m.px(19.75);let mid=y+row.h/2.;let half=m.px(3.9);
+                let ink=if item.enabled{colors.ink}else{colors.disabled};
+                let ink=if crate::theme::high_contrast(){ink}else{ink.with_alpha(0.84)};
+                cv.line(tip-half,mid-half,tip,mid,ink,m.px(1.));cv.line(tip,mid,tip-half,mid+half,ink,m.px(1.));
+            }else{cv.glyph("\u{E76C}",RectF::new(plate.right()-m.px(geometry::CONTENT_RIGHT_DIP+12.),y,m.px(12.),row.h),m.px(10.),color);}
+        }
     }
     if level.max_scroll()>0.{let pad=m.px(geometry::PADDING_DIP);let visible=(body.h-header).max(1.);let track=(visible-2.*pad).max(1.);let thumb=(track*visible/(level.layout.content_height-header).max(1.)).max(m.px(24.)).min(track);
         let top=body.y+header+pad+(track-thumb)*level.scroll/level.max_scroll();cv.round(RectF::new(body.right()-m.px(5.),top,m.px(2.),thumb),m.px(1.),colors.secondary.with_alpha(0.5));}
@@ -327,7 +410,7 @@ fn paint(cv:&Canvas,level:&Level,colors:&Palette){
 }
 fn paint_provider_rows(provider:&Provider,level:&Level,surface:&Surface){
     let shadow=level.metrics.px(geometry::SHADOW_DIP)as i32;
-    for(index,(row,item))in level.layout.rows.iter().zip(&level.items).enumerate(){if !item.owner_draw&&item.bitmap!=HBMMENU_CALLBACK{continue;}
+    for(index,(row,item))in level.layout.rows.iter().zip(&level.items).enumerate(){if item.hidden||row.h<=0.||(!item.owner_draw&&item.bitmap!=HBMMENU_CALLBACK){continue;}
         // Providers may replace an owner-draw payload while a menu is open.
         // Never pass a stale itemData pointer back to the provider's drawer.
         let Ok((current,label))=read_raw(level.menu,item.position)else{continue;};if !same_identity(item,&current,&label){continue;}
@@ -359,27 +442,22 @@ fn present(provider:&Provider,level:&mut Level,gfx:&Gfx,colors:&Palette)->Result
     let updated=unsafe{UpdateLayeredWindow(level.hwnd,Some(screen),Some(&at),Some(&size),Some(target.dc),Some(&origin),Default::default(),Some(&blend),ULW_ALPHA)};
     unsafe{ReleaseDC(None,screen);}updated?;
     if !unsafe{IsWindowVisible(level.hwnd)}.as_bool(){unsafe{SetWindowPos(level.hwnd,Some(HWND_TOPMOST),0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE|SWP_SHOWWINDOW)}?;}
+    #[cfg(feature="menu-visual-qa")]
+    if let Some(dir)=std::env::var_os("ZSDESK_MENU_VISUAL_DIR"){
+        use std::io::Write;
+        let name=format!("{}-{}-{}.pam",std::process::id(),level.frame_id,
+            level.highlight.map(|n|n.to_string()).unwrap_or_else(||"normal".into()));
+        let path=std::path::PathBuf::from(dir).join(name);
+        if let Ok(mut file)=std::fs::OpenOptions::new().write(true).create_new(true).open(path){
+            let _=write!(file,"P7\nWIDTH {width}\nHEIGHT {height}\nDEPTH 4\nMAXVAL 255\nTUPLTYPE RGB_ALPHA\nENDHDR\n");
+            let pixels=unsafe{std::slice::from_raw_parts(target.bits,(width*height*4)as usize)};
+            let mut rgba=Vec::with_capacity(pixels.len());
+            for c in pixels.chunks_exact(4){let a=u16::from(c[3]);let channel=|n:u8|if a==0{0}else{((u16::from(n)*255+a/2)/a).min(255)as u8};
+                rgba.extend_from_slice(&[channel(c[2]),channel(c[1]),channel(c[0]),c[3]]);}
+            let _=file.write_all(&rgba);
+        }
+    }
     level.surface=surface;Ok(())
-}
-
-struct NativeForward<'a>{provider:&'a Provider,menu:HMENU,suppress_init:bool,suppress_uninit:bool}
-unsafe extern "system" fn native_forward(hwnd:HWND,message:u32,wp:WPARAM,lp:LPARAM,_id:usize,data:usize)->LRESULT{
-    let state=unsafe{&mut*(data as*mut NativeForward<'_>)};
-    if message==WM_TIMER&&wp.0==NATIVE_SUBCLASS{let foreground=unsafe{GetForegroundWindow()};
-        if !foreground.0.is_null()&&foreground!=hwnd&&unsafe{GetAncestor(foreground,GA_ROOTOWNER)}!=hwnd{let _=unsafe{EndMenu()};}return LRESULT(0);}
-    if message==WM_INITMENUPOPUP{let popup=HMENU(wp.0 as*mut _);if popup==state.menu&&state.suppress_init{state.suppress_init=false;}else{state.provider.message(message,wp,lp);}state.provider.filter(popup);return LRESULT(0);}
-    if message==WM_UNINITMENUPOPUP&&HMENU(wp.0 as*mut _)==state.menu&&state.suppress_uninit{return LRESULT(0);}
-    if matches!(message,WM_INITMENU|WM_UNINITMENUPOPUP|WM_DRAWITEM|WM_MEASUREITEM|WM_MENUCHAR|WM_MENUSELECT){return state.provider.message(message,wp,lp).unwrap_or(LRESULT(0));}
-    unsafe{DefSubclassProc(hwnd,message,wp,lp)}
-}
-fn native_fallback(provider:&Provider,owner:HWND,menu:HMENU,point:POINT,initialized:bool)->Result<Option<u32>>{
-    let mut state=NativeForward{provider,menu,suppress_init:initialized,suppress_uninit:initialized};
-    if !unsafe{SetWindowSubclass(owner,Some(native_forward),NATIVE_SUBCLASS,(&mut state as*mut NativeForward<'_>)as usize)}.as_bool(){return Err(Error::from_thread());}
-    struct Scope(HWND);impl Drop for Scope{fn drop(&mut self){let _=unsafe{KillTimer(Some(self.0),NATIVE_SUBCLASS)};let _=unsafe{RemoveWindowSubclass(self.0,Some(native_forward),NATIVE_SUBCLASS)};let _=unsafe{PostMessageW(Some(self.0),WM_NULL,WPARAM(0),LPARAM(0))};NATIVE_TRACKING.with(|active|active.set(false));}}
-    NATIVE_TRACKING.with(|active|active.set(true));let _scope=Scope(owner);if unsafe{GetCapture()}.0.is_null()==false{let _=unsafe{ReleaseCapture()};}
-    let _=unsafe{SetForegroundWindow(owner)};unsafe{SetTimer(Some(owner),NATIVE_SUBCLASS,30,None);}
-    let command=unsafe{TrackPopupMenuEx(menu,(TPM_RETURNCMD|TPM_RIGHTBUTTON|TPM_LEFTALIGN|TPM_TOPALIGN).0,point.x,point.y,owner,None)}.0 as u32;
-    Ok((command!=0).then_some(command))
 }
 
 struct Tooltip{hwnd:HWND,owner:HWND,text:Vec<u16>}
@@ -401,7 +479,7 @@ impl Tooltip{
             SendMessageW(self.hwnd,TTM_TRACKACTIVATE,Some(WPARAM(1)),Some(LPARAM((&info as*const TTTOOLINFOW)as isize)));}}
 }
 impl Drop for Tooltip{fn drop(&mut self){self.hide();let _=unsafe{DestroyWindow(self.hwnd)};}}
-struct Session{provider:Provider,owner:HWND,levels:Vec<Level>,entered:bool,revision:u64,tooltip:Option<Tooltip>,tip_target:Option<(usize,usize,Instant)>,tip_shown:bool}
+struct Session{provider:Provider,owner:HWND,anchor:POINT,levels:Vec<Level>,entered:bool,revision:u64,tooltip:Option<Tooltip>,tip_target:Option<(usize,usize,Instant)>,tip_shown:bool}
 impl Session{
     fn hide_tooltip(&mut self){if let Some(tip)=&mut self.tooltip{tip.hide();}self.tip_target=None;self.tip_shown=false;}
     fn schedule_tooltip(&mut self,target:Option<(usize,usize)>){
@@ -423,22 +501,23 @@ impl Session{
         let _=unsafe{DestroyWindow(level.hwnd)};if level.initialized{self.provider.uninitialize(level.menu);}}}
         if let Some(last)=self.levels.last_mut(){last.open_child=None;}}
     fn snapshot(&self){SNAPSHOT.with(|slot|*slot.borrow_mut()=serde_json::json!({"renderer":"drawn-shell-hmenu","metrics":{"row_dip":geometry::ITEM_HEIGHT_DIP,"separator_dip":geometry::SEPARATOR_HEIGHT_DIP,"text_dip":geometry::TEXT_DIP,"radius_dip":geometry::RADIUS_DIP,"shadow_dip":geometry::SHADOW_DIP,"icon_dip":geometry::ICON_DIP,"toolbar_height_dip":TOOLBAR_HEIGHT_DIP,"toolbar_button_dip":TOOLBAR_BUTTON_DIP,"toolbar_label_dip":TOOLBAR_LABEL_DIP,"text_left_dip":SHELL_TEXT_LEFT_DIP,"submenu_overlap_dip":SHELL_SUBMENU_OVERLAP_DIP},"dark":crate::theme::menus_dark(),"levels":self.levels.iter().map(|level|
-        serde_json::json!({"window":level.hwnd.0 as usize,"menu":level.menu.0 as usize,"bounds":[level.body.left,level.body.top,level.body.right,level.body.bottom],
-            "dpi":(level.metrics.scale*96.).round()as u32,"scroll":level.scroll,"highlight":level.highlight,"open_child":level.open_child,"native_fallback":level.native_only,"text_left":level.metrics.px(SHELL_TEXT_LEFT_DIP),"keyboard_focus":level.keyboard_focus,"accelerator_width":level.accelerator_width,
+        serde_json::json!({"window":level.hwnd.0 as usize,"frame_window":level.frame_id,"menu":level.menu.0 as usize,"bounds":[level.body.left,level.body.top,level.body.right,level.body.bottom],
+            "dpi":(level.metrics.scale*96.).round()as u32,"scroll":level.scroll,"highlight":level.highlight,"open_child":level.open_child,"visible":!level.suspended,"native_fallback":false,"text_left":level.metrics.px(level.text_left_dip),"keyboard_focus":level.keyboard_focus,"accelerator_width":level.accelerator_width,
             "toolbar":level.toolbar.iter().enumerate().map(|(slot,index)|{let rect=level.toolbar_rect(slot);let item=&level.items[*index];serde_json::json!({"row":index,"id":item.id,"position":item.position,"label":item.label,"enabled":item.enabled,"rect":[rect.x,rect.y,rect.w,rect.h],"action":format!("{:?}",item.action)})}).collect::<Vec<_>>(),
             "rows":level.items.iter().zip(&level.layout.rows).map(|(item,row)|serde_json::json!({"id":item.id,"label":item.label,"position":item.position,"submenu":item.cascade(),"enabled":item.enabled,"checked":item.checked,"radio":item.radio,"default":item.default,"owner_draw":item.owner_draw,"y":row.y,"height":row.h})).collect::<Vec<_>>()})
         ).collect::<Vec<_>>()}));}
-    fn present(&mut self,depth:usize,gfx:&Gfx,colors:&Palette)->Result<()>{present(&self.provider,&mut self.levels[depth],gfx,colors)?;self.snapshot();Ok(())}
+    fn present(&mut self,depth:usize,gfx:&Gfx,colors:&Palette)->Result<()>{if !self.levels[depth].suspended{present(&self.provider,&mut self.levels[depth],gfx,colors)?;}self.snapshot();Ok(())}
     fn rebuild_level(&mut self,depth:usize,gfx:&Gfx,colors:&Palette)->Result<Step>{
         self.hide_tooltip();
-        let level=&self.levels[depth];let menu=level.menu;let metrics=level.metrics;let body=level.body;
+        let level=&self.levels[depth];let menu=level.menu;let metrics=level.metrics;let body=level.body;let text_left_dip=level.text_left_dip;
         let selected=level.highlight.and_then(|index|level.items.get(index)).map(|item|(item.id,item.submenu,item.item_data,item.raw_label.clone()));
-        let child=self.levels.get(depth+1).map(|level|level.menu);
-        self.provider.filter(menu);let(items,native_only)=read_items(&self.provider,menu,gfx,metrics)?;
-        if native_only{self.close_from(depth+1);let result=native_fallback(&self.provider,self.owner,menu,POINT{x:body.left,y:body.top},true)?;return Ok(result.map_or(Step::Dismiss,Step::Choose));}
-        let child_row=child.and_then(|child|items.iter().position(|item|item.enabled&&item.submenu==child));
+        let child=self.levels.get(depth+1).map(|level|(level.menu,level.variant_label.clone()));
+        self.provider.filter(menu);let mut items=read_items(&self.provider,menu,gfx,metrics)?;
+        variant_rows(&self.provider,menu,&mut items,level.variant_label.as_deref());
+        let child_row=child.as_ref().and_then(|(child,name)|items.iter().position(|item|item.selectable()&&
+            name.as_ref().map_or(!item.variants&&item.submenu==*child,|key|item.variants&&item.label.to_lowercase()==*key)));
         if child.is_some()&&child_row.is_none(){self.close_from(depth+1);}
-        let(mut layout,toolbar,accelerator_width)=measure_items(&items,gfx,metrics,self.provider.is_new_popup(menu));let(work,_)=monitor_at(POINT{x:body.left,y:body.top});
+        let(mut layout,toolbar,accelerator_width)=measure_items(&items,gfx,metrics,self.provider.is_new_popup(menu),text_left_dip);let(work,_)=monitor_at(POINT{x:body.left,y:body.top});
         let width=(layout.width.ceil()as i32).min(work.width().max(1));layout.width=width as f32;let height=geometry::body_height(&layout,work);
         let(x,y)=geometry::place_root(Anchor::Point{x:body.left,y:body.top},width,height,work,metrics);
         let highlight=selected.and_then(|key|items.iter().position(|item|item.selectable()&&(item.id,item.submenu,item.item_data,item.raw_label.clone())==key));
@@ -458,16 +537,18 @@ impl Session{
     fn refresh_states(&mut self,gfx:&Gfx,colors:&Palette)->Result<Step>{
         let mut depth=0;
         while depth<self.levels.len(){
+            if self.levels[depth].suspended{depth+=1;continue;}
             let count=unsafe{GetMenuItemCount(Some(self.levels[depth].menu))};if count<0{return Err(error(0x80070006,"扩展菜单已失效"));}
             let mut rebuild=count as usize!=self.levels[depth].items.len();let mut dirty=false;
             if !rebuild{
-                let level=&mut self.levels[depth];
+                let level=&mut self.levels[depth];let grouped=level.items.iter().any(|item|item.variants)||level.variant_label.is_some();
                 for(index,item)in level.items.iter_mut().enumerate(){
                     let row=&level.layout.rows[index];let visible=level.toolbar.contains(&index)||(row.h>0.&&row.y+row.h>=level.scroll&&row.y<=level.scroll+level.body.height()as f32);
-                    if !visible&&level.open_child!=Some(index)&&level.highlight!=Some(index){continue;}
+                    if !grouped&&!visible&&level.open_child!=Some(index)&&level.highlight!=Some(index){continue;}
                     let(info,label)=read_raw(level.menu,item.position)?;
                     if !same_identity(item,&info,&label)||item.bitmap!=bitmap_for(&info)||item.radio!=info.fType.contains(MFT_RADIOCHECK)||item.default!=info.fState.contains(MFS_DEFAULT){rebuild=true;break;}
                     let enabled=info.fState.0&(MFS_DISABLED|MFS_GRAYED).0==0;let checked=info.fState.contains(MFS_CHECKED);
+                    if enabled!=item.enabled&&grouped{rebuild=true;break;}
                     if enabled!=item.enabled||checked!=item.checked{item.enabled=enabled;item.checked=checked;dirty=true;}
                 }
             }
@@ -483,7 +564,7 @@ impl Session{
     }
     fn highlight(&mut self,depth:usize,row:Option<usize>,mouse:bool,gfx:&Gfx,colors:&Palette)->Result<()>{
         let row=row.filter(|row|self.levels[depth].items[*row].selectable());
-        if self.levels[depth].highlight!=row||self.levels[depth].pressed.is_some()||self.levels[depth].keyboard_focus==mouse{self.levels[depth].highlight=row;self.levels[depth].pressed=None;self.levels[depth].keyboard_focus=!mouse;
+        if self.levels[depth].highlight!=row||self.levels[depth].keyboard_focus==mouse{self.levels[depth].highlight=row;self.levels[depth].pressed=None;self.levels[depth].keyboard_focus=!mouse;
             self.provider.selection(&self.levels[depth],row,mouse);self.present(depth,gfx,colors)?;}
         if !mouse{self.schedule_tooltip(row.filter(|row|self.levels[depth].toolbar.contains(row)).map(|row|(depth,row)));}Ok(())
     }
@@ -491,19 +572,25 @@ impl Session{
         if self.levels[depth].open_child==Some(row)&&self.levels.len()>depth+1{return Ok(Step::Continue);}
         if self.levels.len()>=MAX_LEVELS{return Ok(Step::Continue);}
         let item=self.levels[depth].items[row].clone();if !item.enabled||!item.cascade(){return Ok(Step::Continue);}
-        if self.levels.iter().any(|level|level.menu==item.submenu){return Err(error(0x80070057,"菜单子级引用形成循环"));}
+        if !item.variants&&self.levels.iter().any(|level|level.menu==item.submenu){return Err(error(0x80070057,"菜单子级引用形成循环"));}
         self.close_from(depth+1);let parent=self.levels[depth].body;let top=parent.top+(self.levels[depth].layout.rows[row].y-self.levels[depth].scroll)as i32;
-        let Some(mut child)=open_level(&self.provider,gfx,self.owner,item.submenu,item.position,Place::Beside{parent,top},false)?else{self.present(depth,gfx,colors)?;return Ok(Step::Continue);};
+        let target=if item.variants{self.levels[depth].menu}else{item.submenu};
+        let variant_label=item.variants.then(||item.label.to_lowercase());
+        let replace_root=depth==0&&item.verb.as_deref()==Some("zsdesk.more");
+        let place=if replace_root{Place::Root(self.anchor)}else{Place::Beside{parent,top}};
+        let Some(mut child)=open_level(&self.provider,gfx,self.owner,target,item.position,place,false,variant_label)?else{self.present(depth,gfx,colors)?;return Ok(Step::Continue);};
         let used:u64=self.levels.iter().filter_map(|level|level.surface.as_ref()).map(Surface::pixel_bytes).sum();let shadow=child.metrics.px(geometry::SHADOW_DIP)as u64;
-        let needed=(child.body.width()as u64+2*shadow)*(child.body.height()as u64+2*shadow)*4;child.native_only|=used.saturating_add(needed)>128*1024*1024;
+        let needed=(child.body.width()as u64+2*shadow)*(child.body.height()as u64+2*shadow)*4;if used.saturating_add(needed)>128*1024*1024{let _=unsafe{DestroyWindow(child.hwnd)};if child.initialized{self.provider.uninitialize(target);}return Err(error(0x8007000e,"菜单画布过大"));}
+        if replace_root{
+            // Keep capture and the timer on the same visible HWND. The original
+            // page retains its provider lifetime on the unused, hidden window.
+            std::mem::swap(&mut self.levels[depth].hwnd,&mut child.hwnd);
+            self.levels[depth].suspended=true;
+        }
         self.levels[depth].open_child=Some(row);self.levels.push(child);
         if CANCEL.with(Cell::get)||!unsafe{IsWindow(Some(self.owner))}.as_bool(){return Ok(Step::Dismiss);}
         self.present(depth,gfx,colors)?;
         let child_depth=self.levels.len()-1;
-        if self.levels[child_depth].native_only{
-            let body=self.levels[child_depth].body;let selected=native_fallback(&self.provider,self.owner,item.submenu,POINT{x:body.left,y:body.top},true)?;
-            self.close_from(child_depth);return Ok(selected.map_or(Step::Dismiss,Step::Choose));
-        }
         self.present(child_depth,gfx,colors)?;
         if keyboard{let row=next_in_order(&self.levels[child_depth].visual_order(),None,1);self.highlight(child_depth,row,false,gfx,colors)?;}
         Ok(Step::Continue)
@@ -516,14 +603,14 @@ impl Session{
     }
 }
 impl Drop for Session{fn drop(&mut self){let root=ROOT.with(Cell::get);if !root.0.is_null(){let _=unsafe{KillTimer(Some(root),TIMER)};}
-    ROOT.with(|value|value.set(HWND::default()));NATIVE_TRACKING.with(|value|value.set(true));
+    ROOT.with(|value|value.set(HWND::default()));TEARING_DOWN.with(|value|value.set(true));
     if self.levels.iter().any(|level|unsafe{GetCapture()}==level.hwnd){let _=unsafe{ReleaseCapture()};}
-    self.tooltip.take();self.close_from(0);NATIVE_TRACKING.with(|value|value.set(false));
+    self.tooltip.take();self.close_from(0);TEARING_DOWN.with(|value|value.set(false));
     self.provider.message(WM_MENUSELECT,WPARAM(0xffff0000),LPARAM(0));
     if self.entered&&unsafe{IsWindow(Some(self.owner))}.as_bool(){unsafe{SendMessageW(self.owner,WM_EXITMENULOOP,Some(WPARAM(1)),Some(LPARAM(0)));}}
     let _=unsafe{PostMessageW(Some(self.owner),WM_NULL,WPARAM(0),LPARAM(0))};}}
 enum Step{Continue,Choose(u32),Dismiss}
-fn hit(levels:&[Level],point:POINT)->Option<(usize,Option<usize>)>{levels.iter().enumerate().rev().find(|(_,level)|level.body.contains(point.x,point.y)).map(|(depth,level)|(depth,level.row_at(point)))}
+fn hit(levels:&[Level],point:POINT)->Option<(usize,Option<usize>)>{levels.iter().enumerate().rev().find(|(_,level)|!level.suspended&&level.body.contains(point.x,point.y)).map(|(depth,level)|(depth,level.row_at(point)))}
 
 fn in_triangle(point:POINT,a:POINT,b:POINT,c:POINT)->bool{
     let cross=|a:POINT,b:POINT,p:POINT|(b.x-a.x)as i64*(p.y-a.y)as i64-(b.y-a.y)as i64*(p.x-a.x)as i64;
@@ -561,7 +648,7 @@ fn key(session:&mut Session,vk:VIRTUAL_KEY,gfx:&Gfx,colors:&Palette)->Result<Ste
             let next=next_in_order(&order,level.highlight,if vk==VK_RIGHT{1}else{-1});session.highlight(depth,next,false,gfx,colors)?;Ok(Step::Continue)
         },
         VK_RIGHT=>{if let Some(row)=session.levels[depth].highlight{if session.levels[depth].items[row].cascade(){return session.activate(depth,row,gfx,colors,true);}}Ok(Step::Continue)},
-        VK_LEFT|VK_ESCAPE=>{if depth==0{return Ok(if vk==VK_ESCAPE{Step::Dismiss}else{Step::Continue});}session.close_from(depth);session.present(depth-1,gfx,colors)?;Ok(Step::Continue)},
+        VK_LEFT|VK_ESCAPE=>{if depth==0||session.levels[depth-1].suspended{return Ok(if vk==VK_ESCAPE{Step::Dismiss}else{Step::Continue});}session.close_from(depth);session.present(depth-1,gfx,colors)?;Ok(Step::Continue)},
         VK_RETURN|VK_SPACE=>{if let Some(row)=session.levels[depth].highlight{session.activate(depth,row,gfx,colors,true)}else{Ok(Step::Continue)}},
         VK_MENU|VK_F10|VK_APPS|VK_LWIN|VK_RWIN|VK_TAB=>Ok(Step::Dismiss),_=>Ok(Step::Continue),
     }
@@ -597,14 +684,12 @@ pub(super) fn track_initialized(owner:HWND,menu:HMENU,point:POINT,context:&ICont
     struct Reset;impl Drop for Reset{fn drop(&mut self){ACTIVE.with(|value|value.set(false));CANCEL.with(|value|value.set(false));ROOT.with(|value|value.set(HWND::default()));}}
     let _reset=Reset;
     let provider=Provider{context:context.clone(),options:options.clone(),root:menu,filter,new_root:root_initialized&&!filter};
-    if crate::theme::high_contrast(){let result=native_fallback(&provider,owner,menu,point,root_initialized);if root_initialized{provider.uninitialize(menu);}return result;}
-    let gfx=match register_class().and_then(|_|graphics()){Ok(gfx)=>gfx,Err(error)=>{eprintln!("drawn-menu graphics unavailable: {error}");let result=native_fallback(&provider,owner,menu,point,root_initialized);if root_initialized{provider.uninitialize(menu);}return result;}};
+    let gfx=register_class().and_then(|_|graphics()).inspect_err(|_|{if root_initialized{provider.uninitialize(menu);}})?;
     let colors=palette(crate::theme::menus_dark());
     provider.message(WM_INITMENU,WPARAM(menu.0 as usize),LPARAM(0));
-    let Some(root)=open_level(&provider,&gfx,owner,menu,0,Place::Root(point),root_initialized)?else{return Ok(None);};
-    let mut session=Session{provider,owner,levels:vec![root],entered:false,revision:0,tooltip:None,tip_target:None,tip_shown:false};let root=session.levels[0].hwnd;ROOT.with(|value|value.set(root));
+    let Some(root)=open_level(&provider,&gfx,owner,menu,0,Place::Root(point),root_initialized,None)?else{return Ok(None);};
+    let mut session=Session{provider,owner,anchor:point,levels:vec![root],entered:false,revision:0,tooltip:None,tip_target:None,tip_shown:false};let root=session.levels[0].hwnd;ROOT.with(|value|value.set(root));
     if CANCEL.with(Cell::get)||!unsafe{IsWindow(Some(owner))}.as_bool(){return Ok(None);}
-    if session.levels[0].native_only{return native_fallback(&session.provider,owner,menu,point,true);}
     session.present(0,&gfx,&colors)?;session.entered=true;
     unsafe{SendMessageW(owner,WM_ENTERMENULOOP,Some(WPARAM(1)),Some(LPARAM(0)));SetCapture(root);}
     if unsafe{SetTimer(Some(root),TIMER,30,None)}==0{return Err(Error::from_thread());}
@@ -636,9 +721,9 @@ pub(super) fn track_initialized(owner:HWND,menu:HMENU,point:POINT,context:&ICont
                 armed=true;pending=None;session.hide_tooltip();
                 match hit(&session.levels,pointer){None=>Step::Dismiss,Some((depth,Some(row))) if matches!(message.message,WM_LBUTTONDOWN|WM_RBUTTONDOWN|WM_LBUTTONDBLCLK|WM_RBUTTONDBLCLK)=>{
                     session.highlight(depth,Some(row),true,&gfx,&colors)?;if session.levels[depth].highlight==Some(row){session.levels[depth].pressed=Some(row);session.present(depth,&gfx,&colors)?;
-                        if session.levels[depth].items[row].cascade(){session.activate(depth,row,&gfx,&colors,false)?}else{Step::Continue}}else{Step::Continue}},_=>Step::Continue}
+                        if session.levels[depth].items[row].opens_on_hover(){session.activate(depth,row,&gfx,&colors,false)?}else{Step::Continue}}else{Step::Continue}},_=>Step::Continue}
             },
-            WM_LBUTTONUP|WM_RBUTTONUP=>match hit(&session.levels,pointer){Some((depth,Some(row))) if armed&&session.levels[depth].pressed==Some(row)&&!session.levels[depth].items[row].cascade()=>session.activate(depth,row,&gfx,&colors,false)?,
+            WM_LBUTTONUP|WM_RBUTTONUP=>match hit(&session.levels,pointer){Some((depth,Some(row))) if armed&&session.levels[depth].pressed==Some(row)&&!session.levels[depth].items[row].opens_on_hover()=>session.activate(depth,row,&gfx,&colors,false)?,
                 Some((depth,_))=>{session.levels[depth].pressed=None;session.present(depth,&gfx,&colors)?;Step::Continue},_=>Step::Continue},
             WM_MOUSEWHEEL=>{pending=None;session.hide_tooltip();let depth=hit(&session.levels,pointer).map_or(session.levels.len()-1,|(depth,_)|depth);
                 let delta=((message.wParam.0>>16)as i16)as f32/120.;let level=&mut session.levels[depth];let scroll=(level.scroll-delta*level.metrics.px(geometry::ITEM_HEIGHT_DIP)*3.).clamp(0.,level.max_scroll());
@@ -662,7 +747,7 @@ pub(super) fn track_initialized(owner:HWND,menu:HMENU,point:POINT,context:&ICont
                         // query can race queued input or another desktop.
                         if hit(&session.levels,previous).is_some_and(|(at,hit)|at==depth&&hit==Some(row)){
                             session.highlight(depth,Some(row),true,&gfx,&colors)?;session.close_from(depth+1);
-                            if session.levels[depth].items[row].cascade(){session.activate(depth,row,&gfx,&colors,false)?}else{session.present(depth,&gfx,&colors)?;Step::Continue}
+                            if session.levels[depth].items[row].opens_on_hover(){session.activate(depth,row,&gfx,&colors,false)?}else{session.present(depth,&gfx,&colors)?;Step::Continue}
                         }else{Step::Continue}
                     }else{Step::Continue}}else{Step::Continue}
                     }else{Step::Continue}
@@ -788,7 +873,7 @@ pub(super) fn track_initialized(owner:HWND,menu:HMENU,point:POINT,context:&ICont
         let child=unsafe{CreatePopupMenu()}?;let counts=Rc::new(Counts::default());let menu3:IContextMenu3=DynamicMenu{child,counts:counts.clone(),toolbar:false}.into();let context:IContextMenu=menu3.cast()?;
         unsafe{context.QueryContextMenu(menu,0,1,0x6fff,0)}.ok()?;
         let options=ContextMenuOptions::default();let provider=Provider{context:context.clone(),options:options.clone(),root:menu,filter:false,new_root:false};
-        let gfx=graphics()?;let(_,dpi)=monitor_at(POINT{x:70,y:70});let(items,_)=read_items(&provider,menu,&gfx,Metrics::new(dpi))?;
+        let gfx=graphics()?;let(_,dpi)=monitor_at(POINT{x:70,y:70});let items=read_items(&provider,menu,&gfx,Metrics::new(dpi))?;
         ensure!(items.len()==4&&items[0].cascade()&&!items[2].enabled&&items[3].owner_draw,"native rows/state were not retained");
         ensure!(counts.initialize.get()==0,"inspection eagerly opened the New submenu");
         DRIVER.with(|value|value.set((1,0)));let selected=track(hwnd,menu,POINT{x:70,y:70},&context,&options,false)?;
@@ -807,8 +892,8 @@ pub(super) fn track_initialized(owner:HWND,menu:HMENU,point:POINT,context:&ICont
         let actions3:IContextMenu3=DynamicMenu{child:actions_child,counts:counts.clone(),toolbar:true}.into();let actions:IContextMenu=actions3.cast()?;
         unsafe{actions.QueryContextMenu(actions_menu,0,1,0x6fff,0)}.ok()?;
         let actions_provider=Provider{context:actions.clone(),options:options.clone(),root:actions_menu,filter:false,new_root:false};
-        let(items,_)=read_items(&actions_provider,actions_menu,&gfx,Metrics::new(dpi))?;
-        let(layout,toolbar,_)=measure_items(&items,&gfx,Metrics::new(dpi),false);
+        let items=read_items(&actions_provider,actions_menu,&gfx,Metrics::new(dpi))?;
+        let(layout,toolbar,_)=measure_items(&items,&gfx,Metrics::new(dpi),false,SHELL_ROOT_TEXT_LEFT_DIP);
         ensure!(toolbar==vec![0,1,2,3,4]&&!items[1].enabled&&layout.rows[5].h>0.,"toolbar changed native row positions or lost disabled/body commands");
         DRIVER.with(|value|value.set((5,0)));let selected=track(hwnd,actions_menu,POINT{x:70,y:70},&actions,&options,false)?;
         ensure!(selected==Some(3),"toolbar left/right did not skip disabled native command or retain rename ID");
@@ -853,7 +938,7 @@ pub(super) fn track_initialized(owner:HWND,menu:HMENU,point:POINT,context:&ICont
     }
     #[test]fn toolbar_promotes_only_unambiguous_native_actions(){
         let item=|id,action|Item{position:id,id,raw_label:"复制(&C)\tCtrl+C".into(),label:"复制(C)".into(),mnemonic:Some('c'),accelerator:"Ctrl+C".into(),kind:RowKind::Item,
-            enabled:true,checked:false,radio:false,default:false,submenu:HMENU::default(),item_data:0,owner_draw:false,bitmap:HBITMAP::default(),measured:None,wic:None,image:None,action};
+            enabled:true,checked:false,radio:false,default:false,submenu:HMENU::default(),item_data:0,owner_draw:false,bitmap:HBITMAP::default(),measured:None,wic:None,image:None,action,verb:None,variants:false,hidden:false};
         let mut items=vec![item(41,Some(Action::Copy)),item(77,Some(Action::Copy)),item(80,Some(Action::Cut)),item(90,Some(Action::Delete))];
         items[3].owner_draw=true;
         assert_eq!(toolbar_items(&items),vec![2],"duplicate verbs and owner-draw rows must remain complete body entries");

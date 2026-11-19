@@ -66,7 +66,7 @@ impl ExplorerBrowserHost {
     /// Runs a verb on the selection ("cut", "copy", "delete", "properties" …).
     pub fn invoke_selection(&self, owner: HWND, verb: &str, shift: bool) -> Result<()> {
         let view = unsafe { self.current_view()? };
-        if matches!(verb,"copy"|"cut"|"delete")&&super::file_transfer::filesystem_selection(&view)?{
+        if matches!(verb,"copy"|"cut"|"delete")&&super::file_transfer::filesystem_selection(&view).unwrap_or(false){
             return match verb{
                 "copy"=>super::file_transfer::copy_view(&view,owner,false),
                 "cut"=>super::file_transfer::copy_view(&view,owner,true),
@@ -84,12 +84,12 @@ impl ExplorerBrowserHost {
     pub fn invoke_background(&self, owner: HWND, verb: &str) -> Result<()> {
         let view = unsafe { self.current_view()? };
         if verb=="paste"||verb.eq_ignore_ascii_case("NewFolder"){
-            if let Some(path)=super::file_transfer::filesystem_folder_path(&view)?{
+            if let Some(path)=super::file_transfer::filesystem_folder_path(&view).ok().flatten(){
                 let source=unsafe{view.GetWindow()?};
                 if verb!="paste"{return super::file_transfer::new_folder(source,&path);}
                 // MTP, archives and virtual-file providers can offer a Shell
                 // data object without CF_HDROP. Keep their native paste path.
-                if super::file_transfer::has_filesystem_clipboard(){return super::file_transfer::paste(source,&path);}
+                if super::file_transfer::try_paste_files(source,&path)?{return Ok(());}
             }
         }
         let menu = ShellMenu::for_view(&view, false)?;

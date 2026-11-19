@@ -49,62 +49,67 @@ fn preference_action(preferences: &mut QuickSearchPreferences, id: &str) -> bool
 
 impl WindowState {
     pub(super) unsafe fn search_settings_menu(&mut self) {
-        let mut preferences = match control::load(&self.config_path) {
-            Ok(configuration) => configuration.preferences,
-            Err(error) => { self.show_message(zsdesk_core::tr_format!("无法读取搜索与启动设置：{error:#}", error=error)); return; }
-        };
-        let main_startup = control::main_window_startup::enabled(&self.config_path);
-        let desktop_config = self.config_path.with_file_name("desktop-fences.json");
-        let desktop_startup = crate::edition::DESKTOP.then(|| crate::desktop::startup_enabled(&desktop_config));
-        let spec = settings_menu(&preferences, main_startup.as_ref().ok().copied(),
-            desktop_startup.as_ref().map(|result| result.as_ref().ok().copied()));
-        if let Err(error) = &main_startup { self.show_message(zsdesk_core::tr_format!("无法读取主窗口登录启动设置：{error:#}", error=error)); }
-        if let Some(Err(error)) = &desktop_startup { self.show_message(zsdesk_core::tr_format!("无法读取桌面格子登录启动设置：{error:#}", error=error)); }
-        let Some(choice) = super::input::popup(self.hwnd, &spec, Some(self.layout.app_menu)) else { return; };
+        let profile = self.config_path.clone();
+        show(&profile, self.hwnd, Some(self.layout.app_menu), |text| self.show_message(text));
+    }
+}
 
-        if preference_action(&mut preferences, &choice) {
-            let enabled = preferences.enabled;
-            if let Err(error) = control::apply(&self.config_path, preferences) {
-                self.show_message(zsdesk_core::tr_format!("搜索与启动设置未保存：{error:#}", error=error)); return;
-            }
-            // Keep the integration receiver alive when the global shortcut is
-            // disabled; its reload path unregisters only the search shortcut.
-            let action = if enabled || crate::explorer_forwarder::owns_integration(&self.config_path) { "reload" } else { "stop" };
-            let result = control::signal(&self.config_path, action)
-                .and_then(|_| quick_search::start_if_enabled(&self.config_path));
-            match result {
-                Ok(()) => self.show_message(if enabled { zsdesk_core::i18n::text("设置已保存；后台正在应用全局快捷键，可在运行状态中检查是否注册成功。").into() }
-                    else { zsdesk_core::i18n::text("全局搜索快捷键及其后台登录启动已关闭。主窗口和桌面格子的登录启动分别设置。").into() }),
-                Err(error) => self.show_message(zsdesk_core::tr_format!("设置已保存，后台应用失败：{error:#}", error=error)),
-            }
-            return;
+pub(crate) fn show(profile: &std::path::Path, owner: super::HWND, anchor: Option<super::LayoutRect>, mut report: impl FnMut(String)) {
+    let mut preferences = match control::load(profile) {
+        Ok(configuration) => configuration.preferences,
+        Err(error) => { report(zsdesk_core::tr_format!("无法读取搜索与启动设置：{error:#}", error=error)); return; }
+    };
+    let main_startup = control::main_window_startup::enabled(profile);
+    let desktop_config = profile.with_file_name("desktop-fences.json");
+    let desktop_startup = crate::edition::DESKTOP.then(|| crate::desktop::startup_enabled(&desktop_config));
+    let spec = settings_menu(&preferences, main_startup.as_ref().ok().copied(),
+        desktop_startup.as_ref().map(|result| result.as_ref().ok().copied()));
+    if let Err(error) = &main_startup { report(zsdesk_core::tr_format!("无法读取主窗口登录启动设置：{error:#}", error=error)); }
+    if let Some(Err(error)) = &desktop_startup { report(zsdesk_core::tr_format!("无法读取桌面格子登录启动设置：{error:#}", error=error)); }
+    let Some(choice) = super::input::popup(owner, &spec, anchor) else { return; };
+
+    if preference_action(&mut preferences, &choice) {
+        let enabled = preferences.enabled;
+        if let Err(error) = control::apply(profile, preferences) {
+            report(zsdesk_core::tr_format!("搜索与启动设置未保存：{error:#}", error=error)); return;
         }
-        match choice.as_str() {
-            "main-window-login" => if let Ok(current) = main_startup {
-                match control::main_window_startup::set_enabled(&self.config_path, !current) {
-                    Ok(()) => self.show_message(if current { zsdesk_core::i18n::text("主窗口登录启动已关闭") } else { zsdesk_core::i18n::text("下次登录 Windows 时将打开文件管理主窗口") }.into()),
-                    Err(error) => self.show_message(zsdesk_core::tr_format!("主窗口登录启动未更改：{error:#}", error=error)),
-                }
-            },
-            "desktop-login" => if let Some(Ok(current)) = desktop_startup {
-                match crate::desktop::set_startup_enabled(&desktop_config, !current) {
-                    Ok(()) => self.show_message(if current { zsdesk_core::i18n::text("桌面格子登录启动已关闭") } else { zsdesk_core::i18n::text("下次登录 Windows 时将启动桌面格子") }.into()),
-                    Err(error) => self.show_message(zsdesk_core::tr_format!("桌面格子登录启动未更改：{error:#}", error=error)),
-                }
-            },
-            "search-hotkey-status" => {
-                let status = control::status(&self.config_path);
-                let saved = &status["last_status"];
-                let live = status["running"].as_bool().unwrap_or(false);
-                let matching_key = saved["hotkey"].as_str().is_some_and(|value| value.eq_ignore_ascii_case(&preferences.hotkey));
-                let registered = preferences.enabled && live && matching_key && saved["hotkey_registered"].as_bool().unwrap_or(false);
-                let state = if !preferences.enabled { zsdesk_core::i18n::text("已关闭") } else if registered { zsdesk_core::i18n::text("已注册") }
-                    else if live && !matching_key { zsdesk_core::i18n::text("后台正在应用快捷键") } else if live { zsdesk_core::i18n::text("后台运行，快捷键未注册") } else { zsdesk_core::i18n::text("后台未运行") };
-                let detail = if live { saved["error"].as_str().unwrap_or("") } else { "" };
-                self.show_message(zsdesk_core::tr_format!("全局搜索快捷键 {}：{}{}{}", preferences.hotkey, state, if detail.is_empty() { "" } else { "；" }, detail));
-            }
-            _ => {}
+        // Keep the integration receiver alive when the global shortcut is
+        // disabled; its reload path unregisters only the search shortcut.
+        let action = if enabled || crate::explorer_forwarder::owns_integration(profile) { "reload" } else { "stop" };
+        let result = control::signal(profile, action)
+            .and_then(|_| quick_search::start_if_enabled(profile));
+        match result {
+            Ok(()) => report(if enabled { zsdesk_core::i18n::text("设置已保存；后台正在应用全局快捷键，可在运行状态中检查是否注册成功。").into() }
+                else { zsdesk_core::i18n::text("全局搜索快捷键及其后台登录启动已关闭。主窗口和桌面格子的登录启动分别设置。").into() }),
+            Err(error) => report(zsdesk_core::tr_format!("设置已保存，后台应用失败：{error:#}", error=error)),
         }
+        return;
+    }
+    match choice.as_str() {
+        "main-window-login" => if let Ok(current) = main_startup {
+            match control::main_window_startup::set_enabled(profile, !current) {
+                Ok(()) => report(if current { zsdesk_core::i18n::text("主窗口登录启动已关闭") } else { zsdesk_core::i18n::text("下次登录 Windows 时将打开文件管理主窗口") }.into()),
+                Err(error) => report(zsdesk_core::tr_format!("主窗口登录启动未更改：{error:#}", error=error)),
+            }
+        },
+        "desktop-login" => if let Some(Ok(current)) = desktop_startup {
+            match crate::desktop::set_startup_enabled(&desktop_config, !current) {
+                Ok(()) => report(if current { zsdesk_core::i18n::text("桌面格子登录启动已关闭") } else { zsdesk_core::i18n::text("下次登录 Windows 时将启动桌面格子") }.into()),
+                Err(error) => report(zsdesk_core::tr_format!("桌面格子登录启动未更改：{error:#}", error=error)),
+            }
+        },
+        "search-hotkey-status" => {
+            let status = control::status(profile);
+            let saved = &status["last_status"];
+            let live = status["running"].as_bool().unwrap_or(false);
+            let matching_key = saved["hotkey"].as_str().is_some_and(|value| value.eq_ignore_ascii_case(&preferences.hotkey));
+            let registered = preferences.enabled && live && matching_key && saved["hotkey_registered"].as_bool().unwrap_or(false);
+            let state = if !preferences.enabled { zsdesk_core::i18n::text("已关闭") } else if registered { zsdesk_core::i18n::text("已注册") }
+                else if live && !matching_key { zsdesk_core::i18n::text("后台正在应用快捷键") } else if live { zsdesk_core::i18n::text("后台运行，快捷键未注册") } else { zsdesk_core::i18n::text("后台未运行") };
+            let detail = if live { saved["error"].as_str().unwrap_or("") } else { "" };
+            report(zsdesk_core::tr_format!("全局搜索快捷键 {}：{}{}{}", preferences.hotkey, state, if detail.is_empty() { "" } else { "；" }, detail));
+        }
+        _ => {}
     }
 }
 

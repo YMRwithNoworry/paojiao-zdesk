@@ -158,7 +158,7 @@ extern "C" { fn zs_menu_shared_host(enabled:i32); fn zs_menu_set_working_directo
 const CMIC_MASK_UNICODE: u32 = 0x4000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum MenuOutcome { Dismissed, Application(u32), Rename, Open, Explore, ShellInvoked, NativeHandled, Copy, Cut, Paste, Delete{permanent:bool} }
+pub enum MenuOutcome { Dismissed, Application(u32), Rename, Open, Explore, ShellInvoked, NativeHandled, Copy, Cut, Paste, PinInExplorer, Delete{permanent:bool} }
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct MenuInterceptions { pub rename: bool, pub open: bool, pub file_actions:bool }
@@ -278,6 +278,10 @@ pub(crate) fn public_menu_timings()->(u64,u64){(PUBLIC_BIND_MICROS.with(Cell::ge
 /// retain Shell command identities while hiding the selected functions.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ContextMenuOptions {
+    #[serde(default)]
+    pub quick_first:bool,
+    #[serde(default)]
+    pub native_first_page_apps:Option<Vec<String>>,
     pub modern: bool,
     #[serde(default)]
     pub drawn:bool,
@@ -288,7 +292,7 @@ pub struct ContextMenuOptions {
     pub show_wps: bool,
 }
 impl Default for ContextMenuOptions {
-    fn default() -> Self { Self { modern: true,drawn:false, hidden_verbs: Vec::new(), shown_verbs:Vec::new(), show_seven_zip: true, show_wps: true } }
+    fn default() -> Self { Self { quick_first:false,native_first_page_apps:None,modern:true,drawn:true,hidden_verbs:Vec::new(),shown_verbs:Vec::new(),show_seven_zip:true,show_wps:true } }
 }
 /// SHA-256 of the only `Windows.UI.FileExplorer.dll` build whose private
 /// presenter ABI `native/shell_menu.cpp` supports (`kExpectedMenuSha256`).
@@ -344,20 +348,15 @@ fn file_sha256(path: &std::path::Path) -> Option<String> {
     Some(hasher.finalize().iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
-fn presentation(modern:bool,drawn:bool,build:u32,verified_native:bool)->(bool,bool){
-    if drawn{return(true,true);}
-    if !modern||build<22000{return(false,false);}
-    // Unknown private ABI layouts retain the Windows 11 appearance through
-    // documented Shell commands. They never enter an unverified vtable.
-    (true,!verified_native)
+fn presentation(modern:bool,_drawn:bool,_build:u32,_verified_native:bool)->(bool,bool){
+    (modern,modern)
 }
 pub fn presentation_name()->&'static str{
     let options=context_menu_options();if options.drawn{"public-windows11"}else if options.modern{"verified-native-windows11"}else{"native-classic"}
 }
 pub fn set_context_menu_options(mut options: ContextMenuOptions) {
     let build=crate::theme::os_build();
-    let verified=options.modern&&!options.drawn&&build>=22000&&modern_presenter_supported()==Some(true);
-    (options.modern,options.drawn)=presentation(options.modern,options.drawn,build,verified);
+    (options.modern,options.drawn)=presentation(options.modern,options.drawn,build,false);
     for rules in [&mut options.hidden_verbs,&mut options.shown_verbs]{
         rules.retain(|v| !v.is_empty() && v.len() <= 512 && !v.contains('\0'));
         for verb in rules.iter_mut(){verb.make_ascii_lowercase();}
@@ -368,6 +367,38 @@ pub fn set_context_menu_options(mut options: ContextMenuOptions) {
     OPTIONS.with(|current| *current.borrow_mut() = options);
 }
 pub fn context_menu_options() -> ContextMenuOptions { OPTIONS.with(|options| options.borrow().clone()) }
+pub fn drawn_renderer_ready()->bool{drawn_menu::renderer_ready()}
+pub fn prepare_drawn_runtime()->Result<()>{drawn_menu::prepare()}
+
+pub fn native_app_registrations()->Result<Vec<(String,String)>>{
+    let mut list=super::legacy_commands::inventory().into_iter().collect::<std::collections::BTreeMap<_,_>>();
+    let registrations=match super::packaged_commands::discover(){
+        Ok(found)=>found.registrations,Err(error) if list.is_empty()=>return Err(error),Err(_)=>Vec::new(),
+    };
+    for r in registrations{
+        let package=r.package_family.split('_').next().unwrap_or(&r.package_family);
+        list.entry(r.settings_id()).or_insert_with(||r.display_name.clone().unwrap_or_else(||format!("{package} · {}", r.application_id)));
+    }
+    let mut list=list.into_iter().collect::<Vec<_>>();
+    list.sort_by(|a,b|a.1.cmp(&b.1).then(a.0.cmp(&b.0)));Ok(list)
+}
+/// Pre-0.3.19 profiles may identify a packaged provider by class alone.
+pub fn native_app_selected(id:&str,selected:&[String])->bool{
+    let previous=id.strip_prefix("pkg:").and_then(|key|key.split_once(':')).map(|(class,_)|class);
+    selected.iter().any(|key|key.eq_ignore_ascii_case(id)||previous.is_some_and(|class|class.eq_ignore_ascii_case(key)))
+}
+
+/// Initialize the verified native presenter on its worker STA, without opening a popup.
+pub fn prepare_native_runtime(owner: HWND, browser: &IExplorerBrowser) -> Result<()> {
+    #[cfg(all(target_arch = "x86_64", target_env = "msvc"))]
+    if modern_presenter_supported() == Some(true) {
+        unsafe extern "C" {
+            fn zs_menu_prepare_runtime(owner: HWND, browser: *mut core::ffi::c_void) -> windows::core::HRESULT;
+        }
+        return unsafe { zs_menu_prepare_runtime(owner, browser.as_raw()) }.ok();
+    }
+    Err(windows::core::Error::from_hresult(windows::Win32::Foundation::E_NOTIMPL))
+}
 
 /// Posted to the containing application window when a filtered menu cannot be
 /// opened. WPARAM contains the HRESULT; no unfiltered fallback is displayed.
@@ -490,6 +521,7 @@ pub struct ShellMenu {
     hmenu: HMENU,
     owns_menu:Cell<bool>,
     recycle_bin:bool,
+    recycle_contents:bool,
     background:bool,
     input_flags:Cell<u32>,
     /// Populated for Shift+right-click. Explorer answers that gesture with the
@@ -502,7 +534,7 @@ pub struct ShellMenu {
 impl ShellMenu {
     pub fn new(menu: IContextMenu) -> Result<Self> {
         let hmenu = unsafe { CreatePopupMenu()? };
-        Ok(Self { menu, hmenu,owns_menu:Cell::new(true), recycle_bin:false,background:false,input_flags:Cell::new(0), extended: Cell::new(false),optimized:Cell::new(None),directory:RefCell::new(None) })
+        Ok(Self { menu, hmenu,owns_menu:Cell::new(true), recycle_bin:false,recycle_contents:false,background:false,input_flags:Cell::new(0), extended: Cell::new(false),optimized:Cell::new(None),directory:RefCell::new(None) })
     }
     pub fn new_background(menu:IContextMenu)->Result<Self>{let mut value=Self::new(menu)?;value.background=true;Ok(value)}
 
@@ -547,6 +579,43 @@ impl ShellMenu {
         menu.menu=super::packaged_overlay::create(menu.menu.clone(),browser.clone(),view.clone(),owner,!selection)?;
         Ok(menu)
     }
+    pub fn for_compact_selection(owner:HWND,pidls:&[Vec<u8>],resolve:Box<dyn Fn()->Result<IShellView>>)->Result<Option<Self>>{
+        use windows::Win32::System::SystemServices::SFGAO_FILESYSTEM;
+        let mut ptrs=Vec::with_capacity(pidls.len());
+        let mut parents=std::collections::HashSet::new();
+        for pidl in pidls{
+            let item=super::pidl::item_from_pidl(pidl)?;
+            if !unsafe{item.GetAttributes(SFGAO_FILESYSTEM)}.is_ok_and(|attrs|attrs.contains(SFGAO_FILESYSTEM)){
+                return Ok(None);
+            }
+            // Deleted objects can have a filesystem backing path but a virtual parent.
+            if parents.insert(parent_pidl(pidl))&&!unsafe{item.GetParent().and_then(|parent|parent.GetAttributes(SFGAO_FILESYSTEM))}.is_ok_and(|attrs|attrs.contains(SFGAO_FILESYSTEM)){
+                return Ok(None);
+            }
+            ptrs.push(pidl.as_ptr().cast());
+        }
+        let items=unsafe{SHCreateShellItemArrayFromIDLists(&ptrs)}?;
+        Self::new(super::compact_commands::for_selection(items,owner,resolve)).map(Some)
+    }
+    pub fn for_compact_view(view:&IShellView,browser:&IExplorerBrowser,owner:HWND,selection:bool,options:&ContextMenuOptions)->Result<Self>{
+        let in_bin=super::file_transfer::paste_folder(view).ok().flatten().is_some_and(|item|super::shell_item::is_recycle_bin_item(&item));
+        let bin_icon=selection&&!in_bin&&view.cast::<windows::Win32::UI::Shell::IFolderView2>()
+            .and_then(|folder|unsafe{folder.GetSelection(false)}).is_ok_and(|items|
+                unsafe{items.GetCount()}==Ok(1)&&unsafe{items.GetItemAt(0)}.is_ok_and(|item|super::shell_item::is_recycle_bin_item(&item)));
+        if in_bin||bin_icon{
+            // A deleted item's context is owned by the Recycle Bin namespace.
+            // Opening its backing filesystem path would target another object.
+            let mut menu=Self::for_view(view,selection)?;
+            menu.recycle_bin=bin_icon||!selection;
+            menu.recycle_contents=in_bin&&selection;
+            return Ok(menu);
+        }
+        let mut context=super::compact_commands::create(view,!selection);
+        if options.native_first_page_apps.as_ref().is_some_and(|ids|ids.iter().any(|id|id.starts_with("pkg:")||windows::core::GUID::try_from(id.as_str()).is_ok())){
+            context=super::packaged_overlay::create(context,browser.clone(),view.clone(),owner,!selection)?;
+        }
+        if selection{Self::new(context)}else{Self::new_background(context)}
+    }
 
     pub fn hmenu(&self) -> HMENU { self.hmenu }
     pub fn set_input_context(&self,keyboard:bool,f10:bool){self.input_flags.set(u32::from(keyboard)|(u32::from(keyboard&&f10)<<1));}
@@ -582,10 +651,13 @@ impl ShellMenu {
 
     /// The compact presenter builds its own commands. Expensive classic-only
     /// handlers are queried only if the user opens Show more options.
-    pub fn populate_compact(&self,rename:bool,extended:bool)->Result<()> {
+    pub fn populate_compact(&self,rename:bool,extended:bool,folder_selection:bool)->Result<()> {
         if extended||!context_menu_options().modern{return self.populate(rename,extended);}
         self.optimized.set(Some(rename));self.extended.set(false);
-        let flags=(if self.background{CMF_NODEFAULT}else{CMF_ITEMMENU})|CMF_EXPLORE|CMF_OPTIMIZEFORINVOKE|if rename{CMF_CANRENAME}else{CMF_NORMAL};
+        // The optimized lookup omits PinToStartScreen and can return raw verb
+        // names instead of localized folder command labels.
+        let flags=(if self.background{CMF_NODEFAULT}else{CMF_ITEMMENU})|CMF_EXPLORE|CMF_ASYNCVERBSTATE|
+            if folder_selection{CMF_NORMAL}else{CMF_OPTIMIZEFORINVOKE}|if rename{CMF_CANRENAME}else{CMF_NORMAL};
         unsafe{self.menu.QueryContextMenu(self.hmenu,0,SHELL_FIRST,SHELL_LAST,flags)}.ok()
     }
     fn ensure_classic(&self)->Result<()> {
@@ -659,6 +731,7 @@ impl ShellMenu {
 
     fn track_standalone(&self, owner: HWND, point: POINT, pidls: &[Vec<u8>], folder: Option<&IShellItem>, background: bool, browser:Option<&IExplorerBrowser>,
             application_count: usize, intercept: MenuInterceptions, before: &mut dyn FnMut() -> Result<()>) -> Result<MenuOutcome> {
+        let intercept=if self.recycle_contents{MenuInterceptions::default()}else{intercept};
         let applications = application_ids(application_count)?;
         let options=context_menu_options();
         #[cfg(all(target_arch="x86_64",target_env="msvc"))]
@@ -715,9 +788,15 @@ impl ShellMenu {
     fn dispatch_shell_command(&self,owner:HWND,command:u32,point:Option<POINT>,intercept:MenuInterceptions,
             shift:bool,control:bool,before:&mut dyn FnMut()->Result<()>)->Result<MenuOutcome>{
         if !Self::is_shell_id(command) { return Err(windows::core::Error::from_hresult(windows::core::HRESULT(0x80070057u32 as i32))); }
-        if let Some(action) = intercepted_verb(self.verb(command).as_deref(), intercept,shift) { return Ok(action); }
+        let verb=self.verb(command);
+        if let Some(action) = intercepted_verb(verb.as_deref(), intercept,shift) { return Ok(action); }
         before()?;
-        self.invoke(owner, command, point, shift,control)?;
+        if let Err(error)=self.invoke(owner,command,point,shift,control){
+            if error.code()==windows::Win32::Foundation::E_ACCESSDENIED&&verb.as_deref().is_some_and(|v|matches!(v.to_ascii_lowercase().as_str(),"pintostartscreen"|"unpinfromstart"|"unpinfromstartscreen")){
+                return Ok(MenuOutcome::PinInExplorer);
+            }
+            return Err(error);
+        }
         Ok(MenuOutcome::ShellInvoked)
     }
 
@@ -738,7 +817,7 @@ impl ShellMenu {
         let filter = context;
         if filter { self.filter(menu, &options); }
         let _active = ActiveMenuScope::enter_initialized(&self.menu,filter,menu,initialized);
-        if options.drawn&&(!self.extended.get()||self.input_flags.get()&2!=0){
+        if options.drawn{
             return drawn_menu::track_initialized(owner,menu,point,&self.menu,&options,filter,initialized);
         }
         let flags = TRACK_POPUP_MENU_FLAGS(TPM_RETURNCMD.0 | TPM_RIGHTBUTTON.0 | TPM_LEFTALIGN.0 | TPM_TOPALIGN.0);
@@ -848,12 +927,16 @@ fn legacy_should_hide(verb: Option<&str>, label: &str, options: &ContextMenuOpti
         || (!options.show_wps && (label.contains("wps") || canonical.starts_with("wps")))
 }
 
-fn canonical_verb(context: &IContextMenu, id: u32) -> Option<String> {
+pub(super) fn canonical_verb(context: &IContextMenu, id: u32) -> Option<String> {
     if !ShellMenu::is_shell_id(id) { return None; }
     let mut buffer = [0u16; 128];
     unsafe { context.GetCommandString((id - SHELL_FIRST) as usize, GCS_VERBW, None, PSTR(buffer.as_mut_ptr().cast()), buffer.len() as u32) }.ok()?;
     let end = buffer.iter().position(|&c| c == 0)?;
     if end==0{return None;}String::from_utf16(&buffer[..end]).ok()
+}
+
+pub fn common_command_visible(options:&ContextMenuOptions,verb:&str,label:&str)->bool{
+    !should_hide(Some(verb),label,options)
 }
 
 /// Hides the preference-controlled entries of a context menu's top level.
@@ -925,13 +1008,16 @@ pub(crate) unsafe fn attach_view_menu(view: &IShellView, modern: Rc<Cell<bool>>)
 /// Resolve an owned pointer request outside the application's model borrow.
 /// Keep only the cloned COM view across accessibility calls, which may pump.
 pub fn prepare_pointer_menu(window:HWND,position:LPARAM)->Result<(IShellView,ViewMenuTarget)>{
+    let view=attached_menu_view(window)?;
+    let target=menu_target::prepare(window,window,position)?;
+    Ok((view,target))
+}
+pub fn attached_menu_view(window:HWND)->Result<IShellView>{
     let mut data=0usize;
     if !unsafe{GetWindowSubclass(window,Some(view_menu_proc),VIEW_MENU_SUBCLASS,Some(&mut data))}.as_bool()||data==0{
         return Err(windows::core::Error::from_hresult(windows::core::HRESULT(0x800704c7u32 as i32)));
     }
-    let view=unsafe{(*(data as*const ViewMenuState)).view.clone()};
-    let target=menu_target::prepare(window,window,position)?;
-    Ok((view,target))
+    Ok(unsafe{(*(data as*const ViewMenuState)).view.clone()})
 }
 
 unsafe extern "system" fn view_menu_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM, _: usize, data: usize) -> LRESULT {
@@ -1255,18 +1341,24 @@ unsafe fn ui_object<T: Interface>(parent: &IShellFolder, owner: HWND, children: 
 /// Sibling UI objects, or a complete cross-folder IDataObject for drag and drop.
 pub fn items_ui_object<T: Interface>(owner: HWND, pidls: &[Vec<u8>]) -> Result<T> {
     let offsets = item_offsets(pidls)?;
+    let bind_data_object=||{
+        let pointers:Vec<_>=pidls.iter().map(|pidl|pidl.as_ptr().cast()).collect();
+        let array=unsafe{SHCreateShellItemArrayFromIDLists(&pointers)?};
+        unsafe{array.BindToHandler(None,&BHID_DataObject)}
+    };
     if !same_item_parent(pidls, &offsets) {
         if T::IID == IDataObject::IID {
-            let pointers: Vec<_> = pidls.iter().map(|pidl| pidl.as_ptr().cast()).collect();
-            let array = unsafe { SHCreateShellItemArrayFromIDLists(&pointers)? };
-            return unsafe { array.BindToHandler(None, &BHID_DataObject) };
+            return bind_data_object();
         }
         return Err(windows::core::Error::from_hresult(windows::core::HRESULT(0x80004002u32 as i32)));
     }
     let first = &pidls[0];
     let parent: IShellFolder = unsafe { SHBindToParent(first.as_ptr().cast(), None)? };
     let children: Vec<*const ITEMIDLIST> = pidls.iter().zip(offsets).map(|(pidl, offset)| unsafe { pidl.as_ptr().add(offset).cast() }).collect();
-    unsafe { ui_object(&parent, owner, &children) }
+    match unsafe{ui_object(&parent,owner,&children)}{
+        Err(err) if T::IID==IDataObject::IID && matches!(err.code().0 as u32,0x80004002|0x80004001)=>bind_data_object(),
+        result=>result,
+    }
 }
 
 fn last_item_offset(pidl: &[u8]) -> Option<usize> {
@@ -1340,13 +1432,13 @@ mod runtime_tests;
 #[cfg(test)]mod presentation_tests{
     use super::*;
     #[test]fn menu_style_routes_by_platform_capability_not_one_machine(){
-        for build in [17763,19041,19045]{assert_eq!(presentation(true,false,build,false),(false,false));}
+        for build in [17763,19041,19045]{assert_eq!(presentation(true,false,build,false),(true,true));}
         for build in [22000,22621,26100,26300,30000]{
             assert_eq!(presentation(true,false,build,false),(true,true));
-            assert_eq!(presentation(true,false,build,true),(true,false));
+            assert_eq!(presentation(true,false,build,true),(true,true));
             assert_eq!(presentation(false,false,build,true),(false,false));
         }
         assert_eq!(presentation(true,true,19045,false),(true,true));
-        assert_eq!(presentation(true,false,0,false),(false,false));
+        assert_eq!(presentation(true,false,0,false),(true,true));
     }
 }

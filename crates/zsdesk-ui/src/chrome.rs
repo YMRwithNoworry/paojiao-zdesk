@@ -437,10 +437,12 @@ impl ChromeLayout {
         let status_h = if input.status_bar { s(STATUS_H) } else { 0 };
         let status_y = (height - status_h).max(layout.top);
         layout.status = Rect::clamped(0, status_y, width, height - status_y);
-        let toggle = Rect::clamped(0, status_y + (status_h - s(22)) / 2, s(28), s(22));
-        layout.status_tiles = Rect { x: width - s(8) - toggle.width, ..toggle };
-        layout.status_details = Rect { x: layout.status_tiles.x - s(2) - toggle.width, ..toggle };
-        layout.status_dual_pane = Rect { x: layout.status_details.x - s(2) - toggle.width, ..toggle };
+        if input.status_bar {
+            let toggle = Rect::clamped(0, status_y + (status_h - s(22)) / 2, s(28), s(22));
+            layout.status_tiles = Rect { x: width - s(8) - toggle.width, ..toggle };
+            layout.status_details = Rect { x: layout.status_tiles.x - s(2) - toggle.width, ..toggle };
+            layout.status_dual_pane = Rect { x: layout.status_details.x - s(2) - toggle.width, ..toggle };
+        }
         let content_h = (status_y - layout.top).max(0);
         if input.show_tree && width > s(MIN_TREE_W) * 2 {
             let tree_w = input.tree_width.clamp(s(MIN_TREE_W), (width / 2).max(s(MIN_TREE_W)));
@@ -510,6 +512,33 @@ impl ChromeLayout {
             if let Some(slot)=self.tabs.iter().find(|slot|x>=slot.rect.x&&x<slot.rect.right()&&y<slot.rect.y){return Hit::Tab(slot.index);}
         }
         self.hit(x,y)
+    }
+
+    /// A tab, including its close glyph, opens the tab menu. Only empty space
+    /// in the tab strip closes the active tab. Caption controls stay separate.
+    pub fn tab_strip_right_hit(&self,x:i32,y:i32,extend:bool)->Option<Hit>{
+        if self.vertical_tabs {
+            if !self.tab_panel.contains(x,y){return None;}
+            return match self.hit(x,y){
+                Hit::Tab(i)|Hit::TabClose(i)=>Some(Hit::Tab(i)),
+                Hit::None=>Some(Hit::Caption),
+                _=>None,
+            };
+        }
+        if !self.strip.contains(x,y){return None;}
+        match self.hit_with_top_edge(x,y,extend){
+            Hit::Tab(index)|Hit::TabClose(index)=>Some(Hit::Tab(index)),
+            Hit::Caption=>{
+                let utility_x=if self.tab_list.is_empty(){self.app_menu.x}else{self.tab_list.x};
+                let above_new=x>=self.new_tab.x && x<self.new_tab.right();
+                (x<utility_x && !above_new).then_some(Hit::Caption)
+            }
+            _=>None,
+        }
+    }
+    pub fn top_tab_right_target(&self,x:i32,y:i32,extend:bool,active:usize)->Option<usize>{
+        if self.vertical_tabs{return None;}
+        match self.tab_strip_right_hit(x,y,extend)?{Hit::Tab(i)=>Some(i),Hit::Caption=>Some(active),_=>None}
     }
 
     /// Classifies a client point.
@@ -642,6 +671,19 @@ mod tests {
         ChromeInput { tab_placement:zsdesk_core::model::explorer::TabPlacement::Top, side_tabs_width:210,side_tabs_compact:true,width, height: 800, dpi, caption_width: scale(138, dpi), caption_button: None,
             tab_count: tabs, active_tab: active, show_tab_list:true, show_tree: true, tree_width: scale(220, dpi), show_bookmarks: true,bookmarks_on_right:false,bookmarks_width:scale(210,dpi),
             command_bar: &DEFAULT_COMMAND_BAR, status_bar: true, bookmark_widths: &[], search_panel_open: false }
+    }
+
+    #[test]
+    fn disabled_status_has_no_buttons_or_hit_targets() {
+        for dpi in [96, 144, 192] {
+            let mut options = input(1200, 1, 0, dpi);
+            options.status_bar = false;
+            let layout = ChromeLayout::new(&options);
+            for area in [layout.status, layout.status_details, layout.status_tiles, layout.status_dual_pane] {
+                assert!(area.is_empty());
+            }
+            assert!(!matches!(layout.hit(1185, 799), Hit::Status | Hit::StatusDetails | Hit::StatusTiles | Hit::StatusDualPane));
+        }
     }
 
     #[test]fn bookmark_panel_resizes_without_covering_the_view_or_side_tabs(){
@@ -817,6 +859,26 @@ mod tests {
         let (id, r) = l.commands[0];
         assert_eq!(l.hit(r.x + 1, r.y + 1), Hit::Command(id));
         assert_eq!(l.hit(l.splitter.x + 1, l.splitter.y + 10), Hit::Splitter);
+    }
+
+    #[test]
+    fn right_click_targets_the_pointed_tab_or_the_active_tab_in_empty_space() {
+        for dpi in [96,144,192] {
+            let mut layout=ChromeLayout::new(&input(scale(1400,dpi),3,1,dpi));
+            let target=|x,y|layout.top_tab_right_target(x,y,true,1);
+            for tab in &layout.tabs {
+                assert_eq!(target(tab.rect.x+2,tab.rect.y+2),Some(tab.index));
+                assert_eq!(target(tab.close.x+1,tab.close.y+1),Some(tab.index));
+                assert_eq!(target(tab.rect.x+2,0),Some(tab.index));
+            }
+            assert_eq!(target(layout.new_tab.right()+2,layout.strip.bottom()-2),Some(1));
+            for control in [layout.new_tab,layout.tab_list,layout.app_menu,layout.address] {
+                if !control.is_empty(){assert_eq!(target(control.x+1,control.y+1),None);}
+            }
+            assert_eq!(target(layout.strip.right()-2,layout.strip.bottom()-2),None);
+            layout.vertical_tabs=true;
+            assert_eq!(layout.top_tab_right_target(layout.tabs[0].rect.x+2,0,true,1),None);
+        }
     }
 
     #[test]
