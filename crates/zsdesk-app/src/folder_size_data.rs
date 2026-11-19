@@ -134,7 +134,15 @@ pub(crate) fn calculate(profile:&Path,directory:&Path,items:&[Item],cancel:&impl
     #[test]fn cancellation_never_emits_partial_directory_total()->Result<()>{
         let fixture=Fixture::new()?;for index in 0..20{let dir=fixture.0.join(format!("folder/{index}"));fs::create_dir_all(&dir)?;fs::write(dir.join("data"),[0u8;128])?;}
         let mut scan=Scan::new(fixture.0.join("folder"))?;let calls=std::cell::Cell::new(0);
-        let result=scan.step(&||{let n=calls.get()+1;calls.set(n);n>5});assert!(result.is_err());assert!(scan.bytes<20*128);Ok(())
+        let cancel=||{let n=calls.get()+1;calls.set(n);n>5};
+        loop {
+            match scan.step(&cancel) {
+                Ok(None) => continue, // A time slice may expire before the sixth poll.
+                Ok(Some(_)) => panic!("cancelled scan emitted a directory total"),
+                Err(error) => { assert_eq!(error.to_string(),"大小计算已取消"); break; }
+            }
+        }
+        assert_eq!(calls.get(),6);assert!(scan.bytes<20*128);Ok(())
     }
     #[test]fn native_total_preserves_sizes_above_four_gib_without_allocating_contents()->Result<()>{
         use std::os::windows::io::AsRawHandle;use windows::Win32::System::{IO::DeviceIoControl,Ioctl::FSCTL_SET_SPARSE};
