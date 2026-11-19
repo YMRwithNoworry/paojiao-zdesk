@@ -701,7 +701,8 @@ mod tests {
     fn every_context_setting_has_an_action_and_defaults_preserve_extensions() {
         let options = ContextMenuPreferences { mode: ContextMenuMode::Original, ..Default::default() };
         for id in nested_ids(&context_menu_settings_menu(&options)) {
-            if id=="manage-context-commands"{continue;}
+            // These commands open management dialogs in the application window.
+            if matches!(id.as_str(), "manage-context-commands" | "manage-native-first-page") { continue; }
             assert!(apply_context_menu_setting(&mut options.clone(), &id), "unhandled context setting {id}");
         }
         assert!(options.show_wps);

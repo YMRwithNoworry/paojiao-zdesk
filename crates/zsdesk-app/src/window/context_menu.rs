@@ -291,13 +291,22 @@ pub(super) fn poll(owner:HWND){
     let created=session.client.take_created();
     let catalog=session.client.take_catalog();
     let created_any=!created.is_empty();
-    let valid=if layout.is_some()||!created.is_empty()||matches!(&result,Some(Ok(MenuOutcome::Rename|MenuOutcome::Open|MenuOutcome::Explore|MenuOutcome::Copy|MenuOutcome::Cut|MenuOutcome::Paste|MenuOutcome::PinInExplorer|MenuOutcome::Delete{..}))){
+    let valid=if layout.is_some()||matches!(&result,Some(Ok(MenuOutcome::Rename|MenuOutcome::Open|MenuOutcome::Explore|MenuOutcome::Copy|MenuOutcome::Cut|MenuOutcome::Paste|MenuOutcome::PinInExplorer|MenuOutcome::Delete{..}))){
         same_selection(&session.view,&session.pidls,&session.folder,&session.background,session.input.as_ref())
             &&current(owner,generation)&&live_source(owner,window,identity)
     }else{true};
-    if valid&&matches!(&result,Some(Ok(MenuOutcome::ShellInvoked|MenuOutcome::NativeHandled))){
-        if let Some(layout)=layout{zsdesk_windows::shell::restore_view_layout(&session.view,&layout);}
-        for item in created{super::pane_input::post(owner,identity,super::pane_input::Intent::CreatedItem(item));}
+    if matches!(&result,Some(Ok(MenuOutcome::ShellInvoked|MenuOutcome::NativeHandled))){
+        if valid {if let Some(layout)=layout{zsdesk_windows::shell::restore_view_layout(&session.view,&layout);}}
+        // The Shell may already have selected the new item. Validate its destination
+        // and originating pane, not the selection that existed before creation.
+        if created_any && session.invocation_authorized && current(owner,generation) && live_source(owner,window,identity)
+            && session.input.as_ref().is_none_or(|input| !input.changed()) {
+            for item in created {
+                if item.path.parent().zip(session.folder.as_deref()).is_some_and(|(a,b)|crate::explorer_forwarder::same_path(a,b)) {
+                    super::pane_input::post(owner,identity,super::pane_input::Intent::CreatedItem(item));
+                }
+            }
+        }
     }
     match result{
         Some(Ok(_)) if session.catalog=>{super::pane_input::post(owner,identity,super::pane_input::Intent::ContextCatalog(catalog));},

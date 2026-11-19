@@ -674,7 +674,7 @@ mod tests {
     }
 
     #[test]
-    fn shell_owned_status_has_no_duplicate_buttons_or_hit_targets() {
+    fn disabled_status_has_no_buttons_or_hit_targets() {
         for dpi in [96, 144, 192] {
             let mut options = input(1200, 1, 0, dpi);
             options.status_bar = false;

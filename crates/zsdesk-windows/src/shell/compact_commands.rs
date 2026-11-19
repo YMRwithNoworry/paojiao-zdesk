@@ -9,6 +9,7 @@ use std::{
 use windows::{
     Win32::{
         Foundation::{HWND, LPARAM, LRESULT, WPARAM},
+        System::Ole::{IObjectWithSite, IObjectWithSite_Impl},
         System::SystemServices::{
             SFGAO_CANCOPY, SFGAO_CANDELETE, SFGAO_CANMOVE, SFGAO_CANRENAME, SFGAO_FILESYSTEM,
             SFGAO_FOLDER, SFGAO_LINK, SFGAO_STREAM,
@@ -18,7 +19,7 @@ use windows::{
             WindowsAndMessaging::*,
         },
     },
-    core::{Error, HRESULT, Interface, PCSTR, PSTR, PWSTR, Result, implement},
+    core::{Error, GUID, HRESULT, Interface, IUnknown, PCSTR, PSTR, PWSTR, Ref, Result, implement},
 };
 
 const SYSTEM_START: u32 = 64;
@@ -129,9 +130,10 @@ impl Drop for Templates {
         let _ = unsafe { DestroyMenu(self.menu) };
     }
 }
-#[implement(IContextMenu3, Agile = false)]
+#[implement(IContextMenu3, IObjectWithSite, Agile = false)]
 struct Compact {
     source: Source,
+    site: RefCell<Option<IUnknown>>,
     background: bool,
     context: OnceCell<IContextMenu>,
     full: Cell<HMENU>,
@@ -180,6 +182,7 @@ pub(super) fn for_selection(
 fn make(source: Source, background: bool) -> IContextMenu {
     let obj: IContextMenu3 = Compact {
         source,
+        site: RefCell::new(None),
         background,
         context: OnceCell::new(),
         full: Cell::new(HMENU::default()),
@@ -202,6 +205,13 @@ fn make(source: Source, background: bool) -> IContextMenu {
     obj.cast().expect("IContextMenu3 inherits IContextMenu")
 }
 impl Compact {
+    fn share_site(&self, child: &IContextMenu) -> Result<()> {
+        let site = self.site.borrow().clone();
+        if let (Some(site), Ok(object)) = (site, child.cast::<IObjectWithSite>()) {
+            unsafe { object.SetSite(&site) }?;
+        }
+        Ok(())
+    }
     fn view(&self) -> Result<&IShellView> {
         match &self.source {
             Source::View(view) => Ok(view),
@@ -475,13 +485,14 @@ impl Compact {
     }
     fn full_context(&self) -> Result<&IContextMenu> {
         if self.context.get().is_none() {
-            let ctx = unsafe {
+            let ctx: IContextMenu = unsafe {
                 self.view()?.GetItemObject(if self.background {
                     SVGIO_BACKGROUND
                 } else {
                     SVGIO_SELECTION
                 })
             }?;
+            self.share_site(&ctx)?;
             let _ = self.context.set(ctx);
         }
         let context = self.context.get().unwrap();
@@ -761,6 +772,7 @@ impl Compact {
                         return Ok(LRESULT(0));
                     }
                     let ctx = super::new_menu::context_for_view(self.view()?)?;
+                    self.share_site(&ctx)?;
                     let menu = unsafe { CreatePopupMenu() }?;
                     let mut templates = Templates {
                         ctx,
@@ -830,6 +842,23 @@ impl Compact {
         Ok(LRESULT(0))
     }
 }
+impl IObjectWithSite_Impl for Compact_Impl {
+    fn SetSite(&self, site: Ref<IUnknown>) -> Result<()> {
+        let site = site.cloned();
+        self.site.replace(site.clone());
+        for child in [self.context.get(), self.templates.get().map(|t| &t.ctx)].into_iter().flatten() {
+            if let Ok(object) = child.cast::<IObjectWithSite>() { unsafe { object.SetSite(site.as_ref()) }?; }
+        }
+        Ok(())
+    }
+    fn GetSite(&self, iid: *const GUID, out: *mut *mut std::ffi::c_void) -> Result<()> {
+        if iid.is_null() || out.is_null() { return Err(Error::from_hresult(HRESULT(0x80004003u32 as i32))); }
+        unsafe { *out = std::ptr::null_mut(); }
+        let site = self.site.borrow().clone().ok_or_else(|| Error::from_hresult(HRESULT(0x80004005u32 as i32)))?;
+        unsafe { site.query(iid, out).ok() }
+    }
+}
+
 impl IContextMenu_Impl for Compact_Impl {
     fn QueryContextMenu(&self, m: HMENU, idx: u32, first: u32, last: u32, flags: u32) -> HRESULT {
         self.query(m, idx, first, last, flags)

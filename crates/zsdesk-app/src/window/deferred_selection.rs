@@ -9,6 +9,7 @@ pub(super) struct Pending {
 impl WindowState {
     pub(super) fn defer_selection(&mut self,names:Vec<OsString>,rename:bool){
         if names.is_empty(){return;}
+        if self.rename_follow.take().is_some() { let _ = unsafe { KillTimer(Some(self.hwnd), super::rename_follow::TIMER) }; }
         let duration=Duration::from_secs(8)+Duration::from_millis((names.len().min(10_000).div_ceil(32)as u64)*50);
         self.deferred_selection=Some(Pending{tab:self.session.active_tab().id,location:self.current_location().clone(),
             names,rename,rename_requested:None,deadline:Instant::now()+duration,cursor:0,input:global_search::InputWatch::new()});
@@ -30,11 +31,16 @@ impl WindowState {
         if request.tab!=self.session.active_tab().id||!shell_registration::same_location(&request.location,self.current_location()){
             return;
         }
-        if self.pending.is_some()||self.queued.is_some(){return;}
+        if self.pending.is_some()||self.queued.is_some(){
+            if Instant::now()<request.deadline { self.deferred_selection=Some(request); }
+            return;
+        }
         if request.input.as_ref().is_some_and(global_search::InputWatch::changed){return;}
         if request.rename&&!self.background_pane&&request.rename_requested.is_some(){
             let focus=unsafe{GetFocus()};
-            if text_input_window(focus)&&!self.view_hwnd.0.is_null()&&unsafe{IsChild(self.view_hwnd,focus)}.as_bool(){return;}
+            if text_input_window(focus)&&!self.view_hwnd.0.is_null()&&unsafe{IsChild(self.view_hwnd,focus)}.as_bool(){
+                self.watch_inline_rename(focus);return;
+            }
             // Shell can acknowledge SVSI_EDIT before its inline editor exists.
             // Keep the same guarded request alive while those messages drain.
             if request.rename_requested.is_some_and(|at|at.elapsed()<Duration::from_millis(200)){

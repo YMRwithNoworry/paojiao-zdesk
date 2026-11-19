@@ -42,6 +42,7 @@ mod folder_sizes;
 mod view_memory;
 mod shell_registration;
 mod deferred_selection;
+mod rename_follow;
 pub(crate) mod diagnostics;
 #[cfg(test)]mod integration_navigation_regression;
 #[cfg(test)]
@@ -233,6 +234,11 @@ unsafe fn run_window(session: ExplorerSession, config_path: PathBuf, selection: 
         if crate::utility_panel::dispatch_if_owned(&msg){continue;}
         if matches!(msg.message,WM_KEYDOWN|WM_SYSKEYDOWN|WM_LBUTTONDOWN|WM_LBUTTONDBLCLK|WM_RBUTTONDOWN|WM_MBUTTONDOWN|WM_XBUTTONDOWN|WM_MOUSEWHEEL|WM_MOUSEHWHEEL|WM_POINTERDOWN){
             zsdesk_windows::shell::file_transfer::note_user_input(msg.hwnd);
+            if let Ok(mut slot) = slot.try_borrow_mut() {
+                if let Some(state) = slot.as_mut() {
+                    state.observe_rename_input(unsafe { GetFocus() }, msg.hwnd, msg.message);
+                }
+            }
         }
         if diagnostics::dispatch(&msg){continue;}
         if picker::pre_translate(&slot,&msg){continue;}
@@ -459,6 +465,7 @@ struct WindowState {
     launch_selection: Option<std::ffi::OsString>,
     launch_selections: Vec<std::ffi::OsString>,
     deferred_selection: Option<deferred_selection::Pending>,
+    rename_follow: Option<rename_follow::Watch>,
     open_requests: std::collections::VecDeque<crate::instance::OpenRequest>,
     /// Folder the current search started from, and the results location it produced.
     search_scope: Option<ShellLocation>,
@@ -502,7 +509,7 @@ impl WindowState {
             icons: HashMap::new(), view_status: ViewStatus::default(), view_mode: (0, 0), bookmark_widths: Vec::new(),bookmark_order:Vec::new(),
             drop_registration: None, drop_zones: Rc::new(Cell::new(DropZones::default())), last_focus: HWND::default(),
             pending: None, queued: None, shown_tab: None, closed_tabs: Vec::new(), status: String::new(),
-            launch_selection, launch_selections:Vec::new(), deferred_selection:None, open_requests: Default::default(), search_scope: None, search_result: None,
+            launch_selection, launch_selections:Vec::new(), deferred_selection:None, rename_follow:None, open_requests: Default::default(), search_scope: None, search_result: None,
             browser_role:BrowserRole::Fresh,native_theme_dark:None,fast_search:None,fast_generation:0,fast_submitted:None,fast_found:0,search_progress:None,fast_events:Default::default(),
             fast_reset_pending:false,fast_clearing:None,fast_restore:None,
             search_settings_job:None,
@@ -638,7 +645,7 @@ impl WindowState {
             show_tab_list:self.session.ui.tab_count_button_visible(),
             show_tree: self.session.ui.show_tree && self.tree.is_some() && (!self.session.ui.show_preview || width>=self.s(if self.session.ui.tab_placement==zsdesk_core::model::explorer::TabPlacement::Top{900}else{1110})), tree_width: self.s(self.session.ui.tree_width),
             show_bookmarks: self.session.ui.show_bookmarks,bookmarks_on_right:self.session.ui.bookmarks_on_right,bookmarks_width:self.s(self.session.ui.bookmarks_width),
-            status_bar: !zsdesk_windows::theme::windows10_shell(zsdesk_windows::theme::os_build()), bookmark_widths: &self.bookmark_widths,
+            status_bar: true, bookmark_widths: &self.bookmark_widths,
         };
         let mut layout=ChromeLayout::new(&input);
         layout.retain_tab_viewport(&self.layout,self.session.tabs.len(),self.session.active_tab);
@@ -796,6 +803,8 @@ impl WindowState {
     }
 
     fn refresh_status(&mut self) {
+        if let Some(browser)=&self.browser { browser.settle_frame_layout(); }
+        if let Some(browser)=&self.other_pane.browser { browser.settle_frame_layout(); }
         let status = self.browser.as_ref().map(|b| b.status()).unwrap_or_default();
         let mode = self.browser.as_ref().and_then(|b| b.view_mode()).unwrap_or((0, 0));
         if status != self.view_status || mode != self.view_mode {
@@ -1389,9 +1398,11 @@ impl WindowState {
                 if area == "ShellState" || area.is_empty() { self.invalidate(); }
             }
             WM_THEMECHANGED | WM_DWMCOMPOSITIONCHANGED | WM_SYSCOLORCHANGE => self.refresh_system_theme(),
+            rename_follow::WM_CHANGED=>{self.renamed_item_notification(wp,lp);}
             folder_sizes::WM_CHANGED=>{let change=zsdesk_windows::shell::notify::read_change(wp,lp);if change.event!=0{self.folder_sizes_changed();}}
             WM_TIMER => {
                 if wp.0==deferred_selection::TIMER{self.poll_pane_selections();}
+                if wp.0==rename_follow::TIMER{self.poll_rename_follow();}
                 if wp.0==TIMER_PLACEMENT{let _=unsafe{KillTimer(Some(self.hwnd),TIMER_PLACEMENT)};self.remember_placement();self.save();}
                 if wp.0 == TIMER_STATUS { self.update_shell_registry();self.refresh_status();self.poll_search_settings();self.poll_pane_searches();self.poll_folder_sizes(); }
                 if wp.0 == TIMER_FOLDER_SIZES{self.poll_folder_sizes_inner();}

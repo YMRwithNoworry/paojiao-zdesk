@@ -32,12 +32,12 @@ pub fn os_build() -> u32 {
     })
 }
 
-/// Explorer on Windows 10 supplies the folder groups and status bar inside its frame.
+/// Explorer on Windows 10 groups the user's known folders above its drives.
 pub const fn windows10_shell(build: u32) -> bool { build >= 10240 && build < 22000 }
 
 #[cfg(test)]
 #[test]
-fn windows10_shell_has_distinct_frame_ownership() {
+fn windows10_shell_uses_native_folder_groups() {
     for build in [10240, 18362, 19045] { assert!(windows10_shell(build)); }
     for build in [0, 22000, 26100] { assert!(!windows10_shell(build)); }
 }

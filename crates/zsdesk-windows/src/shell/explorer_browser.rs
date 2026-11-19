@@ -130,6 +130,8 @@ pub struct ExplorerBrowserHost {
     search_materializing_until: Cell<Option<std::time::Instant>>,
     search_metrics:Cell<SearchMaterializationMetrics>,
     bounds:Cell<RECT>,
+    clipped_footer:Cell<i32>,
+    footer_layout:Cell<Option<(u64,u32,RECT)>>,
 }
 
 impl ExplorerBrowserHost {
@@ -217,8 +219,8 @@ impl ExplorerBrowserHost {
 
         let existing_containers=browser_containers(parent);
         unsafe {
-            // Keep the native browser frame responsible for view activation
-            // and OLE drop routing. Pane visibility hides the duplicate chrome.
+            // Keep Explorer's frame for OLE drop routing and optional panes.
+            // resize() fits its file list to the viewport above ZSDesk's footer.
             browser.SetOptions(EBO_SHOWFRAMES | EBO_ALWAYSNAVIGATE | EBO_NOBORDER)?;
             browser.Initialize(parent, &rect, None)?;
         }
@@ -269,6 +271,8 @@ impl ExplorerBrowserHost {
             search_materializing_until: Cell::new(None),
             search_metrics:Cell::new(SearchMaterializationMetrics::default()),
             bounds:Cell::new(rect),
+            clipped_footer:Cell::new(0),
+            footer_layout:Cell::new(None),
         };
         host.prepare_container_theme();Ok(host)
     }
@@ -571,10 +575,53 @@ impl ExplorerBrowserHost {
     ///
     /// Must be called on the STA/UI thread that created this host.
     pub unsafe fn resize(&self, rect: RECT) {
-        // IExplorerBrowser may invalidate its child view even for the same
-        // rectangle. Preserve native scrolling when chrome layout is unchanged.
-        if self.bounds.get()!=rect && unsafe { self.browser.SetRect(None, rect) }.is_ok() {
-            self.bounds.set(rect);
+        use windows::Win32::{Graphics::Gdi::{CreateRectRgn, DeleteObject, SetWindowRgn}, UI::{HiDpi::GetDpiForWindow, WindowsAndMessaging::{GetWindowRect, IsChild}}};
+        let dpi = unsafe { GetDpiForWindow(HWND(self.owner as *mut _)) }.max(96);
+        let stamp = (self.theme_generation.get(), dpi, rect);
+        if self.footer_layout.get() == Some(stamp) { return; }
+        let previous = self.clipped_footer.get();
+        let mut footer = 0;
+        if let (Some(frame), Some(view)) = (self.theme_container, self.view_window()) {
+            let (mut outer, mut content) = (RECT::default(), RECT::default());
+            if unsafe { IsChild(frame, view) }.as_bool() && unsafe { GetWindowRect(frame, &mut outer) }.is_ok()
+                && unsafe { GetWindowRect(view, &mut content) }.is_ok() && content.bottom > content.top {
+                let gap = outer.bottom - content.bottom;
+                // Current Explorer frames reserve one status row below DefView.
+                // Never clip a full bottom details pane or an unlaid-out view.
+                let panes = self.panes.get();
+                let side_by_side = content.right < outer.right - 48*dpi as i32/96;
+                if gap > 0 && ((!panes.preview && !panes.details) || side_by_side ||
+                    (12*dpi as i32/96..=48*dpi as i32/96).contains(&gap)) { footer = gap; }
+            }
+        }
+        if self.bounds.get() == rect && previous == footer {
+            if footer > 0 && !self.navigation_pending.get() { self.footer_layout.set(Some(stamp)); }
+            return;
+        }
+        let mut native = rect;
+        if let Some(frame) = self.theme_container {
+            if footer > 0 {
+                let region = unsafe { CreateRectRgn(0, 0, (rect.right-rect.left).max(0), (rect.bottom-rect.top).max(0)) };
+                if region.is_invalid() { return; }
+                if unsafe { SetWindowRgn(frame, Some(region), false) } == 0 {
+                    let _ = unsafe { DeleteObject(region.into()) }; return;
+                }
+                native.bottom = native.bottom.saturating_add(footer);
+            } else if previous > 0 {
+                unsafe { SetWindowRgn(frame, None, false) };
+            }
+        }
+        if unsafe { self.browser.SetRect(None, native) }.is_ok() {
+            self.bounds.set(rect); self.clipped_footer.set(footer);
+            if footer > 0 && !self.navigation_pending.get() { self.footer_layout.set(Some(stamp)); }
+        }
+    }
+
+    /// A newly navigated frame may lay out its status strip after the host's
+    /// initial resize. Recheck on the ordinary status tick until it has settled.
+    pub fn settle_frame_layout(&self) {
+        if !self.navigation_pending.get() && !self.destroyed.get() {
+            unsafe { self.resize(self.bounds.get()) };
         }
     }
 
@@ -783,9 +830,7 @@ impl IExplorerPaneVisibility_Impl for BrowserSite_Impl {
         let panes = self.panes.get();
         let on = (EPS_DEFAULT_ON.0 | EPS_FORCE.0) as u32;
         let off = (EPS_DEFAULT_OFF.0 | EPS_FORCE.0) as u32;
-        if pane == EP_StatusBar {
-            return Ok(if crate::theme::windows10_shell(crate::theme::os_build()) { on } else { off });
-        }
+        if pane == EP_StatusBar { return Ok(off); }
         if pane == EP_PreviewPane { Ok(if panes.preview { on } else { off }) }
         else if pane == EP_DetailsPane { Ok(if panes.details { on } else { off }) }
         else if [EP_NavPane, EP_Commands, EP_Ribbon].contains(&pane) { Ok(off) }

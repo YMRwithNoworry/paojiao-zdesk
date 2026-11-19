@@ -13,6 +13,131 @@ struct Apartment;impl Drop for Apartment{fn drop(&mut self){unsafe{OleUninitiali
 struct Runner{hwnd:HWND,slot:Box<Slot>}
 
 #[test]
+#[ignore="Exercises a real Shell listing and inline editor on an unswitched private desktop"]
+fn large_folder_rename_reveals_sorted_file_and_directory() -> Result<()> {
+    use windows::{core::Interface, Win32::UI::Shell::{IFolderView2, IShellItem, SIGDN_FILESYSPATH}};
+    let out = PathBuf::from(std::env::var_os("ZSDESK_NATIVE_TEST_OUTPUT").context("test output")?);
+    let root = out.join(format!("sorted-reveal-{}", std::process::id()));
+    let name = wide(&format!("ZSDesk.SortedReveal.{}", std::process::id()));
+    let desktop = unsafe { CreateDesktopW(name.as_ptr(), std::ptr::null(), std::ptr::null(), 0, 0x000f00ff, std::ptr::null()) };
+    ensure!(!desktop.is_null(), "create isolated test desktop");
+    let raw = desktop as usize;
+    let run = thread::spawn(move || -> Result<()> {
+        ensure!(unsafe { SetThreadDesktop(raw as *mut c_void) } != 0, "attach isolated test desktop");
+        unsafe { OleInitialize(None) }?; let _com = Apartment;
+        let folder = root.join("listing"); fs::create_dir_all(&folder)?;
+        for name in ["M-00000.txt","M-00001.txt","M-00002.txt"] { fs::write(folder.join(name), b"")?; }
+        let runner = create(&root, &folder, true)?;
+        for i in 3..1200 { fs::write(folder.join(format!("M-{i:05}.txt")), b"")?; }
+        let shell = unsafe { runner.slot.borrow().as_ref().unwrap().browser.as_ref().unwrap().current_view()? };
+        unsafe { shell.Refresh()?; }
+        let view: IFolderView2 = shell.cast()?;
+        let ready = Instant::now()+Duration::from_secs(30);
+        while runner.slot.borrow().as_ref().unwrap().browser.as_ref().unwrap().status().items != 1200 {
+            ensure!(Instant::now()<ready,"large folder did not finish enumerating"); pump(50);
+        }
+        for (old, new, is_folder, expected_index) in [("new-folder","000-folder",true,0),("new-file.txt","L-first-file.txt",false,1)] {
+            let original = folder.join(old);
+            eprintln!("large-list test: creating {old}");
+            if is_folder { fs::create_dir(&original)?; } else { fs::write(&original,b"")?; }
+            use windows::Win32::UI::Shell::{SHChangeNotify,SHCNE_MKDIR,SHCNE_CREATE,SHCNF_PATHW,SHCNF_FLUSHNOWAIT};
+            let native_path=wide(original.as_os_str().to_string_lossy().as_ref());
+            unsafe {SHChangeNotify(if is_folder{SHCNE_MKDIR}else{SHCNE_CREATE}, SHCNF_PATHW|SHCNF_FLUSHNOWAIT, Some(native_path.as_ptr().cast()), None);}
+            runner.slot.borrow_mut().as_mut().unwrap().select_created_item(original.clone(),true);
+            let deadline = Instant::now()+Duration::from_secs(15);
+            let edit = loop {
+                pump(35);
+                let focus = unsafe { GetFocus() };
+                let slot = runner.slot.borrow();
+                let state = slot.as_ref().unwrap();
+                if text_input_window(focus) && unsafe { IsChild(state.view_hwnd,focus) }.as_bool() &&
+                    state.browser.as_ref().unwrap().selection_paths() == [original.to_string_lossy().to_string()] { break focus; }
+                if Instant::now()>=deadline {
+                    anyhow::bail!("new item did not start editing: {old}, selection={:?}, count={}, focus={focus:?}, view={:?}, deferred={}",
+                        state.browser.as_ref().unwrap().selection_paths_limit(2),state.browser.as_ref().unwrap().status().items,
+                        state.view_hwnd,state.deferred_selection.is_some());
+                }
+            };
+            // Simulate only the scoped editor; the desktop is never switched or activated.
+            runner.slot.borrow_mut().as_mut().unwrap().observe_rename_input(edit,edit,WM_KEYDOWN);
+            ensure!(runner.slot.borrow().as_ref().unwrap().rename_follow.is_some(),"edit identity was not captured");
+            eprintln!("large-list test: committing {old} -> {new}");
+            unsafe {
+                let mut existing=[0u16;260];
+                let len=GetWindowTextW(edit,&mut existing) as usize;
+                let name=if !is_folder && !String::from_utf16_lossy(&existing[..len]).ends_with(".txt") {new.trim_end_matches(".txt")} else {new};
+                SetWindowTextW(edit, PCWSTR(wide(name).as_ptr()))?;
+                SendMessageW(edit,WM_KEYDOWN,Some(WPARAM(VK_RETURN.0 as usize)),Some(LPARAM(1)));
+                SendMessageW(edit,WM_KEYUP,Some(WPARAM(VK_RETURN.0 as usize)),Some(LPARAM(1)));
+            }
+            let deadline=Instant::now()+Duration::from_secs(15);
+            loop {
+                pump(60);
+                let focused=unsafe { view.GetFocusedItem() }.unwrap_or(-1);
+                let first=unsafe { view.GetVisibleItem(-1,false) }.unwrap_or(-1);
+                let item=unsafe { view.GetItem::<IShellItem>(expected_index) }.ok().and_then(|item| unsafe { item.GetDisplayName(SIGDN_FILESYSPATH) }.ok());
+                let exact=item.is_some_and(|text| {
+                    let name=unsafe {text.to_string()}.ok();
+                    unsafe {windows::Win32::System::Com::CoTaskMemFree(Some(text.0.cast()))};
+                    name.as_deref().is_some_and(|p| Path::new(p)==folder.join(new))
+                });
+                if exact && focused==expected_index && first>=0 && (first..first+32).contains(&focused) && folder.join(new).exists() {
+                    eprintln!("large-list test: {new} sorted={focused}, first-visible={first}");break;
+                }
+                if Instant::now()>=deadline { eprintln!("large-list failure: {new} focused={focused} first={first} expected={expected_index} exact={exact}"); }
+                ensure!(Instant::now()<deadline,"renamed item not at sorted visible position: {new}, focused={focused}, first={first}, expected={expected_index}, exact={exact}");
+            }
+            // Wait for DefView's refresh and the bounded post-sort follow to finish
+            // before starting a second, independent edit in this same fixture.
+            pump(900);
+        }
+        drop(view);drop(shell);
+        for details in [false, true] {
+            runner.slot.borrow_mut().as_mut().unwrap().set_panes(false,details);
+            let deadline = Instant::now()+Duration::from_secs(15);
+            loop {
+                pump(80);
+                let slot=runner.slot.borrow();let state=slot.as_ref().unwrap();
+                let outer=state.layout.status;
+                ensure!(!outer.is_empty() && !state.layout.status_dual_pane.is_empty() &&
+                        !state.layout.status_details.is_empty() && !state.layout.status_tiles.is_empty(),
+                        "the ZSDesk outer status bar or its buttons disappeared");
+                for (rect,action) in [(state.layout.status_dual_pane,Hit::StatusDualPane),
+                    (state.layout.status_details,Hit::StatusDetails),(state.layout.status_tiles,Hit::StatusTiles)] {
+                    ensure!(state.layout.hit(rect.x+rect.width/2,rect.y+rect.height/2)==action,"outer footer button lost its hit target");
+                }
+                let expected=state.layout.browser.bottom();
+                let mut bottom=0;
+                let mut view_width=0;
+                if let Some(view)=state.browser.as_ref().and_then(|b| b.view_window()){
+                    let mut r=RECT::default();unsafe{GetWindowRect(view,&mut r)}?;
+                    view_width=r.right-r.left;let mut p=POINT{x:r.left,y:r.bottom};let _=unsafe{ScreenToClient(runner.hwnd,&mut p)};bottom=p.y;
+                }
+                let details_present=!details || (view_width>0 && view_width<state.layout.browser.width-50);
+                if state.pending.is_none() && (bottom-expected).abs()<=1 && details_present {
+                    eprintln!("outer ZSDesk footer: details={details}, file-list bottom={bottom}, footer top={}, three original controls present",outer.y);
+                    break;
+                }
+                ensure!(Instant::now()<deadline,"native file list does not reach the outer bar: details={details}, bottom={bottom}, expected={expected}, width={view_width}");
+            }
+            if !details {
+                #[link(name="user32")] unsafe extern "system" {fn PrintWindow(window: HWND, dc: windows::Win32::Graphics::Gdi::HDC, flags:u32)->i32;}
+                let mut rect=RECT::default();unsafe{GetWindowRect(runner.hwnd,&mut rect)}?;
+                let (width,height)=(rect.right-rect.left,rect.bottom-rect.top);
+                let surface=Surface::new(width,height).context("capture private test window")?;
+                ensure!(unsafe{PrintWindow(runner.hwnd,surface.dc,2)}!=0,"capture private status bar");
+                let pixels=unsafe{std::slice::from_raw_parts(surface.bits,(4*width*height) as usize)};
+                fs::write(root.join("outer-status.bgra"),pixels)?;
+                fs::write(root.join("outer-status.json"),format!("[{width},{height}]"))?;
+            }
+        }
+        Ok(())
+    }).join();
+    ensure!(unsafe {CloseDesktop(desktop)}!=0,"close isolated test desktop");
+    run.map_err(|_|anyhow::anyhow!("isolated rename test panicked"))?
+}
+
+#[test]
 #[ignore="Exercises tab menus and empty-strip closure on an unswitched private desktop"]
 fn tab_menu_and_empty_strip_have_distinct_right_clicks()->Result<()>{
     use zsdesk_core::model::explorer::TabPlacement;
