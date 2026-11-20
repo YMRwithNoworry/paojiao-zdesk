@@ -211,8 +211,8 @@ mod tests {
             let offered = data.GetView()?.GetStorageItemsAsync()?.join()?;
             assert_eq!(offered.Size()?, 1);
             assert_eq!(
-                PathBuf::from(offered.GetAt(0)?.Path()?.to_os_string()),
-                path
+                std::fs::canonicalize(offered.GetAt(0)?.Path()?.to_os_string())?,
+                std::fs::canonicalize(&path)?
             );
             Ok(())
         })

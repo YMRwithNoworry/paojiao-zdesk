@@ -1350,7 +1350,9 @@ mod file_command_tests {
         let called=Rc::new(RefCell::new(Vec::new()));
         compact.open_with_apps.borrow_mut().insert(command,Recorder(called.clone()).into());
         shell.invoke(HWND::default(),command,None,false,false).context("dispatch selected application")?;
-        assert_eq!(*called.borrow(),[path]);
+        let received=called.borrow();
+        assert_eq!(received.len(),1);
+        assert_eq!(std::fs::canonicalize(&received[0])?,std::fs::canonicalize(&path)?);
         Ok(())
     }
 }
