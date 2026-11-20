@@ -11,6 +11,26 @@ pub(super) struct IconEntry { wic: Option<IWICBitmapSource>, bitmap: Option<(u64
 pub(super) fn c(color: zsdesk_ui::theme::Color) -> Color { Color::rgba8(color.r, color.g, color.b, color.a) }
 fn rf(r: LayoutRect) -> RectF { RectF::new(r.x as f32, r.y as f32, r.width as f32, r.height as f32) }
 
+fn paint_chrome_layer(cv: &Canvas, rect: LayoutRect, layer: Color, translucent: bool) {
+    let rect = rf(rect);
+    if translucent {
+        cv.clear_rect(rect);
+        cv.fill(rect, layer.with_alpha(0.18));
+    } else {
+        cv.fill(rect, layer);
+    }
+}
+
+// A paint band can contain only the command row, below all navigation controls.
+fn paint_navigation_band(cv: &Canvas, layout: &ChromeLayout, top: i32, bottom: i32, layer: Color, translucent: bool) {
+    let row = layout.nav_row;
+    let start = row.y.max(top);
+    let end = layout.top.min(bottom);
+    if start < end {
+        paint_chrome_layer(cv, LayoutRect::new(row.x, start, row.width, end - start), layer, translucent);
+    }
+}
+
 pub(super) const UI_TEXT: f32 = 12.0;
 const ICON_DIP: i32 = 16;
 
@@ -82,6 +102,7 @@ impl WindowState {
                 let l=&self.layout;
                 let result=gfx.draw_band(surface,top,|cv|{
                     if touches(l.strip)||touches(l.tab_panel)||touches(l.tab_splitter){self.paint_strip(cv,&tab_icons);}
+                    paint_navigation_band(cv, l, top, top + band_height, c(self.palette.layer), crate::edition::THEMED && self.mica);
                     if touches(l.nav_row){self.paint_nav(cv,address_icon.as_ref());}
                     if touches(l.command_row)||touches(l.command_toggle){self.paint_commands(cv);}
                     if touches(l.search_panel.card){self.paint_search_panel(cv);}
@@ -104,13 +125,6 @@ impl WindowState {
         let p = &self.palette;
         if self.pressed == Some(hit) && self.hover == hit { cv.round(rf(rect), radius, c(p.pressed)); }
         else if self.hover == hit { cv.round(rf(rect), radius, c(p.hover)); }
-    }
-
-    fn paint_chrome_layer(&self, cv: &Canvas, rect: RectF) {
-        if crate::edition::THEMED && self.mica {
-            cv.clear_rect(rect);
-            cv.fill(rect, c(self.palette.layer).with_alpha(0.18));
-        } else { cv.fill(rect, c(self.palette.layer)); }
     }
 
     fn paint_strip(&self, cv: &Canvas, icons: &[Option<ID2D1Bitmap>]) {
@@ -221,7 +235,6 @@ impl WindowState {
     fn paint_nav(&self, cv: &Canvas, address_icon: Option<&ID2D1Bitmap>) {
         let p = &self.palette;
         let l = &self.layout;
-        self.paint_chrome_layer(cv, rf(LayoutRect::new(l.nav_row.x, l.nav_row.y, l.nav_row.width, l.top - l.nav_row.y)));
         let tab = self.session.active_tab();
         let busy = self.pending.is_some();
         let buttons = [
@@ -343,7 +356,7 @@ impl WindowState {
         let p = &self.palette;
         let l = &self.layout;
         if l.bookmarks_row.is_empty() { return; }
-        self.paint_chrome_layer(cv, rf(l.bookmarks_row));
+        paint_chrome_layer(cv, l.bookmarks_row, c(self.palette.layer), crate::edition::THEMED && self.mica);
         if l.bookmarks_vertical{
             let r=l.bookmarks_row;cv.line(r.x as f32,r.y as f32,r.x as f32,r.bottom()as f32,c(p.divider),1.0);
             cv.text(zsdesk_core::i18n::text("收藏夹"),rf(l.bookmarks_title),&self.ui_style(),c(p.text_secondary));

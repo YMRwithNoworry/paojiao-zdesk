@@ -221,6 +221,7 @@ fn tab_settings(ui: &ExplorerUi) -> MenuItemSpec {
         entry(zsdesk_core::i18n::text("恢复侧边标签宽度"), "side-tabs-width-reset", ui.tab_placement != TabPlacement::Top, false),
         MenuItemSpec::Separator,
         entry(zsdesk_core::i18n::text("双击关闭标签页"), "double-click-close-tab", true, ui.double_click_close_tab),
+        entry(zsdesk_core::i18n::text("右键直接关闭标签页"), "right-click-close-tab", true, ui.right_click_close_tab),
         submenu(zsdesk_core::i18n::text("新标签页打开位置"),vec![
             entry(zsdesk_core::i18n::text("此电脑"),"new-tab-this-pc",true,matches!(ui.new_tab_location,zsdesk_core::model::explorer::NewTabLocation::ThisPc)),
             entry(zsdesk_core::i18n::text("当前文件夹"),"new-tab-current",true,matches!(ui.new_tab_location,zsdesk_core::model::explorer::NewTabLocation::CurrentFolder)),
@@ -314,6 +315,7 @@ pub fn apply_interface_setting(ui: &mut ExplorerUi, choice: &str) -> bool {
         "bookmarks-placement-right"=>ui.bookmarks_on_right=true,
         "dual-pane" => ui.dual_pane = !ui.dual_pane,
         "double-click-close-tab" => ui.double_click_close_tab = !ui.double_click_close_tab,
+        "right-click-close-tab" => ui.right_click_close_tab = !ui.right_click_close_tab,
         "double-click-blank-up"=>ui.double_click_blank_up=!ui.double_click_blank_up,
         "close-window-last-tab"=>ui.close_window_on_last_tab=!ui.close_window_on_last_tab,
         "show-tab-count"|"show-tab-list"=>{let visible=!ui.tab_count_button_visible();ui.show_tab_count=visible;ui.show_tab_list=visible;},
@@ -663,6 +665,17 @@ mod tests {
         assert!(nested_ids(&interface_settings_menu(&ui)).contains(&"tab-selection-emphasis".to_owned()));
         assert!(apply_interface_setting(&mut ui,"tab-selection-emphasis"));assert!(ui.tab_selection_emphasis);
         assert!(apply_interface_setting(&mut ui,"tab-selection-emphasis"));assert_eq!(ui,original);
+    }
+    #[test]
+    fn right_click_close_is_an_opt_in_tab_setting() {
+        let mut ui = ExplorerUi::default();
+        let original = ui.clone();
+        assert!(!ui.right_click_close_tab);
+        assert!(nested_ids(&menu(vec![tab_settings(&ui)])).contains(&"right-click-close-tab".to_owned()));
+        assert!(apply_interface_setting(&mut ui, "right-click-close-tab"));
+        assert!(ui.right_click_close_tab);
+        assert!(apply_interface_setting(&mut ui, "right-click-close-tab"));
+        assert_eq!(ui, original);
     }
     #[test]
     fn preview_sources_are_explicit_and_default_to_builtin(){

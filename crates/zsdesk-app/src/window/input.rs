@@ -3,7 +3,27 @@ use zsdesk_ui::{chrome::{CommandId, SearchPanelHit}, menus::{self, MenuItemSpec,
 use zsdesk_windows::shell::commands::{folder_settings, set_folder_settings, Column};
 
 #[derive(Clone,Copy,PartialEq,Eq)]
-pub(super) enum TabRightAction { Menu(u64), Close(u64) }
+pub(super) enum TabRightAction { Menu(u64), Close(u64), CloseFromEmptyStrip(u64) }
+
+impl TabRightAction {
+    fn on_tab(id: u64, direct_close: bool, locked: bool, shift: bool) -> Self {
+        if direct_close && !locked && !shift { Self::Close(id) } else { Self::Menu(id) }
+    }
+}
+
+#[cfg(test)]
+mod right_click_tests {
+    use super::TabRightAction;
+    #[test]
+    fn direct_close_respects_tab_identity_locks_and_menu_override() {
+        use TabRightAction::*;
+        assert!(TabRightAction::on_tab(7, false, false, false) == Menu(7));
+        assert!(TabRightAction::on_tab(7, true, false, false) == Close(7));
+        assert!(TabRightAction::on_tab(7, true, true, false) == Menu(7));
+        assert!(TabRightAction::on_tab(7, true, false, true) == Menu(7));
+        assert!(Close(7) != CloseFromEmptyStrip(7));
+    }
+}
 
 impl WindowState {
     unsafe fn new_default_tab(&mut self){
@@ -358,8 +378,11 @@ impl WindowState {
 
     pub(super) fn tab_strip_right_button(&mut self,p:POINT,down:bool)->bool {
         let tab=match self.layout.tab_strip_right_hit(p.x,p.y,screen_edge_window(self.hwnd)){
-            Some(Hit::Tab(i))=>self.session.tabs.get(i).map(|tab|(i,TabRightAction::Menu(tab.id))),
-            Some(Hit::Caption)=>self.session.tabs.get(self.session.active_tab).map(|tab|(self.session.active_tab,TabRightAction::Close(tab.id))),
+            Some(Hit::Tab(i))=>self.session.tabs.get(i).map(|tab| {
+                let shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
+                (i, TabRightAction::on_tab(tab.id, self.session.ui.right_click_close_tab, tab.locked, shift))
+            }),
+            Some(Hit::Caption)=>self.session.tabs.get(self.session.active_tab).map(|tab|(self.session.active_tab,TabRightAction::CloseFromEmptyStrip(tab.id))),
             _=>None,
         };
         if down{
@@ -373,7 +396,7 @@ impl WindowState {
             if pressed==action && (start.x-p.x).abs()<dx && (start.y-p.y).abs()<dy {
                 match action{
                     TabRightAction::Menu(_)=>unsafe{self.tab_menu(index)},
-                    TabRightAction::Close(_)=>unsafe{self.close_tab(index)},
+                    TabRightAction::Close(_) | TabRightAction::CloseFromEmptyStrip(_)=>unsafe{self.close_tab(index)},
                 }
             }
         }
@@ -713,7 +736,7 @@ impl WindowState {
 
     unsafe fn app_menu(&mut self) {
         self.sync_search_preferences();
-        if let Ok(saved)=storage::load(&self.config_path){self.session.ui.tab_selection_emphasis=saved.ui.tab_selection_emphasis;self.session.ui.startup_location=saved.ui.startup_location;
+        if let Ok(saved)=storage::load(&self.config_path){self.session.ui.tab_selection_emphasis=saved.ui.tab_selection_emphasis;self.session.ui.right_click_close_tab=saved.ui.right_click_close_tab;self.session.ui.startup_location=saved.ui.startup_location;
             self.session.ui.context_menu=saved.ui.context_menu;crate::context_preferences::publish(&self.config_path,&self.session.ui.context_menu);}
         let anchor = Some(self.layout.app_menu);
         let spec=self.app_menu_spec();let hwnd=self.hwnd;
@@ -831,23 +854,24 @@ impl WindowState {
     }
 
     /// Applies an interface preference chosen in ≡ and refreshes what it affects.
-    fn publish_tab_emphasis(&self){
+    fn publish_tab_preferences(&self){
         struct Target{pid:u32,key:Vec<u16>}
         unsafe extern "system" fn each(window:HWND,parameter:LPARAM)->windows::core::BOOL{
             let target=unsafe{&*(parameter.0 as*const Target)};let mut pid=0;
             unsafe{GetWindowThreadProcessId(window,Some(&mut pid));}
             if pid==target.pid&&unsafe{GetPropW(window,PCWSTR(target.key.as_ptr()))}.0 as usize==1{
-                let _=unsafe{PostMessageW(Some(window),WM_TAB_EMPHASIS_CHANGED,WPARAM(0),LPARAM(0))};
+                let _=unsafe{PostMessageW(Some(window),WM_TAB_PREFERENCES_CHANGED,WPARAM(0),LPARAM(0))};
             }true.into()
         }
         let target=Target{pid:std::process::id(),key:crate::instance::property(&self.config_path)};
         let _=unsafe{EnumWindows(Some(each),LPARAM(&target as*const Target as isize))};
     }
     pub(super) fn apply_interface_choice(&mut self, id: &str) {
-        if id=="tab-selection-emphasis"{
-            let current=storage::load(&self.config_path).map(|saved|saved.ui.tab_selection_emphasis).unwrap_or(self.session.ui.tab_selection_emphasis);
-            match storage::save_tab_selection_emphasis(&self.config_path,!current){
-                Ok(())=>{self.session.ui.tab_selection_emphasis=!current;self.invalidate();self.publish_tab_emphasis();},
+        if matches!(id, "tab-selection-emphasis" | "right-click-close-tab") {
+            let field: fn(&mut zsdesk_core::model::explorer::ExplorerUi) -> &mut bool =
+                if id == "right-click-close-tab" { |ui| &mut ui.right_click_close_tab } else { |ui| &mut ui.tab_selection_emphasis };
+            match storage::toggle_tab_preference(&self.config_path, field) {
+                Ok(enabled) => { *field(&mut self.session.ui) = enabled; self.invalidate(); self.publish_tab_preferences(); },
                 Err(error)=>self.show_message(zsdesk_core::tr_format!("无法保存标签显示设置：{error:#}", error=error)),
             }return;
         }
@@ -996,7 +1020,7 @@ impl WindowState {
 
 }
 
-pub(super) const SHORTCUTS: &str = "文件管理器\nCtrl+T 新建标签　Ctrl+W / Ctrl+F4 关闭标签　Ctrl+Shift+T 恢复标签\nCtrl+Tab / Ctrl+Shift+Tab 切换标签　Ctrl+1…9 第 N 个标签\nAlt+← / Backspace 后退　Alt+→ 前进　Alt+↑ 上一级　F5 刷新\nCtrl+L / Alt+D / F4 地址栏　Ctrl+F / Ctrl+E / F3 搜索（输入即搜）\nCtrl+Shift+N 新建文件夹　Ctrl+Shift+C 复制路径　Ctrl+D 收藏\nAlt+P 预览窗格　Alt+Shift+P 详细信息窗格　Ctrl+F1 展开/收起命令栏\nF2 重命名　Del 删除　Shift+Del 永久删除　Alt+Enter 属性　Ctrl+A 全选\n右键标签打开菜单，右键标签栏空白处关闭当前标签\n标签中键关闭，拖动排序；收藏中键在新标签打开\n\n桌面格子\n鼠标悬停 展开折叠的格子　双击标题 折叠/展开　拖动标题 移动　拖动边缘 调整大小\nEnter 打开　F2 重命名　Del 删除　Ctrl+A / C / X / V 全选/复制/剪切/粘贴\n方向键 选择　Backspace 返回上一级（文件夹格子）　F5 刷新\n双击桌面空白处 隐藏/显示全部格子";
+pub(super) const SHORTCUTS: &str = "文件管理器\nCtrl+T 新建标签　Ctrl+W / Ctrl+F4 关闭标签　Ctrl+Shift+T 恢复标签\nCtrl+Tab / Ctrl+Shift+Tab 切换标签　Ctrl+1…9 第 N 个标签\nAlt+← / Backspace 后退　Alt+→ 前进　Alt+↑ 上一级　F5 刷新\nCtrl+L / Alt+D / F4 地址栏　Ctrl+F / Ctrl+E / F3 搜索（输入即搜）\nCtrl+Shift+N 新建文件夹　Ctrl+Shift+C 复制路径　Ctrl+D 收藏\nAlt+P 预览窗格　Alt+Shift+P 详细信息窗格　Ctrl+F1 展开/收起命令栏\nF2 重命名　Del 删除　Shift+Del 永久删除　Alt+Enter 属性　Ctrl+A 全选\n右键标签打开菜单；启用右键关闭后，Shift+右键打开菜单。右键标签栏空白处关闭当前标签\n标签中键关闭，拖动排序；收藏中键在新标签打开\n\n桌面格子\n鼠标悬停 展开折叠的格子　双击标题 折叠/展开　拖动标题 移动　拖动边缘 调整大小\nEnter 打开　F2 重命名　Del 删除　Ctrl+A / C / X / V 全选/复制/剪切/粘贴\n方向键 选择　Backspace 返回上一级（文件夹格子）　F5 刷新\n双击桌面空白处 隐藏/显示全部格子";
 
 fn desktop_host_running() -> bool {
     unsafe { FindWindowW(windows::core::w!("ZSDesk.Native.DesktopHost"), PCWSTR::null()) }.is_ok_and(|h| !h.0.is_null())

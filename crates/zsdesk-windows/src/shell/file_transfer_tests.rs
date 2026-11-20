@@ -469,3 +469,13 @@ fn ordinary_fence_copy_and_move_preserve_the_expected_source() -> anyhow::Result
     assert!(same_cut_selection(&[a.clone(),b.clone()],&[b.clone(),a.clone()]));
     assert!(!same_cut_selection(&[a.clone(),b.clone()],&[a.clone(),a]));
 }
+
+#[test]
+fn native_cut_keeps_ownership_and_only_unsupported_untouched_views_fall_back() {
+    use windows::Win32::Foundation::{E_NOTIMPL, E_ACCESSDENIED};
+    assert!(!needs_legacy_cut(Ok(()), 10, 10).unwrap());
+    assert!(!needs_legacy_cut(Ok(()), 10, 11).unwrap());
+    assert!(needs_legacy_cut(Err(Error::from_hresult(E_NOTIMPL)), 10, 10).unwrap());
+    assert!(needs_legacy_cut(Err(Error::from_hresult(E_NOTIMPL)), 10, 11).is_err());
+    assert!(needs_legacy_cut(Err(Error::from_hresult(E_ACCESSDENIED)), 10, 10).is_err());
+}

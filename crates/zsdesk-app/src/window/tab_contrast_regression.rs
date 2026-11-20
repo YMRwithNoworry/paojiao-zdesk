@@ -47,6 +47,41 @@ fn render_tabs(gfx:&Gfx,palette:Palette,focused:bool,emphasis:bool,vertical:bool
 fn pixels(surface:&Surface)->&[u8]{unsafe{std::slice::from_raw_parts(surface.bits,(surface.width*surface.height*4)as usize)}}
 
 #[test]
+fn command_row_background_survives_separate_paint_bands() -> Result<()> {
+    unsafe { OleInitialize(None) }?;
+    struct Apartment;
+    impl Drop for Apartment { fn drop(&mut self) { unsafe { OleUninitialize() }; } }
+    let _apartment = Apartment;
+    let gfx = Gfx::new("Segoe UI")?;
+    for dpi in [96, 120, 144, 192] {
+        let scale = |v| v * dpi / 96;
+        let layout = ChromeLayout {
+            nav_row: LayoutRect::new(8, scale(40), 96, scale(48)),
+            top: scale(176),
+            ..Default::default()
+        };
+        for palette in [Palette::light(), Palette::dark()] {
+            for translucent in [false, true] {
+                let reference = Surface::new(112, layout.top).context("reference surface")?;
+                let band = Surface::new(112, 96).context("band surface")?;
+                let draw = |cv: &Canvas, top, bottom| paint_navigation_band(cv, &layout, top, bottom, c(palette.layer), translucent);
+                gfx.draw(&reference, |cv| draw(cv, 0, layout.top))?;
+                for top in (0..layout.top).step_by(96) {
+                    gfx.draw_band(&band, top, |cv| draw(cv, top, top + 96))?;
+                    for y in top.max(layout.nav_row.bottom())..layout.top.min(top + 96) {
+                        let sample = pixel(&band, 16, y - top);
+                        assert_eq!(sample, pixel(&reference, 16, y));
+                        if translucent { assert!(sample[3] > 0); } else { assert!(close(sample, palette.layer)); }
+                        assert_eq!(pixel(&band, 0, y - top), [0; 4]);
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn opt_in_tab_contrast_keeps_legacy_pixels_and_never_adds_an_accent_marker()->Result<()>{
     unsafe{OleInitialize(None)}?;
     struct Apartment;impl Drop for Apartment{fn drop(&mut self){unsafe{OleUninitialize();}}}let _apartment=Apartment;

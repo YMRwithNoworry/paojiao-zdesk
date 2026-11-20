@@ -103,7 +103,7 @@ const TIMER_PLACEMENT:usize=9;
 const TIMER_FOLDER_SIZES:usize=10;
 const WM_FAST_SEARCH:u32=WM_APP+43;
 const WM_DIAGNOSTIC:u32=WM_APP+44;
-pub(super) const WM_TAB_EMPHASIS_CHANGED:u32=WM_APP+182;
+pub(super) const WM_TAB_PREFERENCES_CHANGED:u32=WM_APP+182;
 type Slot = RefCell<Option<WindowState>>;
 #[derive(Clone,Copy,PartialEq,Eq)]
 enum BrowserRole{Fresh,Ordinary,Results}
@@ -1505,7 +1505,8 @@ impl WindowState {
                 self.crumbs_for=None;self.measure_bookmarks();self.relayout();self.position_children();
                 unsafe{self.update_address();}self.refresh_status();self.invalidate();
             },
-            WM_TAB_EMPHASIS_CHANGED=>if let Ok(saved)=storage::load(&self.config_path){
+            WM_TAB_PREFERENCES_CHANGED=>if let Ok(saved)=storage::load(&self.config_path){
+                self.session.ui.right_click_close_tab = saved.ui.right_click_close_tab;
                 if self.session.ui.tab_selection_emphasis!=saved.ui.tab_selection_emphasis{
                     self.session.ui.tab_selection_emphasis=saved.ui.tab_selection_emphasis;self.invalidate();
                 }

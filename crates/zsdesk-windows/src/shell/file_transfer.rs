@@ -258,27 +258,37 @@ fn same_cut_selection(a:&[PathBuf],b:&[PathBuf])->bool{
 pub fn copy_view(view:&IShellView,owner:HWND,cut:bool)->Result<()>{
     let paths=selected_paths(view)?;if paths.is_empty(){return Ok(());}
     if cut{
-        if let Ok(folder)=view.cast::<IShellFolderView>(){
-            let before=unsafe{GetClipboardSequenceNumber()};
-            let native=unsafe{folder.SetClipboard(true)};
-            let after=unsafe{GetClipboardSequenceNumber()};
-            if after!=before{
-                // A different application may have taken the clipboard while
-                // Shell pumped messages. Never replace its newer selection.
-                if let Ok((published,effect,_))=clipboard_files(){
-                    if move_intent(effect)&&same_cut_selection(&published,&paths){return Ok(());}
-                }
-                if !owned_clipboard_on_current_thread()||unsafe{GetClipboardSequenceNumber()}!=after{
-                    native?;
-                    return Err(invalid(zsdesk_core::i18n::text("剪贴板已改变，请重新剪切")));
-                }
-            }
-            // Some hosted views only mark the selection visually, or return
-            // E_NOTIMPL. Publish the actual paths and explicit MOVE intent.
-            return publish_paths(owner,&paths,true,Some(after));
+        // Let the source view publish its own data object and track its lifetime.
+        // Replacing that object after a successful cut clears Explorer's ghosted icons.
+        let folder_view: IFolderView2 = view.cast()?;
+        let sequence = unsafe { GetClipboardSequenceNumber() };
+        let result = unsafe { folder_view.InvokeVerbOnSelection(windows::core::s!("cut")) };
+        if !needs_legacy_cut(result, sequence, unsafe { GetClipboardSequenceNumber() })? { return Ok(()); }
+        if !same_cut_selection(&selected_paths(view)?, &paths) {
+            return Err(invalid(zsdesk_core::i18n::text("剪贴板已改变，请重新剪切")));
         }
+        let legacy_view = view.cast::<IShellFolderView>().ok();
+        publish_paths(owner, &paths, true, Some(sequence))?;
+        let published = unsafe { GetClipboardSequenceNumber() };
+        if let Some(folder) = legacy_view {
+            // Some views only mark their selection here. Publish the move first,
+            // so a subsequent OleSetClipboard cannot immediately erase that mark.
+            if selected_paths(view).is_ok_and(|current| same_cut_selection(&current, &paths))
+                && owned_clipboard_on_current_thread() && unsafe { GetClipboardSequenceNumber() } == published {
+                let _ = unsafe { folder.SetClipboard(true) };
+            }
+        }
+        return Ok(());
     }
     copy_paths(owner,&paths,cut)
+}
+
+fn needs_legacy_cut(result: Result<()>, before: u32, after: u32) -> Result<bool> {
+    match result {
+        Ok(()) => Ok(false),
+        Err(error) if before == after && matches!(error.code(), windows::Win32::Foundation::E_NOTIMPL | windows::Win32::Foundation::E_NOINTERFACE) => Ok(true),
+        Err(error) => Err(error),
+    }
 }
 pub fn paths_from_pidls(pidls:&[Vec<u8>])->Result<Vec<PathBuf>>{
     if pidls.len()>MAX_ITEMS{return Err(invalid("选择超过 10000 项"));}
