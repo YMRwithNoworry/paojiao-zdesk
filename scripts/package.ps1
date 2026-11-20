@@ -23,6 +23,8 @@ $WorkDir = [IO.Path]::GetFullPath($WorkDir)
 if (-not $TargetDir) { $TargetDir = Join-Path $WorkDir 'target' }
 $TargetDir = [IO.Path]::GetFullPath($TargetDir)
 $version = [regex]::Match((Get-Content -LiteralPath (Join-Path $root 'Cargo.toml') -Raw), '(?m)^version\s*=\s*"([^"]+)"').Groups[1].Value
+$updateFolder=(Get-Content -LiteralPath (Join-Path $root 'packaging\lanzou-folder.txt') -Raw).Trim()
+if ($updateFolder -notmatch '^https://(www\.)?ilanzou\.com/s/[A-Za-z0-9_-]{1,128}$') {throw 'A public ZSDesk update folder is required for packaging'}
 if ($version -notmatch '^\d+\.\d+\.\d+([+-][A-Za-z0-9.-]+)?$') { throw 'Workspace version is invalid' }
 if (-not $OutputDir) { $OutputDir = Join-Path $root "releases\$version" }
 $OutputDir = [IO.Path]::GetFullPath($OutputDir)
@@ -250,6 +252,7 @@ try {
         $searchBackends=@();if(-not $definition.DesktopOnly){$searchBackends=@('native_ntfs','everything')}
         $manifest=[ordered]@{product='ZSDesk';version=$version;edition=$edition;edition_name=$definition.Name;platform='windows-x64';features=$definition.Features;desktop_only=[bool]$definition.DesktopOnly;
             search_engine=$searchEngine;search_default_backend=$defaultSearchBackend;search_backends=@($searchBackends);files=$files}
+        $manifest.update_folder=$updateFolder
         Write-Json (Join-Path $stage 'manifest.json') $manifest
         Assert-Payload $stage $manifest
         $zip=Join-Path $WorkDir "$name.zip"
@@ -271,5 +274,23 @@ try {
         $state.state='verified';$state['ended']=[DateTimeOffset]::Now.ToString('o');$state['output']=$destination;$state['exe_sha256']=$files['ZSDesk.exe'].sha256
         Write-Json (Join-Path $WorkDir 'package-state.current.json') $state
         Write-Output "$name verified"
+    }
+    if ($InnoCompiler) {
+        $assets=@(foreach ($edition in ($definitions.Keys | Sort-Object)) {
+            foreach ($suffix in @('-setup.exe','.zip')) {
+                $name="ZSDesk-$version-$edition-x64$suffix"
+                $path=Join-Path $OutputDir $name
+                if (Test-Path -LiteralPath $path -PathType Leaf) {
+                    [ordered]@{name=$name;size=(Get-Item -LiteralPath $path).Length;sha256=(Get-FileHash -Algorithm SHA256 -LiteralPath $path).Hash.ToLowerInvariant()}
+                }
+            }
+        })
+        if ($assets.Count -eq 2*$definitions.Count) {
+            $encoding=[Text.UTF8Encoding]::new($false)
+            $sums=@($assets|ForEach-Object { "$($_.sha256)  $($_.name)" })
+            [IO.File]::WriteAllLines((Join-Path $OutputDir 'SHA256SUMS.txt'),[string[]]$sums,$encoding)
+            $feed=[ordered]@{format='zsdesk-update-v1';version=$version;files=$assets}
+            [IO.File]::WriteAllText((Join-Path $OutputDir 'zsdesk-update.json'),($feed|ConvertTo-Json -Depth 5),$encoding)
+        }
     }
 } finally { $lock.Dispose() }

@@ -549,6 +549,7 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
 fn point_of(lp: LPARAM) -> POINT { POINT { x: (lp.0 as i16) as i32, y: ((lp.0 >> 16) as i16) as i32 } }
 
 unsafe extern "system" fn fence_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    if msg==WM_NCDESTROY{zsdesk_windows::shell::file_dialogs::release(hwnd);}
     if msg != 0 && msg == zsdesk_windows::shell::menu::failure_message() {
         let text = wide(&zsdesk_core::tr_format!("右键菜单加载失败（0x{:08X}），隐藏设置仍保留。" , wp.0 as u32));
         unsafe { MessageBoxW(Some(hwnd), PCWSTR(text.as_ptr()), windows::core::PCWSTR(zsdesk_core::i18n::wide("ZSDesk 桌面格子").as_ptr()), MB_OK | MB_ICONWARNING); }
@@ -645,7 +646,7 @@ unsafe extern "system" fn fence_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
                 }).flatten();
                 if let Some((pidl,folder,profile))=selected{
                     if let Some(prefs)=crate::context_preferences::current(&profile){
-                        crate::context_menu_process::prewarm::start(hwnd,pidl,folder,false,crate::context_preferences::native(&prefs),None);
+                        crate::context_menu_process::prewarm::start(hwnd,pidl,Some(folder),false,crate::context_preferences::native(&prefs),None);
                     }
                 }
             }
@@ -853,11 +854,19 @@ fn finish_menu_work(){
             let owner=HWND(request.owner as*mut _);
             // Shell commands already ran against their captured PIDLs. Only
             // application actions require the current selection to still match.
-            let actionable=matches!(&outcome,Ok(MenuOutcome::Application(_)|MenuOutcome::Rename|MenuOutcome::Open|MenuOutcome::Explore|MenuOutcome::Copy|MenuOutcome::Cut|MenuOutcome::Paste|MenuOutcome::PinInExplorer|MenuOutcome::Delete{..}));
+            let actionable=matches!(&outcome,Ok(MenuOutcome::Application(_)|MenuOutcome::Rename|MenuOutcome::Open|MenuOutcome::Explore|MenuOutcome::Copy|MenuOutcome::Cut|MenuOutcome::Paste|MenuOutcome::PinInExplorer|MenuOutcome::Share|MenuOutcome::ChooseApplication|MenuOutcome::Delete{..}));
             // A superseded construction can fail after another menu was
             // requested. Its error must not interrupt the newer interaction.
             if outcome.is_err()&&!menu_request_current(request.generation){continue;}
             if actionable&&(!menu_request_current(request.generation)||!menu_target_current(&request)){continue;}
+            if let Ok(action @ (MenuOutcome::Share|MenuOutcome::ChooseApplication))=&outcome{
+                if let menu_worker::Target::Items{pidls,..}=&request.target{
+                    if let Err(error)=zsdesk_windows::shell::file_dialogs::show(owner,*action,pidls){
+                        if !zsdesk_windows::shell::file_transfer::is_cancelled(error.code()){file_action_error(owner,&error);}
+                    }
+                }
+                continue;
+            }
             if matches!(outcome,Ok(MenuOutcome::PinInExplorer)){
                 if let menu_worker::Target::Items{pidls,..}=&request.target{
                     let owner_id=owner.0 as isize;

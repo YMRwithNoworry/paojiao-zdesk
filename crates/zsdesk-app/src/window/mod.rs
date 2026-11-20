@@ -982,7 +982,7 @@ fn native_caption(hwnd:HWND)->bool{
 
 unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     if (msg==WM_ACTIVATE&&(wp.0&0xffff)==0)||(msg==WM_ACTIVATEAPP&&wp.0==0){pane_input::invalidate_blank_clicks(hwnd);}
-    if msg==WM_NCDESTROY{release_window_properties(hwnd);}
+    if msg==WM_NCDESTROY{zsdesk_windows::shell::file_dialogs::release(hwnd);release_window_properties(hwnd);}
     let native_caption = native_caption(hwnd);
     let caption_message = matches!(msg, WM_NCHITTEST | WM_NCMOUSEMOVE | WM_NCMOUSELEAVE | WM_NCLBUTTONDOWN | WM_NCLBUTTONUP | WM_NCLBUTTONDBLCLK);
     let owns_caption_press=!unsafe{GetPropW(hwnd,windows::core::w!("ZSDesk.CaptionPress"))}.0.is_null();
@@ -1490,7 +1490,7 @@ impl WindowState {
             WM_SHELL_NAVIGATED => if lp.0 != 0 { unsafe { self.navigation_completed(*Box::from_raw(lp.0 as *mut ShellLocation)); } context_menu::schedule_prewarm(self.hwnd); },
             WM_SHELL_FOLDER_INVOKED => if lp.0 != 0 { unsafe { self.navigate_to(*Box::from_raw(lp.0 as *mut ShellLocation)); } },
             WM_SHELL_NAVIGATION_FAILED => unsafe { self.navigation_failed() },
-            WM_SHELL_SELECTION_CHANGED => { unsafe { acknowledge_selection_changed(lp.0); } self.refresh_status();self.picker_selection_changed();context_menu::schedule_prewarm(self.hwnd); }
+            WM_SHELL_SELECTION_CHANGED => { unsafe { acknowledge_selection_changed(lp.0); } self.refresh_status();self.picker_selection_changed(); }
             zsdesk_windows::shell::WM_SHELL_PICKER_ACCEPT=>self.picker_accept_view(),
             WM_TREE_NAVIGATE => if lp.0 != 0 {
                 let location = unsafe { *Box::from_raw(lp.0 as *mut ShellLocation) };

@@ -84,12 +84,21 @@ fn dialog_kind(dialog:HWND,parts:&Parts,automation:Option<&IUIAutomation>)->Opti
         ||(!visible_types&&automation.is_some_and(|automation|folder_field_label(automation,parts.name)));
     selection_kind(&accept,visible_types,folder_field)
 }
+fn profile_display_name()->Option<String>{
+    use windows::Win32::{System::Com::CoTaskMemFree,UI::Shell::{IShellItem,SHGetKnownFolderItem,FOLDERID_UsersFiles,KF_FLAG_DEFAULT,SIGDN_NORMALDISPLAY}};
+    let item:IShellItem=unsafe{SHGetKnownFolderItem(&FOLDERID_UsersFiles,KF_FLAG_DEFAULT,None)}.ok()?;
+    let raw=unsafe{item.GetDisplayName(SIGDN_NORMALDISPLAY)}.ok()?;
+    let result=unsafe{raw.to_string()}.ok();
+    unsafe{CoTaskMemFree(Some(raw.0.cast()));}
+    result.filter(|name|!name.trim().is_empty())
+}
 fn initial_location(value:&str)->Option<zsdesk_core::model::explorer::ShellLocation>{
     use zsdesk_core::model::explorer::ShellLocation;
     let value=value.split_once(": ").or_else(||value.split_once('：')).map_or(value,|(_,value)|value).trim();
     if Path::new(value).is_absolute(){return Some(ShellLocation::Path(value.into()));}
     match value.to_lowercase().as_str(){"桌面"|"desktop"=>zsdesk_windows::desktop::user_desktop().map(ShellLocation::Path),"此电脑"|"this pc"=>Some(ShellLocation::ThisPc),
-        "主文件夹"|"home"=>Some(ShellLocation::Shell{pidl:None,parsing_name:"shell:HomeFolder".into(),title:zsdesk_core::i18n::text("主文件夹").into()}),_=>None}
+        "主文件夹"|"home"=>Some(ShellLocation::Shell{pidl:None,parsing_name:"shell:HomeFolder".into(),title:zsdesk_core::i18n::text("主文件夹").into()}),
+        _=>profile_display_name().filter(|name|name.eq_ignore_ascii_case(value)).and_then(|_|dirs::home_dir()).map(ShellLocation::Path)}
 }
 fn pattern(label:&str)->String{
     let value=label.replace('（',"(").replace('）',")");
@@ -219,12 +228,19 @@ fn run(profile:&Path,stop:&AtomicBool)->Result<()>{
             Event::Ready{token,window}=>if let Some(session)=sessions.iter_mut().find(|session|session.token==token){
                 session.picker=Some(window);
                 if enabled&&session.source.matches(){
-                    if let Some(reason)=capabilities::preservation(session.source.hwnd(),&parts(session.source.hwnd()),automation.as_ref()){
-                        session.close_picker();preserved_native+=1;last_preservation=Some(reason.key());last_kind=Some("native");last_confirmation=None;continue;
+                    match capabilities::inspect(session.source.hwnd(),&parts(session.source.hwnd()),automation.as_ref()){
+                        Err(reason)=>{session.close_picker();preserved_native+=1;last_preservation=Some(reason.key());last_kind=Some("native");last_confirmation=None;continue;}
+                        Ok(true)=>{if !crate::window::picker::native_reply(window,token,NativeReply::MobileUpload){session.close_picker();continue;}}
+                        Ok(false)=>{}
                     }
                     let result=if let Some(early)=&session.early{early.bind(window)}else{guard::Guard::hide(session.source.clone(),window,token).map(|guard|session.guard=Some(guard))};
                     if let Err(error)=result{last_error=Some(error.to_string());session.close_picker();}
                 }else{session.close_picker();}
+            },
+            Event::UseOriginal{token}=>if let Some(session)=sessions.iter_mut().find(|session|session.token==token){
+                if !returning.contains_key(&token) && !session.fallback{
+                    session.close_picker();last_kind=Some("native");last_preservation=Some("user-requested-native");
+                }
             },
             Event::Submit{token,outcome}=>if let Some(session)=sessions.iter_mut().find(|session|session.token==token){
                 if session.fallback||!session.source.matches(){continue;}
@@ -286,7 +302,7 @@ fn run(profile:&Path,stop:&AtomicBool)->Result<()>{
             while index<preparing.len()&&sessions.len()<4{
                 let source=preparing[index].source();let dialog=source.hwnd();let part=parts(dialog);let token=preparing[index].token();
                 if part.shell&&!part.name.0.is_null(){
-                    if let Some(reason)=capabilities::preservation(dialog,&part,automation.as_ref()){
+                    if let Err(reason)=capabilities::inspect(dialog,&part,automation.as_ref()){
                         // Releasing an unbound claim restores the same native
                         // window. No replica is opened and no choice is sent.
                         contracts.remove(&token);drop(preparing.remove(index));
@@ -301,7 +317,7 @@ fn run(profile:&Path,stop:&AtomicBool)->Result<()>{
                     // controls before applying FOS_PICKFOLDERS. Keep the native
                     // window masked while its complete contract settles.
                     if !contracts.entry(token).or_default().observe(contract,Instant::now()){index+=1;continue;}
-                    if let Some(reason)=capabilities::preservation(dialog,&part,automation.as_ref()){
+                    if let Err(reason)=capabilities::inspect(dialog,&part,automation.as_ref()){
                         contracts.remove(&token);drop(preparing.remove(index));
                         preserved_native+=1;last_preservation=Some(reason.key());last_kind=Some("native");last_confirmation=None;continue;
                     }
@@ -329,6 +345,14 @@ fn run(profile:&Path,stop:&AtomicBool)->Result<()>{
 
 #[cfg(test)]mod tests{
     use super::*;
+    #[test]fn profile_breadcrumb_resolves_the_localized_shell_display_name()->Result<()>{
+        unsafe{CoInitializeEx(None,COINIT_MULTITHREADED)}.ok()?;
+        struct Apartment;impl Drop for Apartment{fn drop(&mut self){unsafe{CoUninitialize();}}}
+        let _apartment=Apartment;
+        let label=profile_display_name().context("current user shell folder")?;
+        assert_eq!(initial_location(&format!("地址: {label}")),dirs::home_dir().map(zsdesk_core::model::explorer::ShellLocation::Path));
+        Ok(())
+    }
     #[test]fn folder_followup_requires_confirmed_navigation_and_consumed_input(){
         use zsdesk_core::model::explorer::ShellLocation;
         let target=PathBuf::from(r"E:\selected folder");let selected=Outcome::Selected{paths:vec![target.clone()],filter:0};

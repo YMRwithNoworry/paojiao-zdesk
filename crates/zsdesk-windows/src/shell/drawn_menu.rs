@@ -21,6 +21,7 @@ const TIMER:usize=0x5a53464c;
 const MAX_ITEMS:usize=16384;
 const MAX_LEVELS:usize=32;
 const HOVER_DELAY:Duration=Duration::from_millis(300);
+const OPEN_WITH_HOVER_DELAY:Duration=Duration::from_millis(120);
 const AIM_DELAY:Duration=Duration::from_millis(450);
 // Independently measured Shell popup metrics. Generic application flyouts keep
 // their own layout; these values describe the Shell's command strip and body.
@@ -86,7 +87,13 @@ impl Action{
     hidden:bool,variants:bool,
 }
 impl Item{fn cascade(&self)->bool{self.variants||!self.submenu.is_invalid()}fn selectable(&self)->bool{self.kind==RowKind::Item&&!self.hidden&&self.enabled}
-    fn opens_on_hover(&self)->bool{self.cascade()&&self.verb.as_deref()!=Some("zsdesk.more")}}
+    fn opens_on_hover(&self)->bool{self.cascade()&&self.verb.as_deref()!=Some("zsdesk.more")}
+    fn hover_delay(&self)->Duration{
+        if self.cascade()&&self.verb.as_deref().is_some_and(|v|v.eq_ignore_ascii_case("openas")){
+            OPEN_WITH_HOVER_DELAY
+        }else{HOVER_DELAY}
+    }
+}
 struct Level{menu:HMENU,hwnd:HWND,frame_id:usize,body:Bounds,metrics:Metrics,layout:LevelLayout,items:Vec<Item>,scroll:f32,
     toolbar:Vec<usize>,accelerator_width:f32,text_left_dip:f32,keyboard_focus:bool,variant_label:Option<String>,suspended:bool,
     highlight:Option<usize>,pressed:Option<usize>,open_child:Option<usize>,surface:Option<Surface>,initialized:bool}
@@ -711,7 +718,7 @@ pub(super) fn track_initialized(owner:HWND,menu:HMENU,point:POINT,context:&ICont
                         if let Some(row)=row{if !pending.is_some_and(|(at,old,_,delay)|at==depth&&old==row&&delay==AIM_DELAY){pending=Some((depth,row,Instant::now(),AIM_DELAY));}}
                     }else{
                         let before=session.levels[depth].highlight;session.highlight(depth,row,true,&gfx,&colors)?;
-                        if session.levels[depth].highlight!=before{pending=session.levels[depth].highlight.map(|row|(depth,row,Instant::now(),HOVER_DELAY));}
+                        if session.levels[depth].highlight!=before{pending=session.levels[depth].highlight.map(|row|(depth,row,Instant::now(),session.levels[depth].items[row].hover_delay()));}
                     }
                 }else{pending=None;}
                 let tip=hit(&session.levels,pointer).and_then(|(depth,row)|row.filter(|row|session.levels[depth].toolbar.contains(row)).map(|row|(depth,row)));
@@ -739,7 +746,7 @@ pub(super) fn track_initialized(owner:HWND,menu:HMENU,point:POINT,context:&ICont
                     session.update_tooltip();
                     let revision=session.revision;
                     let update=if refreshed.elapsed()>=Duration::from_millis(120){refreshed=Instant::now();session.refresh_states(&gfx,&colors)?}else{Step::Continue};
-                    if revision!=session.revision{pending=hit(&session.levels,previous).and_then(|(depth,row)|row.filter(|row|session.levels[depth].items[*row].selectable()).map(|row|(depth,row,Instant::now(),HOVER_DELAY)));}
+                    if revision!=session.revision{pending=hit(&session.levels,previous).and_then(|(depth,row)|row.filter(|row|session.levels[depth].items[*row].selectable()).map(|row|(depth,row,Instant::now(),session.levels[depth].items[row].hover_delay())));}
                     if !matches!(update,Step::Continue){update}
                     else if let Some((depth,row,since,delay))=pending{
                     if since.elapsed()>=delay{pending=None;if depth<session.levels.len(){
@@ -944,6 +951,12 @@ pub(super) fn track_initialized(owner:HWND,menu:HMENU,point:POINT,context:&ICont
         assert_eq!(toolbar_items(&items),vec![2],"duplicate verbs and owner-draw rows must remain complete body entries");
         assert_eq!(action_label(&items[0]),"复制");assert_eq!(items[0].raw_label,"复制(&C)\tCtrl+C");
         assert_eq!(Action::from_verb("Windows.ModernShare"),Some(Action::Share));assert_eq!(Action::from_verb("sharewith"),None);
+        let mut cascade=items[0].clone();
+        cascade.variants=true;
+        cascade.verb=Some("openas".into());
+        assert_eq!(cascade.hover_delay(),Duration::from_millis(120));
+        cascade.verb=Some("newfolder".into());
+        assert_eq!(cascade.hover_delay(),Duration::from_millis(300));
         assert_eq!(next_in_order(&[80,41,90],Some(80),1),Some(41));
         let work=Bounds::new(0,0,1920,1080);let parent=Bounds::new(100,100,400,600);
         assert_eq!(place_shell_submenu(parent,160,250,400,work,Metrics::new(96)),(392,156));

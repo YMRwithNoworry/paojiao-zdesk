@@ -19,7 +19,7 @@ use windows::{
             WindowsAndMessaging::*,
         },
     },
-    core::{Error, GUID, HRESULT, Interface, IUnknown, PCSTR, PSTR, PWSTR, Ref, Result, implement},
+    core::{Error, GUID, HRESULT, Interface, IUnknown, PCSTR, PCWSTR, PSTR, PWSTR, Ref, Result, implement},
 };
 
 const SYSTEM_START: u32 = 64;
@@ -27,6 +27,8 @@ const RESERVED: u32 = SYSTEM_START + 512;
 const NEW_COUNT: u32 = 512;
 const FULL_OFFSET: u32 = RESERVED + NEW_COUNT;
 const MORE: u32 = 31;
+const CHOOSE_APP: u32 = 32;
+const OPEN_WITH_FIRST: u32 = CHOOSE_APP + 1;
 struct AppGroup {
     context: IContextMenu,
     first: u32,
@@ -120,12 +122,12 @@ struct Alias {
     source: HMENU,
     position: u32,
 }
-struct Templates {
+struct NativeSubmenu {
     ctx: IContextMenu,
     menu: HMENU,
     child: HMENU,
 }
-impl Drop for Templates {
+impl Drop for NativeSubmenu {
     fn drop(&mut self) {
         let _ = unsafe { DestroyMenu(self.menu) };
     }
@@ -143,10 +145,12 @@ struct Compact {
     loaded: Cell<bool>,
     roots: RefCell<HashMap<usize, Row>>,
     aliases: RefCell<HashMap<usize, Alias>>,
+    open_with_apps: RefCell<HashMap<u32, IAssocHandler>>,
+    open_with: RefCell<Option<NativeSubmenu>>,
     groups: RefCell<Vec<std::rc::Rc<AppGroup>>>,
     group_menus: RefCell<HashMap<usize, usize>>,
     full_last: Cell<u32>,
-    templates: OnceCell<Templates>,
+    templates: OnceCell<NativeSubmenu>,
     icons: RefCell<Vec<std::rc::Rc<super::packaged_overlay::Bitmap>>>,
     sys_nodes: RefCell<Vec<IExplorerCommand>>,
     sys_groups: RefCell<HashMap<usize, IExplorerCommand>>,
@@ -192,6 +196,8 @@ fn make(source: Source, background: bool) -> IContextMenu {
         loaded: Cell::new(false),
         roots: Default::default(),
         aliases: Default::default(),
+        open_with_apps: Default::default(),
+        open_with: Default::default(),
         groups: Default::default(),
         group_menus: Default::default(),
         full_last: Cell::new(0),
@@ -240,6 +246,8 @@ impl Compact {
         self.loaded.set(false);
         self.roots.borrow_mut().clear();
         self.aliases.borrow_mut().clear();
+        self.open_with_apps.borrow_mut().clear();
+        self.open_with.borrow_mut().take();
         self.groups.borrow_mut().clear();
         self.group_menus.borrow_mut().clear();
         let options = super::menu::context_menu_options();
@@ -492,7 +500,9 @@ impl Compact {
                     SVGIO_SELECTION
                 })
             }?;
-            self.share_site(&ctx)?;
+            // The selection menu is already sited by its Shell view. Only a
+            // background menu needs our ShellNew selection/edit callback.
+            if self.background { self.share_site(&ctx)?; }
             let _ = self.context.set(ctx);
         }
         let context = self.context.get().unwrap();
@@ -651,7 +661,12 @@ impl Compact {
                     .trim()
                     .to_lowercase()
             };
-            if verb.eq_ignore_ascii_case(row.verb)
+            // Use the sharing cascade initialized by the Shell for this
+            // selection. Its standalone CommandStore class needs Explorer's site.
+            let sharing_cascade = row.verb == "sharewith" && !i.hSubMenu.is_invalid()
+                && ["sharing","modernsharing","windows.modernshareflyout","modernshareflyout"]
+                    .iter().any(|candidate| verb.eq_ignore_ascii_case(candidate));
+            if sharing_cascade || verb.eq_ignore_ascii_case(row.verb)
                 || row.verb == "pintostartscreen"
                     && matches!(
                         verb.to_lowercase().as_str(),
@@ -664,6 +679,200 @@ impl Compact {
         }
         Ok(None)
     }
+    // Keep the selected application callable after the native submenu closes.
+    // Leave ambiguous captions and Shell-specific entries with their provider.
+    fn bind_open_with(&self, menu: HMENU, context: &IContextMenu, first: u32, last: u32) -> Result<()> {
+        use std::os::windows::ffi::OsStrExt;
+        let item=unsafe { self.selection()?.GetItemAt(0)? };
+        let path=super::file_transfer::item_path(&item)?;
+        let Some(ext)=path.extension() else{return Ok(());};
+        let suffix:Vec<_>=std::iter::once(46).chain(ext.encode_wide()).chain(Some(0)).collect();
+        let list=unsafe{SHAssocEnumHandlers(PCWSTR(suffix.as_ptr()),ASSOC_FILTER_RECOMMENDED)}?;
+        let mut names:HashMap<String,Option<IAssocHandler>>=HashMap::new();
+        loop {
+            let mut next=[None];let mut fetched=0;
+            unsafe{list.Next(&mut next,Some(&mut fetched))}?;
+            let Some(handler)=next[0].take().filter(|_|fetched==1) else{break;};
+            if let Ok(name)=unsafe{handler.GetUIName()}{
+                let name=unsafe{super::take(name)}.to_lowercase();
+                names.entry(name).and_modify(|slot|*slot=None).or_insert(Some(handler));
+            }
+        }
+        let mut apps=HashMap::new();
+        let mut seen:HashMap<String,u32>=HashMap::new();
+        for i in 0..unsafe{GetMenuItemCount(Some(menu))}.max(0) as u32 {
+            let (item,text)=info(menu,i)?;
+            if !item.hSubMenu.is_invalid() || !(first..=last).contains(&item.wID){continue;}
+            if let Some(verb)=super::menu::canonical_verb_at_offset(context,item.wID-first) {
+                if verb.eq_ignore_ascii_case("openas"){
+                    let id=MENUITEMINFOW{cbSize:size_of::<MENUITEMINFOW>() as u32,fMask:MIIM_ID,wID:self.first.get()+CHOOSE_APP,..Default::default()};
+                    unsafe{SetMenuItemInfoW(menu,i,true,&id)}?;
+                }
+                continue;
+            }
+            let label=String::from_utf16_lossy(&text[..text.iter().position(|c|*c==0).unwrap_or(text.len())]);
+            let label=label.split('\t').next().unwrap_or("").replace('&',"").to_lowercase();
+            let Some(Some(handler))=names.get(&label) else{continue;};
+            if let Some(previous)=seen.insert(label,item.wID){
+                apps.remove(&previous);
+                continue;
+            }
+            apps.insert(item.wID,handler.clone());
+        }
+        self.open_with_apps.replace(apps);
+        Ok(())
+    }
+
+    fn open_with_provider(&self) -> Result<NativeSubmenu> {
+        use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, IDataObject};
+        // Inbox "Open With" handler registered for files. Query only this handler
+        // when opening its cascade; the full selection menu is still lazy.
+        let init: IShellExtInit = unsafe {
+            CoCreateInstance(
+                &GUID::from_u128(0x09799afb_ad67_11d1_abcd_00c04fc30936),
+                None,
+                CLSCTX_INPROC_SERVER,
+            )
+        }?;
+        let data: IDataObject = unsafe { self.selection()?.BindToHandler(None, &BHID_DataObject) }?;
+        unsafe {
+            init.Initialize(None, &data, None)?;
+        }
+        let ctx: IContextMenu = init.cast()?;
+        self.share_site(&ctx)?;
+        let mut source = NativeSubmenu {
+            ctx,
+            menu: unsafe { CreatePopupMenu() }?,
+            child: HMENU::default(),
+        };
+        let first = self.first.get() + OPEN_WITH_FIRST;
+        let last = self.first.get() + SYSTEM_START - 1;
+        let count = unsafe {
+            source.ctx.QueryContextMenu(
+                source.menu,
+                0,
+                first,
+                last,
+                self.flags.get() & !CMF_OPTIMIZEFORINVOKE,
+            )
+        };
+        count.ok()?;
+        if count.0 as u32 & 0xffff > last - first + 1
+            || unsafe { GetMenuItemCount(Some(source.menu)) } != 1
+        {
+            return Err(err("打开方式未提供独立子菜单"));
+        }
+        let (entry, _) = info(source.menu, 0)?;
+        source.child = entry.hSubMenu;
+        if source.child.is_invalid()
+            && !((first..=last).contains(&entry.wID)
+                && super::menu::canonical_verb_at_offset(&source.ctx, entry.wID - first)
+                    .is_some_and(|v| v.eq_ignore_ascii_case("openas")))
+        {
+            return Err(err("打开方式未提供独立子菜单"));
+        }
+        Ok(source)
+    }
+
+    fn fill_open_with(&self, popup: HMENU, row: Row) -> Result<()> {
+        self.open_with_apps.borrow_mut().clear();
+        self.aliases.borrow_mut().remove(&(popup.0 as usize));
+        if self.open_with.borrow().is_none() {
+            if let Ok(source) = self.open_with_provider() {
+                self.open_with.replace(Some(source));
+            }
+        }
+        let direct = self
+            .open_with
+            .borrow()
+            .as_ref()
+            .map(|source| (source.ctx.clone(), source.child));
+        if let Some((context, child)) = direct {
+            if child.is_invalid() {
+                return self.fill_app_chooser(popup);
+            }
+            let src = Alias {
+                source: child,
+                position: 0,
+            };
+            let _ = Self::apply_message(
+                &context,
+                WM_INITMENUPOPUP,
+                WPARAM(child.0 as usize),
+                LPARAM(0),
+            );
+            let count = unsafe { GetMenuItemCount(Some(child)) };
+            let first = self.first.get() + OPEN_WITH_FIRST;
+            let last = self.first.get() + SYSTEM_START - 1;
+            let flat = count > 0
+                && (0..count).all(|i| {
+                    info(child, i as u32).is_ok_and(|(mi, _)| {
+                        mi.fType.contains(MFT_SEPARATOR)
+                            || (mi.hSubMenu.is_invalid()
+                                && !mi.fType.contains(MFT_OWNERDRAW)
+                                && mi.hbmpItem != HBMMENU_CALLBACK
+                                && (first..=last).contains(&mi.wID))
+                    })
+                });
+            if flat {
+                self.aliases.borrow_mut().insert(popup.0 as usize, src);
+                self.fill_alias(popup, src)?;
+                let _ = self.bind_open_with(popup, &context, first, last);
+                return Ok(());
+            }
+            let _ = Self::apply_message(
+                &context,
+                WM_UNINITMENUPOPUP,
+                WPARAM(child.0 as usize),
+                LPARAM(0),
+            );
+            self.open_with.borrow_mut().take();
+        }
+        if let Ok(Some((item, position))) = self.matching(row) {
+            if !item.hSubMenu.is_invalid() {
+                let src = Alias {
+                    source: item.hSubMenu,
+                    position,
+                };
+                let _ = Self::apply_message(
+                    self.full_context()?,
+                    WM_INITMENUPOPUP,
+                    WPARAM(src.source.0 as usize),
+                    LPARAM(position as isize),
+                );
+                self.aliases.borrow_mut().insert(popup.0 as usize, src);
+                self.fill_alias(popup, src)?;
+                if unsafe { GetMenuItemCount(Some(popup)) } > 0 {
+                    let _ = self.bind_open_with(
+                        popup,
+                        self.full_context()?,
+                        self.first.get() + FULL_OFFSET,
+                        self.full_last.get(),
+                    );
+                    return Ok(());
+                }
+            }
+        }
+        self.fill_app_chooser(popup)
+    }
+    fn fill_app_chooser(&self, popup: HMENU) -> Result<()> {
+        while unsafe { GetMenuItemCount(Some(popup)) } > 0 {
+            unsafe { DeleteMenu(popup, 0, MF_BYPOSITION) }?;
+        }
+        let label: Vec<_> = zsdesk_core::i18n::text("选择其他应用")
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
+        unsafe {
+            AppendMenuW(
+                popup,
+                MF_STRING,
+                (self.first.get() + CHOOSE_APP) as usize,
+                PCWSTR(label.as_ptr()),
+            )
+        }
+    }
+
     fn fill_alias(&self, popup: HMENU, src: Alias) -> Result<()> {
         // Keep Shell-owned handles on the original tree; this displayed copy owns
         // its own child handles. Command IDs still belong to the Shell context.
@@ -710,6 +919,18 @@ impl Compact {
     }
     fn message(&self, msg: u32, wp: WPARAM, lp: LPARAM) -> Result<LRESULT> {
         let popup = HMENU(wp.0 as *mut _);
+        let source_popup=match msg {
+            WM_UNINITMENUPOPUP=>Some(wp.0),
+            WM_MENUSELECT|WM_MENUCHAR=>Some(lp.0 as usize),
+            _=>None,
+        };
+        if let Some(alias)=source_popup.and_then(|h|self.aliases.borrow().get(&h).copied()){
+            let ctx=self.open_with.borrow().as_ref().filter(|s|s.child==alias.source).map(|s|s.ctx.clone());
+            if let Some(ctx)=ctx{
+                return if msg==WM_UNINITMENUPOPUP{Self::apply_message(&ctx,msg,WPARAM(alias.source.0 as usize),LPARAM(0))}
+                    else{Self::apply_message(&ctx,msg,wp,LPARAM(alias.source.0 as isize))};
+            }
+        }
         let which = match msg {
             WM_INITMENUPOPUP | WM_UNINITMENUPOPUP => self.group_menus.borrow().get(&wp.0).copied(),
             WM_MENUCHAR | WM_MENUSELECT => self.group_menus.borrow().get(&(lp.0 as usize)).copied(),
@@ -753,11 +974,18 @@ impl Compact {
         }
         if msg == WM_INITMENUPOPUP || msg == WM_UNINITMENUPOPUP {
             let root = self.roots.borrow().get(&wp.0).copied();
+            if let Some(row)=root.filter(|row|msg==WM_INITMENUPOPUP && row.verb=="openas") {
+                self.fill_open_with(popup,row)?;
+                return Ok(LRESULT(0));
+            }
+            if msg == WM_UNINITMENUPOPUP && root.is_some_and(|row| matches!(row.verb,"sharewith"|"openas"))
+                && !self.aliases.borrow().contains_key(&wp.0) {
+                return Ok(LRESULT(0));
+            }
             if msg == WM_INITMENUPOPUP {
                 let nested = self.sys_groups.borrow().get(&wp.0).cloned();
                 let known = root.and_then(|r| match r.verb {
                     "compressto" => Some("CompressTo"),
-                    "sharewith" => Some("ModernShareFlyout"),
                     _ => None,
                 });
                 if let Some(c) = nested.or_else(|| known.and_then(|k| self.system_command(k).ok()))
@@ -774,7 +1002,7 @@ impl Compact {
                     let ctx = super::new_menu::context_for_view(self.view()?)?;
                     self.share_site(&ctx)?;
                     let menu = unsafe { CreatePopupMenu() }?;
-                    let mut templates = Templates {
+                    let mut templates = NativeSubmenu {
                         ctx,
                         menu,
                         child: HMENU::default(),
@@ -822,6 +1050,19 @@ impl Compact {
                         self.aliases.borrow_mut().insert(wp.0, alias.unwrap());
                     }
                 }
+                if alias.is_none() && root.is_some_and(|row| row.verb == "sharewith") {
+                    // Some Shell views expose only the Share dialog. Preserve
+                    // its original command ID, caption and enabled state.
+                    if unsafe { GetMenuItemCount(Some(popup)) } == 0 {
+                        if let Some((_, position)) = self.matching(COMMANDS[3])? {
+                            let (item, _caption) = info(self.full.get(), position)?;
+                            if item.hSubMenu.is_invalid() {
+                                unsafe { InsertMenuItemW(popup, 0, true, &item) }?;
+                            }
+                        }
+                    }
+                    return Ok(LRESULT(0));
+                }
             }
             if let Some(a) = alias {
                 let result = Self::apply_message(
@@ -846,7 +1087,8 @@ impl IObjectWithSite_Impl for Compact_Impl {
     fn SetSite(&self, site: Ref<IUnknown>) -> Result<()> {
         let site = site.cloned();
         self.site.replace(site.clone());
-        for child in [self.context.get(), self.templates.get().map(|t| &t.ctx)].into_iter().flatten() {
+        let open_with=self.open_with.borrow().as_ref().map(|source|source.ctx.clone());
+        for child in [self.context.get().filter(|_| self.background), self.templates.get().map(|t| &t.ctx),open_with.as_ref()].into_iter().flatten() {
             if let Ok(object) = child.cast::<IObjectWithSite>() { unsafe { object.SetSite(site.as_ref()) }?; }
         }
         Ok(())
@@ -872,6 +1114,10 @@ impl IContextMenu_Impl for Compact_Impl {
         target: PSTR,
         count: u32,
     ) -> Result<()> {
+        if (OPEN_WITH_FIRST as usize..SYSTEM_START as usize).contains(&offset){
+            let ctx=self.open_with.borrow().as_ref().map(|s|s.ctx.clone()).ok_or_else(||err("打开方式菜单已关闭"))?;
+            return unsafe{ctx.GetCommandString(offset-OPEN_WITH_FIRST as usize,kind,Some(reserved),target,count)};
+        }
         if (SYSTEM_START as usize..RESERVED as usize).contains(&offset) {
             return Err(Error::from_hresult(windows::Win32::Foundation::E_NOTIMPL));
         }
@@ -923,7 +1169,7 @@ impl IContextMenu_Impl for Compact_Impl {
         }
         let row = COMMANDS
             .iter()
-            .find(|r| r.offset as usize == offset)
+            .find(|r| r.offset as usize == offset || (offset==CHOOSE_APP as usize && r.verb=="openas"))
             .ok_or_else(|| err("未知菜单命令"))?;
         if matches!(kind, GCS_VALIDATEA | GCS_VALIDATEW) {
             return Ok(());
@@ -943,6 +1189,17 @@ impl IContextMenu_Impl for Compact_Impl {
         }
         let base = unsafe { &*p };
         let offset = base.lpVerb.0 as usize;
+        if offset == CHOOSE_APP as usize {
+            let item=unsafe{self.selection()?.GetItemAt(0)?};
+            return super::file_dialogs::choose_application(base.hwnd,&super::file_transfer::item_path(&item)?);
+        }
+        if offset<=0xffff {
+            let handler=self.open_with_apps.borrow().get(&(self.first.get()+offset as u32)).cloned();
+            if let Some(handler)=handler{
+                let data:windows::Win32::System::Com::IDataObject=unsafe{self.selection()?.BindToHandler(None,&BHID_DataObject)}?;
+                return unsafe{handler.Invoke(&data)};
+            }
+        }
         if (SYSTEM_START as usize..RESERVED as usize).contains(&offset) {
             let c = self
                 .sys_nodes
@@ -974,6 +1231,8 @@ impl IContextMenu_Impl for Compact_Impl {
                 .ok_or_else(|| err("模板已改变"))?
                 .ctx
                 .clone()
+        } else if (OPEN_WITH_FIRST as usize..SYSTEM_START as usize).contains(&offset) {
+            self.open_with.borrow().as_ref().map(|s|s.ctx.clone()).ok_or_else(||err("打开方式菜单已关闭"))?
         } else if let Some(g) = &group {
             g.context.clone()
         } else {
@@ -981,6 +1240,8 @@ impl IContextMenu_Impl for Compact_Impl {
         };
         let target = if template {
             offset - RESERVED as usize
+        } else if (OPEN_WITH_FIRST as usize..SYSTEM_START as usize).contains(&offset) {
+            offset-OPEN_WITH_FIRST as usize
         } else if let Some(g) = group {
             (id - g.first) as usize
         } else if offset >= FULL_OFFSET as usize {
@@ -1021,6 +1282,75 @@ impl IContextMenu3_Impl for Compact_Impl {
                 *r = v;
             }
         }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod file_command_tests {
+    use super::*;
+    use std::{path::PathBuf,rc::Rc};
+    use windows::Win32::{System::{Com::IDataObject,Ole::{OleInitialize,OleUninitialize}},Foundation::E_NOTIMPL};
+    use super::super::menu::{ShellMenu,SHELL_FIRST};
+
+    #[implement(IAssocHandler)]
+    struct Recorder(Rc<RefCell<Vec<PathBuf>>>);
+    impl IAssocHandler_Impl for Recorder_Impl {
+        fn GetName(&self)->Result<PWSTR>{Err(Error::from_hresult(E_NOTIMPL))}
+        fn GetUIName(&self)->Result<PWSTR>{Err(Error::from_hresult(E_NOTIMPL))}
+        fn GetIconLocation(&self,_:*mut PWSTR,_:*mut i32)->Result<()>{Err(Error::from_hresult(E_NOTIMPL))}
+        fn IsRecommended(&self)->HRESULT{HRESULT(0)}
+        fn MakeDefault(&self,_:&PCWSTR)->Result<()>{Err(Error::from_hresult(E_NOTIMPL))}
+        fn CreateInvoker(&self,_:Ref<IDataObject>)->Result<IAssocHandlerInvoker>{Err(Error::from_hresult(E_NOTIMPL))}
+        fn Invoke(&self,data:Ref<IDataObject>)->Result<()>{
+            let items:IShellItemArray=unsafe{SHCreateShellItemArrayFromDataObject(data.ok()?)}?;
+            for i in 0..unsafe{items.GetCount()?}{
+                let item=unsafe{items.GetItemAt(i)?};
+                self.0.borrow_mut().push(super::super::file_transfer::item_path(&item)?);
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    #[ignore="Read-only native .txt associations with a recording application"]
+    fn open_with_dispatches_exact_file_after_submenu_closes() -> anyhow::Result<()> {
+        use anyhow::Context;
+        unsafe{OleInitialize(None)?;}
+        struct Apartment;
+        impl Drop for Apartment{fn drop(&mut self){unsafe{OleUninitialize();}}}
+        let _apartment=Apartment;
+        let path=std::env::temp_dir().join(format!("ZSDesk 打开方式 {}.txt",std::process::id()));
+        std::fs::File::create_new(&path)?;
+        struct File(PathBuf);
+        impl Drop for File{fn drop(&mut self){let _=std::fs::remove_file(&self.0);}}
+        let _file=File(path.clone());
+        let pidl=super::super::pidl::location_pidl(&zsdesk_core::model::explorer::ShellLocation::Path(path.clone())).unwrap();
+        let items=unsafe{SHCreateShellItemArrayFromIDLists(&[pidl.as_ptr().cast()])}?;
+        let context=for_selection(items,HWND::default(),Box::new(||Err(err("unexpected view binding"))));
+        let compact=context.cast_object_ref::<Compact>().context("compact provider")?;
+        let shell=ShellMenu::new(context.clone())?;
+        shell.populate(true,false).context("populate compact root")?;
+        let root=shell.hmenu();
+        let pos=(0..unsafe{GetMenuItemCount(Some(root))}).find(|p|info(root,*p as u32).is_ok_and(|(i,_)|i.wID==SHELL_FIRST+6)).unwrap();
+        let popup=unsafe{GetSubMenu(root,pos)};
+        let started=std::time::Instant::now();
+        compact.message(WM_INITMENUPOPUP,WPARAM(popup.0 as usize),LPARAM(pos as isize)).context("populate Open With submenu")?;
+        let labels=(0..unsafe{GetMenuItemCount(Some(popup))}).map(|i|{
+            let (_,text)=info(popup,i as u32).unwrap();
+            String::from_utf16_lossy(&text[..text.iter().position(|c|*c==0).unwrap_or(text.len())])
+        }).collect::<Vec<_>>();
+        eprintln!("open_with_first_us={} rows={labels:?}",started.elapsed().as_micros());
+        assert!(compact.context.get().is_none() && !compact.loaded.get(),"opening the submenu bound the full file context");
+        assert!(compact.open_with.borrow().is_some(),"dedicated provider missing");
+        assert!((0..unsafe{GetMenuItemCount(Some(popup))}).any(|i|info(popup,i as u32).is_ok_and(|(entry,_)|entry.wID==SHELL_FIRST+CHOOSE_APP)),
+            "the Windows application chooser is missing");
+        let command=*compact.open_with_apps.borrow().keys().next().expect("no recommended native .txt application bound");
+        let _=compact.message(WM_UNINITMENUPOPUP,WPARAM(popup.0 as usize),LPARAM(0));
+        let called=Rc::new(RefCell::new(Vec::new()));
+        compact.open_with_apps.borrow_mut().insert(command,Recorder(called.clone()).into());
+        shell.invoke(HWND::default(),command,None,false,false).context("dispatch selected application")?;
+        assert_eq!(*called.borrow(),[path]);
         Ok(())
     }
 }

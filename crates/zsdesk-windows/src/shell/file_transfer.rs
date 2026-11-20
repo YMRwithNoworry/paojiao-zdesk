@@ -227,7 +227,7 @@ pub fn filesystem_selection(view:&IShellView)->Result<bool>{
     let items:IShellItemArray=unsafe{folder.Items(SVGIO_SELECTION)?};
     Ok(unsafe{items.GetAttributes(SIATTRIBFLAGS_AND,SFGAO_FILESYSTEM)?}.0&SFGAO_FILESYSTEM.0!=0)
 }
-fn item_path(item:&IShellItem)->Result<PathBuf>{
+pub(super) fn item_path(item:&IShellItem)->Result<PathBuf>{
     let value=unsafe{item.GetDisplayName(SIGDN_FILESYSPATH)?};let text=unsafe{value.to_string()};unsafe{CoTaskMemFree(Some(value.0.cast()));}Ok(text.map(PathBuf::from)?)
 }
 pub(super) fn paste_folder(view:&IShellView)->Result<Option<IShellItem>>{

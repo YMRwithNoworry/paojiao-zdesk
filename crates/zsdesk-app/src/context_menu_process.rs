@@ -108,6 +108,7 @@ struct IdleWorker {
     /// never terminated on retirement.
     committed:bool,
     native_owner:Option<MenuOwner>,
+    prepared_drawn:bool,
 }
 impl IdleWorker {
     fn within_lifetime(&self,margin:Duration)->bool{
@@ -365,7 +366,7 @@ fn validate(request:&Request)->Result<()>{
     ensure!(request.pidls.iter().map(Vec::len).sum::<usize>()<=3*1024*1024,"菜单选择标识总量过大");
     ensure!(!request.pidls.is_empty()||request.folder.is_some(),"没有可用的系统菜单目标");
     if request.mode.prewarm(){
-        ensure!(request.pidls.len()==1 && request.folder.is_some() && request.options.modern &&
+        ensure!(request.pidls.len()==1 &&
             !request.options.quick_first && !request.extended,"无效的原生预热请求");
     }
     ensure!(!matches!(request.mode,Mode::Background|Mode::New|Mode::CatalogBackground|Mode::PasteBackground)||request.pidls.len()==1,"背景菜单需要一个文件夹标识");
@@ -418,6 +419,8 @@ impl Client{
         Self::spawn_at(owner,point,pidls,folder,options,intercept,mode,extended,origin)
     }
     fn spawn_at(owner:HWND,point:POINT,pidls:Vec<Vec<u8>>,folder:Option<PathBuf>,options:ContextMenuOptions,intercept:MenuInterceptions,mode:Mode,extended:bool,origin:Origin)->Result<Self>{
+        // Keep worker selection and its lifetime policy on the effective OS presentation.
+        let options=zsdesk_windows::shell::menu::resolve_presentation(options);
         if !mode.prewarm(){prewarm::interrupt();}
         let started=origin.started;let started_counter=origin.counter;
         let root=diagnostics_directory();ensure!(root.is_absolute(),"菜单缓存目录必须是绝对路径");fs::create_dir_all(&root)?;
@@ -438,7 +441,7 @@ impl Client{
             let Some(idle)=cached else{break;};
             // Switching styles must not lend a parked native STA (and any
             // resources it already owns) to an on-demand drawn session.
-            if options.drawn{drop(idle);break;}
+            if idle.prepared_drawn != options.drawn {drop(idle);break;}
             let valid=idle.child.as_ref().is_some_and(|child|created(child.id())==Some(idle.created))
                 &&read_small::<Status>(&idle.workspace.join("status.json"),MAX_STATUS).is_ok_and(|status|
                     status.phase=="idle"&&status.reusable&&status.token==idle.token&&idle.child.as_ref().is_some_and(|child|status.pid==child.id()));
@@ -626,6 +629,7 @@ impl Drop for Client{fn drop(&mut self){
     if reusable{
         let idle=IdleWorker{child:self.child.take(),job:self.job.take(),workspace:self.workspace.clone(),session:self.session.clone(),token:self.token.clone(),
             events:self.events.take(),count:self.ordinal,created:self.child_created,last_used:Instant::now(),desktop:self.desktop,thread:self.thread,committed,
+            prepared_drawn:self.mode.prewarm() && self.last_status.as_ref().is_some_and(|s|s.native_menu["drawn_renderer_ready"]==true),
             native_owner:self.last_status.as_ref().filter(|s|s.native_menu["runtime_initializations"].as_u64().unwrap_or(0)>0).map(|_|self.owner)};
         let retired={let mut pool=IDLE.lock().unwrap_or_else(|error|error.into_inner());let old=pool.iter().position(|worker|worker.thread==self.thread).map(|index|pool.swap_remove(index));
             let evicted=if pool.len()>=MAX_IDLE_WORKERS{Some(pool.remove(0))}else{None};pool.push(idle);(old,evicted)};drop(retired);start_reaper();return;
@@ -941,7 +945,15 @@ fn run_request(path:&Path,request:Request,events:&EventSet,com_us:u64,fault_repo
     let result=(||->Result<MenuOutcome>{
         let request=state.request.clone();zsdesk_windows::shell::menu::set_context_menu_options(request.options.clone());
         if request.mode.prewarm(){
-            if request.options.modern&&!request.options.quick_first{zsdesk_windows::shell::menu::prepare_drawn_runtime()?;}
+            let effective=zsdesk_windows::shell::menu::context_menu_options();
+            if effective.drawn {
+                zsdesk_windows::shell::menu::prepare_drawn_runtime()?;
+                if request.folder.is_some() && effective.native_first_page_apps.as_ref().is_some_and(|apps| !apps.is_empty()) {
+                    if let Some(folder)=request.view_context.as_ref().and_then(|context| context.folder.as_deref()) {
+                        background_view::prepare_folder(folder,&request,events)?;
+                    }
+                }
+            }
             return Ok(MenuOutcome::Dismissed);
         }
         #[cfg(test)]if request.probe.as_deref()==Some("dismiss"){state.allow(false)?;return Ok(MenuOutcome::Dismissed);}
@@ -1028,6 +1040,9 @@ fn run_request(path:&Path,request:Request,events:&EventSet,com_us:u64,fault_repo
         menu.populate(request.rename,request.extended)?;
         #[cfg(test)]watch.menu.set(menu.hmenu());
         state.status.populate_microseconds=started.elapsed().as_micros()as u64;
+        #[cfg(test)]if request.probe.as_deref()==Some("query-compact-catalog"){
+            state.allow(false)?;state.status.catalog=menu.catalog();return Ok(MenuOutcome::Dismissed);
+        }
         if matches!(request.mode,Mode::CatalogSelection|Mode::CatalogBackground){
             state.allow(false)?;state.status.catalog=menu.catalog();return Ok(MenuOutcome::Dismissed);
         }
@@ -1143,7 +1158,7 @@ fn run_request(path:&Path,request:Request,events:&EventSet,com_us:u64,fault_repo
     }
     // A drawn request owns one short-lived isolation process. The existing
     // done path still pumps modeless dialogs and protects clipboard ownership.
-    let reusable=!state.request.options.drawn&&state.status.error.is_none()&&state.request.ordinal<MAX_SESSION_REQUESTS
+    let reusable=(state.request.mode.prewarm() || !state.request.options.drawn)&&state.status.error.is_none()&&state.request.ordinal<MAX_SESSION_REQUESTS
         &&persisted&&!owns_clipboard()&&!process_visible_windows(std::process::id(),window)&&!EventSet::signaled(events.cancel);
     if reusable{
         // Release all selection/menu objects and their real owner before
@@ -1186,7 +1201,8 @@ fn run_worker(path:&Path)->Result<()>{
     ensure!(path.is_absolute()&&path.file_name().is_some_and(|name|name=="request.json"),"菜单请求路径无效");
     ensure!(std::env::var_os("ZSDESK_MENU_WORKSPACE").map(PathBuf::from).as_deref()==path.parent(),"菜单工作目录不匹配");
     let session=std::env::var("ZSDESK_MENU_SESSION").context("菜单会话缺失")?;
-    let mut request:Request=read_small(path,MAX_REQUEST)?;validate(&request)?;
+    let mut request:Request=read_small(path,MAX_REQUEST)?;
+    validate(&request)?;
     ensure!(session==request.session&&request.ordinal==1&&parent_alive(&request),"菜单请求归属无效");
     let parent=(request.parent,request.parent_created);let events=EventSet::open(&session)?;
     let deadline=Instant::now()+Duration::from_secs(5);

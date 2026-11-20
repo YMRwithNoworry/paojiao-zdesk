@@ -434,7 +434,8 @@ fn drawn_menu_exits_after_dismissal_and_reopens_after_idle()->Result<()>{
             let pid=log["worker_pid"].as_u64().context("worker PID")?;
             ensure!(log["parent_pid"]==std::process::id()&&log["timing"]["menu_open_observation"]=="drawn-win11-menu"&&
                 log["error"].is_null()&&log["committed"]==false,"native presentation failed: {log}");
-            ensure!(log["timing"]["reused_process"]==false,"unexpected idle process at {stage}: {log}");
+            ensure!(!records.iter().any(|previous:&serde_json::Value|previous["pid"]==pid && previous["created"]==log["worker_created"]),
+                "a displayed drawn menu worker was reused at {stage}: {log}");
             records.push(serde_json::json!({"stage":stage,"pid":pid,"created":log["worker_created"],"timing":log["timing"],"target":file,"parked":0}));
             fs::write(out.join("drawn-on-demand.json"),serde_json::to_vec_pretty(&records)?)?;
         }
@@ -452,7 +453,7 @@ fn drawn_menu_exits_after_dismissal_and_reopens_after_idle()->Result<()>{
 
 #[test]
 #[ignore="Native prewarm and a different file selection in an isolated Win32 desktop"]
-fn selecting_files_keeps_drawn_worker_stopped_until_right_click()->Result<()>{
+fn selecting_files_prewarms_shell_without_showing_a_menu()->Result<()>{
     use crate::context_menu_process as worker;
     let output=PathBuf::from(std::env::var_os("ZSDESK_NATIVE_TEST_OUTPUT").context("test output")?);
     let name=format!("ZSDesk.Prewarm.{}",std::process::id());
@@ -478,9 +479,11 @@ fn selecting_files_keeps_drawn_worker_stopped_until_right_click()->Result<()>{
             (unsafe{browser.current_view()?},browser.view_window().context("view window")?)
         };
         super::context_menu::prewarm_active_view(runner.hwnd);
-        pump(500);
-        ensure!(worker::idle_worker_diagnostics().as_array().is_some_and(Vec::is_empty)
-            &&worker::pending_workers()==0&&!workers.join("menu-prewarm.json").exists(),"selection started a speculative drawn worker");
+        let until=Instant::now()+Duration::from_secs(6);
+        while worker::idle_worker_diagnostics().as_array().is_none_or(Vec::is_empty){
+            ensure!(Instant::now()<until,"prepared worker did not become idle");pump(10);
+        }
+        let prepared=worker::idle_worker_diagnostics()[0]["pid"].clone();
         {
             let slot=runner.slot.borrow();slot.as_ref().unwrap().browser.as_ref().unwrap().select_children(&["two.txt".into()])?;
         }
@@ -491,7 +494,7 @@ fn selecting_files_keeps_drawn_worker_stopped_until_right_click()->Result<()>{
         let deadline=Instant::now()+Duration::from_secs(10);
         while super::context_menu::request_active(runner.hwnd){ensure!(Instant::now()<deadline,"native popup did not close");pump(5);}
         let shown=worker::read_recent_diagnostics()["current"].clone();
-        ensure!(shown["worker_pid"].as_u64().is_some() && shown["timing"]["reused_process"]==false &&
+        ensure!(shown["worker_pid"]==prepared && shown["timing"]["reused_process"]==true &&
             shown["timing"]["menu_open_observation"]=="drawn-win11-menu" && shown["committed"]==false &&
             shown["error"].is_null(),"on-demand drawn popup failed: {shown}");
         ensure!(super::context_menu::selected_identities(&view)?==selected,"presentation changed its target");

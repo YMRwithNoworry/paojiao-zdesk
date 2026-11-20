@@ -2,10 +2,13 @@
 use super::*;
 
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
-enum ActionKind { Files, Folders, Mixed, Other }
+enum ActionKind { Files, Folders, Mixed, MobileUpload, Other }
 
 fn action_kind(label:&str)->ActionKind {
     let label=control_label(label);
+    if matches!(label.as_str(),"从移动设备上传"|"從行動裝置上傳"|"從行動裝置上載"|"upload from mobile"|"upload from mobile device"|"upload from a mobile device"){
+        return ActionKind::MobileUpload;
+    }
     if ["文件和文件夹","文件或文件夹","文件/文件夹","files and folders","files or folders","files/folders","file or folder"]
         .iter().any(|text|label.contains(text)){return ActionKind::Mixed;}
     if [zsdesk_core::i18n::text("选择文件夹"),"选择此文件夹","选取文件夹","选取目录","选择目录","上传文件夹","添加文件夹",
@@ -62,14 +65,21 @@ fn preserve(primary_kind:Option<SelectionKind>,actions:&[Action])->Option<Preser
     let files=primary_kind==Some(SelectionKind::Files)||actions.iter().any(|action|action.kind==ActionKind::Files);
     let folders=primary_kind==Some(SelectionKind::Folders)||actions.iter().any(|action|action.kind==ActionKind::Folders);
     if files&&folders{return Some(Preservation::MixedSelection);}
-    actions.iter().any(|action|!action.primary&&(action.secondary_confirmation||matches!(action.kind,ActionKind::Files|ActionKind::Folders)))
+    actions.iter().any(|action|!action.primary
+        && !(primary_kind==Some(SelectionKind::Files) && action.kind==ActionKind::MobileUpload)
+        && (action.secondary_confirmation||matches!(action.kind,ActionKind::Files|ActionKind::Folders)))
         .then_some(Preservation::AdditionalSelectionAction)
+}
+
+fn supported(kind:Option<SelectionKind>,actions:&[Action])->std::result::Result<bool,Preservation>{
+    if let Some(reason)=preserve(kind,actions){return Err(reason);}
+    Ok(kind==Some(SelectionKind::Files) && actions.iter().any(|a|!a.primary && a.kind==ActionKind::MobileUpload))
 }
 
 /// The original dialog remains the authority for every extra button and
 /// dropdown callback. Never synthesize an IDOK result for those contracts.
-pub(super) fn preservation(dialog:HWND,part:&Parts,automation:Option<&IUIAutomation>)->Option<Preservation>{
-    let inspect=(||->windows::core::Result<Option<Preservation>>{
+pub(super) fn inspect(dialog:HWND,part:&Parts,automation:Option<&IUIAutomation>)->std::result::Result<bool,Preservation>{
+    let inspected=(||->windows::core::Result<std::result::Result<bool,Preservation>>{
         let primary=unsafe{GetDlgItem(Some(dialog),1)}?;
         let automation=automation.ok_or_else(||windows::core::Error::new(windows::core::HRESULT(0x80004005u32 as i32),"原窗口选择能力不可读取"))?;
         let root=unsafe{automation.ElementFromHandle(dialog)}?;
@@ -83,7 +93,7 @@ pub(super) fn preservation(dialog:HWND,part:&Parts,automation:Option<&IUIAutomat
             .map(|pattern|unsafe{pattern.CurrentExpandCollapseState()}).transpose()?;
         let primary_dropdown=has_dropdown(unsafe{primary.CurrentControlType()}?==UIA_SplitButtonControlTypeId,expansion.map(|state|state.0));
         if primary_dropdown{
-            return Ok(Some(Preservation::ConfirmationDropdown));
+            return Ok(Err(Preservation::ConfirmationDropdown));
         }
         let buttons=unsafe{automation.CreatePropertyCondition(UIA_ControlTypePropertyId,&VARIANT::from(UIA_ButtonControlTypeId.0))}?;
         let split=unsafe{automation.CreatePropertyCondition(UIA_ControlTypePropertyId,&VARIANT::from(UIA_SplitButtonControlTypeId.0))}?;
@@ -92,7 +102,7 @@ pub(super) fn preservation(dialog:HWND,part:&Parts,automation:Option<&IUIAutomat
         let condition=unsafe{automation.CreateOrCondition(&condition,&menu)}?;
         let elements=unsafe{root.FindAll(TreeScope_Descendants,&condition)}?;
         let count=unsafe{elements.Length()}?;
-        if !(0..=256).contains(&count){return Ok(Some(Preservation::InspectionUnavailable));}
+        if !(0..=256).contains(&count){return Ok(Err(Preservation::InspectionUnavailable));}
         let mut actions=Vec::with_capacity(count as usize);
         for index in 0..count{
             let item=unsafe{elements.GetElement(index)}?;
@@ -105,15 +115,26 @@ pub(super) fn preservation(dialog:HWND,part:&Parts,automation:Option<&IUIAutomat
                 secondary_confirmation:!is_primary&&same_confirmation_row(primary_bounds,bounds),
                 dropdown:is_primary&&primary_dropdown});
         }
-        if !actions.iter().any(|action|action.primary){return Ok(Some(Preservation::InspectionUnavailable));}
-        Ok(preserve(dialog_kind(dialog,part,Some(automation)),&actions))
+        if !actions.iter().any(|action|action.primary){return Ok(Err(Preservation::InspectionUnavailable));}
+        Ok(supported(dialog_kind(dialog,part,Some(automation)),&actions))
     })();
-    inspect.unwrap_or(Some(Preservation::InspectionUnavailable))
+    inspected.unwrap_or(Err(Preservation::InspectionUnavailable))
 }
 
 #[cfg(test)]mod tests{
     use super::*;
     fn action(label:&str,primary:bool)->Action{Action{kind:action_kind(label),primary,dropdown:false,secondary_confirmation:false}}
+    #[test]fn browser_upload_offers_native_alternative_without_disabling_local_file_selection(){
+        for caption in ["从移动设备上传","Upload from mobile","從行動裝置上傳"]{
+            let mut mobile=action(caption,false);mobile.secondary_confirmation=true;
+            let open=action("打开(&O)",true);
+            assert_eq!(supported(Some(SelectionKind::Files),&[open.clone(),mobile.clone()]),Ok(true));
+            let mut other=action("Custom action",false);other.secondary_confirmation=true;
+            assert_eq!(supported(Some(SelectionKind::Files),&[open.clone(),mobile.clone(),other]),Err(Preservation::AdditionalSelectionAction));
+            assert_eq!(supported(Some(SelectionKind::Files),&[open]),Ok(false));
+            assert_eq!(supported(Some(SelectionKind::Folders),&[action("Choose folder",true),mobile]),Err(Preservation::AdditionalSelectionAction));
+        }
+    }
     #[test]fn a_file_dialog_with_a_folder_action_keeps_both_native_entry_points(){
         let actions=[action("打开(&O)",true),action("选择文件夹(&D)",false),action("取消",false)];
         assert_eq!(preserve(Some(SelectionKind::Files),&actions),Some(Preservation::MixedSelection));

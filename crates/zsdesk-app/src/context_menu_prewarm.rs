@@ -14,8 +14,8 @@ pub(crate) fn needed()->bool {
         IDLE.try_lock().is_ok_and(|pool|!pool.iter().any(|worker|worker.within_lifetime(Duration::from_secs(2))))
 }
 
-pub(crate) fn start(owner:HWND,target:Vec<u8>,folder:PathBuf,background:bool,options:ContextMenuOptions,context:Option<MenuViewContext>){
-    if options.drawn || !options.modern || options.quick_first || !needed(){return;}
+pub(crate) fn start(owner:HWND,target:Vec<u8>,folder:Option<PathBuf>,background:bool,options:ContextMenuOptions,context:Option<MenuViewContext>){
+    if options.quick_first || !needed(){return;}
     let epoch=EPOCH.load(Ordering::Acquire);
     if BUSY.compare_exchange(false,true,Ordering::AcqRel,Ordering::Acquire).is_err(){return;}
     struct Busy;
@@ -35,13 +35,15 @@ pub(crate) fn start(owner:HWND,target:Vec<u8>,folder:PathBuf,background:bool,opt
         let valid=||EPOCH.load(Ordering::Acquire)==epoch && unsafe{IsWindow(Some(owner))}.as_bool();
         if !valid(){return;}
         use std::path::{Component,Prefix};
-        let Some(Component::Prefix(prefix))=folder.components().next()else{return;};
-        let (Prefix::Disk(letter)|Prefix::VerbatimDisk(letter))=prefix.kind()else{return;};
-        let root=[u16::from(letter),58,92,0];
-        if unsafe{windows::Win32::Storage::FileSystem::GetDriveTypeW(PCWSTR(root.as_ptr()))}!=3{return;}
+        if let Some(path)=&folder {
+            let Some(Component::Prefix(prefix))=path.components().next()else{return;};
+            let (Prefix::Disk(letter)|Prefix::VerbatimDisk(letter))=prefix.kind()else{return;};
+            let root=[u16::from(letter),58,92,0];
+            if unsafe{windows::Win32::Storage::FileSystem::GetDriveTypeW(PCWSTR(root.as_ptr()))}!=3{return;}
+        }
         let mode=if background{Mode::PrepareBackground}else{Mode::PrepareSelection};
         let intercept=MenuInterceptions{rename:!background,..Default::default()};
-        let Ok(mut client)=Client::spawn_at(owner,POINT::default(),vec![target],Some(folder),options,intercept,mode,false,origin) else{return;};
+        let Ok(mut client)=Client::spawn_at(owner,POINT::default(),vec![target],folder,options,intercept,mode,false,origin) else{return;};
         let until=Instant::now()+Duration::from_secs(5);
         while valid() && Instant::now()<until{
             if client.poll(&mut |_|false).is_some(){break;}

@@ -72,6 +72,15 @@ impl BackgroundView {
 }
 impl Drop for BackgroundView {fn drop(&mut self){let _=unsafe{self.browser.Destroy()};let _=unsafe{DestroyWindow(self.window)};}}
 
+/// Only the folder view is prepared. The interactive request independently
+/// resolves and validates its selected items before creating any menu.
+pub(super) fn prepare_folder(pidl:&[u8],request:&Request,events:&EventSet)->Result<()> {
+    let item=zsdesk_windows::shell::pidl::item_from_pidl(pidl)?;
+    let host=BackgroundView::create(&item,request,events)?;
+    SELECTION_CACHE.with(|cache| cache.borrow_mut().replace((SelectionNamespace::Folder(item),host)));
+    Ok(())
+}
+
 /// The source view's namespace is independent of the selected items' parents.
 /// In particular, a search result must remain a ResultsFolder even when its
 /// current selection happens to contain items from only one disk directory.

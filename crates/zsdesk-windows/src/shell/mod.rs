@@ -2,6 +2,7 @@
 
 pub mod commands;
 pub mod file_transfer;
+pub mod file_dialogs;
 pub mod folder_totals;
 mod events;
 mod explorer_browser;
