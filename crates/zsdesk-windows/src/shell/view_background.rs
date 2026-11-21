@@ -56,10 +56,11 @@ fn install_one_phase(hwnd:HWND,colors:Rc<Cell<Colors>>,owner:PaintOwner,apply_th
     };
     // ResultsFolder can create its renderer after the original browser theme
     // was applied. Theme that new control as well, without resetting view state.
-    // DefView/DirectUI own their ItemsView theme, inherited from the browser
-    // container before navigation. Do not replace it after the view is ready.
+    // DirectUI is the ItemsView renderer. Set its explicit Explorer theme when
+    // it is attached: after a process-mode switch, the native renderer can keep
+    // the previous scheme even when the new browser/container is already themed.
     if changed{
-        if owner==PaintOwner::ListView{crate::theme::theme_control(hwnd,palette.dark);}
+        if matches!(owner,PaintOwner::ListView|PaintOwner::Native){crate::theme::theme_control(hwnd,palette.dark);}
         else{
             crate::theme::allow_dark_for_window(hwnd,palette.dark);
             if permitted(apply_theme,permit.as_ref()){
