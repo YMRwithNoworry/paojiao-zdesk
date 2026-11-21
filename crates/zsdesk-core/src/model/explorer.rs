@@ -209,15 +209,15 @@ pub struct WindowPlacement {
 /// Individually configurable actions in the Explorer command bar.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "kebab-case")]
-pub enum CommandBarItem { New, Cut, Copy, Paste, Rename, Share, Delete, Sort, View, More, PreviewPane, DetailsPane }
+pub enum CommandBarItem { New, NewFolder, Cut, Copy, Paste, Rename, Share, Delete, Sort, View, More, PreviewPane, DetailsPane }
 
 impl CommandBarItem {
-    pub const ALL: [Self; 11] = [Self::New, Self::Cut, Self::Copy, Self::Paste, Self::Rename, Self::Share,
+    pub const ALL: [Self; 12] = [Self::New, Self::NewFolder, Self::Cut, Self::Copy, Self::Paste, Self::Rename, Self::Share,
         Self::Delete, Self::Sort, Self::View, Self::More, Self::PreviewPane];
 
     pub const fn key(self) -> &'static str {
         match self {
-            Self::New => "new", Self::Cut => "cut", Self::Copy => "copy", Self::Paste => "paste",
+            Self::New => "new", Self::NewFolder => "new-folder", Self::Cut => "cut", Self::Copy => "copy", Self::Paste => "paste",
             Self::Rename => "rename", Self::Share => "share", Self::Delete => "delete", Self::Sort => "sort",
             Self::View => "view", Self::More => "more", Self::PreviewPane => "preview-pane", Self::DetailsPane => "details-pane",
         }
@@ -340,6 +340,7 @@ pub struct ExplorerUi {
     pub double_click_close_tab: bool,
     pub right_click_close_tab: bool,
     pub double_click_blank_up: bool,
+    pub single_click_blank_up: bool,
     pub close_window_on_last_tab: bool,
     pub show_tab_count: bool,
     pub show_tab_list: bool,
@@ -405,7 +406,7 @@ impl Default for ExplorerUi {
     fn default() -> Self {
         Self { language:crate::i18n::LanguagePreference::System,startup_location:StartupLocation::default(),new_tab_location:NewTabLocation::default(), tab_placement:TabPlacement::Top, side_tabs_width:210,side_tabs_compact:true,dual_pane:false, pane_ratio:500,
             double_click_close_tab:true, right_click_close_tab:false, mouse_gestures:true, everything_folder_sizes:false,
-            close_window_on_last_tab:true,double_click_blank_up:true,show_tab_count:true,show_tab_list:true,tab_selection_emphasis:false,
+            close_window_on_last_tab:true,double_click_blank_up:true,single_click_blank_up:false,show_tab_count:true,show_tab_list:true,tab_selection_emphasis:false,
             show_tree: true, tree_width: 220, show_bookmarks: true, bookmarks_on_right:false, bookmarks_width:210, explorer_tray:false, show_preview: false, show_details: false,
             command_bar: CommandBarPreferences::default(), context_menu: ContextMenuPreferences::default(),
             search_all_files: true, search_backend: SearchBackendPreference::NativeNtfs, space_preview: true,

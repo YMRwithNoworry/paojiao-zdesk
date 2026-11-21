@@ -36,12 +36,12 @@ pub fn scale(value: i32, dpi: u32) -> i32 {
 
 /// Command bar entries, left to right.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum CommandId { New, Cut, Copy, Paste, Rename, Share, Delete, Sort, View, More, PreviewPane, DetailsPane }
+pub enum CommandId { New, NewFolder, Cut, Copy, Paste, Rename, Share, Delete, Sort, View, More, PreviewPane, DetailsPane }
 
 impl CommandId {
     pub const fn preference(self) -> CommandBarItem {
         match self {
-            Self::New => CommandBarItem::New, Self::Cut => CommandBarItem::Cut, Self::Copy => CommandBarItem::Copy,
+            Self::New => CommandBarItem::New, Self::NewFolder => CommandBarItem::NewFolder, Self::Cut => CommandBarItem::Cut, Self::Copy => CommandBarItem::Copy,
             Self::Paste => CommandBarItem::Paste, Self::Rename => CommandBarItem::Rename, Self::Share => CommandBarItem::Share,
             Self::Delete => CommandBarItem::Delete, Self::Sort => CommandBarItem::Sort, Self::View => CommandBarItem::View,
             Self::More => CommandBarItem::More, Self::PreviewPane => CommandBarItem::PreviewPane, Self::DetailsPane => CommandBarItem::DetailsPane,
@@ -56,7 +56,7 @@ impl CommandId {
     }
     pub fn tooltip(self) -> &'static str {
         zsdesk_core::i18n::text(match self {
-            Self::New => "新建项目", Self::Cut => "剪切 (Ctrl+X)", Self::Copy => "复制 (Ctrl+C)",
+            Self::New => "新建项目", Self::NewFolder => "新建文件夹 (Ctrl+Shift+N)", Self::Cut => "剪切 (Ctrl+X)", Self::Copy => "复制 (Ctrl+C)",
             Self::Paste => "粘贴 (Ctrl+V)", Self::Rename => "重命名 (F2)", Self::Share => "共享",
             Self::Delete => "删除 (Del)", Self::Sort => "排序方式", Self::View => "布局和视图选项",
             Self::More => "查看更多", Self::PreviewPane => "预览窗格 (Alt+P)", Self::DetailsPane => "详细信息窗格 (Alt+Shift+P)",
@@ -69,7 +69,7 @@ impl CommandId {
 }
 
 const COMMAND_GROUPS: &[&[CommandId]] = &[
-    &[CommandId::New],
+    &[CommandId::New, CommandId::NewFolder],
     &[CommandId::Cut, CommandId::Copy, CommandId::Paste, CommandId::Rename, CommandId::Share, CommandId::Delete],
     &[CommandId::Sort, CommandId::View],
     &[CommandId::More],
@@ -328,7 +328,7 @@ impl ChromeLayout {
             x += natural;
         }
         if x + s(4) + button <= utility_left {
-            layout.new_tab = Rect::clamped(x + s(4), tab_y, button, tab_h);
+            layout.new_tab = Rect::clamped(x + s(4), button_y, button, button_h);
         }
 
         let full_width=width;
@@ -929,9 +929,7 @@ mod tests {
         for dpi in [96, 120, 144, 192] {
             let caption = Rect::new(1600 - scale(138, dpi), scale(3, dpi), scale(46, dpi), scale(30, dpi));
             let l = ChromeLayout::new(&ChromeInput { caption_button: Some(caption), ..input(1600, 2, 0, dpi) });
-            assert_eq!(l.new_tab.y, l.tabs[0].rect.y);
-            assert_eq!(l.new_tab.height, l.tabs[0].rect.height);
-            for rect in [l.tab_list, l.app_menu] {
+            for rect in [l.new_tab, l.tab_list, l.app_menu] {
                 assert_eq!(rect.y, caption.y);
                 assert_eq!(rect.height, caption.height);
                 assert_eq!(rect.y * 2 + rect.height, caption.y * 2 + caption.height);
@@ -948,7 +946,9 @@ mod tests {
         let after = ChromeLayout::new(&ChromeInput { command_bar: &preferences, ..input(1400, 2, 0, 96) });
         assert!(after.command_rect(CommandId::Cut).is_none());
         assert_eq!(after.command_rect(CommandId::Copy).unwrap().x, before.command_rect(CommandId::Cut).unwrap().x);
+        assert!(after.command_rect(CommandId::NewFolder).is_some());
         preferences.set_item_visible(CommandBarItem::New, false);
+        preferences.set_item_visible(CommandBarItem::NewFolder, false);
         let after = ChromeLayout::new(&ChromeInput { command_bar: &preferences, ..input(1400, 2, 0, 96) });
         assert_eq!(after.commands[0].0, CommandId::Copy);
         assert_eq!(after.commands[0].1.x, 12);

@@ -56,17 +56,73 @@ fn zoom_icon_size(current: IconSize, steps: i32) -> IconSize {
     let index = match current { IconSize::Small => 0i32, IconSize::Medium => 1, IconSize::Large => 2 };
     match (index + steps).clamp(0, 2) { 0 => IconSize::Small, 2 => IconSize::Large, _ => IconSize::Medium }
 }
-fn desktop_item_position(origin:Bounds,width:i32,height:i32,occupied:&[Bounds])->Option<Bounds> {
-    if origin.w<=0||origin.h<=0||origin.w>width||origin.h>height{return None;}
-    let candidate=Bounds::new(origin.x.clamp(0,(width-origin.w).max(0)),origin.y.clamp(0,(height-origin.h).max(0)),origin.w,origin.h);
-    let free=|cell:Bounds|occupied.iter().all(|other|cell.right()<=other.x||cell.x>=other.right()||cell.bottom()<=other.y||cell.y>=other.bottom());
-    if free(candidate) { return Some(candidate); }
-    for x in (candidate.x.rem_euclid(origin.w)..=(width-origin.w).max(0)).step_by(origin.w as usize) {
-        for y in (candidate.y.rem_euclid(origin.h)..=(height-origin.h).max(0)).step_by(origin.h as usize) {
-            let cell=Bounds::new(x,y,origin.w,origin.h); if free(cell) { return Some(cell); }
-        }
+fn arrival_cell(preferred: Option<(i32,i32)>, area: (i32,i32), grid: super::drag_placement::Grid, occupied: &[Bounds]) -> Option<Bounds> {
+    let (w,h) = (96,104);
+    if area.0 < w || area.1 < h { return None; }
+    let free = |x,y| {
+        let cell = Bounds::new(x,y,w,h);
+        occupied.iter().all(|other| cell.right()<=other.x || cell.x>=other.right() || cell.bottom()<=other.y || cell.y>=other.bottom()).then_some(cell)
+    };
+    if let Some((x,y)) = preferred {
+        if let Some(cell) = free(x.clamp(0,area.0-w),y.clamp(0,area.1-h)) { return Some(cell); }
+    }
+    let dx = grid.spacing.0.max(w);
+    let dy = grid.spacing.1.max(h);
+    let left = grid.origin.0.rem_euclid(dx).min(area.0-w);
+    let top = grid.origin.1.rem_euclid(dy).min(area.1-h);
+    let rows=(area.1-h-top)/dy+1;
+    let columns=(area.0-w-left)/dx+1;
+    let (x,y)=preferred.unwrap_or((left,top));
+    let column=((x-left+dx/2).div_euclid(dx)).clamp(0,columns-1);
+    let row=((y-top+dy/2).div_euclid(dy)).clamp(0,rows-1);
+    let start=column*rows+row;
+    let count=rows*columns;
+    // Continue down from Explorer's assigned cell; wrap after the last column.
+    for offset in 0..count {
+        let index=(start+offset)%count;
+        if let Some(cell)=free(left+(index/rows)*dx,top+(index%rows)*dy) { return Some(cell); }
     }
     None
+}
+
+struct ArrivalMonitor {
+    monitor: Monitor,
+    grid: std::cell::OnceCell<super::drag_placement::Grid>,
+    occupied: Vec<Bounds>,
+}
+impl ArrivalMonitor {
+    fn capture(config:&DesktopConfig, entries:&[ShellEntry]) -> Vec<Self> {
+        let live:HashSet<_>=entries.iter().map(|entry|entry.key.to_lowercase()).collect();
+        let mut displays=monitors();
+        if displays.is_empty() { displays.push(primary_monitor()); }
+        displays.sort_by_key(|m| !m.primary);
+        let primary = displays[0].name.clone();
+        let names:HashSet<_>=displays.iter().map(|m|m.name.clone()).collect();
+        displays.into_iter().map(|monitor| {
+            let groups=config.fences.iter().filter(|f|!config.settings.hidden&&!f.is_hidden_tab());
+            let loose=config.released_items.iter().filter(|f|f.members.iter().any(|key|live.contains(&key.to_lowercase())));
+            let area=(unscale(monitor.work.right-monitor.work.left,monitor.dpi), unscale(monitor.work.bottom-monitor.work.top,monitor.dpi));
+            let occupied=groups.chain(loose).filter(|f|f.placement.monitor==monitor.name ||
+                (monitor.name==primary&&!names.contains(&f.placement.monitor))).map(|f|{
+                    let p=&f.placement;
+                    let w=p.width.min(area.0);
+                    let h=(if f.collapsed {TITLE_H} else {p.height}).min(area.1);
+                    Bounds::new(p.x.clamp(0,area.0-w),p.y.clamp(0,area.1-h),w,h)
+                }).collect();
+            Self {monitor,grid:Default::default(),occupied}
+        }).collect()
+    }
+    fn place(&mut self, point:Option<POINT>) -> Option<Placement> {
+        let m=&self.monitor;
+        let grid=*self.grid.get_or_init(||desktop::icon_grid(m.work).ok().map(|g|super::drag_placement::Grid {
+            origin:(unscale(g.origin.x-m.work.left,m.dpi),unscale(g.origin.y-m.work.top,m.dpi)),
+            spacing:(unscale(g.spacing.x,g.dpi),unscale(g.spacing.y,g.dpi))
+        }).unwrap_or(super::drag_placement::Grid{origin:(0,0),spacing:(96,104)}));
+        let preferred=point.map(|p|(unscale(p.x-m.work.left,m.dpi),unscale(p.y-m.work.top,m.dpi)));
+        let cell=arrival_cell(preferred,(unscale(m.work.right-m.work.left,m.dpi),unscale(m.work.bottom-m.work.top,m.dpi)),grid,&self.occupied)?;
+        self.occupied.push(cell);
+        Some(Placement{monitor:m.name.clone(),x:cell.x,y:cell.y,width:cell.w,height:cell.h})
+    }
 }
 
 pub const WM_TRAY: u32 = super::protocol::Message::Tray as u32;
@@ -408,6 +464,12 @@ impl DesktopHost {
         zsdesk_windows::flyout::refresh_system();
         self.palette = FencePalette::new(if dark { Mode::Dark } else { Mode::Light }, self.config.settings.opacity);
         if let Some(accent) = zsdesk_windows::theme::system_accent(dark) { self.palette = self.palette.with_accent(accent); }
+        if let Some(colors)=zsdesk_windows::theme::explorer_selection_colors(dark) {
+            let color=|[r,g,b]:[u8;3]| zsdesk_ui::theme::Color::rgb(r,g,b);
+            self.palette.selected=color(colors.fill);
+            self.palette.selected_border=color(colors.border);
+            self.palette.selected_text=color(colors.text);
+        }
     }
 
     pub fn schedule_save(&self) { unsafe { SetTimer(Some(self.hwnd), TIMER_SAVE, 400, None); } }
@@ -1324,14 +1386,17 @@ impl DesktopHost {
         }
         let infos: Vec<ItemInfo> = self.desktop_entries.iter().map(item_info).collect();
         if self.config.settings.organize {
-            let monitor=primary_monitor();let width=unscale(monitor.work.right-monitor.work.left,monitor.dpi);let height=unscale(monitor.work.bottom-monitor.work.top,monitor.dpi);
-            if width<96||height<104{return;}
-            let mut occupied:Vec<_>=self.config.fences.iter().chain(&self.config.released_items).filter(|item|item.placement.monitor==monitor.name&&!item.is_hidden_tab())
-                .map(|item|Bounds::new(item.placement.x,item.placement.y,item.placement.width,if item.collapsed{TITLE_H}else{item.placement.height})).collect();
             let mut planned=self.config.clone();
-            let changed=planned.try_reconcile_uncollected(&infos,|_|{
-                let cell=desktop_item_position(Bounds::new(24,24,96,104),width,height,&occupied).ok_or(())?;occupied.push(cell);
-                Ok::<Placement,()>(Placement{monitor:monitor.name.clone(),x:cell.x,y:cell.y,width:cell.w,height:cell.h})
+            let mut layout=None;
+            let changed=planned.try_reconcile_uncollected(&infos,|key|{
+                let (screens,positions)=layout.get_or_insert_with(||(ArrivalMonitor::capture(&self.config,&self.desktop_entries),desktop::DesktopPositions::read()));
+                let point=positions.as_ref().and_then(|p|self.desktop_entries.iter().find(|e|e.key==key).and_then(|e|p.position(e)));
+                if let Some(point)=point {
+                    if let Some(screen)=screens.iter_mut().find(|s| {
+                        let r=s.monitor.work;point.x>=r.left&&point.x<r.right&&point.y>=r.top&&point.y<r.bottom
+                    }) { if let Some(p)=screen.place(Some(point)) { return Ok(p); } }
+                }
+                screens.iter_mut().find_map(|s|s.place(None)).ok_or(())
             });
             let Ok(changed)=changed else{
                 if self.config.settings.icons_hidden_by_zsdesk{self.restore_desktop();self.notify_error(zsdesk_core::i18n::text("桌面空间不足，已恢复系统桌面图标；原格子布局仍保留。"));}
@@ -1598,7 +1663,7 @@ impl DesktopHost {
                 self.render(id);
                 return After::Nothing;
             }
-            Some(Interaction::Press { key, cursor }) => {
+            Some(Interaction::Press { key, cursor, .. }) => {
                 let Some(item)=win.entries.iter().position(|entry|entry.key==key)else{win.interaction=None;return After::Nothing;};
                 let threshold = unsafe { GetSystemMetrics(SM_CXDRAG) };
                 if (point.x - cursor.x).abs() > threshold || (point.y - cursor.y).abs() > threshold {
@@ -1810,6 +1875,7 @@ impl DesktopHost {
             FenceHit::Item(i) => {
                 if double { return After::Open { fence: id, index: i, explorer: ctrl }; }
                 let key = win.entries[i].key.clone();
+                let deselect_on_release = !ctrl && !shift && win.toggles_on_plain_click(&key);
                 if shift {
                     let anchor = win.anchor.unwrap_or(i);
                     let (a, b) = (anchor.min(i), anchor.max(i));
@@ -1823,7 +1889,7 @@ impl DesktopHost {
                     win.anchor = Some(i);
                 }
                 win.focus = Some(i);
-                win.interaction = Some(Interaction::Press { key:win.entries[i].key.clone(), cursor: point });
+                win.interaction = Some(Interaction::Press { key:win.entries[i].key.clone(), cursor: point, deselect_on_release });
                 unsafe { windows::Win32::UI::Input::KeyboardAndMouse::SetCapture(win.hwnd); }
             }
             FenceHit::Empty => {
@@ -1873,10 +1939,17 @@ impl DesktopHost {
                 }
                 self.schedule_save();
             }
-            Some(Interaction::Press { key, .. }) => {
+            Some(Interaction::Press { key, deselect_on_release, .. }) => {
                 let ctrl = unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0;
                 let shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
-                if !ctrl && !shift &&win.entries.iter().any(|entry|entry.key==key){ win.selection = HashSet::from([key]); }
+                if !ctrl && !shift && win.entries.iter().any(|entry|entry.key==key) {
+                    if deselect_on_release && self.config.fence(id).is_some_and(|f| {
+                        matches!(win.geometry(f).hit(point.x,point.y,win.dpi,f.locked,win.collapsed(f)),FenceHit::Item(i)
+                            if win.entries.get(i).is_some_and(|entry|entry.key==key))
+                    }) {
+                        win.change_selection(SelectionChange::Clear);
+                    } else { win.selection = HashSet::from([key]); }
+                }
             }
             _ => {}
         }
@@ -2024,7 +2097,7 @@ impl DesktopHost {
             VK_DELETE => return After::Verb { fence: id, verb: "delete", background: false },
             VK_F2 => if let Some(f) = selected_focus_index(win) { let key = win.entries[f].key.clone(); self.begin_rename(id, RenameTarget::Item(key)); },
             VK_F5 => if fence.is_desktop() { self.refresh_desktop(); } else { self.refresh_folder(id); },
-            VK_ESCAPE => { win.selection.clear(); self.render(id); }
+            VK_ESCAPE => { win.change_selection(SelectionChange::Clear); self.render(id); }
             VK_BACK => if fence.browse.is_some() { self.browse_up(id); },
             _ if ctrl && !alt && k == VK_A => { win.change_selection(if shift { SelectionChange::Invert } else { SelectionChange::All }); self.render(id); }
             _ if ctrl && k == VK_C => return After::Verb { fence: id, verb: "copy", background: false },
@@ -2976,17 +3049,37 @@ mod shortcut_tests {
     }
     #[test]
     fn loose_desktop_icon_placement_avoids_fences_and_stays_on_monitor() {
-        let origin=Bounds::new(100,100,96,104);
-        let occupied=vec![Bounds::new(0,0,192,208)];
-        let cell=desktop_item_position(origin,800,600,&occupied).unwrap();
-        assert!(cell.x>=192||cell.y>=208);
-        assert!(cell.x>=0&&cell.y>=0&&cell.right()<=800&&cell.bottom()<=600);
-        let outside=desktop_item_position(Bounds::new(-500,900,96,104),800,600,&[]).unwrap();
-        assert_eq!((outside.x,outside.y),(0,496));
-        let first=desktop_item_position(Bounds::new(24,24,96,104),800,600,&[]).unwrap();
-        let second=desktop_item_position(Bounds::new(24,24,96,104),800,600,&[first]).unwrap();
-        assert_eq!((second.x,second.y),(first.x,first.y+104));
-        assert!(desktop_item_position(origin,800,600,&[Bounds::new(0,0,800,600)]).is_none());
+        let grid=super::super::drag_placement::Grid{origin:(7,11),spacing:(100,112)};
+        let area=(800,600);
+        assert_eq!(arrival_cell(Some((302,113)),area,grid,&[]),Some(Bounds::new(302,113,96,104)));
+        let first=arrival_cell(None,area,grid,&[]).unwrap();
+        assert_eq!(first,Bounds::new(7,11,96,104));
+        let second=arrival_cell(Some((7,11)),area,grid,&[first]).unwrap();
+        assert_eq!(second,Bounds::new(7,123,96,104));
+        let blocked=Bounds::new(307,123,96,104);
+        assert_eq!(arrival_cell(Some((307,123)),area,grid,&[blocked]),Some(Bounds::new(307,235,96,104)));
+        assert_eq!(arrival_cell(None,area,grid,&[Bounds::new(0,0,103,600)]),Some(Bounds::new(107,11,96,104)));
+        assert!(arrival_cell(None,area,grid,&[Bounds::new(0,0,800,600)]).is_none());
+    }
+    #[test]
+    fn download_on_secondary_monitor_uses_its_work_origin_and_scale() {
+        let mut screen = ArrivalMonitor {
+            monitor:Monitor{name:"secondary".into(), work:RECT{left:-1920,top:45,right:0,bottom:1125},dpi:144,primary:false},
+            grid:Default::default(),occupied:Vec::new(),
+        };
+        screen.grid.set(super::super::drag_placement::Grid{origin:(0,0),spacing:(100,112)}).unwrap();
+        let p=screen.place(Some(POINT{x:-1470,y:495})).unwrap();
+        assert_eq!(p.monitor,"secondary");assert_eq!((p.x,p.y),(300,300));
+    }
+    #[test]
+    fn repeated_click_can_clear_a_single_fence_selection_without_changing_a_drag_group() {
+        let mut win=keyboard_selection();
+        win.selection=HashSet::from(["A".to_owned()]);
+        assert!(win.toggles_on_plain_click("A") && !win.toggles_on_plain_click("B"));
+        win.selection.insert("B".to_owned());
+        assert!(!win.toggles_on_plain_click("A"));
+        win.focus=Some(1); win.anchor=Some(0); win.change_selection(SelectionChange::Clear);
+        assert!(win.selection.is_empty() && win.focus.is_none() && win.anchor.is_none());
     }
     #[test]
     fn fence_startup_command_binds_the_exact_profile() {

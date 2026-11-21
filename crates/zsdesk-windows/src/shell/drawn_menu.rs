@@ -182,8 +182,17 @@ fn bitmap_alpha(bitmap:HBITMAP)->BitmapAlpha{
     }BitmapAlpha::Ignore
 }
 fn read_raw(menu:HMENU,position:u32)->Result<(MENUITEMINFOW,String)>{
+    let mut short = [0u16; 256];
     let mut info=MENUITEMINFOW{cbSize:std::mem::size_of::<MENUITEMINFOW>()as u32,
-        fMask:MIIM_ID|MIIM_FTYPE|MIIM_STATE|MIIM_SUBMENU|MIIM_DATA|MIIM_BITMAP|MIIM_CHECKMARKS|MIIM_STRING,..Default::default()};
+        fMask:MIIM_ID|MIIM_FTYPE|MIIM_STATE|MIIM_SUBMENU|MIIM_DATA|MIIM_BITMAP|MIIM_CHECKMARKS|MIIM_STRING,
+        dwTypeData:PWSTR(short.as_mut_ptr()),cch:short.len()as u32,..Default::default()};
+    unsafe{GetMenuItemInfoW(menu,position,true,&mut info)}?;
+    info.dwTypeData=PWSTR::null();
+    if (info.cch as usize) < short.len()-1 {
+        let end = short.iter().position(|&unit| unit == 0).unwrap_or(short.len());
+        return Ok((info, String::from_utf16_lossy(&short[..end])));
+    }
+    info.cch=0;
     unsafe{GetMenuItemInfoW(menu,position,true,&mut info)}?;
     if info.cch>32767{return Err(error(0x8007000e,"菜单文字超过可绘制范围"));}
     let mut buffer=vec![0u16;info.cch as usize+1];info.dwTypeData=PWSTR(buffer.as_mut_ptr());info.cch=buffer.len()as u32;
@@ -417,6 +426,7 @@ fn paint(cv:&Canvas,level:&Level,colors:&Palette){
 }
 fn paint_provider_rows(provider:&Provider,level:&Level,surface:&Surface){
     let shadow=level.metrics.px(geometry::SHADOW_DIP)as i32;
+    let mut painted = Vec::new();
     for(index,(row,item))in level.layout.rows.iter().zip(&level.items).enumerate(){if item.hidden||row.h<=0.||(!item.owner_draw&&item.bitmap!=HBMMENU_CALLBACK){continue;}
         // Providers may replace an owner-draw payload while a menu is open.
         // Never pass a stale itemData pointer back to the provider's drawer.
@@ -432,15 +442,24 @@ fn paint_provider_rows(provider:&Provider,level:&Level,surface:&Surface){
         let mut draw=DRAWITEMSTRUCT{CtlType:ODT_MENU,itemID:item.id,itemAction:ODA_DRAWENTIRE,itemState:flags,hwndItem:HWND(level.menu.0),hDC:surface.dc,rcItem:rect,itemData:item.item_data,..Default::default()};
         let saved=unsafe{SaveDC(surface.dc)};unsafe{IntersectClipRect(surface.dc,clip.left,clip.top,clip.right,clip.bottom);SetBkMode(surface.dc,TRANSPARENT);}
         provider.message(WM_DRAWITEM,WPARAM(0),LPARAM((&mut draw as*mut DRAWITEMSTRUCT)as isize));
-        if saved!=0{let _=unsafe{RestoreDC(surface.dc,saved)};}let _=unsafe{GdiFlush()};
-        // Ordinary GDI drawers write RGB and leave alpha undefined. Only their
-        // clipped row becomes opaque; the flyout's rounded shadow stays intact.
-        let pixels=unsafe{std::slice::from_raw_parts_mut(surface.bits,surface.pixel_bytes()as usize)};
+        if saved!=0{let _=unsafe{RestoreDC(surface.dc,saved)};}
+        painted.push(clip);
+    }
+    if painted.is_empty() { return; }
+    let _ = unsafe { GdiFlush() };
+    // Flush the provider's GDI draws once before touching any DIB pixels.
+    let pixels=unsafe{std::slice::from_raw_parts_mut(surface.bits,surface.pixel_bytes()as usize)};
+    for clip in painted {
         for y in clip.top.max(0)..clip.bottom.min(surface.height){for x in clip.left.max(0)..clip.right.min(surface.width){pixels[((y*surface.width+x)*4+3)as usize]=255;}}
     }
 }
 fn present(provider:&Provider,level:&mut Level,gfx:&Gfx,colors:&Palette)->Result<()>{
-    for item in &mut level.items{if item.image.as_ref().is_none_or(|(generation,_)|*generation!=gfx.generation()){item.image=item.wic.as_ref().and_then(|wic|gfx.upload(wic)).map(|image|(gfx.generation(),image));}}
+    for (i, (item, row)) in level.items.iter_mut().zip(&level.layout.rows).enumerate() {
+        if !level.toolbar.contains(&i) && (row.h <= 0. || row.y+row.h < level.scroll || row.y > level.scroll+level.body.height() as f32) { continue; }
+        if item.image.as_ref().is_none_or(|(generation,_)| *generation != gfx.generation()) {
+            item.image=item.wic.as_ref().and_then(|wic| gfx.upload(wic)).map(|image| (gfx.generation(),image));
+        }
+    }
     let shadow=level.metrics.px(geometry::SHADOW_DIP)as i32;let(width,height)=(level.body.width()+2*shadow,level.body.height()+2*shadow);
     let mut surface=level.surface.take();let target=Surface::ensure(&mut surface,width,height).ok_or_else(||error(0x8007000e,"菜单绘图内存不足"))?;
     let drawn=gfx.draw(target,|canvas|paint(canvas,level,colors));if drawn.is_ok(){paint_provider_rows(provider,level,target);}
@@ -920,6 +939,21 @@ pub(super) fn track_initialized(owner:HWND,menu:HMENU,point:POINT,context:&ICont
         let closed=unsafe{CloseDesktop(desktop)}!=0;let mut foreground=0;unsafe{GetWindowThreadProcessId(GetForegroundWindow(),Some(&mut foreground));}
         let isolated=foreground!=std::process::id();let report=serde_json::json!({"state":if result.is_ok()&&closed&&isolated{"passed"}else{"failed"},"checks":result.as_ref().map_err(|error|format!("{error:#}")),"desktop_closed":closed,"test_did_not_activate":isolated,"physical_input_generated":false});
         std::fs::write(output.join("drawn-shell-menu.current.json"),serde_json::to_vec_pretty(&report)?)?;println!("{report}");result?;ensure!(closed&&isolated,"private popup cleanup/foreground failed");Ok(())
+    }
+    #[test]
+    fn menu_labels_round_trip_below_at_and_above_stack_capacity() -> Result<()> {
+        struct OwnedMenu(HMENU);
+        impl Drop for OwnedMenu { fn drop(&mut self) { let _=unsafe{DestroyMenu(self.0)}; } }
+        let menu=OwnedMenu(unsafe { CreatePopupMenu()? });
+        for (i,len) in [0, 10, 254, 255, 256, 900].into_iter().enumerate() {
+            let label = "名".repeat(len);
+            let wide:Vec<_> = label.encode_utf16().chain(Some(0)).collect();
+            unsafe { AppendMenuW(menu.0, MF_STRING, 10+i, PCWSTR(wide.as_ptr()))?; }
+            let (info,actual) = read_raw(menu.0,i as u32)?;
+            assert_eq!(info.wID, (10+i) as u32);
+            assert_eq!(actual, label);
+        }
+        Ok(())
     }
     #[test]fn submenu_aim_corridor_keeps_diagonal_pointer_travel(){
         let a=POINT{x:100,y:140};let b=POINT{x:200,y:100};let c=POINT{x:200,y:350};

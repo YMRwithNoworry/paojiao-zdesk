@@ -174,6 +174,57 @@ pub fn set_dark_frame(hwnd: HWND, dark: bool) {
     let _ = unsafe { DwmSetWindowAttribute(hwnd, attribute, (&value as *const i32).cast(), 4) };
 }
 
+pub struct ItemSelectionColors { pub fill: [u8;3], pub border: [u8;3], pub text: [u8;3] }
+
+/// Sample Explorer's selected ListView tile once when the desktop theme changes.
+/// Some Windows themes provide this state as a bitmap, without a fill-color property.
+pub fn explorer_selection_colors(dark:bool) -> Option<ItemSelectionColors> {
+    use windows::Win32::Graphics::Gdi::{COLOR_HIGHLIGHT,COLOR_HIGHLIGHTTEXT,GetSysColor,GdiFlush};
+    use windows::Win32::UI::Controls::{OpenThemeData,CloseThemeData,HTHEME,DrawThemeBackground,GetThemeColor,LVP_LISTITEM,LISS_SELECTED,TMT_TEXTCOLOR};
+    let rgb=|v:u32|[v as u8,(v>>8) as u8,(v>>16) as u8];
+    if high_contrast() {
+        let fill=rgb(unsafe{GetSysColor(COLOR_HIGHLIGHT)});
+        return Some(ItemSelectionColors{fill,border:fill,text:rgb(unsafe{GetSysColor(COLOR_HIGHLIGHTTEXT)})});
+    }
+    struct Theme(HTHEME);
+    impl Drop for Theme{fn drop(&mut self){let _=unsafe{CloseThemeData(self.0)};}}
+    let name=if dark { w!("DarkMode_ItemsView::ListView") } else { w!("ItemsView::ListView") };
+    let handle=unsafe{OpenThemeData(None,name)};
+    if handle.is_invalid() { return None; }
+    let theme=Theme(handle);
+    let surface=crate::gfx::Surface::new(32,24)?;
+    let base=if dark{32}else{255};
+    unsafe{std::ptr::write_bytes(surface.bits,base,surface.pixel_bytes() as usize);}
+    let rect=RECT{left:0,top:0,right:32,bottom:24};
+    unsafe{DrawThemeBackground(theme.0,surface.dc,LVP_LISTITEM.0,LISS_SELECTED.0,&rect,None)}.ok()?;
+    let _=unsafe{GdiFlush()};
+    let pixel=|x:usize,y:usize|{let i=(y*32+x)*4;unsafe{[*surface.bits.add(i+2),*surface.bits.add(i+1),*surface.bits.add(i)]}};
+    let fill=pixel(16,12);
+    if fill==[base;3] { return None; }
+    let lightness=|[r,g,b]:[u8;3]|(299*i32::from(r)+587*i32::from(g)+114*i32::from(b))/1000;
+    let text=unsafe{GetThemeColor(theme.0,LVP_LISTITEM.0,LISS_SELECTED.0,TMT_TEXTCOLOR)}.ok().map(|value|rgb(value.0))
+        .filter(|text|(lightness(*text)-lightness(fill)).abs()>=90)
+        .unwrap_or(if lightness(fill)<128{[255;3]}else{[0;3]});
+    let edge=pixel(16,0);
+    Some(ItemSelectionColors{fill,border:if edge==[base;3]{fill}else{edge},text})
+}
+
+/// Match the system caption buttons to the app strip when Windows colors title bars.
+pub fn match_accented_caption(hwnd: HWND, background: u32, foreground: u32) -> bool {
+    use windows::Win32::Graphics::Dwm::{DWMWA_CAPTION_COLOR, DWMWA_TEXT_COLOR};
+    if os_build() < 22000 { return false; }
+    let mut enabled = 0u32;
+    let mut size = 4;
+    let _ = unsafe { RegGetValueW(HKEY_CURRENT_USER, w!("Software\\Microsoft\\Windows\\DWM"), w!("ColorPrevalence"),
+        RRF_RT_REG_DWORD, None, Some((&mut enabled as *mut u32).cast()), Some(&mut size)) };
+    let use_palette = enabled != 0 && !high_contrast();
+    for (attribute, color) in [(DWMWA_CAPTION_COLOR, background), (DWMWA_TEXT_COLOR, foreground)] {
+        let color = if use_palette { color } else { u32::MAX }; // DWMWA_COLOR_DEFAULT
+        let _ = unsafe { DwmSetWindowAttribute(hwnd, attribute, (&color as *const u32).cast(), 4) };
+    }
+    use_palette
+}
+
 /// Windows 11 rounded window corners (`small` for popups such as tooltips and editors).
 /// Earlier systems keep square corners; ZSDesk draws its own rounded surfaces there.
 pub fn round_corners(hwnd: HWND, small: bool) {
@@ -227,6 +278,15 @@ pub fn caption_button_bounds(hwnd: HWND) -> Option<RECT> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn explorer_selection_theme_has_legible_text_when_available() {
+        for dark in [false,true] {
+            if let Some(colors)=super::explorer_selection_colors(dark) {
+                println!("dark={dark} selected={:?} edge={:?} text={:?}",colors.fill,colors.border,colors.text);
+                assert_ne!(colors.fill,colors.text);
+            }
+        }
+    }
     #[test]
     fn accent_palette_uses_winui_shades() {
         // Windows 11 default blue palette.

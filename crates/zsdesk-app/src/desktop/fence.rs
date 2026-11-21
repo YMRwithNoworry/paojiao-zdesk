@@ -76,7 +76,7 @@ pub struct Edges { pub left: bool, pub top: bool, pub right: bool, pub bottom: b
 pub enum Interaction {
     Move { cursor: POINT, rect: RECT },
     Resize { edges: Edges, cursor: POINT, rect: RECT },
-    Press { key: String, cursor: POINT },
+    Press { key: String, cursor: POINT, deselect_on_release: bool },
     /// Rubber-band selection; `start` is in content coordinates (client y +
     /// scroll at the press), `current` in client coordinates.
     Rubber { start: POINT, current: POINT, base: HashSet<String> },
@@ -418,11 +418,21 @@ impl FenceWin {
     }
 
     pub fn change_selection(&mut self, change: SelectionChange) {
+        if matches!(change, SelectionChange::Clear) {
+            self.selection.clear();
+            self.focus=None;
+            self.anchor=None;
+            return;
+        }
         self.selection = changed_selection(self.entries.iter().map(|entry| entry.key.as_str()), &self.selection, change);
         if !self.focus.and_then(|index| self.entries.get(index)).is_some_and(|entry| self.selection.contains(&entry.key)) {
             self.focus = self.entries.iter().position(|entry| self.selection.contains(&entry.key));
         }
         self.anchor = self.focus;
+    }
+
+    pub(super) fn toggles_on_plain_click(&self,key:&str)->bool {
+        !self.standalone && self.selection.len()==1 && self.selection.contains(key)
     }
 
     /// Paints and presents the fence. `icon` resolves item bitmaps.
@@ -563,7 +573,6 @@ impl FenceWin {
                     } else if self.hover == FenceHit::Item(i) {
                         cv.round(r, sf(4.0), col(palette.hover));
                     }
-                    if self.focus == Some(i) && selected { cv.stroke_round(r, sf(4.0), col(palette.selected_border), 1.0); }
                     let icon_rect = rf(cell.icon);
                     let opacity = if entry.ghosted || self.cut_keys.contains(&entry.key) { 0.5 } else { 1.0 };
                     match bitmap {
@@ -585,13 +594,13 @@ impl FenceWin {
                     if shadow.a > 0.0 && !selected {
                         cv.text(&entry.name, RectF::new(label.x + 1.0, label.y + 1.0, label.w, label.h), &label_style, shadow);
                     }
-                    cv.text(&entry.name, label, &label_style, col(palette.text));
+                    cv.text(&entry.name, label, &label_style, col(if selected{palette.selected_text}else{palette.text}));
                 }
                 if let Some(Interaction::Rubber { start, current, .. }) = &self.interaction {
                     let start = POINT { x: start.x, y: start.y - self.scroll };
                     let band = RectF::new(start.x.min(current.x) as f32, start.y.min(current.y) as f32,
                         (start.x - current.x).abs() as f32, (start.y - current.y).abs() as f32);
-                    cv.fill(band, col(palette.selected));
+                    cv.fill(band, col(palette.accent).with_alpha(0.18));
                     cv.stroke_round(band, 0.0, col(palette.selected_border), 1.0);
                 }
                 if !self.standalone{if let Some((text,until))=&self.notice{if std::time::Instant::now()<*until{

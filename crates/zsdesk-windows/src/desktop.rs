@@ -110,6 +110,26 @@ pub fn desktop_view() -> Result<IFolderView2> {
     view.cast()
 }
 
+/// Read the position of a new item from Explorer's desktop view.
+pub struct DesktopPositions {
+    view: IFolderView2,
+    origin: POINT,
+}
+impl DesktopPositions {
+    pub fn read() -> Option<Self> {
+        let view = desktop_view().ok()?;
+        let list = desktop_list().or_else(desktop_defview)?;
+        let mut origin = POINT::default();
+        unsafe { windows::Win32::Graphics::Gdi::ClientToScreen(list, &mut origin) }.ok().ok()?;
+        Some(Self { view, origin })
+    }
+    pub fn position(&self, item: &ShellEntry) -> Option<POINT> {
+        if item.pidl.len() <= 2 || !pidl::valid(&item.pidl) { return None; }
+        let point = unsafe { self.view.GetItemPosition(item.pidl.as_ptr().cast()) }.ok()?;
+        Some(POINT { x: self.origin.x.checked_add(point.x)?, y: self.origin.y.checked_add(point.y)? })
+    }
+}
+
 /// Read Explorer's alignment policy and lattice without changing its layout.
 /// Coordinates and spacing are physical pixels in the caller's PMv2 context.
 #[derive(Clone, Copy, Debug)]

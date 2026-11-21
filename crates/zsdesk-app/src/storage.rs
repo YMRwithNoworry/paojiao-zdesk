@@ -102,13 +102,19 @@ pub fn save_explorer_tray(path:&Path,enabled:bool)->Result<()>{
     let mut session=if path.try_exists()?{load(path)?}else{default_session()};session.ui.explorer_tray=enabled;save_unlocked(path,&session)
 }
 pub fn toggle_tab_preference(path: &Path, field: fn(&mut zsdesk_core::model::explorer::ExplorerUi) -> &mut bool) -> Result<bool> {
+    update_shared_ui(path, |ui| {
+        let value = field(ui);
+        *value = !*value;
+        *value
+    })
+}
+
+pub fn update_shared_ui<T>(path: &Path, edit: impl FnOnce(&mut zsdesk_core::model::explorer::ExplorerUi) -> T) -> Result<T> {
     let _write=SAVE_LOCK.lock().map_err(|_|anyhow::anyhow!("会话保存锁异常"))?;
     let mut session=if path.try_exists()?{load(path)?}else{default_session()};
-    let value = field(&mut session.ui);
-    *value = !*value;
-    let enabled = *value;
+    let value = edit(&mut session.ui);
     save_unlocked(path, &session)?;
-    Ok(enabled)
+    Ok(value)
 }
 pub fn save_context_menu(path:&Path,options:&zsdesk_core::model::explorer::ContextMenuPreferences)->Result<()> {
     let _write=SAVE_LOCK.lock().map_err(|_|anyhow::anyhow!("会话保存锁异常"))?;
@@ -164,7 +170,9 @@ fn save_window_preferences(path:&Path,session:&ExplorerSession,secondary:bool,
     let saved=load(path).ok();let mut next=session.clone();
     if let Some(saved)=&saved {next.ui.explorer_tray=saved.ui.explorer_tray;next.ui.language=saved.ui.language;
         next.ui.startup_location=saved.ui.startup_location.clone();next.ui.new_tab_location=saved.ui.new_tab_location.clone();next.ui.context_menu=saved.ui.context_menu.clone();next.ui.forward_unhandled_windows=saved.ui.forward_unhandled_windows;next.ui.forward_while_running=saved.ui.forward_while_running;next.ui.tab_selection_emphasis=saved.ui.tab_selection_emphasis;
-        next.ui.right_click_close_tab=saved.ui.right_click_close_tab;}
+        next.ui.right_click_close_tab=saved.ui.right_click_close_tab;
+        next.ui.single_click_blank_up=saved.ui.single_click_blank_up;
+        next.ui.double_click_blank_up=saved.ui.double_click_blank_up;}
     if next.ui.search_preferences()==*baseline{if let Some(saved)=&saved{next.ui.apply_search_preferences(&saved.ui.search_preferences());}}
     if let (Some(baseline),Some(saved))=(baseline_bookmarks,&saved){
         next.bookmarks=merge_bookmarks(baseline,&next.bookmarks,&saved.bookmarks,next.next_id.max(saved.next_id));

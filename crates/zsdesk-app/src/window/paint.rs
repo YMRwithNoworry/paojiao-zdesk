@@ -135,7 +135,14 @@ impl WindowState {
         cv.clear_rect(strip);
         // Fullscreen has no extended DWM frame: transparent pixels otherwise
         // become black and hide the dark caption glyphs.
-        if !self.mica || window_actions::fullscreen(self.hwnd) { cv.fill(strip, c(p.strip)); }
+        if !self.mica || self.solid_caption || window_actions::fullscreen(self.hwnd) {
+            cv.fill(strip, c(p.strip));
+            if self.solid_caption && native_caption(self.hwnd) {
+                if let Some([min, _, close]) = self.caption_buttons() {
+                    cv.clear_rect(rf(LayoutRect::new(min.x,min.y,close.right()-min.x,close.height)));
+                }
+            }
+        }
         let text = if self.active { c(p.text) } else { c(p.text_secondary) };
         let active = self.session.active_tab;
         if self.layout.vertical_tabs{
@@ -259,6 +266,7 @@ impl WindowState {
             let icon = self.sf(ICON_DIP as f32);
             let icon_rect = RectF::new(address.x + self.sf(10.0), address.y + (address.h - icon) / 2.0, icon, icon);
             if let Some(bitmap) = address_icon { cv.image(bitmap, pixel_aligned_icon(icon_rect), 1.0); }
+            else { cv.glyph(if matches!(self.current_location(),ShellLocation::Search{..}) {glyph::SEARCH} else {glyph::FOLDER}, icon_rect, self.sf(14.0), c(p.text_secondary)); }
             for slot in &self.crumb_slots {
                 let r = rf(slot.rect);
                 let hovered = self.hover_crumb == Some(slot.part);
@@ -325,6 +333,7 @@ impl WindowState {
             let color = if enabled { c(p.text) } else { c(p.text_disabled) };
             let r = rf(*rect);
             let g = match id {
+                CommandId::NewFolder => "\u{E8F4}",
                 CommandId::New => glyph::ADD, CommandId::Cut => glyph::CUT, CommandId::Copy => glyph::COPY,
                 CommandId::Paste => glyph::PASTE, CommandId::Rename => glyph::RENAME, CommandId::Share => glyph::SHARE,
                 CommandId::Delete => glyph::DELETE, CommandId::Sort => glyph::SORT, CommandId::View => glyph::VIEW,
@@ -546,12 +555,39 @@ fn resolve_icon(location: &ShellLocation, px: i32) -> Option<icons::OwnedIcon> {
     if let ShellLocation::Path(path) = location {
         let text = path.to_string_lossy();
         if text.starts_with(r"\\") {
-            let index = icons::icon_index_for_name(&text, path.extension().is_none())?;
+            // The location is a directory even when its final component has a dot.
+            // Avoid passing a potentially overlong UNC path to SHGetFileInfoW.
+            let index = icons::icon_index_for_name("folder", true)?;
             return icons::system_icon(index, px).map(icons::OwnedIcon);
         }
     }
     let pidl = pidl::location_pidl(location)?;
     icons::pidl_icon(&pidl, px)
+}
+
+#[cfg(test)]
+#[test]
+fn long_dotted_share_directory_uses_the_stock_folder_icon() {
+    use std::os::windows::ffi::OsStrExt;
+    unsafe{OleInitialize(None)}.unwrap();
+    struct Apartment; impl Drop for Apartment{fn drop(&mut self){unsafe{OleUninitialize();}}}
+    let _apartment=Apartment;
+    let mut path = PathBuf::from(r"\\offline.invalid\share");
+    for _ in 0..35 { path.push("1234567890"); }
+    path.push("report.v2");
+    assert!(path.as_os_str().encode_wide().count()>260);
+    let actual=resolve_icon(&ShellLocation::Path(path),16).expect("UNC folder icon");
+    let expected=icons::system_icon(icons::icon_index_for_name("folder",true).unwrap(),16).map(icons::OwnedIcon).unwrap();
+    // Compare the Shell icon pixels, independently of the handle identities.
+    let gfx=Gfx::new("Segoe UI").unwrap();
+    let render=|icon: &icons::OwnedIcon| {
+        let surface=Surface::new(16,16).unwrap();
+        let wic=gfx.wic_from_icon(icon.0).unwrap();
+        let image=gfx.upload(&wic).unwrap();
+        gfx.draw(&surface, |cv| cv.image(&image, RectF::new(0.,0.,16.,16.),1.)).unwrap();
+        unsafe{std::slice::from_raw_parts(surface.bits,16*16*4)}.to_vec()
+    };
+    let pixels=render(&actual);assert!(pixels.iter().any(|&b| b!=0));assert_eq!(pixels,render(&expected));
 }
 
 fn clipboard_has_files() -> bool {

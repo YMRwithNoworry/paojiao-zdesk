@@ -152,7 +152,7 @@ pub fn command_glyph(id: &str) -> Option<(&'static str, bool)> {
 }
 
 pub const COMMAND_BAR_CHOICES: &[(&str, CommandBarItem)] = &[
-    ("新建", CommandBarItem::New), ("剪切", CommandBarItem::Cut), ("复制", CommandBarItem::Copy),
+    ("新建", CommandBarItem::New), ("新建文件夹", CommandBarItem::NewFolder), ("剪切", CommandBarItem::Cut), ("复制", CommandBarItem::Copy),
     ("粘贴", CommandBarItem::Paste), ("重命名", CommandBarItem::Rename), ("共享", CommandBarItem::Share),
     ("删除", CommandBarItem::Delete), ("排序", CommandBarItem::Sort), ("查看", CommandBarItem::View),
     ("更多", CommandBarItem::More), ("预览", CommandBarItem::PreviewPane),
@@ -241,6 +241,7 @@ fn tab_settings(ui: &ExplorerUi) -> MenuItemSpec {
 fn preview_settings(ui: &ExplorerUi) -> MenuItemSpec {
     group(zsdesk_core::i18n::text("预览与操作"), "settings-preview", vec![
         entry(zsdesk_core::i18n::text("双击空白处返回上一级"),"double-click-blank-up",true,ui.double_click_blank_up),
+        entry(zsdesk_core::i18n::text("单击文件夹空白处返回上一级"),"single-click-blank-up",true,ui.single_click_blank_up),
         submenu(zsdesk_core::i18n::text("空格预览方式"),vec![
             entry(zsdesk_core::i18n::text("内置预览（默认）"),"space-preview-builtin",true,ui.space_preview),
             entry(zsdesk_core::i18n::text("QuickLook（需单独安装并运行）"),"space-preview-quicklook",true,!ui.space_preview),
@@ -316,7 +317,14 @@ pub fn apply_interface_setting(ui: &mut ExplorerUi, choice: &str) -> bool {
         "dual-pane" => ui.dual_pane = !ui.dual_pane,
         "double-click-close-tab" => ui.double_click_close_tab = !ui.double_click_close_tab,
         "right-click-close-tab" => ui.right_click_close_tab = !ui.right_click_close_tab,
-        "double-click-blank-up"=>ui.double_click_blank_up=!ui.double_click_blank_up,
+        "double-click-blank-up"=>{
+            ui.double_click_blank_up = !ui.double_click_blank_up;
+            if ui.double_click_blank_up { ui.single_click_blank_up = false; }
+        }
+        "single-click-blank-up"=>{
+            ui.single_click_blank_up = !ui.single_click_blank_up;
+            if ui.single_click_blank_up { ui.double_click_blank_up = false; }
+        }
         "close-window-last-tab"=>ui.close_window_on_last_tab=!ui.close_window_on_last_tab,
         "show-tab-count"|"show-tab-list"=>{let visible=!ui.tab_count_button_visible();ui.show_tab_count=visible;ui.show_tab_list=visible;},
         "tab-selection-emphasis"=>ui.tab_selection_emphasis=!ui.tab_selection_emphasis,
@@ -676,6 +684,16 @@ mod tests {
         assert!(ui.right_click_close_tab);
         assert!(apply_interface_setting(&mut ui, "right-click-close-tab"));
         assert_eq!(ui, original);
+    }
+
+    #[test]
+    fn single_blank_click_is_opt_in_and_exclusive_with_double_click() {
+        let mut ui=ExplorerUi::default();
+        assert!(ui.double_click_blank_up && !ui.single_click_blank_up);
+        assert!(apply_interface_setting(&mut ui, "single-click-blank-up"));
+        assert!(ui.single_click_blank_up && !ui.double_click_blank_up);
+        assert!(apply_interface_setting(&mut ui, "double-click-blank-up"));
+        assert!(ui.double_click_blank_up && !ui.single_click_blank_up);
     }
     #[test]
     fn preview_sources_are_explicit_and_default_to_builtin(){

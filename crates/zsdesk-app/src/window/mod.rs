@@ -103,7 +103,7 @@ const TIMER_PLACEMENT:usize=9;
 const TIMER_FOLDER_SIZES:usize=10;
 const WM_FAST_SEARCH:u32=WM_APP+43;
 const WM_DIAGNOSTIC:u32=WM_APP+44;
-pub(super) const WM_TAB_PREFERENCES_CHANGED:u32=WM_APP+182;
+pub(super) const WM_INPUT_PREFERENCES_CHANGED:u32=WM_APP+182;
 type Slot = RefCell<Option<WindowState>>;
 #[derive(Clone,Copy,PartialEq,Eq)]
 enum BrowserRole{Fresh,Ordinary,Results}
@@ -429,6 +429,7 @@ struct WindowState {
     palette: Palette,
     dark: bool,
     mica: bool,
+    solid_caption: bool,
     active: bool,
     layout: ChromeLayout,
     crumbs: Vec<Crumb>,
@@ -502,7 +503,7 @@ impl WindowState {
             other_pane:Default::default(),active_pane_right:false,background_pane:false,routing_pane_message:false,pane_splitter_drag:None,
             address_edit: HWND::default(), search_edit: HWND::default(), rename_hwnd: HWND::default(), rename_id: None,
             tooltip: HWND::default(), tooltip_text: vec![0], font: HFONT::default(), gfx: None, surface: None,
-            palette: Palette::light(), dark: false, mica: false, active: true, layout: ChromeLayout::default(),
+            palette: Palette::light(), dark: false, mica: false, solid_caption: false, active: true, layout: ChromeLayout::default(),
             crumbs: Vec::new(), crumb_slots: Vec::new(), crumbs_for: None, address_editing: false, open_chevron: None,
             hover: Hit::None, hover_crumb: None, pressed: None, tracking_mouse: false, right_tab_press:None, tab_drag: None,bookmark_drag:None, splitter_drag: None,bookmark_resize:None,
             side_tab_resize:None,side_tab_scroll_drag:None,side_tab_first:None,side_tab_wheel:0,
@@ -746,6 +747,7 @@ impl WindowState {
         theme::round_corners(self.hwnd, false);
         theme::round_corners(self.tooltip, true);
         self.mica = theme::set_backdrop(self.hwnd, prefs.backdrop);
+        self.solid_caption = theme::match_accented_caption(self.hwnd, colorref(self.palette.strip), colorref(self.palette.text));
         unsafe {
             if self.mica { let _=SetPropW(self.hwnd,windows::core::w!("ZSDesk.NativeCaption"),Some(windows::Win32::Foundation::HANDLE(1usize as *mut _))); }
             else { let _=RemovePropW(self.hwnd,windows::core::w!("ZSDesk.NativeCaption")); }
@@ -984,6 +986,12 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
     if (msg==WM_ACTIVATE&&(wp.0&0xffff)==0)||(msg==WM_ACTIVATEAPP&&wp.0==0){pane_input::invalidate_blank_clicks(hwnd);}
     if msg==WM_NCDESTROY{zsdesk_windows::shell::file_dialogs::release(hwnd);release_window_properties(hwnd);}
     let native_caption = native_caption(hwnd);
+    // A queued move can carry the previous button's hit code after a layout or
+    // DPI change. Use the same coordinates as the click and the current frame.
+    let wp = if msg == WM_NCMOUSEMOVE && [HTMINBUTTON, HTMAXBUTTON, HTCLOSE].contains(&(wp.0 as u32)) {
+        let point = POINT { x: x_lparam(lp.0), y: y_lparam(lp.0) };
+        WPARAM(caption_hit(hwnd, point).unwrap_or(HTCAPTION) as usize)
+    } else { wp };
     let caption_message = matches!(msg, WM_NCHITTEST | WM_NCMOUSEMOVE | WM_NCMOUSELEAVE | WM_NCLBUTTONDOWN | WM_NCLBUTTONUP | WM_NCLBUTTONDBLCLK);
     let owns_caption_press=!unsafe{GetPropW(hwnd,windows::core::w!("ZSDesk.CaptionPress"))}.0.is_null();
     let padding_press=msg==WM_NCLBUTTONDOWN&&caption_padding_hit(hwnd,POINT{x:x_lparam(lp.0),y:y_lparam(lp.0)});
@@ -1041,7 +1049,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
     // cursors. Returning FALSE lets the child finish WM_SETCURSOR processing.
     if msg == WM_SETCURSOR && wp.0 != hwnd.0 as usize { return LRESULT(0); }
     if msg == WM_SETCURSOR {
-        if (lp.0&0xffff)as u32==HTCAPTION{
+        if [HTCAPTION, HTMINBUTTON, HTMAXBUTTON, HTCLOSE].contains(&((lp.0&0xffff)as u32)){
             if let Ok(cursor)=unsafe{LoadCursorW(None,IDC_ARROW)}{unsafe{SetCursor(Some(cursor));}return LRESULT(1);}
         }
         if let Some(cursor)=resize_cursor((lp.0&0xffff)as u32){
@@ -1397,7 +1405,7 @@ impl WindowState {
                 if let Some(tree) = &self.tree { tree.refresh_metrics(); }
                 if area == "ShellState" || area.is_empty() { self.invalidate(); }
             }
-            WM_THEMECHANGED | WM_DWMCOMPOSITIONCHANGED | WM_SYSCOLORCHANGE => self.refresh_system_theme(),
+            WM_THEMECHANGED | WM_DWMCOMPOSITIONCHANGED | WM_DWMCOLORIZATIONCOLORCHANGED | WM_SYSCOLORCHANGE => self.refresh_system_theme(),
             rename_follow::WM_CHANGED=>{self.renamed_item_notification(wp,lp);}
             folder_sizes::WM_CHANGED=>{let change=zsdesk_windows::shell::notify::read_change(wp,lp);if change.event!=0{self.folder_sizes_changed();}}
             WM_TIMER => {
@@ -1505,7 +1513,10 @@ impl WindowState {
                 self.crumbs_for=None;self.measure_bookmarks();self.relayout();self.position_children();
                 unsafe{self.update_address();}self.refresh_status();self.invalidate();
             },
-            WM_TAB_PREFERENCES_CHANGED=>if let Ok(saved)=storage::load(&self.config_path){
+            WM_INPUT_PREFERENCES_CHANGED=>if let Ok(saved)=storage::load(&self.config_path){
+                pane_input::invalidate_blank_clicks(self.hwnd);
+                self.session.ui.single_click_blank_up=saved.ui.single_click_blank_up;
+                self.session.ui.double_click_blank_up=saved.ui.double_click_blank_up;
                 self.session.ui.right_click_close_tab = saved.ui.right_click_close_tab;
                 if self.session.ui.tab_selection_emphasis!=saved.ui.tab_selection_emphasis{
                     self.session.ui.tab_selection_emphasis=saved.ui.tab_selection_emphasis;self.invalidate();

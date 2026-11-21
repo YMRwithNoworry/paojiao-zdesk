@@ -465,13 +465,14 @@ impl WindowState {
     // ---- command bar ----------------------------------------------------
 
     pub(super) unsafe fn command(&mut self, id: CommandId) {
-        if (self.pending.is_some()||self.queued.is_some())&&matches!(id,CommandId::New|CommandId::Cut|CommandId::Copy|CommandId::Paste|CommandId::Rename|CommandId::Share|CommandId::Delete){
+        if (self.pending.is_some()||self.queued.is_some())&&matches!(id,CommandId::New|CommandId::NewFolder|CommandId::Cut|CommandId::Copy|CommandId::Paste|CommandId::Rename|CommandId::Share|CommandId::Delete){
             self.show_message(zsdesk_core::i18n::text("文件夹正在加载，请完成后再操作").into());return;
         }
         zsdesk_windows::shell::file_transfer::note_user_input(self.view_hwnd);
         let shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
         let hwnd = self.hwnd;
         match id {
+            CommandId::NewFolder => unsafe { self.execute(Command::NewFolder); },
             CommandId::New => {
                 let rect = self.layout.command_rect(id).unwrap_or_default();
                 let point = self.screen_point(rect.x, rect.bottom());
@@ -737,6 +738,8 @@ impl WindowState {
     unsafe fn app_menu(&mut self) {
         self.sync_search_preferences();
         if let Ok(saved)=storage::load(&self.config_path){self.session.ui.tab_selection_emphasis=saved.ui.tab_selection_emphasis;self.session.ui.right_click_close_tab=saved.ui.right_click_close_tab;self.session.ui.startup_location=saved.ui.startup_location;
+            self.session.ui.single_click_blank_up=saved.ui.single_click_blank_up;
+            self.session.ui.double_click_blank_up=saved.ui.double_click_blank_up;
             self.session.ui.context_menu=saved.ui.context_menu;crate::context_preferences::publish(&self.config_path,&self.session.ui.context_menu);}
         let anchor = Some(self.layout.app_menu);
         let spec=self.app_menu_spec();let hwnd=self.hwnd;
@@ -854,24 +857,39 @@ impl WindowState {
     }
 
     /// Applies an interface preference chosen in ≡ and refreshes what it affects.
-    fn publish_tab_preferences(&self){
+    fn publish_input_preferences(&self){
         struct Target{pid:u32,key:Vec<u16>}
         unsafe extern "system" fn each(window:HWND,parameter:LPARAM)->windows::core::BOOL{
             let target=unsafe{&*(parameter.0 as*const Target)};let mut pid=0;
             unsafe{GetWindowThreadProcessId(window,Some(&mut pid));}
             if pid==target.pid&&unsafe{GetPropW(window,PCWSTR(target.key.as_ptr()))}.0 as usize==1{
-                let _=unsafe{PostMessageW(Some(window),WM_TAB_PREFERENCES_CHANGED,WPARAM(0),LPARAM(0))};
+                let _=unsafe{PostMessageW(Some(window),WM_INPUT_PREFERENCES_CHANGED,WPARAM(0),LPARAM(0))};
             }true.into()
         }
         let target=Target{pid:std::process::id(),key:crate::instance::property(&self.config_path)};
         let _=unsafe{EnumWindows(Some(each),LPARAM(&target as*const Target as isize))};
     }
     pub(super) fn apply_interface_choice(&mut self, id: &str) {
+        if matches!(id, "single-click-blank-up" | "double-click-blank-up") {
+            match storage::update_shared_ui(&self.config_path, |ui| {
+                menus::apply_interface_setting(ui, id);
+                (ui.single_click_blank_up, ui.double_click_blank_up)
+            }) {
+                Ok((single, double)) => {
+                    self.session.ui.single_click_blank_up = single;
+                    self.session.ui.double_click_blank_up = double;
+                    pane_input::invalidate_blank_clicks(self.hwnd);
+                    self.publish_input_preferences();
+                }
+                Err(error) => self.show_message(error.to_string()),
+            }
+            return;
+        }
         if matches!(id, "tab-selection-emphasis" | "right-click-close-tab") {
             let field: fn(&mut zsdesk_core::model::explorer::ExplorerUi) -> &mut bool =
                 if id == "right-click-close-tab" { |ui| &mut ui.right_click_close_tab } else { |ui| &mut ui.tab_selection_emphasis };
             match storage::toggle_tab_preference(&self.config_path, field) {
-                Ok(enabled) => { *field(&mut self.session.ui) = enabled; self.invalidate(); self.publish_tab_preferences(); },
+                Ok(enabled) => { *field(&mut self.session.ui) = enabled; self.invalidate(); self.publish_input_preferences(); },
                 Err(error)=>self.show_message(zsdesk_core::tr_format!("无法保存标签显示设置：{error:#}", error=error)),
             }return;
         }

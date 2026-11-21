@@ -33,17 +33,20 @@ pub(super) fn resolve(key: u16, modifiers: Modifiers, file_context: bool, text_e
     None
 }
 
-/// Native views own their undo/redo routing. Give them the original message
-/// before considering a currently available background-menu command.
+/// Filesystem cuts share the same publish-and-mark path as the command bar.
+/// Virtual folders can supply their own native accelerator and data format.
 pub(super) fn execute_message(view: &IShellView, owner: HWND, action: FileShortcut, message: &MSG) -> Result<()> {
-    if matches!(action, FileShortcut::Undo | FileShortcut::Redo | FileShortcut::SelectAll) {
-        return translate_history_then_invoke(|| unsafe { view.TranslateAccelerator(message) },
+    if action == FileShortcut::Cut && zsdesk_windows::shell::file_transfer::filesystem_selection(view).unwrap_or(false) {
+        return zsdesk_windows::shell::file_transfer::copy_view(view, owner, true);
+    }
+    if matches!(action, FileShortcut::Cut | FileShortcut::Undo | FileShortcut::Redo | FileShortcut::SelectAll) {
+        return translate_view_shortcut(|| unsafe { view.TranslateAccelerator(message) },
             || execute(view, owner, action));
     }
     execute(view, owner, action)
 }
 
-fn translate_history_then_invoke(translate: impl FnOnce() -> HRESULT, invoke: impl FnOnce() -> Result<()>) -> Result<()> {
+fn translate_view_shortcut(translate: impl FnOnce() -> HRESULT, invoke: impl FnOnce() -> Result<()>) -> Result<()> {
     match translate() {
         S_OK => Ok(()),
         // S_FALSE means unhandled. A view may also explicitly lack this method.
@@ -116,11 +119,11 @@ mod tests {
     fn native_history_handling_precedes_fallback_and_runs_once() {
         use std::cell::Cell;
         let calls = Cell::new(0);
-        translate_history_then_invoke(|| { calls.set(1); HRESULT(0) }, || {
+        translate_view_shortcut(|| { calls.set(1); HRESULT(0) }, || {
             calls.set(100); Ok(())
         }).unwrap();
         assert_eq!(calls.get(), 1);
-        translate_history_then_invoke(|| { calls.set(1); HRESULT(1) }, || {
+        translate_view_shortcut(|| { calls.set(1); HRESULT(1) }, || {
             assert_eq!(calls.get(), 1); calls.set(2); Ok(())
         }).unwrap();
         assert_eq!(calls.get(), 2);
@@ -128,10 +131,10 @@ mod tests {
     #[test]
     fn native_history_failure_does_not_repeat_the_operation() {
         let failure = HRESULT(0x80004005u32 as i32);
-        let error = translate_history_then_invoke(|| failure, || panic!("failed command must not run again")).unwrap_err();
+        let error = translate_view_shortcut(|| failure, || panic!("failed command must not run again")).unwrap_err();
         assert_eq!(error.code(), failure);
         let disabled = HRESULT(0x80040101u32 as i32);
-        let error = translate_history_then_invoke(|| HRESULT(1), || Err(Error::from_hresult(disabled))).unwrap_err();
+        let error = translate_view_shortcut(|| HRESULT(1), || Err(Error::from_hresult(disabled))).unwrap_err();
         assert_eq!(error.code(), disabled);
     }
     #[test]
