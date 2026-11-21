@@ -145,7 +145,7 @@ pub(super) const TRAY_ID:u32=1;
 /// Work that must run outside the host borrow (modal menus, Shell UI, drag loops).
 pub enum After {
     Nothing,
-    ItemMenu { fence: u64, point: POINT },
+    ItemMenu { fence: u64, point: POINT, highlight: Option<u64> },
     FenceMenu { fence: u64, point: POINT },
     FolderSystemMenu { fence: u64, point: POINT },
     TrayMenu(POINT),
@@ -1803,8 +1803,18 @@ impl DesktopHost {
     pub(super) fn begin_modal(&mut self,id:u64){*self.modal_holds.entry(id).or_default()+=1;}
     pub(super) fn end_modal(&mut self,id:u64){if let Some(count)=self.modal_holds.get_mut(&id){*count=count.saturating_sub(1);if *count==0{self.modal_holds.remove(&id);}}}
     pub(super) fn menu_started(&mut self,id:u64,generation:u64){self.pending_menu=Some((id,generation));}
-    pub(super) fn menu_finished(&mut self,id:u64,generation:u64){if self.pending_menu==Some((id,generation)){self.pending_menu=None;}}
-    pub(super) fn menu_cancelled(&mut self){self.pending_menu=None;}
+    pub(super) fn menu_finished(&mut self,id:u64,generation:u64){
+        if self.pending_menu==Some((id,generation)){self.menu_cancelled();}
+    }
+    pub(super) fn menu_cancelled(&mut self){
+        self.pending_menu=None;
+        self.clear_other_menu_highlights(None);
+    }
+    pub(super) fn clear_other_menu_highlights(&mut self, keep:Option<u64>) {
+        let changed: Vec<_> = self.fences.iter_mut().filter_map(|window|
+            window.clear_other_menu_highlight(keep).then_some(window.id)).collect();
+        for id in changed { self.render(id); }
+    }
     pub(super) fn can_start_desktop_selection(&self)->bool{
         self.config.settings.organize&&self.config.settings.icons_hidden_by_zsdesk&&self.internal_drag.is_none()&&self.incoming_drag.is_none()
             &&self.pending_menu.is_none()&&self.modal_holds.values().all(|count|*count==0)
@@ -1827,6 +1837,7 @@ impl DesktopHost {
     }
 
     pub fn mouse_down(&mut self, id: u64, point: POINT, double: bool) -> After {
+        self.clear_other_menu_highlights(None);
         let Some(index) = self.win_index(id) else { return After::Nothing };
         let Some(fence) = self.config.fence(id).cloned() else { return After::Nothing };
         self.commit_rename_if_any(id);
@@ -1977,6 +1988,7 @@ impl DesktopHost {
     }
 
     pub fn right_click(&mut self, id: u64, point: POINT) -> After {
+        self.menu_cancelled();
         self.menu_input_started=Some((id,Instant::now()));
         let Some(index) = self.win_index(id) else { return After::Nothing };
         let Some(fence) = self.config.fence(id).cloned() else { return After::Nothing };
@@ -1992,18 +2004,17 @@ impl DesktopHost {
                 .map(|window|{window.selection.clear();window.focus=None;window.id}).collect();
             for other in changed {self.render(other);}
         }
+        let multiple = self.fences[index].standalone && !clear_others && self.fences.iter()
+            .filter(|w| w.standalone).flat_map(|w| &w.selection).take(2).count() == 2;
         let win = &mut self.fences[index];
         let g = win.geometry(&fence);
         let mut screen = point;
         let _ = unsafe { windows::Win32::Graphics::Gdi::ClientToScreen(win.hwnd, &mut screen) };
         match g.hit(point.x, point.y, win.dpi, true, win.collapsed(&fence)) {
             FenceHit::Item(i) => {
-                let key = win.entries[i].key.clone();
-                let changed=!win.selection.contains(&key)||win.focus!=Some(i);
-                if !win.selection.contains(&key) { win.selection = HashSet::from([key]); }
-                win.focus = Some(i);
+                let (highlight,changed)=win.select_for_pointer_menu(i,multiple);
                 if changed { self.render(id); }
-                After::ItemMenu { fence: id, point: screen }
+                After::ItemMenu { fence: id, point: screen, highlight }
             }
             FenceHit::Tab(i) => {
                 let tab = win.tabs[i].id;
@@ -2070,7 +2081,7 @@ impl DesktopHost {
             let window=&self.fences[index];let geometry=window.geometry(&fence);
             let mut point=keyboard_menu_anchor(window,&geometry);
             let _=unsafe{windows::Win32::Graphics::Gdi::ClientToScreen(window.hwnd,&mut point)};
-            return if !window.selection.is_empty(){After::ItemMenu{fence:id,point}}
+            return if !window.selection.is_empty(){After::ItemMenu{fence:id,point,highlight:None}}
                 else if window.collapsed(&fence)||window.standalone{After::FenceMenu{fence:id,point}}
                 else{After::FolderSystemMenu{fence:id,point}};
         }
@@ -3006,6 +3017,25 @@ mod shortcut_tests {
         window.entries=["A","B"].into_iter().map(|name|ShellEntry{key:name.into(),name:name.into(),pidl:vec![0,0],
             is_folder:false,is_file_system:true,is_link:false,is_stream:false,can_drop:false,ghosted:false,path:None,size:None,modified:None}).collect();
         window
+    }
+    #[test]
+    fn desktop_menu_finish_releases_only_its_own_icon_target() -> anyhow::Result<()> {
+        let mut host=DesktopHost::new(HWND::default(),PathBuf::new(),PathBuf::new(),DesktopConfig::default(),Gfx::new("Segoe UI")?);
+        let mut window=keyboard_selection();
+        window.standalone=true;
+        host.fences.push(window);
+        let first=host.fences[0].select_for_pointer_menu(0,false).0.unwrap();
+        host.menu_started(1,17);
+        assert_eq!(host.fences[0].menu_entry(first).unwrap().key,"A");
+        host.menu_cancelled();
+        let next=host.fences[0].select_for_pointer_menu(1,false).0.unwrap();
+        host.menu_started(1,18);
+        host.menu_finished(1,17);
+        assert!(host.fences[0].menu_entry(first).is_none());
+        assert_eq!(host.fences[0].menu_entry(next).unwrap().key,"B");
+        host.menu_finished(1,18);
+        assert!(host.fences[0].menu_entry(next).is_none() && host.fences[0].selection.is_empty());
+        Ok(())
     }
     #[test]
     fn ctrl_deselected_focus_is_not_an_open_rename_or_menu_target(){

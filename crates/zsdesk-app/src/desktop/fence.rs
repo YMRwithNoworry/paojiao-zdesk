@@ -321,6 +321,12 @@ impl Geometry {
     }
 }
 
+struct PointerMenuTarget {
+    token: u64,
+    key: String,
+    visible: bool,
+}
+
 /// Runtime state of one fence window.
 pub struct FenceWin {
     pub id: u64,
@@ -328,6 +334,8 @@ pub struct FenceWin {
     pub dpi: u32,
     pub entries: Vec<ShellEntry>,
     pub selection: HashSet<String>,
+    /// Paint-only target of a mouse menu on a loose desktop icon.
+    menu_highlight: Option<PointerMenuTarget>,
     pub anchor: Option<usize>,
     pub focus: Option<usize>,
     pub hover: FenceHit,
@@ -370,9 +378,10 @@ impl FenceWin {
     pub fn advance_operation_epoch(&mut self){
         static NEXT:std::sync::atomic::AtomicU64=std::sync::atomic::AtomicU64::new(1);
         self.operation_epoch=NEXT.fetch_add(1,std::sync::atomic::Ordering::Relaxed);self.pending_selection=None;
+        self.menu_highlight=None;
     }
     pub fn new(id: u64) -> Self {
-        let mut value=Self { id, hwnd: HWND::default(), dpi: 96, entries: Vec::new(), selection: HashSet::new(), anchor: None, focus: None,
+        let mut value=Self { id, hwnd: HWND::default(), dpi: 96, entries: Vec::new(), selection: HashSet::new(), menu_highlight: None, anchor: None, focus: None,
             hover: FenceHit::None, scroll: 0, zoom_remainder: 0, standalone: false, interaction: None, surface: None, notify: None, notify_path: None, drop: None,
             drop_hover: None, rename: None, message: None,notice:None,cut_keys:HashSet::new(),pending_selection:None,operation_epoch:0, tracking: false, peek: false, peek_blocked: false,
             tabs: Vec::new(), ghost: false, merge_hover: None, drop_tab: None };
@@ -433,6 +442,63 @@ impl FenceWin {
 
     pub(super) fn toggles_on_plain_click(&self,key:&str)->bool {
         !self.standalone && self.selection.len()==1 && self.selection.contains(key)
+    }
+
+    pub(super) fn select_for_pointer_menu(&mut self, index:usize, desktop_multiselect:bool) -> (Option<u64>,bool) {
+        let key=self.entries[index].key.clone();
+        if !self.standalone || desktop_multiselect {
+            let changed=!self.selection.contains(&key) || self.focus!=Some(index);
+            if !self.selection.contains(&key) { self.selection=HashSet::from([key]); }
+            self.focus=Some(index);
+            return (None,changed);
+        }
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let token = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.change_selection(SelectionChange::Clear);
+        self.menu_highlight = Some(PointerMenuTarget {token,key,visible:true});
+        (Some(token),true)
+    }
+
+    pub(super) fn menu_entry(&self, token: u64) -> Option<&ShellEntry> {
+        let target = self.menu_highlight.as_ref()?;
+        if token != target.token || !self.selection.is_empty() { return None; }
+        self.entries.iter().find(|entry| entry.key == target.key)
+    }
+
+    pub(super) fn hide_menu_highlight(&mut self, token:u64) -> bool {
+        let Some(target)=self.menu_highlight.as_mut() else { return false; };
+        if target.token!=token || !target.visible { return false; }
+        target.visible=false;
+        self.hover=FenceHit::None;
+        true
+    }
+
+    pub(super) fn clear_other_menu_highlight(&mut self, keep: Option<u64>) -> bool {
+        let Some(target) = &self.menu_highlight else { return false; };
+        if Some(target.token) == keep { return false; }
+        let repaint=target.visible;
+        self.menu_highlight=None;
+        if repaint { self.hover=FenceHit::None; }
+        repaint
+    }
+
+    fn paint_item_background(&self, cv:&Canvas, i:usize, rect:RectF, palette:&FencePalette) -> bool {
+        let key=&self.entries[i].key;
+        let selected=self.selection.contains(key) || self.menu_highlight.as_ref().is_some_and(|target| target.visible && &target.key==key);
+        let scale=self.dpi as f32/96.0;
+        let col=|c:zsdesk_ui::theme::Color| Color::rgba8(c.r,c.g,c.b,c.a);
+        // Alpha 1 keeps an unselected loose icon hit-testable without a visible plate.
+        if self.standalone { cv.fill(rect,Color::rgba8(0,0,0,1)); }
+        if self.drop_hover==Some(i) {
+            cv.round(rect,4.*scale,col(palette.selected));
+            cv.stroke_round(rect,4.*scale,col(palette.accent),1.5*scale);
+        } else if selected {
+            cv.round(rect,4.*scale,col(palette.selected));
+            cv.stroke_round(rect,4.*scale,col(palette.selected_border),1.);
+        } else if self.hover==FenceHit::Item(i) {
+            cv.round(rect,4.*scale,col(palette.hover));
+        }
+        selected
     }
 
     /// Paints and presents the fence. `icon` resolves item bitmaps.
@@ -559,20 +625,7 @@ impl FenceWin {
                 for (i,cell,bitmap) in &visible {
                     let i=*i;
                     let entry = &self.entries[i];
-                    let selected = self.selection.contains(&entry.key);
-                    let r = rf(cell.cell);
-                    // Nonzero alpha only over the icon's own cell. The rest of
-                    // the desktop remains native and receives clicks normally.
-                    if self.standalone { cv.fill(r, Color::rgba8(0, 0, 0, 1)); }
-                    if self.drop_hover == Some(i) {
-                        cv.round(r, sf(4.0), col(palette.selected));
-                        cv.stroke_round(r, sf(4.0), col(palette.accent), sf(1.5));
-                    } else if selected {
-                        cv.round(r, sf(4.0), col(palette.selected));
-                        cv.stroke_round(r, sf(4.0), col(palette.selected_border), 1.0);
-                    } else if self.hover == FenceHit::Item(i) {
-                        cv.round(r, sf(4.0), col(palette.hover));
-                    }
+                    let selected=self.paint_item_background(cv,i,rf(cell.cell),palette);
                     let icon_rect = rf(cell.icon);
                     let opacity = if entry.ghosted || self.cut_keys.contains(&entry.key) { 0.5 } else { 1.0 };
                     match bitmap {
@@ -652,6 +705,57 @@ mod tests {
     use zsdesk_core::model::desktop::{FenceSource, Placement};
 
     fn fence() -> Fence { Fence::new(1, "t", FenceSource::Desktop, Placement::default()) }
+
+    #[test]
+    fn desktop_pointer_menu_highlight_pixels_and_selection_lifetime() -> anyhow::Result<()> {
+        use windows::Win32::System::Ole::{OleInitialize,OleUninitialize};
+        unsafe { OleInitialize(None)?; }
+        struct Apartment;
+        impl Drop for Apartment { fn drop(&mut self) { unsafe { OleUninitialize(); } } }
+        let _apartment=Apartment;
+        let gfx=Gfx::new("Segoe UI")?;
+        let surface=Surface::new(40,40).expect("offscreen icon cell");
+        let mut win=FenceWin::new(1);
+        win.standalone=true;
+        win.entries.push(ShellEntry{key:"file".into(),name:"file".into(),pidl:vec![2,0,0,0],path:None,
+            is_folder:false,is_file_system:true,is_link:false,is_stream:false,can_drop:false,ghosted:false,size:None,modified:None});
+        for mode in [zsdesk_ui::theme::Mode::Light,zsdesk_ui::theme::Mode::Dark] {
+            let palette=FencePalette::new(mode,80);
+            let pixels=|w:&FenceWin| -> anyhow::Result<Vec<u8>> {
+                gfx.draw(&surface,|cv|{w.paint_item_background(cv,0,RectF::new(0.,0.,40.,40.),&palette);})?;
+                Ok(unsafe{std::slice::from_raw_parts(surface.bits,surface.pixel_bytes() as usize)}.to_vec())
+            };
+            let plain=pixels(&win)?;
+            win.hover=FenceHit::Item(0);
+            let (first,changed)=win.select_for_pointer_menu(0,false);
+            let first=first.unwrap();
+            assert!(changed && win.selection.is_empty());
+            assert_eq!(win.menu_entry(first).unwrap().pidl,[2,0,0,0]);
+            let highlighted=pixels(&win)?;
+            assert!(highlighted[(20*40+20)*4+3]>plain[(20*40+20)*4+3]);
+            let (next,_)=win.select_for_pointer_menu(0,false);
+            assert!(win.menu_entry(first).is_none());
+            assert!(!win.clear_other_menu_highlight(next));
+            assert_eq!(pixels(&win)?,highlighted);
+            assert!(!win.hide_menu_highlight(first));
+            assert!(win.hide_menu_highlight(next.unwrap()));
+            assert_eq!(pixels(&win)?,plain);
+            assert!(win.menu_entry(next.unwrap()).is_some()); // Menu action can still use its captured target.
+            assert!(!win.clear_other_menu_highlight(None));
+            assert!(win.menu_entry(next.unwrap()).is_none());
+            assert_eq!(pixels(&win)?,plain);
+            win.selection.insert("file".into());
+            assert_eq!(win.select_for_pointer_menu(0,true).0,None);
+            assert!(!win.clear_other_menu_highlight(None) && win.selection.contains("file"));
+            assert_eq!(pixels(&win)?,highlighted);
+            let token=win.select_for_pointer_menu(0,false).0.unwrap();
+            win.selection.insert("file".into()); // A fresh intentional selection made before completion.
+            assert!(win.menu_entry(token).is_none());
+            assert!(win.clear_other_menu_highlight(None) && win.selection.contains("file"));
+            win.change_selection(SelectionChange::Clear);
+        }
+        Ok(())
+    }
 
     #[test]
     fn inverse_selection_uses_the_complete_original_set() {

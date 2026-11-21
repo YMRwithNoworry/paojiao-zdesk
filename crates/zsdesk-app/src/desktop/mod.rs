@@ -431,7 +431,11 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
         WM_TIMER if wp.0==external_drop::TIMER=>{external_drop::tick();return LRESULT(0);}
         WM_CANCELMODE=>{outside_selection::cancel();return unsafe{DefWindowProcW(hwnd,msg,wp,lp)};}
         WM_CLOSE => { execute(DesktopCommand::Quit); return LRESULT(0); }
-        menu_worker::READY => { finish_menu_work(); return LRESULT(0); }
+        menu_worker::READY => { finish_menu_work(hwnd); return LRESULT(0); }
+        WM_TIMER if wp.0 == protocol::HostTimer::MenuReady as usize => {
+            let _ = unsafe { KillTimer(Some(hwnd), wp.0) };
+            finish_menu_work(hwnd); return LRESULT(0);
+        }
         WM_COPYDATA if lp.0 != 0 => {
             let data = unsafe { &*(lp.0 as *const COPYDATASTRUCT) };
             if data.dwData != DESKTOP_MAGIC || data.cbData > 65536 || data.lpData.is_null() { return LRESULT(0); }
@@ -726,7 +730,7 @@ fn run_after(after: After) {
     let _hold=hold.map(FenceModal::begin);
     match after {
         After::Nothing => {}
-        After::ItemMenu { fence, point } => item_menu(fence, point),
+        After::ItemMenu { fence, point, highlight } => item_menu(fence, point, highlight),
         After::FenceMenu { fence, point } => fence_menu(fence, point),
         After::FolderSystemMenu { fence, point } => folder_system_menu(fence, point),
         After::TrayMenu(point) => tray_menu(point),
@@ -779,17 +783,21 @@ fn run_after(after: After) {
     }
 }
 
-fn item_menu(fence: u64, point: POINT) {
+fn item_menu(fence: u64, point: POINT, highlight: Option<u64>) {
     let input_started=with_host(|host|host.menu_input_started.take().filter(|(id,_)|*id==fence).map(|(_,time)|time)).flatten().unwrap_or_else(std::time::Instant::now);
-    let Some((hwnd, pidls, target_key, profile)) = with_host(|h| h.win_index(fence).map(|i| {
+    let Some((hwnd, pidls, target_key, profile)) = with_host(|h| h.win_index(fence).and_then(|i| {
         let window = &h.fences[i];
+        if let Some(token) = highlight {
+            let entry=window.menu_entry(token)?;
+            return Some((window.hwnd,vec![entry.pidl.clone()],Some(entry.key.clone()),h.explorer_config.clone()));
+        }
         let target = h.focused_entry(fence).filter(|entry| window.selection.contains(&entry.key))
             .or_else(|| window.entries.iter().find(|entry| window.selection.contains(&entry.key)));
-        (window.hwnd, h.selected_pidls(fence), target.map(|entry| entry.key.clone()), h.explorer_config.clone())
+        Some((window.hwnd, h.selected_pidls(fence), target.map(|entry| entry.key.clone()), h.explorer_config.clone()))
     })).flatten() else { return };
     if pidls.is_empty() { return fence_menu(fence, point); }
     let mut request=menu_worker::Request::new(fence,hwnd,point,profile,Vec::new(),menu_worker::Target::Items{pidls,key:target_key},key_down(VK_SHIFT));
-    request.input_started=input_started;quick_fence_menu(request);
+    request.highlight=highlight;request.input_started=input_started;quick_fence_menu(request);
 }
 
 fn quick_fence_menu(mut request:menu_worker::Request){
@@ -801,14 +809,14 @@ fn queue_menu(mut request:menu_worker::Request){
     let fence=request.fence;
     if matches!(request.target,menu_worker::Target::Background{..})&&request.mode==crate::context_menu_process::Mode::More{request.layout=with_host(|host|host.menu_layout(fence)).flatten();}else{request.layout=None;}
     let owner=HWND(request.owner as*mut _);
-    let Some(host)=with_host(|host|host.hwnd)else{return;};
+    let Some(host)=with_host(|host|{host.clear_other_menu_highlights(request.highlight);host.hwnd})else{return;};
     let _=unsafe{SetForegroundWindow(owner)};
     request.foreground=unsafe{GetForegroundWindow()}.0 as isize;
     let result=MENU_WORKER.with(|worker|->anyhow::Result<()>{
         let mut worker=worker.borrow_mut();if worker.is_none(){*worker=Some(menu_worker::Worker::new(host)?);}
         let generation=worker.as_ref().unwrap().submit(request);with_host(|host|host.menu_started(fence,generation));Ok(())
     });
-    if let Err(error)=result{file_action_error(owner,&windows::core::Error::new(windows::core::HRESULT(0x80004005u32 as i32),error.to_string()));}
+    if let Err(error)=result{with_host(|host|host.menu_cancelled());file_action_error(owner,&windows::core::Error::new(windows::core::HRESULT(0x80004005u32 as i32),error.to_string()));}
     request_layer_repair();
 }
 
@@ -817,6 +825,10 @@ fn menu_target_current(request:&menu_worker::Request)->bool{
         let index=host.win_index(request.fence)?;
         if host.fences[index].hwnd.0 as isize!=request.owner||!unsafe{IsWindowVisible(host.fences[index].hwnd)}.as_bool(){return None;}
         Some(match &request.target{
+            menu_worker::Target::Items{..} if request.highlight.is_some()=>{
+                let entry=host.fences[index].menu_entry(request.highlight?)?;
+                menu_worker::Target::Items{pidls:vec![entry.pidl.clone()],key:None}
+            },
             menu_worker::Target::Items{..}=>menu_worker::Target::Items{pidls:host.selected_pidls(request.fence),key:None},
             menu_worker::Target::Background{..}=>background_target(host,request.fence),
         })
@@ -840,7 +852,17 @@ fn menu_target_current(request:&menu_worker::Request)->bool{
 fn menu_diagnostics()->serde_json::Value{MENU_WORKER.with(|worker|worker.borrow().as_ref().map_or(serde_json::Value::Null,menu_worker::Worker::diagnostics))}
 fn menu_request_current(generation:u64)->bool{MENU_WORKER.with(|worker|worker.borrow().as_ref().is_some_and(|worker|worker.is_current(generation)))}
 
-fn finish_menu_work(){
+fn finish_menu_work(hwnd: HWND){
+    // A Shell callback can re-enter while the desktop model is borrowed.
+    // Leave the events in the queue until their cleanup and redraw can run.
+    if HOST.with(|slot|slot.try_borrow_mut().is_err()) {
+        unsafe { SetTimer(Some(hwnd),protocol::HostTimer::MenuReady as usize,20,None); }
+        return;
+    }
+    struct Completion(u64,u64);
+    impl Drop for Completion {
+        fn drop(&mut self) { with_host(|host|host.menu_finished(self.0,self.1)); }
+    }
     let events=MENU_WORKER.with(|worker|worker.borrow_mut().as_mut().map(menu_worker::Worker::drain).unwrap_or_default());
     for event in events{match event{
         menu_worker::Event::Validate{request,before_invoke,answer}=>{
@@ -849,7 +871,16 @@ fn finish_menu_work(){
             let _=answer.try_send(valid);
         }
         menu_worker::Event::Finished{request,ids,outcome,effects,..}=>{
-            with_host(|host|host.menu_finished(request.fence,request.generation));
+            let _completion=Completion(request.fence,request.generation);
+            // Remove the pointer plate before validating/dispatching a command
+            // that may open a modal dialog. The captured target remains usable.
+            if let Some(token)=request.highlight {
+                with_host(|host| {
+                    if let Some(i)=host.win_index(request.fence) {
+                        if host.fences[i].hide_menu_highlight(token) { host.render(request.fence); }
+                    }
+                });
+            }
             let _layer=MenuLayerRepair;
             let owner=HWND(request.owner as*mut _);
             // Shell commands already ran against their captured PIDLs. Only

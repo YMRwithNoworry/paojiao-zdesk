@@ -41,7 +41,10 @@ unsafe extern "system" fn dismiss_owned_dialog(window:HWND,_data:LPARAM)->window
 // The test does not run the real host's global desktop repair/notify timers.
 // Only the production menu completion callback is forwarded into the host.
 unsafe extern "system" fn test_host_proc(hwnd:HWND,msg:u32,wp:WPARAM,lp:LPARAM)->LRESULT{
-    if msg==menu_worker::READY{finish_menu_work();return LRESULT(0);}
+    if msg==menu_worker::READY || (msg==WM_TIMER && wp.0==protocol::HostTimer::MenuReady as usize) {
+        if msg==WM_TIMER {let _=unsafe{KillTimer(Some(hwnd),wp.0)};}
+        finish_menu_work(hwnd);return LRESULT(0);
+    }
     if msg==WM_TIMER&&wp.0==MENU_TIMER{
         HEARTBEATS.with(|beats|beats.set(beats.get()+1));
         let _=unsafe{EnumThreadWindows(windows::Win32::System::Threading::GetCurrentThreadId(),Some(dismiss_owned_dialog),LPARAM(0))};return LRESULT(0);
