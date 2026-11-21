@@ -2,11 +2,11 @@
 use std::{cell::Cell,rc::Rc};
 use windows::{core::BOOL,Win32::{Foundation::{HWND,LPARAM,LRESULT,WPARAM,COLORREF,RECT,POINT},
     Graphics::Gdi::{CreateSolidBrush,DeleteObject,FillRect,HBRUSH,HDC,GetSysColorBrush,GetSysColor,COLOR_WINDOW,
-        SaveDC,RestoreDC,ExcludeClipRect,MapWindowPoints,COLOR_WINDOWTEXT},
+        SaveDC,RestoreDC,ExcludeClipRect,MapWindowPoints,COLOR_WINDOWTEXT,RedrawWindow,RDW_INVALIDATE,RDW_ERASE,RDW_UPDATENOW,RDW_ALLCHILDREN},
     UI::{Controls::{LVM_SETBKCOLOR,LVM_SETTEXTBKCOLOR,LVM_SETTEXTCOLOR,LVM_SETEXTENDEDLISTVIEWSTYLE,LVS_EX_DOUBLEBUFFER,LVS_EX_TWOCLICKACTIVATE},
         Shell::{IShellView,SetWindowSubclass,GetWindowSubclass,RemoveWindowSubclass,DefSubclassProc},
         WindowsAndMessaging::{EnumChildWindows,GetClassNameW,GetClientRect,GetWindowRect,GetWindow,GetWindowLongPtrW,
-            SendMessageW,GWL_STYLE,GW_CHILD,GW_HWNDNEXT,WS_VISIBLE,WM_ERASEBKGND,WM_NCDESTROY,WM_PARENTNOTIFY,WM_CREATE,WM_THEMECHANGED}}}};
+            SendMessageW,GWL_STYLE,GW_CHILD,GW_HWNDNEXT,WS_VISIBLE,WM_ERASEBKGND,WM_NCDESTROY,WM_PARENTNOTIFY,WM_CREATE,WM_THEMECHANGED,WM_SETREDRAW}}}};
 
 const SUBCLASS:usize=0x5a534247;
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
@@ -20,7 +20,7 @@ impl ThemePermit{
     fn current(&self)->bool{!self.pending.get()&&self.generation.get()==self.expected}
 }
 fn permitted(apply:bool,permit:Option<&ThemePermit>)->bool{apply&&permit.is_none_or(ThemePermit::current)}
-struct State{colors:Rc<Cell<Colors>>,brush:HBRUSH,last:Option<u32>,owner:PaintOwner,theme:Option<(bool,bool)>,apply_theme:bool,permit:Option<ThemePermit>}
+struct State{colors:Rc<Cell<Colors>>,brush:HBRUSH,last:Option<u32>,owner:PaintOwner,theme:Option<(bool,bool)>,apply_theme:bool,permit:Option<ThemePermit>,redraw_suppressed:bool,stage_new_renderers:bool}
 impl Drop for State{fn drop(&mut self){if !self.brush.0.is_null(){let _=unsafe{DeleteObject(self.brush.into())};}}}
 fn paint_owner(hwnd:HWND)->Option<PaintOwner>{
     let mut name=[0u16;96];let count=unsafe{GetClassNameW(hwnd,&mut name)}.max(0)as usize;
@@ -44,16 +44,33 @@ fn prepare_list_view(hwnd:HWND,colors:Colors){
         SendMessageW(hwnd,LVM_SETTEXTCOLOR,None,Some(LPARAM(text as isize)));
     }
 }
+#[cfg(test)]
 fn install_one_phase(hwnd:HWND,colors:Rc<Cell<Colors>>,owner:PaintOwner,apply_theme:bool,permit:Option<ThemePermit>){
+    let stage_new_renderers=!apply_theme&&permit.is_none();
+    install_one_staged(hwnd,colors,owner,apply_theme,permit,stage_new_renderers);
+}
+fn install_one_staged(hwnd:HWND,colors:Rc<Cell<Colors>>,owner:PaintOwner,apply_theme:bool,permit:Option<ThemePermit>,stage_new_renderers:bool){
     let palette=colors.get();let theme=(palette.dark,palette.high_contrast);
     let apply_theme=permitted(apply_theme,permit.as_ref());
+    // A ResultsFolder renderer can be made visible before Shell reports
+    // navigation completion. Hold its first paint until the final palette is
+    // installed, rather than letting the default light frame flash onscreen.
+    let stage_renderer=stage_new_renderers&&!apply_theme&&permit.is_none()&&matches!(owner,PaintOwner::Native|PaintOwner::ListView);
     let mut old=0usize;
-    let changed=if unsafe{GetWindowSubclass(hwnd,Some(procedure),SUBCLASS,Some(&mut old))}.as_bool()&&old!=0{
-        let state=unsafe{&mut*(old as*mut State)};let changed=apply_theme&&state.theme!=Some(theme);state.colors=colors;state.apply_theme=apply_theme;state.permit=permit.clone();if changed{state.theme=Some(theme);}changed
+    let (changed,begin_redraw_hold)=if unsafe{GetWindowSubclass(hwnd,Some(procedure),SUBCLASS,Some(&mut old))}.as_bool()&&old!=0{
+        let state=unsafe{&mut*(old as*mut State)};
+        let changed=apply_theme&&state.theme!=Some(theme);
+        let begin_redraw_hold=stage_renderer&&!state.redraw_suppressed;
+        state.colors=colors;state.apply_theme=apply_theme;state.permit=permit.clone();state.stage_new_renderers=stage_new_renderers;
+        if changed{state.theme=Some(theme);}
+        if begin_redraw_hold{state.redraw_suppressed=true;}
+        (changed,begin_redraw_hold)
     }else{
-        let pointer=Box::into_raw(Box::new(State{colors,brush:HBRUSH::default(),last:None,owner,theme:apply_theme.then_some(theme),apply_theme,permit:permit.clone()}));
-        if !unsafe{SetWindowSubclass(hwnd,Some(procedure),SUBCLASS,pointer as usize)}.as_bool(){unsafe{drop(Box::from_raw(pointer));}return;}apply_theme
+        let pointer=Box::into_raw(Box::new(State{colors,brush:HBRUSH::default(),last:None,owner,theme:apply_theme.then_some(theme),apply_theme,permit:permit.clone(),redraw_suppressed:stage_renderer,stage_new_renderers}));
+        if !unsafe{SetWindowSubclass(hwnd,Some(procedure),SUBCLASS,pointer as usize)}.as_bool(){unsafe{drop(Box::from_raw(pointer));}return;}
+        (apply_theme,stage_renderer)
     };
+    if begin_redraw_hold{unsafe{SendMessageW(hwnd,WM_SETREDRAW,Some(WPARAM(0)),None);}}
     // ResultsFolder can create its renderer after the original browser theme
     // was applied. Theme that new control as well, without resetting view state.
     // DirectUI is the ItemsView renderer. Set its explicit Explorer theme when
@@ -69,34 +86,61 @@ fn install_one_phase(hwnd:HWND,colors:Rc<Cell<Colors>>,owner:PaintOwner,apply_th
             }
         }
     }
-    if permitted(apply_theme,permit.as_ref())&&owner==PaintOwner::ListView{prepare_list_view(hwnd,palette);}
+    if permitted(apply_theme,permit.as_ref()){
+        if owner==PaintOwner::ListView{prepare_list_view(hwnd,palette);}
+        release_redraw_hold(hwnd);
+    }
+}
+fn release_redraw_hold(hwnd:HWND){
+    let mut data=0usize;
+    if !unsafe{GetWindowSubclass(hwnd,Some(procedure),SUBCLASS,Some(&mut data))}.as_bool()||data==0{return;}
+    let should_release={
+        let state=unsafe{&mut*(data as*mut State)};
+        if !state.redraw_suppressed{false}else{state.redraw_suppressed=false;true}
+    };
+    if !should_release{return;}
+    unsafe{
+        SendMessageW(hwnd,WM_SETREDRAW,Some(WPARAM(1)),None);
+        let _=RedrawWindow(Some(hwnd),None,None,RDW_INVALIDATE|RDW_ERASE|RDW_UPDATENOW|RDW_ALLCHILDREN);
+    }
 }
 unsafe extern "system" fn enumerate(hwnd:HWND,lp:LPARAM)->BOOL{
-    let (colors,apply_theme,permit)=unsafe{&*(lp.0 as*const (Rc<Cell<Colors>>,bool,Option<ThemePermit>))};
-    if let Some(owner)=paint_owner(hwnd){install_one_phase(hwnd,colors.clone(),owner,*apply_theme,permit.clone());}true.into()
+    let (colors,apply_theme,permit,stage_new_renderers)=unsafe{&*(lp.0 as*const (Rc<Cell<Colors>>,bool,Option<ThemePermit>,bool))};
+    if let Some(owner)=paint_owner(hwnd){install_one_staged(hwnd,colors.clone(),owner,*apply_theme,permit.clone(),*stage_new_renderers);}true.into()
 }
-fn install_children_phase(hwnd:HWND,colors:&Rc<Cell<Colors>>,apply_theme:bool,permit:Option<ThemePermit>){
-    let context=(colors.clone(),apply_theme,permit);
-    let _=unsafe{EnumChildWindows(Some(hwnd),Some(enumerate),LPARAM((&context as*const (Rc<Cell<Colors>>,bool,Option<ThemePermit>))as isize))};
+fn install_children_phase(hwnd:HWND,colors:&Rc<Cell<Colors>>,apply_theme:bool,permit:Option<ThemePermit>,stage_new_renderers:bool){
+    let context=(colors.clone(),apply_theme,permit,stage_new_renderers);
+    let _=unsafe{EnumChildWindows(Some(hwnd),Some(enumerate),LPARAM((&context as*const (Rc<Cell<Colors>>,bool,Option<ThemePermit>,bool))as isize))};
 }
-fn install_phase(view:&IShellView,colors:Rc<Cell<Colors>>,apply_theme:bool,permit:Option<ThemePermit>){
+fn install_phase(view:&IShellView,colors:Rc<Cell<Colors>>,apply_theme:bool,permit:Option<ThemePermit>,stage_new_renderers:bool){
     let Ok(hwnd)=(unsafe{view.GetWindow()})else{return;};
-    if let Some(owner)=paint_owner(hwnd){install_one_phase(hwnd,colors.clone(),owner,apply_theme,permit.clone());}
-    install_children_phase(hwnd,&colors,apply_theme,permit);
+    if let Some(owner)=paint_owner(hwnd){install_one_staged(hwnd,colors.clone(),owner,apply_theme,permit.clone(),stage_new_renderers);}
+    install_children_phase(hwnd,&colors,apply_theme,permit,stage_new_renderers);
 }
-pub(super) fn install(view:&IShellView,colors:Rc<Cell<Colors>>,permit:ThemePermit){install_phase(view,colors,true,Some(permit));}
-/// Installing during Shell navigation must not reset a renderer's theme or
-/// selection visuals. The matching completion enables the queued palette.
-pub(super) fn install_pending(view:&IShellView,colors:Rc<Cell<Colors>>){install_phase(view,colors,false,None);}
+pub(super) fn install(view:&IShellView,colors:Rc<Cell<Colors>>,permit:ThemePermit){install_phase(view,colors,true,Some(permit),false);}
+/// Refresh the current view during navigation without hiding the old renderer.
+pub(super) fn install_pending(view:&IShellView,colors:Rc<Cell<Colors>>){install_phase(view,colors,false,None,false);}
+/// Hide only a newly created view's native renderers until its final theme is ready.
+pub(super) fn install_new_view_pending(view:&IShellView,colors:Rc<Cell<Colors>>){install_phase(view,colors,false,None,true);}
 
 #[cfg(test)]fn install_one(hwnd:HWND,colors:Rc<Cell<Colors>>,owner:PaintOwner){install_one_phase(hwnd,colors,owner,true,None);}
-#[cfg(test)]fn install_children(hwnd:HWND,colors:&Rc<Cell<Colors>>){install_children_phase(hwnd,colors,true,None);}
+#[cfg(test)]fn install_children(hwnd:HWND,colors:&Rc<Cell<Colors>>){install_children_phase(hwnd,colors,true,None,false);}
 
 #[cfg(test)]
 pub(super) fn installed_colors(hwnd:HWND)->Option<Colors>{
     let mut data=0usize;
     (unsafe{GetWindowSubclass(hwnd,Some(procedure),SUBCLASS,Some(&mut data))}.as_bool()&&data!=0)
         .then(||unsafe{(*(data as*const State)).colors.get()})
+}
+#[cfg(test)]fn configured_theme(hwnd:HWND)->Option<(bool,bool)>{
+    let mut data=0usize;
+    if !unsafe{GetWindowSubclass(hwnd,Some(procedure),SUBCLASS,Some(&mut data))}.as_bool()||data==0{return None;}
+    unsafe{(*(data as*const State)).theme}
+}
+#[cfg(test)]fn redraw_suppressed(hwnd:HWND)->bool{
+    let mut data=0usize;
+    if !unsafe{GetWindowSubclass(hwnd,Some(procedure),SUBCLASS,Some(&mut data))}.as_bool()||data==0{return false;}
+    unsafe{(*(data as*const State)).redraw_suppressed}
 }
 #[cfg(test)]pub(super) fn applied_theme(hwnd:HWND)->Option<(bool,bool)>{
     let mut data=0usize;
@@ -147,8 +191,8 @@ unsafe extern "system" fn procedure(hwnd:HWND,msg:u32,wp:WPARAM,lp:LPARAM,id:usi
         if !brush.0.is_null()&&fill_container(hwnd,HDC(wp.0 as*mut _),brush){return LRESULT(1);}
     }
     if msg==WM_PARENTNOTIFY && (wp.0&0xffff)as u32==WM_CREATE{
-        let (colors,apply_theme,permit)={let state=unsafe{&*(data as*const State)};(state.colors.clone(),state.apply_theme,state.permit.clone())};let child=HWND(lp.0 as*mut _);
-        if let Some(owner)=paint_owner(child){install_one_phase(child,colors.clone(),owner,apply_theme,permit.clone());}install_children_phase(child,&colors,apply_theme,permit);
+        let (colors,apply_theme,permit,stage_new_renderers)={let state=unsafe{&*(data as*const State)};(state.colors.clone(),state.apply_theme,state.permit.clone(),state.stage_new_renderers)};let child=HWND(lp.0 as*mut _);
+        if let Some(owner)=paint_owner(child){install_one_staged(child,colors.clone(),owner,apply_theme,permit.clone(),stage_new_renderers);}install_children_phase(child,&colors,apply_theme,permit,stage_new_renderers);
     }
     if msg==WM_THEMECHANGED{
         let (owner,colors,apply_theme,permit)={let state=unsafe{&*(data as*const State)};(state.owner,state.colors.clone(),state.apply_theme,state.permit.clone())};
@@ -287,6 +331,22 @@ unsafe extern "system" fn procedure(hwnd:HWND,msg:u32,wp:WPARAM,lp:LPARAM,id:usi
             Ok(())
         }).unwrap();
     }
+    #[test]
+    fn pending_navigation_holds_new_renderer_until_final_theme(){
+        let window=owner();
+        let colors=Rc::new(Cell::new(Colors{background:0x191919,high_contrast:false,dark:true}));
+        install_one_phase(window.0,colors.clone(),PaintOwner::Native,true,None);
+        assert_eq!(configured_theme(window.0),Some((true,false)));
+        colors.set(Colors{background:0xfafafa,high_contrast:false,dark:false});
+        install_one_staged(window.0,colors.clone(),PaintOwner::Native,false,None,true);
+        assert_eq!(configured_theme(window.0),Some((true,false)),"pending navigation must not retheme an existing renderer");
+        assert!(applied_theme(window.0).is_none(),"pending initialization must not mark navigation complete");
+        assert!(redraw_suppressed(window.0),"new view should not paint using the previous theme");
+        install_one_phase(window.0,colors.clone(),PaintOwner::Native,true,None);
+        assert_eq!(configured_theme(window.0),Some((false,false)));
+        assert!(!redraw_suppressed(window.0),"redraw should resume only after the final palette is installed");
+    }
+
     #[test]
     fn superseded_navigation_cannot_retheme_a_classic_renderer(){
         use windows::Win32::UI::Controls::{InitCommonControlsEx,INITCOMMONCONTROLSEX,ICC_LISTVIEW_CLASSES,LVM_GETBKCOLOR,LVS_REPORT};

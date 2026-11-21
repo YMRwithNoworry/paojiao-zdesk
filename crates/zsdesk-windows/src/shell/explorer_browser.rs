@@ -306,7 +306,7 @@ impl ExplorerBrowserHost {
         self.theme_generation.set(self.theme_generation.get().wrapping_add(1));
         self.prepare_container_theme();
         let result=unsafe { self.browser.BrowseToObject(&item, 0) };
-        if result.is_err(){self.navigation_pending.set(false);}result
+        if result.is_err(){self.finish_theme_navigation();}result
     }
 
     /// True after this browser has hosted a streamed ResultsFolder. Windows
@@ -343,7 +343,7 @@ impl ExplorerBrowserHost {
         self.theme_generation.set(self.theme_generation.get().wrapping_add(1));
         self.prepare_container_theme();
         let result = unsafe { self.browser.FillFromObject(None::<&IUnknown>, EBF_NODROPTARGET) };
-        if result.is_err() { self.results_active.set(false);self.navigation_pending.set(false); }
+        if result.is_err() { self.results_active.set(false);self.finish_theme_navigation(); }
         result
     }
 
@@ -719,6 +719,12 @@ mod search_path_tests {
 }
 
 impl ExplorerBrowserHost {
+    fn finish_theme_navigation(&self){
+        self.navigation_pending.set(false);
+        if let Ok(view)=unsafe{self.current_view()}{
+            view_background::install(&view,self.background.clone(),view_background::ThemePermit::new(self.navigation_pending.clone(),self.theme_generation.clone()));
+        }
+    }
     fn prepare_container_theme(&self){
         let colors=self.background.get();let wanted=(colors.dark,colors.high_contrast);
         if self.container_theme.get()==Some(wanted){return;}
@@ -956,7 +962,10 @@ impl IExplorerBrowserEvents_Impl for BrowserEvents_Impl {
         let generation=self.theme_generation.get();
         if let Some(view) = shell_view.as_ref() {
             apply_picker_flags(view,&self.picker);
-            if generation==self.theme_generation.get()&&self.navigation_pending.get(){view_background::install_pending(view,self.background.clone());}
+            if generation==self.theme_generation.get()&&self.navigation_pending.get(){
+                if self.results_active.get(){view_background::install_new_view_pending(view,self.background.clone());}
+                else{view_background::install_pending(view,self.background.clone());}
+            }
             unsafe { super::menu::attach_view_menu(view, self.modern.clone()); }
             if self.results_active.get() { configure_results_columns(view); }
             if let Ok(folder)=view.cast::<IFolderView2>(){let _=super::view_state::sync_column_header(&folder);}
@@ -1001,6 +1010,11 @@ impl IExplorerBrowserEvents_Impl for BrowserEvents_Impl {
         self.results_active.set(false);
         self.navigation_pending.set(false);
         self.theme_generation.set(self.theme_generation.get().wrapping_add(1));
+        if let Some(browser)=self.browser.upgrade(){
+            if let Ok(view)=unsafe{browser.GetCurrentView::<IShellView>()}{
+                view_background::install(&view,self.background.clone(),view_background::ThemePermit::new(self.navigation_pending.clone(),self.theme_generation.clone()));
+            }
+        }
         let _ = unsafe { PostMessageW(Some(HWND(self.hwnd as *mut _)), WM_SHELL_NAVIGATION_FAILED, WPARAM(self.source), LPARAM(0)) };
         Ok(())
     }
