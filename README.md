@@ -4,7 +4,7 @@ Windows 多标签文件管理器与桌面格子。可以在一个窗口里浏览
 
 [下载安装](https://github.com/qiu7824/zsdesk/releases/latest) · [使用说明](docs/user-guide.md) · [更新日志](CHANGELOG.md) · [问题反馈](https://github.com/qiu7824/zsdesk/issues)
 
-适用于 Windows 10 / 11，64 位。当前版本为 **0.4.1**，支持简体中文和英文界面。
+适用于 Windows 10 / 11，64 位。当前版本为 **0.4.2**，支持简体中文和英文界面。
 
 English UI is available. Non-Chinese Windows systems use English by default. Choose **≡ → Language → English** to change the application language immediately. Each package includes `README.en.txt`.
 
@@ -34,13 +34,14 @@ English UI is available. Non-Chinese Windows systems use English by default. Cho
 | 操作 | 快捷键或入口 |
 |---|---|
 | 新建、关闭、恢复标签 | Ctrl+T / Ctrl+W / Ctrl+Shift+T |
-| 标签栏 | 右键标签打开该标签的菜单，右键标签栏空白处关闭当前标签 |
+| 标签栏 | 默认右键标签打开菜单；可在“≡ → 标签页”开启右键直接关闭，Shift+右键仍可打开菜单 |
 | 在新标签打开文件夹 | 鼠标中键点击文件夹 |
 | 后退、前进、上一级 | Alt+← / Alt+→ / Alt+↑，支持鼠标侧键 |
 | 调整图标大小 | Ctrl+滚轮 |
 | 快速预览 | 空格；右侧预览窗格用 Alt+P |
 | 新窗口 | Ctrl+N |
-| 双击空白处返回上一级 | 在“预览与操作”中开关 |
+| 单击或双击文件夹空白处返回上一级 | 在“预览与操作”中选择，单击返回默认关闭 |
+| 新建文件夹 | 命令栏的文件夹按钮或 Ctrl+Shift+N |
 | 显示文件夹总大小并排序 | 排序 → 计算并按总大小排序 |
 | 检查版本更新 | 关于 ZSDesk → 检查更新 |
 

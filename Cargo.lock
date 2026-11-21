@@ -1044,7 +1044,7 @@ checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 
 [[package]]
 name = "zsdesk-app"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "aes",
  "anyhow",
@@ -1068,7 +1068,7 @@ dependencies = [
 
 [[package]]
 name = "zsdesk-core"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -1076,14 +1076,14 @@ dependencies = [
 
 [[package]]
 name = "zsdesk-platform"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "zsdesk-core",
 ]
 
 [[package]]
 name = "zsdesk-ui"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "zsdesk-core",
  "zsui",
@@ -1091,7 +1091,7 @@ dependencies = [
 
 [[package]]
 name = "zsdesk-windows"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "cc",
