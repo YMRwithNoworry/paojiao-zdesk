@@ -89,12 +89,43 @@ fn selection_kind_for(dialog:HWND,parts:&Parts,accept:&str,automation:Option<&IU
 fn dialog_kind(dialog:HWND,parts:&Parts,automation:Option<&IUIAutomation>)->Option<SelectionKind>{
     selection_kind_for(dialog,parts,&accept_label(dialog)?,automation)
 }
+fn address_value(value:&str)->&str{
+    // Strip the toolbar's localized prefix, not a drive letter or UNC path.
+    let value=value.trim();
+    if Path::new(value).is_absolute(){return value;}
+    value.split_once(": ").or_else(||value.split_once('：')).map_or_else(
+        ||if matches!(value,"地址:"|"Address:"){""}else{value},
+        |(_,value)|value).trim()
+}
 fn initial_location(value:&str)->Option<zsdesk_core::model::explorer::ShellLocation>{
     use zsdesk_core::model::explorer::ShellLocation;
-    let value=value.split_once(": ").or_else(||value.split_once('：')).map_or(value,|(_,value)|value).trim();
+    let value=address_value(value);
     if Path::new(value).is_absolute(){return Some(ShellLocation::Path(value.into()));}
     match value.to_lowercase().as_str(){"桌面"|"desktop"=>zsdesk_windows::desktop::user_desktop().map(ShellLocation::Path),"此电脑"|"this pc"=>Some(ShellLocation::ThisPc),
         "主文件夹"|"home"=>Some(ShellLocation::Shell{pidl:None,parsing_name:"shell:HomeFolder".into(),title:zsdesk_core::i18n::text("主文件夹").into()}),_=>None}
+}
+fn known_location(value:&str)->Option<zsdesk_core::model::explorer::ShellLocation>{
+    use windows::Win32::{System::Com::CoTaskMemFree,UI::Shell::*};
+    use zsdesk_core::model::explorer::ShellLocation;
+    let value=address_value(value);
+    if value.is_empty(){return None;}
+    let folded=value.to_lowercase();
+    for folder in [&FOLDERID_Profile,&FOLDERID_Downloads,&FOLDERID_Pictures,&FOLDERID_Documents,&FOLDERID_Music,&FOLDERID_Videos]{
+        let Ok(item)=(unsafe{SHGetKnownFolderItem::<IShellItem>(folder,KF_FLAG_DONT_VERIFY,None)})else{continue;};
+        let name=|kind|{
+            let raw=unsafe{item.GetDisplayName(kind)}.ok()?;
+            let result=unsafe{raw.to_string()}.ok();
+            unsafe{CoTaskMemFree(Some(raw.0.cast()));}
+            result
+        };
+        if name(SIGDN_NORMALDISPLAY).is_some_and(|display|display.to_lowercase()==folded){
+            if let Some(path)=name(SIGDN_FILESYSPATH){return Some(ShellLocation::Path(path.into()));}
+        }
+    }
+    None
+}
+fn dialog_location(address:&str)->Option<zsdesk_core::model::explorer::ShellLocation>{
+    initial_location(address).or_else(||known_location(address))
 }
 fn pattern(label:&str)->String{
     let value=label.replace('（',"(").replace('）',")");
@@ -126,14 +157,14 @@ fn multiple(automation:&IUIAutomation,shell:HWND)->Option<bool>{
     None
 }
 #[derive(Clone,PartialEq)]
-struct Contract{kind:SelectionKind,name:isize,types:isize,shell:isize,accept:String,initial:zsdesk_core::model::explorer::ShellLocation}
-fn read_contract(dialog:HWND,part:&Parts,automation:Option<&IUIAutomation>)->Option<Contract>{
-    if part.shell.0.is_null()||part.name.0.is_null(){return None;}
-    let accept=accept_label(dialog)?;
-    let kind=selection_kind_for(dialog,part,&accept,automation)?;
-    let initial=text(part.address).and_then(|value|initial_location(&value))?;
-    Some(Contract{kind,name:part.name.0 as isize,types:if kind.folders(){0}else{part.types.0 as isize},
-        shell:part.shell.0 as isize,accept,initial})
+struct Contract{kind:SelectionKind,name:isize,types:isize,shell:isize,accept:String,address:String}
+fn read_contract(dialog:HWND,part:&Parts,automation:Option<&IUIAutomation>)->Result<Contract,&'static str>{
+    if part.shell.0.is_null()||part.name.0.is_null(){return Err("waiting-for-controls");}
+    let accept=accept_label(dialog).ok_or("waiting-for-confirmation-control")?;
+    let kind=selection_kind_for(dialog,part,&accept,automation).ok_or("waiting-for-selection-kind")?;
+    let address=text(part.address).filter(|value|!address_value(value).is_empty()).ok_or("waiting-for-initial-location")?;
+    Ok(Contract{kind,name:part.name.0 as isize,types:if kind.folders(){0}else{part.types.0 as isize},
+        shell:part.shell.0 as isize,accept,address})
 }
 #[derive(Default)]struct StableContract(Option<(Contract,Instant)>);
 impl StableContract{
@@ -194,7 +225,7 @@ impl Session{
                     send(owner,WM_COMMAND,1136|((CBN_CLOSEUP as usize)<<16),self.types.0 as isize).context("文件类型收尾失败")?;
                     #[cfg(test)]eprintln!("filter owner={} control_id={} selected={:?}",class(owner),unsafe{GetDlgCtrlID(self.types)},send(self.types,CB_GETCURSEL,0,0));
                 }
-                let current_folder=self.kind.folders()&&paths.len()==1&&same_folder(text(actual.address).and_then(|value|initial_location(&value)),&paths[0]);
+                let current_folder=self.kind.folders()&&paths.len()==1&&same_folder(text(actual.address).and_then(|value|dialog_location(&value)),&paths[0]);
                 let value=if current_folder{String::new()}else{paths.iter().map(|path|format!("\"{}\"",path.to_string_lossy())).collect::<Vec<_>>().join(" ")};let value=wide(&value);
                 ensure!(send(self.name,WM_SETTEXT,0,value.as_ptr()as isize).is_some_and(|result|result!=0),"文件选择结果未能返回");
                 // Only the caller's Open command can validate and accept paths.
@@ -230,6 +261,13 @@ fn run_with_watcher(profile:&Path,stop:&AtomicBool,mut spawn_watcher:impl FnMut(
     let mut refresh=Instant::now()-Duration::from_secs(3);let mut last_error=None::<String>;let mut previous=String::new();let mut completed=0u64;
     let mut last_kind=None::<&'static str>;let mut last_confirmation=None::<&'static str>;
     let mut preserved_native=0u64;let mut last_preservation=None::<&'static str>;
+    // Stages contain no caller titles, file names, or paths.
+    let mut last_handoff=None::<(u64,&'static str,u64)>;
+    let record=|last:&mut Option<(u64,&'static str,u64)>,claim:&watcher::Claim,stage|{
+        if !last.is_some_and(|(token,previous,_)|token==claim.token()&&previous==stage){
+            *last=Some((claim.token(),stage,claim.age_ms()));
+        }
+    };
     while !stop.load(Ordering::Acquire){
         if refresh.elapsed()>=Duration::from_secs(1){
             profile_session=crate::storage::load(profile).ok().filter(|session|session.ui.file_dialog_takeover);
@@ -241,26 +279,50 @@ fn run_with_watcher(profile:&Path,stop:&AtomicBool,mut spawn_watcher:impl FnMut(
             if !enabled{automation=None;preparing.clear();contracts.clear();}
         }
         for event in rx.try_iter(){match event{
-            Event::Ready{token,window,show}=>if let Some(session)=sessions.iter_mut().find(|session|session.token==token){
+            Event::Ready{token,window,use_native,show}=>if let Some(session)=sessions.iter_mut().find(|session|session.token==token){
                 session.picker=Some(window);
                 if enabled&&!session.fallback&&session.early.as_ref().is_some_and(watcher::Claim::preparing){
                     let dialog=session.source.hwnd();
                     let part=parts(dialog);
                     let kind=dialog_kind(dialog,&part,automation.as_ref());
-                    if let Some(reason)=capabilities::preservation(dialog,&part,kind,automation.as_ref()){
-                        session.close_picker();preserved_native+=1;last_preservation=Some(reason.key());last_kind=Some("native");last_confirmation=None;continue;
+                    match capabilities::inspect(dialog,&part,kind,automation.as_ref()){
+                        Err(reason)=>{
+                            record(&mut last_handoff,session.early.as_ref().unwrap(),reason.key());
+                            session.close_picker();preserved_native+=1;last_preservation=Some(reason.key());last_kind=Some("native");last_confirmation=None;continue;
+                        }
+                        // If the alternative appeared late, don't show a
+                        // picker that can't get back to it.
+                        Ok(true) if !use_native=>{
+                            record(&mut last_handoff,session.early.as_ref().unwrap(),"late-native-alternative");
+                            session.close_picker();continue;
+                        }
+                        Ok(_)=>{},
                     }
                     if kind==Some(session.kind)&&part.name==session.name&&(session.kind.folders()||part.types==session.types)
                         &&accept_label(dialog).as_deref()==Some(session.accept.as_str())
                         &&session.early.as_ref().is_some_and(|claim|claim.bind(window).is_ok())
-                        &&show.send(()).is_ok(){continue;}
+                        &&show.send(()).is_ok(){record(&mut last_handoff,session.early.as_ref().unwrap(),"show-authorized");continue;}
                 }
+                if let Some(claim)=&session.early{record(&mut last_handoff,claim,"show-not-authorized");}
                 session.close_picker();
+            },
+            Event::UseNative{token}=>if let Some(session)=sessions.iter_mut().find(|session|session.token==token){
+                if !session.fallback&&!returning.contains_key(&token)&&session.early.as_ref().is_some_and(watcher::Claim::active){
+                    record(&mut last_handoff,session.early.as_ref().unwrap(),"native-requested");
+                    session.close_picker();
+                    // Only a deliberate switch activates the caller. Other
+                    // recovery paths must never steal foreground focus.
+                    if session.source.matches(){let _=unsafe{SetForegroundWindow(session.source.hwnd())};}
+                    last_kind=Some("native");last_error=None;
+                }
             },
             Event::Submit{token,outcome}=>if let Some(session)=sessions.iter_mut().find(|session|session.token==token){
                 if session.fallback||!session.source.matches()||session.early.as_ref().is_some_and(|claim|!claim.active()){continue;}
                 if returning.contains_key(&token)&&!matches!(outcome,Outcome::Cancelled){continue;}
-                let native=parts(session.source.hwnd());let folder_navigation=folder_navigation_pending(session.kind,&outcome,text(native.address).and_then(|value|initial_location(&value)));
+                let folder_navigation=if session.kind.folders()&&matches!(outcome,Outcome::Selected{..}){
+                    let native=parts(session.source.hwnd());
+                    folder_navigation_pending(session.kind,&outcome,text(native.address).and_then(|value|dialog_location(&value)))
+                }else{None};
                 match session.finish(outcome.clone()){
                     Ok(())=>{last_confirmation=Some("pending");returning.insert(token,PendingReturn{outcome,started:Instant::now(),reported_wait:false,folder_navigation});},
                     Err(error)=>{last_confirmation=Some("rejected");last_error=Some(format!("选择结果回传失败：{error:#}"));if let Some(window)=session.picker{let reply=if returning.contains_key(&token){NativeReply::Waiting}else{NativeReply::Rejected};let _=crate::window::picker::native_reply(window,token,reply);}},
@@ -284,7 +346,7 @@ fn run_with_watcher(profile:&Path,stop:&AtomicBool,mut spawn_watcher:impl FnMut(
                 }
                 if pending.started.elapsed()>=Duration::from_millis(150)&&unsafe{IsWindowEnabled(session.source.hwnd())}.as_bool(){
                     if let Some(target)=pending.folder_navigation.as_ref(){
-                        let native=parts(session.source.hwnd());let location=text(native.address).and_then(|value|initial_location(&value));
+                        let native=parts(session.source.hwnd());let location=text(native.address).and_then(|value|dialog_location(&value));
                         if native.name==session.name&&text(native.name).is_some_and(|name|folder_navigation_ready(target,location,&name)){
                             // Some folder pickers consume a typed absolute path
                             // as navigation first. Confirm the current folder
@@ -307,35 +369,62 @@ fn run_with_watcher(profile:&Path,stop:&AtomicBool,mut spawn_watcher:impl FnMut(
                     last_error=Some("原程序未响应取消，已恢复原选择窗口".into());session.close_picker();
                 }
             }
+            let startup_failure=session.early.as_ref().filter(|claim|!session.fallback&&!claim.active()&&session.source.matches()
+                &&last_handoff.is_some_and(|(id,stage,_)|id==token&&stage=="starting-picker"));
+            if let Some(claim)=startup_failure{record(&mut last_handoff,claim,"picker-startup-timeout");}
             session.poll(enabled);if session.fallback{returning.remove(&token);}index+=1;
         }
         if let Some(watcher)=&watcher{preparing.extend(watcher.claims());}
-        preparing.retain(watcher::Claim::preparing);
+        preparing.retain(|claim|{
+            if claim.preparing(){return true;}
+            if let Some((token,stage,ms))=last_handoff.as_mut(){
+                if *token==claim.token(){*ms=claim.age_ms();last_error=Some(format!("原文件选择窗口已恢复：{stage}"));}
+            }
+            false
+        });
         contracts.retain(|token,_|preparing.iter().any(|claim|claim.token()==*token));
         if let Some(profile_session)=profile_session.as_ref(){
             let mut index=0;
             while index<preparing.len()&&sessions.len()<4{
                 let source=preparing[index].source();let dialog=source.hwnd();let part=parts(dialog);let token=preparing[index].token();
                 let observed=contracts.entry(token).or_default();
-                let Some(contract)=read_contract(dialog,&part,automation.as_ref())else{observed.reset();index+=1;continue;};
+                let contract=match read_contract(dialog,&part,automation.as_ref()){
+                    Ok(contract)=>contract,
+                    Err(stage)=>{record(&mut last_handoff,&preparing[index],stage);observed.reset();index+=1;continue;}
+                };
                 // Do not scan the accessibility tree while the caller is still
                 // switching between its initial file and folder controls.
-                if !observed.observe(contract.clone(),Instant::now()){index+=1;continue;}
-                let Some(multiple)=automation.as_ref().and_then(|uia|multiple(uia,part.shell))else{index+=1;continue;};
-                if let Some(reason)=capabilities::preservation(dialog,&part,Some(contract.kind),automation.as_ref()){
-                    contracts.remove(&token);drop(preparing.remove(index));
-                    preserved_native+=1;last_preservation=Some(reason.key());last_kind=Some("native");last_confirmation=None;continue;
-                }
+                if !observed.observe(contract.clone(),Instant::now()){record(&mut last_handoff,&preparing[index],"stabilizing-contract");index+=1;continue;}
+                let Some(multiple)=automation.as_ref().and_then(|uia|multiple(uia,part.shell))else{record(&mut last_handoff,&preparing[index],"waiting-for-multi-select-mode");index+=1;continue;};
+                record(&mut last_handoff,&preparing[index],"inspecting-actions");
+                let use_native=match capabilities::inspect(dialog,&part,Some(contract.kind),automation.as_ref()){
+                    Ok(use_native)=>use_native,
+                    Err(reason)=>{
+                        record(&mut last_handoff,&preparing[index],reason.key());
+                        contracts.remove(&token);drop(preparing.remove(index));
+                        preserved_native+=1;last_preservation=Some(reason.key());last_kind=Some("native");last_confirmation=None;continue;
+                    }
+                };
                 let current=parts(dialog);
-                if read_contract(dialog,&current,automation.as_ref()).as_ref()!=Some(&contract){
+                if read_contract(dialog,&current,automation.as_ref()).as_ref().ok()!=Some(&contract){
                     observed.reset();index+=1;continue;
                 }
-                let Contract{kind,accept,initial,..}=contract;
+                let location=dialog_location(&contract.address);
+                if location.is_none()&&contract.kind.folders(){
+                    record(&mut last_handoff,&preparing[index],"unsupported-folder-location");
+                    drop(preparing.remove(index));contracts.remove(&token);continue;
+                }
+                // Absolute file results don't depend on the caller's current
+                // folder. Don't copy relative input into a different location.
+                let matched_location=location.is_some();
+                let initial=location.unwrap_or(zsdesk_core::model::explorer::ShellLocation::ThisPc);
+                let Contract{kind,accept,..}=contract;
                 contracts.remove(&token);let early=preparing.remove(index);
                 let (types,filter)=if kind.folders(){(Vec::new(),0)}else{types(part.types)};
-                let initial_name=if kind.folders(){String::new()}else{text(part.name).filter(|name|!name.contains(['*','?'])).unwrap_or_default()};
-                if !early.preparing(){continue;}
-                let options=Options{token,title:kind.title().into(),initial,multiple,kind,initial_name,types,filter,events:tx.clone()};
+                let initial_name=if kind.folders()||!matched_location{String::new()}else{text(part.name).filter(|name|!name.contains(['*','?'])).unwrap_or_default()};
+                record(&mut last_handoff,&early,"starting-picker");
+                if !early.preparing(){record(&mut last_handoff,&early,"preparation-timeout");continue;}
+                let options=Options{token,title:kind.title().into(),initial,multiple,kind,initial_name,types,filter,use_native,events:tx.clone()};
                 let config=profile.to_path_buf();let report=tx.clone();
                 let profile_session=profile_session.clone();let time_to_show=early.show_check();
                 let worker=thread::Builder::new().name("zsdesk-picker-window".into()).spawn(move||{
@@ -348,7 +437,7 @@ fn run_with_watcher(profile:&Path,stop:&AtomicBool,mut spawn_watcher:impl FnMut(
             }
         }
         DIALOG_BUSY.store(!sessions.is_empty()||!returning.is_empty()||!preparing.is_empty(),std::sync::atomic::Ordering::Release);
-        let status=serde_json::json!({"pid":std::process::id(),"enabled":enabled,"active_pickers":sessions.len(),"awaiting_caller":returning.len(),"last_kind":last_kind,"last_confirmation":last_confirmation,"completed":completed,"last_error":last_error,"early_masking":watcher.is_some(),"preserved_native":preserved_native,"last_preservation":last_preservation}).to_string();
+        let status=serde_json::json!({"pid":std::process::id(),"enabled":enabled,"active_pickers":sessions.len(),"awaiting_caller":returning.len(),"last_kind":last_kind,"last_confirmation":last_confirmation,"completed":completed,"last_error":last_error,"early_masking":watcher.is_some(),"preserved_native":preserved_native,"last_preservation":last_preservation,"last_handoff":last_handoff.map(|(_,stage,ms)|serde_json::json!({"stage":stage,"elapsed_ms":ms}))}).to_string();
         if status!=previous{let _=crate::quick_search::control::atomic_write(&profile.with_file_name("file-dialog-takeover-status.json"),status.as_bytes());previous=status;}
         thread::sleep(Duration::from_millis(10));
     }
@@ -379,7 +468,7 @@ fn run_with_watcher(profile:&Path,stop:&AtomicBool,mut spawn_watcher:impl FnMut(
     }
     #[test]fn folder_mode_must_settle_after_transient_file_controls(){
         let start=Instant::now();let mut observed=StableContract::default();
-        let file=Contract{kind:SelectionKind::Files,name:1,types:2,shell:3,accept:"上传".into(),initial:zsdesk_core::model::explorer::ShellLocation::ThisPc};
+        let file=Contract{kind:SelectionKind::Files,name:1,types:2,shell:3,accept:"上传".into(),address:"此电脑".into()};
         assert!(!observed.observe(file.clone(),start));
         assert!(!observed.observe(file.clone(),start+Duration::from_millis(100)));
         let folder=Contract{kind:SelectionKind::Folders,types:0,..file};
@@ -421,5 +510,31 @@ fn run_with_watcher(profile:&Path,stop:&AtomicBool,mut spawn_watcher:impl FnMut(
         for label in ["文件名：","File name:","选择文件夹上传"]{assert!(!directory_label(label));}
     }
     #[test]fn filter_labels_preserve_masks_and_default_to_all(){assert_eq!(pattern("文本文件 (*.txt;*.log)"),"*.txt;*.log");assert_eq!(pattern("文档（*.docx）"),"*.docx");assert_eq!(pattern("Files"),"*");}
-    #[test]fn initial_location_preserves_unc_and_chinese_paths(){use zsdesk_core::model::explorer::ShellLocation;assert_eq!(initial_location(r"地址: E:\中文 资料"),Some(ShellLocation::Path(r"E:\中文 资料".into())));assert_eq!(initial_location(r"Address: \\server\share"),Some(ShellLocation::Path(r"\\server\share".into())));}
+    #[test]fn initial_location_preserves_unc_and_chinese_paths(){
+        use zsdesk_core::model::explorer::ShellLocation;
+        assert_eq!(initial_location(r"地址: E:\中文 资料"),Some(ShellLocation::Path(r"E:\中文 资料".into())));
+        assert_eq!(initial_location(r"Address: \\server\share"),Some(ShellLocation::Path(r"\\server\share".into())));
+        assert_eq!(address_value("地址: "), "");
+        assert_eq!(address_value("Address: Administrator"), "Administrator");
+        assert_eq!(address_value(r"E:\中文 资料"), r"E:\中文 资料");
+    }
+    #[test]
+    #[ignore="Read-only check of an explicitly identified open native dialog"]
+    fn inspect_live_dialog()->Result<()>{
+        let hwnd=std::env::var("ZSDESK_INSPECT_DIALOG")?.parse::<isize>()?;
+        let dialog=HWND(hwnd as *mut _);
+        ensure!(class(dialog)=="#32770","not a native dialog");
+        unsafe{CoInitializeEx(None,COINIT_MULTITHREADED)}.ok()?;
+        struct Apartment;impl Drop for Apartment{fn drop(&mut self){unsafe{CoUninitialize();}}}let _apartment=Apartment;
+        let uia:IUIAutomation=unsafe{CoCreateInstance(&CUIAutomation,None,CLSCTX_INPROC_SERVER)}?;
+        let start=Instant::now();
+        let part=parts(dialog);
+        let contract=read_contract(dialog,&part,Some(&uia)).map_err(anyhow::Error::msg)?;
+        let resolved=dialog_location(&contract.address).is_some();
+        let mode=multiple(&uia,part.shell).context("selection mode")?;
+        let action=capabilities::inspect(dialog,&part,Some(contract.kind),Some(&uia)).map_err(|reason|anyhow::anyhow!("{}",reason.key()))?;
+        let (filters,_)=types(part.types);
+        eprintln!("kind={:?} resolved_location={resolved} multiple={mode} native_alternative={action} filters={} inspection_ms={}",contract.kind,filters.len(),start.elapsed().as_millis());
+        Ok(())
+    }
 }

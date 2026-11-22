@@ -8,8 +8,10 @@ use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 pub(crate) const MARKER:PCWSTR=windows::core::w!("ZSDesk.FilePicker.v1");
 pub(super) const ACCEPT:usize=7301;
 pub(super) const CANCEL:usize=7302;
-const NAME:usize=7303;
+pub(crate) const NAME:usize=7303;
 const FILTER:usize=7304;
+pub(crate) const USE_NATIVE:usize=7305;
+#[cfg(test)]pub(crate) const TEST_ACCEPT_EDIT:usize=7306;
 const FOOTER_H:i32=76;
 pub(crate) const WM_NATIVE_REPLY:u32=WM_APP+147;
 #[derive(Clone,Copy)]pub(crate) enum NativeReply{Accepted=1,Cancelled=2,Rejected=3,Waiting=4,Fallback=5}
@@ -28,13 +30,13 @@ impl SelectionKind{
 }
 #[derive(Clone)]pub(crate) struct Options{
     pub token:u64,pub title:String,pub initial:ShellLocation,pub multiple:bool,pub kind:SelectionKind,
-    pub initial_name:String,pub types:Vec<FileType>,pub filter:usize,pub events:Sender<Event>,
+    pub initial_name:String,pub types:Vec<FileType>,pub filter:usize,pub use_native:bool,pub events:Sender<Event>,
 }
 #[derive(Clone,Debug,Default)]pub(crate) enum Outcome{
     Selected{paths:Vec<PathBuf>,filter:usize},
     #[default] Cancelled,
 }
-pub(crate) enum Event{Ready{token:u64,window:isize,show:Sender<()>},Submit{token:u64,outcome:Outcome},Finished{token:u64,result:Result<Outcome,String>}}
+pub(crate) enum Event{Ready{token:u64,window:isize,use_native:bool,show:Sender<()>},UseNative{token:u64},Submit{token:u64,outcome:Outcome},Finished{token:u64,result:Result<Outcome,String>}}
 #[derive(Default)]struct Submission{waiting:bool,cancel_requested:bool,confirmed:bool,selected:Option<Outcome>}
 impl Submission{
     fn begin(&mut self,outcome:&Outcome)->bool{
@@ -53,18 +55,18 @@ impl Submission{
     }
 }
 pub(super) struct State{
-    pub options:Options,pub result:Rc<RefCell<Outcome>>,name:HWND,filter:HWND,accept:HWND,cancel:HWND,edited:bool,submission:Submission,
+    pub options:Options,pub result:Rc<RefCell<Outcome>>,name:HWND,filter:HWND,accept:HWND,cancel:HWND,use_native:HWND,edited:bool,submission:Submission,
     time_to_show:Option<Box<dyn Fn()->Option<Duration>>>,
 }
 impl State{
-    pub fn new(options:Options,result:Rc<RefCell<Outcome>>)->Self{let edited=!options.initial_name.is_empty();Self{options,result,name:HWND::default(),filter:HWND::default(),accept:HWND::default(),cancel:HWND::default(),edited,submission:Submission::default(),time_to_show:None}}
+    pub fn new(options:Options,result:Rc<RefCell<Outcome>>)->Self{let edited=!options.initial_name.is_empty();Self{options,result,name:HWND::default(),filter:HWND::default(),accept:HWND::default(),cancel:HWND::default(),use_native:HWND::default(),edited,submission:Submission::default(),time_to_show:None}}
     pub fn pattern(&self)->&str{if self.options.kind.folders(){"*"}else{self.options.types.get(self.options.filter).map_or("*",|value|value.pattern.as_str())}}
-    fn controls(&self)->[HWND;4]{[self.name,self.filter,self.accept,self.cancel]}
+    fn controls(&self)->[HWND;5]{[self.name,self.filter,self.accept,self.cancel,self.use_native]}
     pub fn authorize_show(&mut self,window:HWND)->bool{
         let Some(time_to_show)=self.time_to_show.take()else{return false;};
         let Some(remaining)=time_to_show()else{return false;};
         let(show,permission)=mpsc::channel();
-        self.options.events.send(Event::Ready{token:self.options.token,window:window.0 as isize,show}).is_ok()
+        self.options.events.send(Event::Ready{token:self.options.token,window:window.0 as isize,use_native:self.options.use_native,show}).is_ok()
             &&permission.recv_timeout(remaining).is_ok()&&time_to_show().is_some()
     }
 }
@@ -97,6 +99,7 @@ impl WindowState{
             picker.submission.confirmed=true;*picker.result.borrow_mut()=Outcome::Cancelled;post(self.hwnd,WM_CLOSE,0,0);return;
         }
         unsafe{let _=EnableWindow(picker.accept,false);}
+        if !picker.use_native.0.is_null(){unsafe{let _=EnableWindow(picker.use_native,false);}}
         self.show_message(zsdesk_core::i18n::text("正在等待原程序确认选择…").into());
     }
     pub(super) fn picker_native_reply(&mut self,token:u64,code:isize){
@@ -104,6 +107,7 @@ impl WindowState{
         let Some(picker)=self.picker.as_mut().filter(|picker|picker.options.token==token)else{return;};
         if let Some(outcome)=picker.submission.reply(reply){*picker.result.borrow_mut()=outcome;post(self.hwnd,WM_CLOSE,0,0);return;}
         unsafe{let _=EnableWindow(picker.accept,!picker.submission.waiting);}
+        if !picker.use_native.0.is_null(){unsafe{let _=EnableWindow(picker.use_native,!picker.submission.waiting);}}
         self.show_message(match reply{NativeReply::Rejected=>zsdesk_core::i18n::text("原程序未接受选择，请检查后重试"),_=>zsdesk_core::i18n::text("原程序尚未完成选择，可取消后重新打开")}.into());
     }
     pub(super) fn picker_height(&self)->i32{if self.picker.is_some(){self.s(FOOTER_H)}else{0}}
@@ -115,6 +119,9 @@ impl WindowState{
             picker.filter=child(self.hwnd,"COMBOBOX","",FILTER,(CBS_DROPDOWNLIST|WS_VSCROLL.0 as i32)as u32,!picker.options.kind.folders())?;
             picker.accept=child(self.hwnd,"BUTTON",picker.options.kind.title(),ACCEPT,BS_DEFPUSHBUTTON as u32,true)?;
             picker.cancel=child(self.hwnd,"BUTTON",zsdesk_core::i18n::text("取消"),CANCEL,BS_PUSHBUTTON as u32,true)?;
+            if picker.options.use_native{
+                picker.use_native=child(self.hwnd,"BUTTON",zsdesk_core::i18n::text("使用原生窗口"),USE_NATIVE,BS_PUSHBUTTON as u32,true)?;
+            }
             for value in &picker.options.types{SendMessageW(picker.filter,CB_ADDSTRING,Some(WPARAM(0)),Some(LPARAM(wide(&value.label).as_ptr()as isize)));}
             SendMessageW(picker.filter,CB_SETCURSEL,Some(WPARAM(picker.options.filter)),Some(LPARAM(0)));
         }Ok(())
@@ -128,6 +135,9 @@ impl WindowState{
             move_control(picker.filter,LayoutRect::new(width-filter-pad,top+self.s(8),filter,self.s(240)));
             move_control(picker.accept,LayoutRect::new(width-pad-button*2-gap,top+self.s(42),button,control));
             move_control(picker.cancel,LayoutRect::new(width-pad-button,top+self.s(42),button,control));
+            if !picker.use_native.0.is_null(){
+                move_control(picker.use_native,LayoutRect::new(pad,top+self.s(42),self.s(144),control));
+            }
             // Moving a child never changes WS_VISIBLE. Keep the footer usable
             // after creation, resize, theme changes and navigation.
             for window in [picker.name,picker.accept,picker.cancel]{let _=ShowWindow(window,SW_SHOWNA);}
@@ -151,7 +161,18 @@ impl WindowState{
     pub(super) fn picker_command(&mut self,id:usize,code:u32)->bool{
         if self.picker.is_none(){return false;}
         match id{
+            #[cfg(test)]
+            TEST_ACCEPT_EDIT=>{self.picker.as_mut().unwrap().edited=true;self.picker_accept();true},
             ACCEPT=>{self.picker_accept();true},CANCEL=>{post(self.hwnd,WM_CLOSE,0,0);true},
+            USE_NATIVE=>{
+                if let Some(picker)=self.picker.as_mut().filter(|picker|picker.options.use_native&&!picker.submission.waiting&&!picker.submission.confirmed){
+                    if picker.options.events.send(Event::UseNative{token:picker.options.token}).is_ok(){
+                        picker.submission.waiting=true;
+                        unsafe{let _=EnableWindow(picker.use_native,false);let _=EnableWindow(picker.accept,false);}
+                    }
+                }
+                true
+            },
             NAME=>{if code==EN_CHANGE{if let Some(picker)=self.picker.as_mut(){if unsafe{GetFocus()}==picker.name{picker.edited=true;}}}true},
             FILTER=>{if code==CBN_SELCHANGE as u32{
                 let index=unsafe{SendMessageW(self.picker.as_ref().unwrap().filter,CB_GETCURSEL,None,None)}.0;
@@ -200,7 +221,12 @@ pub(super) fn pre_translate(slot:&Slot,message:&MSG)->bool{
     if message.message!=WM_KEYDOWN{return false;}
     let Ok(slot)=slot.try_borrow()else{return false;};let Some(state)=slot.as_ref()else{return false;};let Some(picker)=&state.picker else{return false;};
     if message.wParam.0==VK_RETURN.0 as usize&&message.hwnd==picker.name{post(state.hwnd,WM_COMMAND,ACCEPT,0);return true;}
-    if message.wParam.0==VK_RETURN.0 as usize&&[picker.accept,picker.cancel].contains(&message.hwnd){post(state.hwnd,WM_COMMAND,if message.hwnd==picker.cancel{CANCEL}else{ACCEPT},0);return true;}
+    if message.wParam.0==VK_RETURN.0 as usize{
+        if let Some(id)=[(picker.accept,ACCEPT),(picker.cancel,CANCEL),(picker.use_native,USE_NATIVE)].into_iter()
+            .find_map(|(window,id)|(!window.0.is_null()&&message.hwnd==window).then_some(id)){
+            post(state.hwnd,WM_COMMAND,id,0);return true;
+        }
+    }
     if message.wParam.0==VK_TAB.0 as usize&&picker.controls().contains(&message.hwnd){return unsafe{IsDialogMessageW(state.hwnd,message)}.as_bool();}
     if message.wParam.0==VK_ESCAPE.0 as usize&&!state.address_editing{post(state.hwnd,WM_CLOSE,0,0);return true;}false
 }

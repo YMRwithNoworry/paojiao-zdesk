@@ -51,7 +51,7 @@ fn exercise(root:&Path)->Result<serde_json::Value>{
     for (cancelled,multiple) in [(false,false),(false,true),(true,false)]{
         let(tx,rx)=std::sync::mpsc::channel();let result=Rc::new(RefCell::new(Outcome::Cancelled));
         let options=Options{token:100+u64::from(cancelled)+u64::from(multiple)*2,title:"选择文件".into(),initial:ShellLocation::Path(first.clone()),multiple,kind:SelectionKind::Files,initial_name:String::new(),
-            types:vec![FileType{label:"文本文件 (*.txt)".into(),pattern:"*.txt".into()}],filter:0,events:tx};
+            types:vec![FileType{label:"文本文件 (*.txt)".into(),pattern:"*.txt".into()}],filter:0,use_native:!cancelled,events:tx};
         let mut state=WindowState::new(saved.clone(),profile.clone(),None,false);state.picker=Some(State::new(options,result.clone()));state.secondary_window=true;
         let slot=Box::new(RefCell::new(Some(state)));
         let window=unsafe{CreateWindowExW(WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE,name,windows::core::w!("Picker fixture"),WS_OVERLAPPEDWINDOW|WS_CLIPCHILDREN,
@@ -94,7 +94,7 @@ fn exercise(root:&Path)->Result<serde_json::Value>{
     for selected_child in [false,true]{
         let(tx,rx)=std::sync::mpsc::channel();let result=Rc::new(RefCell::new(Outcome::Cancelled));
         let options=Options{token:200+u64::from(selected_child),title:"选择文件夹".into(),initial:ShellLocation::Path(first.clone()),multiple:false,kind:SelectionKind::Folders,
-            initial_name:String::new(),types:Vec::new(),filter:0,events:tx};
+            initial_name:String::new(),types:Vec::new(),filter:0,use_native:false,events:tx};
         let mut state=WindowState::new(saved.clone(),profile.clone(),None,false);state.picker=Some(State::new(options,result.clone()));state.secondary_window=true;
         let slot=Box::new(RefCell::new(Some(state)));
         let window=unsafe{CreateWindowExW(WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE,name,windows::core::w!("Folder picker fixture"),WS_OVERLAPPEDWINDOW|WS_CLIPCHILDREN,

@@ -50,6 +50,7 @@ pub(super) struct Claim{lease:Lease,pipe:Pipe,transferred:bool}
 impl Claim{
     pub fn source(&self)->guard::Identity{self.lease.source.clone()}
     pub fn token(&self)->u64{self.lease.token}
+    pub fn age_ms(&self)->u64{now().saturating_sub(self.lease.started)}
     pub fn active(&self)->bool{marked(&self.lease)}
     pub fn preparing(&self)->bool{self.lease.remaining().is_some()}
     pub fn show_check(&self)->impl Fn()->Option<Duration>+use<>{let lease=self.lease.clone();move||lease.remaining()}
@@ -255,8 +256,9 @@ fn run()->Result<()>{
         let root=PathBuf::from(std::env::var_os("ZSDESK_DIALOG_FIXTURE").context("fixture")?);
         let until=Instant::now()+Duration::from_secs(10);while !root.join("go").exists(){ensure!(Instant::now()<until,"fixture start timeout");thread::sleep(Duration::from_millis(5));}
         let(tx,rx)=mpsc::channel::<isize>();let output=root.clone();let reporter=thread::spawn(move||{if let Ok(window)=rx.recv_timeout(Duration::from_secs(10)){let _=fs::write(output.join("source.json"),window.to_string());}});
-        let kind=if std::env::var("ZSDESK_DIALOG_KIND").ok().as_deref()==Some("folder"){SelectionKind::Folders}else{SelectionKind::Files};
-        let result=super::super::native_tests::original(root.clone(),tx,kind,Some("上传(&U)"))?;
+        let mode=std::env::var("ZSDESK_DIALOG_KIND").unwrap_or_default();
+        let kind=if mode=="folder"{SelectionKind::Folders}else{SelectionKind::Files};
+        let result=super::super::native_tests::original_with_mode(root.clone(),tx,kind,(mode!="single-image").then_some("上传(&U)"),mode=="single-image")?;
         let _=reporter.join();fs::write(root.join("result.json"),serde_json::to_vec(&result)?)?;
         fs::write(root.join("activation-alpha.json"),super::super::native_tests::FIRST_ACTIVATION_ALPHA.load(Ordering::Relaxed).to_string())?;Ok(())
     }
@@ -278,11 +280,109 @@ fn run()->Result<()>{
         if self.0.try_wait().ok().flatten().is_none(){let _=self.0.kill();let _=self.0.wait();}
     }}
     #[test]
+    #[ignore="Requires isolated Windows desktop, Edge and a local DevTools fixture"]
+    fn browser_upload_picker_first_show()->Result<()>{
+        let root=PathBuf::from(std::env::var_os("ZSDESK_NATIVE_TEST_OUTPUT").context("output")?);
+        let executable=PathBuf::from(std::env::var_os("ZSDESK_GUARD_TEST_EXE").context("watcher executable")?);
+        let edge=std::env::var_os("ZSDESK_TEST_EDGE").context("Edge executable")?;
+        let script=Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/test-edge-file-picker.mjs");
+        let edge_profile=root.join("edge-profile");
+        struct Browser(Child);impl Drop for Browser{fn drop(&mut self){let _=self.0.kill();let _=self.0.wait();}}
+        let _browser=Browser(Command::new(edge).arg(format!("--user-data-dir={}",edge_profile.display()))
+            .args(["--remote-debugging-port=0","--no-first-run","--no-default-browser-check","--disable-background-networking",
+                "data:text/html,<input%20type=file%20accept=image/*%20multiple>"]).creation_flags(0x08000000).spawn()?);
+        let profile=root.join("explorer-session.json");
+        let mut session=crate::storage::default_session();session.ui.file_dialog_takeover=true;
+        crate::storage::save(&profile,&session)?;
+        let status=root.join("file-dialog-takeover-status.json");
+        let read_status=||fs::read(&status).ok().and_then(|bytes|serde_json::from_slice::<serde_json::Value>(&bytes).ok()).unwrap_or_default();
+        let stop=AtomicBool::new(false);
+        thread::scope(|scope|->Result<()>{
+            struct StopOnDrop<'a>(&'a AtomicBool);
+            impl Drop for StopOnDrop<'_>{fn drop(&mut self){self.0.store(true,Ordering::Release);}}
+            // Edge can run IFileOpenDialog in a separate utility process.
+            let bridge=scope.spawn(||run_with_watcher(&profile,&stop,||Connection::spawn_for(&executable,None)));
+            let _stop=StopOnDrop(&stop);
+            wait_until(||read_status()["early_masking"]==true,"bridge watcher was not ready")?;
+            let port_file=edge_profile.join("DevToolsActivePort");
+            let devtools=|args:&[&str]|->Result<String>{
+                let result=Command::new("node").arg(&script).arg(&port_file).args(args).creation_flags(0x08000000).output()?;
+                ensure!(result.status.success(),"browser fixture failed: {}",String::from_utf8_lossy(&result.stderr));
+                Ok(String::from_utf8(result.stdout)?.trim().to_owned())
+            };
+            let picker_visible=||{
+            let mut picker=HWND::default();
+                unsafe extern "system" fn find(window:HWND,slot:LPARAM)->BOOL{
+                    let mut owner=0;unsafe{GetWindowThreadProcessId(window,Some(&mut owner));}
+                    if owner==std::process::id()&&unsafe{IsWindowVisible(window)}.as_bool()&&!unsafe{GetPropW(window,crate::window::picker::MARKER)}.0.is_null(){
+                        unsafe{*(slot.0 as*mut HWND)=window;}return false.into();
+                    }true.into()
+                }
+                let _=unsafe{EnumWindows(Some(find),LPARAM(&mut picker as*mut _ as isize))};picker
+            };
+            let native_window=||{
+                unsafe extern "system" fn find(window:HWND,value:LPARAM)->BOOL{
+                    if class(window)=="#32770"&&unsafe{IsWindowVisible(window)}.as_bool()&&control_visible(parts(window).types){
+                        unsafe{*(value.0 as *mut HWND)=window};return false.into();
+                    }true.into()
+                }
+                let mut window=HWND::default();
+                let _=unsafe{EnumWindows(Some(find),LPARAM(&mut window as*mut _ as isize))};window
+            };
+            for mode in ["cancel","select","native"]{
+                let clicked=devtools(&["open"])?.parse::<u128>()?;
+                let mut picker=HWND::default();
+                wait_until(||{picker=picker_visible();!picker.0.is_null()},"ZSDesk browser picker did not become visible")
+                    .with_context(||format!("bridge status: {}",read_status()))?;
+                let visible=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_millis();
+                eprintln!("Edge {mode}: visible {} ms after click; {}",visible.saturating_sub(clicked),read_status());
+                match mode{
+                    "select"=>{
+                        let first=root.join("first.png");let second=root.join("second.png");
+                        for file in [&first,&second]{fs::write(file,b"local selection fixture")?;}
+                        // Exercise the real picker footer and original Edge
+                        // caller. The data URL has no upload endpoint.
+                        let edit=unsafe{GetDlgItem(Some(picker),crate::window::picker::NAME as i32)}?;
+                        let names=wide(&format!("\"{}\" \"{}\"",first.display(),second.display()));
+                        ensure!(send(edit,WM_SETTEXT,0,names.as_ptr()as isize).is_some_and(|result|result!=0),"file names not set");
+                        // The isolated desktop cannot assign keyboard focus.
+                        unsafe{PostMessageW(Some(picker),WM_COMMAND,WPARAM(crate::window::picker::TEST_ACCEPT_EDIT),LPARAM(0))}?;
+                        wait_until(||read_status()["last_confirmation"]=="accepted","Edge did not accept selection")?;
+                        assert_eq!(devtools(&["files"])?,r#"["first.png","second.png"]"#);
+                    }
+                    "native"=>{
+                        let source=native_window();ensure!(!source.0.is_null(),"masked Edge dialog missing");
+                        let button=unsafe{GetDlgItem(Some(picker),crate::window::picker::USE_NATIVE as i32)}?;
+                        unsafe{PostMessageW(Some(picker),WM_COMMAND,WPARAM(crate::window::picker::USE_NATIVE),LPARAM(button.0 as isize))}?;
+                        wait_until(||picker_visible().0.is_null()&&read_status()["last_handoff"]["stage"]=="native-requested","Edge native switch did not finish")?;
+                        ensure!(native_window()==source&&unsafe{GetPropW(source,MARKER)}.0.is_null(),"original Edge dialog was not restored");
+                        native_choice(source,2)?;
+                    }
+                    _=>{
+                        unsafe{PostMessageW(Some(picker),WM_CLOSE,WPARAM(0),LPARAM(0))}?;
+                        wait_until(||read_status()["last_confirmation"]=="cancelled","bridge did not confirm browser cancellation")?;
+                    }
+                }
+                wait_until(||picker_visible().0.is_null()&&native_window().0.is_null(),"previous browser picker did not close")?;
+            }
+            stop.store(true,Ordering::Release);
+            bridge.join().map_err(|_|anyhow::anyhow!("bridge panicked"))?
+        })
+    }
+    #[test]
     #[ignore="Live picker and isolated native upload fixture; use a separate Windows desktop"]
     fn native_upload_picker_first_show()->Result<()>{
+        live_native_picker("files")
+    }
+    #[test]
+    #[ignore="Single-image picker with a profile display name; use a separate Windows desktop"]
+    fn native_qq_style_image_picker()->Result<()>{
+        live_native_picker("single-image")
+    }
+    fn live_native_picker(mode:&str)->Result<()>{
         let root=PathBuf::from(std::env::var_os("ZSDESK_NATIVE_TEST_OUTPUT").context("output")?).join("live-upload");
         let executable=PathBuf::from(std::env::var_os("ZSDESK_GUARD_TEST_EXE").context("guard executable")?);
-        let mut source=Source::spawn(&root,"files")?;
+        let mut source=Source::spawn(&root,mode)?;
         let pid=source.0.id();let profile=root.join("explorer-session.json");
         let mut session=crate::storage::default_session();session.ui.file_dialog_takeover=true;
         crate::storage::save(&profile,&session)?;
@@ -310,12 +410,23 @@ fn run()->Result<()>{
             },"ZSDesk picker did not become visible").with_context(||format!("bridge status: {}",read_status()))?;
             let visible_ms=opened.elapsed().as_millis();
             eprintln!("native upload picker visible after {visible_ms} ms");
-            unsafe{PostMessageW(Some(picker),WM_CLOSE,WPARAM(0),LPARAM(0))}?;
-            wait_until(||source.0.try_wait().ok().flatten().is_some(),"native caller did not cancel")?;
+            let single=mode=="single-image";
+            let filename=root.join("avatar.png");
+            if single{
+                fs::write(&filename,b"local image selection fixture")?;
+                let edit=unsafe{GetDlgItem(Some(picker),crate::window::picker::NAME as i32)}?;
+                let name=wide(&format!("\"{}\"",filename.display()));
+                ensure!(send(edit,WM_SETTEXT,0,name.as_ptr()as isize).is_some_and(|result|result!=0),"file name not set");
+                unsafe{PostMessageW(Some(picker),WM_COMMAND,WPARAM(crate::window::picker::TEST_ACCEPT_EDIT),LPARAM(0))}?;
+            }else{unsafe{PostMessageW(Some(picker),WM_CLOSE,WPARAM(0),LPARAM(0))}?;}
+            wait_until(||source.0.try_wait().ok().flatten().is_some(),"native caller did not close").with_context(||format!("bridge status: {}",read_status()))?;
             ensure!(source.0.wait()?.success(),"source failed");
             let result:serde_json::Value=serde_json::from_slice(&fs::read(root.join("result.json"))?)?;
-            ensure!(result[2]==true,"native caller did not receive cancellation");
-            wait_until(||read_status()["last_confirmation"]=="cancelled","bridge did not confirm cancellation")?;
+            if single{
+                ensure!(result[2]==false&&result[0]==serde_json::json!([filename]),"native caller received wrong image");
+            }else{ensure!(result[2]==true,"native caller did not receive cancellation");}
+            let confirmation=if single{"accepted"}else{"cancelled"};
+            wait_until(||read_status()["last_confirmation"]==confirmation,"bridge did not confirm result")?;
             stop.store(true,Ordering::Release);
             bridge.join().map_err(|_|anyhow::anyhow!("bridge panicked"))?
         })

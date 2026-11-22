@@ -2,10 +2,13 @@
 use super::*;
 
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
-enum ActionKind { Files, Folders, Mixed, Other }
+enum ActionKind { Files, Folders, Mixed, MobileUpload, Other }
 
 fn action_kind(label:&str)->ActionKind {
     let label=control_label(label);
+    if matches!(label.as_str(),"从移动设备上传"|"upload from mobile"|"upload from mobile device"|"upload from a mobile device"){
+        return ActionKind::MobileUpload;
+    }
     if ["文件和文件夹","文件或文件夹","文件/文件夹","files and folders","files or folders","files/folders","file or folder"]
         .iter().any(|text|label.contains(text)){return ActionKind::Mixed;}
     if [zsdesk_core::i18n::text("选择文件夹"),"选择此文件夹","选取文件夹","选取目录","选择目录","上传文件夹","添加文件夹",
@@ -56,59 +59,71 @@ fn inside_field(automation:&IUIAutomation,walker:&IUIAutomationTreeWalker,item:&
     Err(windows::core::Error::new(windows::core::HRESULT(0x80004005u32 as i32),"选择控件层级超出限制"))
 }
 
+fn mobile_alternative(primary_kind:Option<SelectionKind>,action:&Action)->bool{
+    primary_kind==Some(SelectionKind::Files)&&!action.primary&&action.secondary_confirmation&&action.kind==ActionKind::MobileUpload
+}
+
 fn preserve(primary_kind:Option<SelectionKind>,actions:&[Action])->Option<Preservation>{
     if actions.iter().any(|action|action.primary&&action.dropdown){return Some(Preservation::ConfirmationDropdown);}
     if actions.iter().any(|action|action.kind==ActionKind::Mixed){return Some(Preservation::MixedSelection);}
     let files=primary_kind==Some(SelectionKind::Files)||actions.iter().any(|action|action.kind==ActionKind::Files);
     let folders=primary_kind==Some(SelectionKind::Folders)||actions.iter().any(|action|action.kind==ActionKind::Folders);
     if files&&folders{return Some(Preservation::MixedSelection);}
-    actions.iter().any(|action|!action.primary&&(action.secondary_confirmation||matches!(action.kind,ActionKind::Files|ActionKind::Folders)))
+    actions.iter().any(|action|!action.primary&&!mobile_alternative(primary_kind,action)
+        &&(action.secondary_confirmation||matches!(action.kind,ActionKind::Files|ActionKind::Folders)))
         .then_some(Preservation::AdditionalSelectionAction)
 }
 
 /// The original dialog remains the authority for every extra button and
 /// dropdown callback. Never synthesize an IDOK result for those contracts.
-pub(super) fn preservation(dialog:HWND,part:&Parts,kind:Option<SelectionKind>,automation:Option<&IUIAutomation>)->Option<Preservation>{
-    let inspect=(||->windows::core::Result<Option<Preservation>>{
+pub(super) fn inspect(dialog:HWND,part:&Parts,kind:Option<SelectionKind>,automation:Option<&IUIAutomation>)->Result<bool,Preservation>{
+    let inspect=(||->windows::core::Result<Result<bool,Preservation>>{
         let primary=unsafe{GetDlgItem(Some(dialog),1)}?;
         let automation=automation.ok_or_else(||windows::core::Error::new(windows::core::HRESULT(0x80004005u32 as i32),"原窗口选择能力不可读取"))?;
         let root=unsafe{automation.ElementFromHandle(dialog)}?;
         let primary=unsafe{automation.ElementFromHandle(primary)}?;
         let primary_bounds=unsafe{primary.CurrentBoundingRectangle()}?;
         let cancel=unsafe{GetDlgItem(Some(dialog),2)}.and_then(|window|unsafe{automation.ElementFromHandle(window)})?;
-        let walker=unsafe{automation.ControlViewWalker()}?;
-        let mut fields=Vec::new();
-        for window in [part.name,part.types]{if !window.0.is_null(){fields.push(unsafe{automation.ElementFromHandle(field_root(window))}?);}}
         let expansion=unsafe{primary.GetCurrentPatternAs::<IUIAutomationExpandCollapsePattern>(UIA_ExpandCollapsePatternId)}.ok()
             .map(|pattern|unsafe{pattern.CurrentExpandCollapseState()}).transpose()?;
         let primary_dropdown=has_dropdown(unsafe{primary.CurrentControlType()}?==UIA_SplitButtonControlTypeId,expansion.map(|state|state.0));
         if primary_dropdown{
-            return Ok(Some(Preservation::ConfirmationDropdown));
+            return Ok(Err(Preservation::ConfirmationDropdown));
         }
         let buttons=unsafe{automation.CreatePropertyCondition(UIA_ControlTypePropertyId,&VARIANT::from(UIA_ButtonControlTypeId.0))}?;
         let split=unsafe{automation.CreatePropertyCondition(UIA_ControlTypePropertyId,&VARIANT::from(UIA_SplitButtonControlTypeId.0))}?;
         let menu=unsafe{automation.CreatePropertyCondition(UIA_ControlTypePropertyId,&VARIANT::from(UIA_MenuItemControlTypeId.0))}?;
         let condition=unsafe{automation.CreateOrCondition(&buttons,&split)}?;
         let condition=unsafe{automation.CreateOrCondition(&condition,&menu)}?;
-        let elements=unsafe{root.FindAll(TreeScope_Descendants,&condition)}?;
+        // Read names and geometry in one UIA request instead of walking each
+        // toolbar and shell-view button's ancestors across process boundaries.
+        let cache=unsafe{automation.CreateCacheRequest()}?;
+        unsafe{cache.AddProperty(UIA_NamePropertyId)?;cache.AddProperty(UIA_BoundingRectanglePropertyId)?;}
+        let elements=unsafe{root.FindAllBuildCache(TreeScope_Descendants,&condition,&cache)}?;
         let count=unsafe{elements.Length()}?;
-        if !(0..=256).contains(&count){return Ok(Some(Preservation::InspectionUnavailable));}
+        if !(0..=256).contains(&count){return Ok(Err(Preservation::InspectionUnavailable));}
+        let walker=unsafe{automation.ControlViewWalker()}?;
+        let mut fields=Vec::new();
+        for window in [part.name,part.types]{if !window.0.is_null(){fields.push(unsafe{automation.ElementFromHandle(field_root(window))}?);}}
         let mut actions=Vec::with_capacity(count as usize);
         for index in 0..count{
             let item=unsafe{elements.GetElement(index)}?;
-            if inside_field(automation,&walker,&item,&fields)?{continue;}
-            let label=unsafe{item.CurrentName()}?.to_string();
+            let label=unsafe{item.CachedName()}?.to_string();
+            let kind=action_kind(&label);
+            let bounds=unsafe{item.CachedBoundingRectangle()}?;
+            let same_row=same_confirmation_row(primary_bounds,bounds);
+            if !same_row&&kind==ActionKind::Other{continue;}
             let is_primary=unsafe{automation.CompareElements(&item,&primary)}?.as_bool();
             if unsafe{automation.CompareElements(&item,&cancel)}?.as_bool(){continue;}
-            let bounds=unsafe{item.CurrentBoundingRectangle()}?;
-            actions.push(Action{kind:action_kind(&label),primary:is_primary,
-                secondary_confirmation:!is_primary&&same_confirmation_row(primary_bounds,bounds),
+            if !is_primary&&inside_field(automation,&walker,&item,&fields)?{continue;}
+            actions.push(Action{kind,primary:is_primary,
+                secondary_confirmation:!is_primary&&same_row,
                 dropdown:is_primary&&primary_dropdown});
         }
-        if !actions.iter().any(|action|action.primary){return Ok(Some(Preservation::InspectionUnavailable));}
-        Ok(preserve(kind,&actions))
+        if !actions.iter().any(|action|action.primary){return Ok(Err(Preservation::InspectionUnavailable));}
+        Ok(preserve(kind,&actions).map_or_else(||Ok(actions.iter().any(|action|mobile_alternative(kind,action))),Err))
     })();
-    inspect.unwrap_or(Some(Preservation::InspectionUnavailable))
+    inspect.unwrap_or(Err(Preservation::InspectionUnavailable))
 }
 
 #[cfg(test)]mod tests{
@@ -144,5 +159,12 @@ pub(super) fn preservation(dialog:HWND,part:&Parts,kind:Option<SelectionKind>,au
         assert!(same_confirmation_row(first,RECT{left:80,top:400,right:180,bottom:430}));
         assert!(!same_confirmation_row(first,RECT{left:80,top:20,right:180,bottom:50}));
         assert!(!same_confirmation_row(RECT::default(),RECT::default()));
+    }
+    #[test]fn mobile_upload_can_be_reached_via_the_original_file_dialog(){
+        let mut mobile=action(" 从移动设备上传 ",false);mobile.secondary_confirmation=true;
+        assert!(mobile_alternative(Some(SelectionKind::Files),&mobile));
+        let actions=[action("Open",true),mobile];
+        assert_eq!(preserve(Some(SelectionKind::Files),&actions),None);
+        assert_eq!(preserve(Some(SelectionKind::Folders),&actions),Some(Preservation::AdditionalSelectionAction));
     }
 }

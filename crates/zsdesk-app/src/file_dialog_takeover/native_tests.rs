@@ -33,16 +33,25 @@ unsafe extern "system" fn offscreen(code:i32,wp:WPARAM,lp:LPARAM)->windows::Win3
     fn OnOverwrite(&self,_:Ref<IFileDialog>,_:Ref<IShellItem>)->windows::core::Result<FDE_OVERWRITE_RESPONSE>{Ok(FDEOR_DEFAULT)}
 }
 pub(super) fn original(directory:PathBuf,ready:mpsc::Sender<isize>,kind:SelectionKind,accept_label:Option<&str>)->Result<(Vec<PathBuf>,u32,bool)>{
+    original_with_mode(directory,ready,kind,accept_label,false)
+}
+pub(super) fn original_with_mode(directory:PathBuf,ready:mpsc::Sender<isize>,kind:SelectionKind,accept_label:Option<&str>,single_image:bool)->Result<(Vec<PathBuf>,u32,bool)>{
     let hook=unsafe{SetWindowsHookExW(WH_CBT,Some(offscreen),None,GetCurrentThreadId())}?;struct Hook(HHOOK);impl Drop for Hook{fn drop(&mut self){let _=unsafe{UnhookWindowsHookEx(self.0)};}}let _hook=Hook(hook);
     unsafe{OleInitialize(None)}?;struct Apartment;impl Drop for Apartment{fn drop(&mut self){unsafe{OleUninitialize();}}}let _apartment=Apartment;
     let dialog:IFileOpenDialog=unsafe{CoCreateInstance(&FileOpenDialog,None,CLSCTX_INPROC_SERVER)}?;
-    let folder:IShellItem=unsafe{SHCreateItemFromParsingName(PCWSTR(wide(&directory.to_string_lossy()).as_ptr()),None)}?;
+    let folder:IShellItem=if single_image{unsafe{SHGetKnownFolderItem(&FOLDERID_Profile,KF_FLAG_DEFAULT,None)}?}
+        else{unsafe{SHCreateItemFromParsingName(PCWSTR(wide(&directory.to_string_lossy()).as_ptr()),None)}?};
     let sink:IFileDialogEvents=Events{ready,sent:Cell::new(false)}.into();
     let cookie=unsafe{dialog.Advise(&sink)}?;
-    unsafe{dialog.SetOptions(if kind.folders(){FOS_PICKFOLDERS|FOS_PATHMUSTEXIST|FOS_FORCEFILESYSTEM}else{FOS_ALLOWMULTISELECT|FOS_FILEMUSTEXIST|FOS_FORCEFILESYSTEM})?;dialog.SetFolder(&folder)?;
+    unsafe{dialog.SetOptions(if kind.folders(){FOS_PICKFOLDERS|FOS_PATHMUSTEXIST|FOS_FORCEFILESYSTEM}
+        else if single_image{FOS_FILEMUSTEXIST|FOS_FORCEFILESYSTEM}else{FOS_ALLOWMULTISELECT|FOS_FILEMUSTEXIST|FOS_FORCEFILESYSTEM})?;dialog.SetFolder(&folder)?;
         dialog.SetTitle(w!("ZSDesk Original Picker Test"))?;
         if let Some(label)=accept_label{dialog.SetOkButtonLabel(PCWSTR(wide(label).as_ptr()))?;}
-        if !kind.folders(){dialog.SetFileTypes(&[Common::COMDLG_FILTERSPEC{pszName:w!("文本文件"),pszSpec:w!("*.txt")},Common::COMDLG_FILTERSPEC{pszName:w!("所有文件"),pszSpec:w!("*.*")}])?;}}
+        if !kind.folders(){
+            let filter=if single_image{Common::COMDLG_FILTERSPEC{pszName:w!("图片文件"),pszSpec:w!("*.png;*.jpg")}}
+                else{Common::COMDLG_FILTERSPEC{pszName:w!("文本文件"),pszSpec:w!("*.txt")}};
+            dialog.SetFileTypes(&[filter,Common::COMDLG_FILTERSPEC{pszName:w!("所有文件"),pszSpec:w!("*.*")}])?;
+        }}
     let shown=unsafe{dialog.Show(None)};unsafe{dialog.Unadvise(cookie)}?;
     if let Err(error)=shown{ensure!(error.code().0 as u32==0x800704c7,"native dialog failed: {error}");return Ok((Vec::new(),0,true));}
     let items=unsafe{dialog.GetResults()}?;let mut paths=Vec::new();for index in 0..unsafe{items.GetCount()}?{

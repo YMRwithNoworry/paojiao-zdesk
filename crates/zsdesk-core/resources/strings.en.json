@@ -563,6 +563,7 @@
   "文件夹：": "Folder:",
   "文件名：": "File name:",
   "文件夹正在加载，请稍后选择": "The folder is loading. Select an item after it finishes",
+  "使用原生窗口": "Use Windows dialog",
   "请选择文件": "Select a file",
   "请打开文件夹后选择文件": "Open a folder before selecting a file",
   "文件名的引号不完整": "The file name contains an unmatched quotation mark",
