@@ -1,6 +1,6 @@
 //! File selection uses the ordinary explorer window and its existing tabs.
 use super::*;
-use std::{path::{Path,PathBuf},sync::mpsc::Sender};
+use std::{path::{Path,PathBuf},sync::mpsc::{self,Sender},time::Duration};
 use zsdesk_windows::gfx::{Canvas,RectF};
 use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 #[cfg(test)]#[path="picker_regression.rs"]mod native_tests;
@@ -34,7 +34,7 @@ impl SelectionKind{
     Selected{paths:Vec<PathBuf>,filter:usize},
     #[default] Cancelled,
 }
-pub(crate) enum Event{Ready{token:u64,window:isize},Submit{token:u64,outcome:Outcome},Finished{token:u64,result:Result<Outcome,String>}}
+pub(crate) enum Event{Ready{token:u64,window:isize,show:Sender<()>},Submit{token:u64,outcome:Outcome},Finished{token:u64,result:Result<Outcome,String>}}
 #[derive(Default)]struct Submission{waiting:bool,cancel_requested:bool,confirmed:bool,selected:Option<Outcome>}
 impl Submission{
     fn begin(&mut self,outcome:&Outcome)->bool{
@@ -54,11 +54,19 @@ impl Submission{
 }
 pub(super) struct State{
     pub options:Options,pub result:Rc<RefCell<Outcome>>,name:HWND,filter:HWND,accept:HWND,cancel:HWND,edited:bool,submission:Submission,
+    time_to_show:Option<Box<dyn Fn()->Option<Duration>>>,
 }
 impl State{
-    pub fn new(options:Options,result:Rc<RefCell<Outcome>>)->Self{let edited=!options.initial_name.is_empty();Self{options,result,name:HWND::default(),filter:HWND::default(),accept:HWND::default(),cancel:HWND::default(),edited,submission:Submission::default()}}
+    pub fn new(options:Options,result:Rc<RefCell<Outcome>>)->Self{let edited=!options.initial_name.is_empty();Self{options,result,name:HWND::default(),filter:HWND::default(),accept:HWND::default(),cancel:HWND::default(),edited,submission:Submission::default(),time_to_show:None}}
     pub fn pattern(&self)->&str{if self.options.kind.folders(){"*"}else{self.options.types.get(self.options.filter).map_or("*",|value|value.pattern.as_str())}}
     fn controls(&self)->[HWND;4]{[self.name,self.filter,self.accept,self.cancel]}
+    pub fn authorize_show(&mut self,window:HWND)->bool{
+        let Some(time_to_show)=self.time_to_show.take()else{return false;};
+        let Some(remaining)=time_to_show()else{return false;};
+        let(show,permission)=mpsc::channel();
+        self.options.events.send(Event::Ready{token:self.options.token,window:window.0 as isize,show}).is_ok()
+            &&permission.recv_timeout(remaining).is_ok()&&time_to_show().is_some()
+    }
 }
 fn prepare_session(mut session:ExplorerSession,initial:&ShellLocation)->ExplorerSession{
     for tab in &mut session.tabs{tab.locked=false;if let Some(view)=&mut tab.view{view.selected.clear();view.focused=None;}}
@@ -67,12 +75,14 @@ fn prepare_session(mut session:ExplorerSession,initial:&ShellLocation)->Explorer
     else{let id=session.take_id();session.tabs.push(ExplorerTab::new(id,initial.clone()));session.active_tab=session.tabs.len()-1;}
     session
 }
-pub(crate) fn run(session:ExplorerSession,profile:PathBuf,options:Options)->Result<Outcome>{
+pub(crate) fn run(session:ExplorerSession,profile:PathBuf,options:Options,time_to_show:impl Fn()->Option<Duration>+'static)->Result<Outcome>{
+    if time_to_show().is_none(){return Ok(Outcome::Cancelled);}
     let session=prepare_session(session,&options.initial);
     let result=Rc::new(RefCell::new(Outcome::Cancelled));
     unsafe{OleInitialize(None)}?;
     struct Apartment;impl Drop for Apartment{fn drop(&mut self){zsdesk_windows::flyout::release_thread_resources();unsafe{OleUninitialize();}}}let _apartment=Apartment;
-    unsafe{run_window(session,profile,None,true,true,None,Some(State::new(options,result.clone())))}?;
+    let mut picker=State::new(options,result.clone());picker.time_to_show=Some(Box::new(time_to_show));
+    unsafe{run_window(session,profile,None,true,true,None,Some(picker))}?;
     let outcome=result.borrow().clone();Ok(outcome)
 }
 impl WindowState{

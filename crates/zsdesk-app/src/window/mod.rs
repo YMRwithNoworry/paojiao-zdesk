@@ -189,6 +189,7 @@ unsafe fn run_window(session: ExplorerSession, config_path: PathBuf, selection: 
     unsafe { RegisterClassW(&wc) };
     let placement = session.ui.window;
     let relaunch = relaunch_command(&config_path);
+    let is_picker = picker.is_some();
     // The slot outlives the window and every callback that can reach it.
     let mut state = WindowState::new(session, config_path, selection, modern);
     state.picker=picker;
@@ -201,22 +202,26 @@ unsafe fn run_window(session: ExplorerSession, config_path: PathBuf, selection: 
     let _ = unsafe { SetWindowPos(hwnd, None, 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE) };
     let created = slot.borrow_mut().as_mut().map(|s| unsafe { s.create(hwnd) });
     if let Some(Err(error)) = created {
-        let text = wide(&zsdesk_core::tr_format!("无法创建文件管理窗口：{error:#}", error=error));
-        unsafe { MessageBoxW(Some(hwnd), pcwstr(&text), PCWSTR(wide("ZSDesk").as_ptr()), MB_OK | MB_ICONERROR); }
+        if !is_picker {
+            let text = wide(&zsdesk_core::tr_format!("无法创建文件管理窗口：{error:#}", error=error));
+            unsafe { MessageBoxW(Some(hwnd), pcwstr(&text), PCWSTR(wide("ZSDesk").as_ptr()), MB_OK | MB_ICONERROR); }
+        }
         let _ = unsafe { DestroyWindow(hwnd) };
         return Err(error);
     }
     flush_deferred(hwnd,true);
     // Before the first show, so the taskbar button is created in the pin's group.
-    if !cfg!(test){if let Ok(exe)=std::env::current_exe(){let _=zsdesk_windows::taskbar::repair_taskbar_shortcuts(&exe,crate::edition::application_id());}}
+    if !is_picker&&!cfg!(test){if let Ok(exe)=std::env::current_exe(){let _=zsdesk_windows::taskbar::repair_taskbar_shortcuts(&exe,crate::edition::application_id());}}
     if let Some((command,icon))=&relaunch{
         let _=zsdesk_windows::taskbar::set_identity(hwnd,&zsdesk_windows::taskbar::Identity{app_id:crate::edition::application_id(),
             relaunch_command:command,display_name:"ZSDesk",icon});
     }
     let accelerators = unsafe { CreateAcceleratorTableW(&accelerator_table())? };
-    let _ = unsafe { ShowWindow(hwnd, if placement.is_some_and(|p| p.maximized) { SW_SHOWMAXIMIZED } else { SW_SHOW }) };
-    if let Some(picker)=slot.borrow().as_ref().and_then(|state|state.picker.as_ref()){
-        let _=picker.options.events.send(picker::Event::Ready{token:picker.options.token,window:hwnd.0 as isize});
+    let show=slot.borrow_mut().as_mut().and_then(|state|state.picker.as_mut()).is_none_or(|picker|picker.authorize_show(hwnd));
+    if show {
+        let _ = unsafe { ShowWindow(hwnd, if placement.is_some_and(|p| p.maximized) { SW_SHOWMAXIMIZED } else { SW_SHOW }) };
+    } else {
+        let _=unsafe{DestroyWindow(hwnd)};
     }
     if let Some(settings)=focus_search{post(hwnd,WM_ACTION,if settings{ACTION_SEARCH_SETTINGS}else{Command::FocusSearch.id()as usize},0);}
     let mut msg = MSG::default();
@@ -228,7 +233,7 @@ unsafe fn run_window(session: ExplorerSession, config_path: PathBuf, selection: 
     let mut gestures=mouse_gestures::MouseGestures::default();
     let mut blank_clicks=pane_input::BlankClicks::default();
     let mut last_space_preview=slot.borrow().as_ref().is_none_or(|state|state.session.ui.space_preview);
-    loop {
+    while show {
         let result = unsafe { GetMessageW(&mut msg, None, 0, 0) }.0;
         if result <= 0 { break; }
         if crate::utility_panel::dispatch_if_owned(&msg){continue;}

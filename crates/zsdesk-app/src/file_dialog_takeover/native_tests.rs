@@ -59,8 +59,8 @@ fn exercise(root:&Path)->Result<serde_json::Value>{
         let worker=thread::spawn(move||{let _=done_tx.send(original(folder,tx,SelectionKind::Files,label));});
         let window=HWND(rx.recv_timeout(Duration::from_secs(10)).context("native dialog ready")?as*mut _);
         struct Cancel(HWND);impl Drop for Cancel{fn drop(&mut self){if unsafe{IsWindow(Some(self.0))}.as_bool(){let _=unsafe{PostMessageW(Some(self.0),WM_COMMAND,WPARAM(2),LPARAM(0))};}}}let _cancel=Cancel(window);
-        let deadline=Instant::now()+Duration::from_secs(8);let part=loop{let part=parts(window);if part.shell&&!part.name.0.is_null()&&!part.address.0.is_null(){break part;}ensure!(Instant::now()<deadline,"native controls unavailable");thread::sleep(Duration::from_millis(20));};
-        let until=Instant::now()+Duration::from_secs(3);let mode=loop{let mode=multiple(&automation,window);if mode==Some(true)||Instant::now()>=until{break mode;}thread::sleep(Duration::from_millis(30));};
+        let deadline=Instant::now()+Duration::from_secs(8);let part=loop{let part=parts(window);if !part.shell.0.is_null()&&!part.name.0.is_null()&&!part.address.0.is_null(){break part;}ensure!(Instant::now()<deadline,"native controls unavailable");thread::sleep(Duration::from_millis(20));};
+        let until=Instant::now()+Duration::from_secs(3);let mode=loop{let mode=multiple(&automation,parts(window).shell);if mode==Some(true)||Instant::now()>=until{break mode;}thread::sleep(Duration::from_millis(30));};
         if mode!=Some(true){
             if let Ok(root)=unsafe{automation.ElementFromHandle(window)}{if let Ok(condition)=unsafe{automation.CreateTrueCondition()}{if let Ok(elements)=unsafe{root.FindAll(TreeScope_Descendants,&condition)}{
                 for index in 0..unsafe{elements.Length()}.unwrap_or(0).min(64){if let Ok(item)=unsafe{elements.GetElement(index)}{eprintln!("uia kind={:?} class={:?} id={:?}",unsafe{item.CurrentControlType()},unsafe{item.CurrentClassName()},unsafe{item.CurrentAutomationId()});}}
@@ -99,13 +99,13 @@ fn exercise(root:&Path)->Result<serde_json::Value>{
         let window=HWND(rx.recv_timeout(Duration::from_secs(10)).context("native folder dialog ready")?as*mut _);
         struct Cancel(HWND);impl Drop for Cancel{fn drop(&mut self){if unsafe{IsWindow(Some(self.0))}.as_bool(){let _=unsafe{PostMessageW(Some(self.0),WM_COMMAND,WPARAM(2),LPARAM(0))};}}}let _cancel=Cancel(window);
         let deadline=Instant::now()+Duration::from_secs(8);let part=loop{
-            let part=parts(window);if part.shell&&!part.name.0.is_null()&&!part.address.0.is_null()&&dialog_kind(window,&part,Some(&automation))==Some(SelectionKind::Folders){break part;}
+            let part=parts(window);if !part.shell.0.is_null()&&!part.name.0.is_null()&&!part.address.0.is_null()&&dialog_kind(window,&part,Some(&automation))==Some(SelectionKind::Folders){break part;}
             if Instant::now()>=deadline{
                 unsafe extern "system" fn dump(window:HWND,_:LPARAM)->BOOL{
                     eprintln!("folder control hwnd={:?} class={} id={} visible={} text={:?}",window,class(window),unsafe{GetDlgCtrlID(window)},unsafe{IsWindowVisible(window)}.as_bool(),text(window));true.into()
                 }
                 let _=unsafe{EnumChildWindows(Some(window),Some(dump),LPARAM(0))};
-                anyhow::bail!("native folder contract was not recognized: shell={}, name={:?}, address={:?}, kind={:?}, accept={:?}, types-visible={}",part.shell,part.name,part.address,dialog_kind(window,&part,Some(&automation)),unsafe{GetDlgItem(Some(window),1)}.ok().and_then(text),unsafe{IsWindowVisible(part.types)}.as_bool());
+                anyhow::bail!("native folder contract was not recognized: shell={:?}, name={:?}, address={:?}, kind={:?}, accept={:?}, types-visible={}",part.shell,part.name,part.address,dialog_kind(window,&part,Some(&automation)),unsafe{GetDlgItem(Some(window),1)}.ok().and_then(text),unsafe{IsWindowVisible(part.types)}.as_bool());
             }thread::sleep(Duration::from_millis(30));
         };
         let accept=unsafe{GetDlgItem(Some(window),1)}.ok().and_then(text).context("folder accept label")?;

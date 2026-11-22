@@ -68,7 +68,7 @@ fn preserve(primary_kind:Option<SelectionKind>,actions:&[Action])->Option<Preser
 
 /// The original dialog remains the authority for every extra button and
 /// dropdown callback. Never synthesize an IDOK result for those contracts.
-pub(super) fn preservation(dialog:HWND,part:&Parts,automation:Option<&IUIAutomation>)->Option<Preservation>{
+pub(super) fn preservation(dialog:HWND,part:&Parts,kind:Option<SelectionKind>,automation:Option<&IUIAutomation>)->Option<Preservation>{
     let inspect=(||->windows::core::Result<Option<Preservation>>{
         let primary=unsafe{GetDlgItem(Some(dialog),1)}?;
         let automation=automation.ok_or_else(||windows::core::Error::new(windows::core::HRESULT(0x80004005u32 as i32),"原窗口选择能力不可读取"))?;
@@ -106,7 +106,7 @@ pub(super) fn preservation(dialog:HWND,part:&Parts,automation:Option<&IUIAutomat
                 dropdown:is_primary&&primary_dropdown});
         }
         if !actions.iter().any(|action|action.primary){return Ok(Some(Preservation::InspectionUnavailable));}
-        Ok(preserve(dialog_kind(dialog,part,Some(automation)),&actions))
+        Ok(preserve(kind,&actions))
     })();
     inspect.unwrap_or(Some(Preservation::InspectionUnavailable))
 }

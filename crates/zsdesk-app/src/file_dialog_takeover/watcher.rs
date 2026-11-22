@@ -5,10 +5,19 @@ use windows::Win32::{Foundation::{COLORREF,HANDLE,WAIT_TIMEOUT},System::{SystemI
 const MARKER:PCWSTR=w!("ZSDesk.EarlyFileDialog.v1");
 const MASK:u32=WS_EX_LAYERED.0|WS_EX_TOOLWINDOW.0|WS_EX_APPWINDOW.0|WS_EX_TRANSPARENT.0;
 const PREPARE_MS:u64=8000;
+// Only a visible picker may keep the caller's dialog masked beyond this budget.
+const MASK_MS:u64=2000;
+const BOUND:PCWSTR=w!("ZSDesk.BoundFilePicker.v1");
 const COMPLETE_MS:u64=2000;
 fn now()->u64{unsafe{GetTickCount64()}}
 #[derive(Clone,serde::Serialize,serde::Deserialize)]
-struct Lease{source:guard::Identity,token:u64,style:u32,started:u64}
+struct Lease{source:guard::Identity,token:u64,style:u32,started:u64,masked_at:Option<u64>}
+impl Lease{
+    fn remaining(&self)->Option<Duration>{
+        let remaining=MASK_MS.saturating_sub(now().saturating_sub(self.masked_at?));
+        (remaining>0&&marked(self)).then_some(Duration::from_millis(remaining))
+    }
+}
 #[derive(serde::Serialize,serde::Deserialize)]
 enum Event{Ready,Prepared(Lease),Hidden(Lease),Released(u64)}
 #[derive(serde::Serialize,serde::Deserialize)]
@@ -42,7 +51,20 @@ impl Claim{
     pub fn source(&self)->guard::Identity{self.lease.source.clone()}
     pub fn token(&self)->u64{self.lease.token}
     pub fn active(&self)->bool{marked(&self.lease)}
-    pub fn bind(&self,window:isize)->Result<()>{ensure!(self.active(),"原文件选择窗口已恢复");command(&self.pipe,&Control::Bind(self.token(),window))}
+    pub fn preparing(&self)->bool{self.lease.remaining().is_some()}
+    pub fn show_check(&self)->impl Fn()->Option<Duration>+use<>{let lease=self.lease.clone();move||lease.remaining()}
+    pub fn bind(&self,window:isize)->Result<()>{
+        ensure!(self.preparing(),"原文件选择窗口已恢复");
+        command(&self.pipe,&Control::Bind(self.token(),window))?;
+        let picker=HWND(window as*mut _);
+        // Wait for the watchdog to acknowledge before permitting first show.
+        let until=Instant::now()+Duration::from_millis(100);
+        while self.preparing()&&Instant::now()<until{
+            if unsafe{GetPropW(picker,BOUND)}.0 as usize==self.token()as usize{return Ok(());}
+            thread::sleep(Duration::from_millis(2));
+        }
+        anyhow::bail!("文件选择窗口接管已超时")
+    }
     pub fn complete(mut self)->Result<()>{ensure!(self.active(),"原文件选择窗口已恢复");command(&self.pipe,&Control::Complete(self.token()))?;self.transferred=true;Ok(())}
 }
 impl Drop for Claim{fn drop(&mut self){if !self.transferred{let _=command(&self.pipe,&Control::Restore(self.token()));restore(&self.lease);}}}
@@ -90,7 +112,8 @@ impl Drop for Connection{fn drop(&mut self){
     if self.child.try_wait().ok().flatten().is_none(){let _=self.child.kill();let _=self.child.wait();}
     if let Some(reader)=self.reader.take(){let _=reader.join();}
 }}
-struct Entry{lease:Lease,hidden:bool,picker:Option<isize>,finishing:Option<u64>}
+struct BoundPicker{window:isize,shown:bool}
+struct Entry{lease:Lease,hidden:bool,picker:Option<BoundPicker>,finishing:Option<u64>}
 struct Watcher{parent:u32,target:Option<u32>,enabled:bool,heartbeat:u64,serial:u64,known:HashSet<isize>,pending:HashMap<isize,u64>,entries:HashMap<u64,Entry>,output:mpsc::SyncSender<Event>}
 thread_local!{
     static WATCHER:RefCell<Option<Watcher>>=const{RefCell::new(None)};
@@ -105,7 +128,7 @@ unsafe extern "system" fn early_message(window:HWND,message:u32,wp:WPARAM,lp:LPA
     let source=HWND(wp.0 as*mut _);
     // Cross-process style changes can synchronously reenter this endpoint.
     let accepted=WATCHER.with(|slot|{let Ok(mut slot)=slot.try_borrow_mut()else{return false;};
-        if let Some(watcher)=slot.as_mut(){watcher.observe(source);watcher.tick();true}else{false}});
+        if let Some(watcher)=slot.as_mut(){watcher.observe(source);watcher.prepare(source.0 as isize);true}else{false}});
     if !accepted{return windows::Win32::Foundation::LRESULT(0);}
     let until=Instant::now()+Duration::from_millis(50);
     loop{
@@ -126,39 +149,47 @@ impl Watcher{
         if pid==0||pid==self.parent||pid==std::process::id()||self.target.is_some_and(|target|target!=pid){return;}
         self.pending.entry(key).or_insert_with(now);
     }
+    fn prepare(&mut self,key:isize){
+        let Some(stamp)=self.pending.get(&key).copied()else{return;};
+        let window=HWND(key as*mut _);
+        if !unsafe{IsWindow(Some(window))}.as_bool()||now().saturating_sub(stamp)>PREPARE_MS{self.pending.remove(&key);return;}
+        if self.entries.len()>=4{return;}
+        let part=parts(window);
+        // The filename and acceptance controls exist before the Shell
+        // view finishes loading; masking must not wait for that view.
+        let accept=accept_label(window).unwrap_or_default();
+        let label=control_label(&accept);
+        let provisional=part.native&&(open_label(&label)||matches!(label.as_str(),"上传"|"upload")
+            ||label.starts_with("选择文件夹")||label.starts_with("select folder"));
+        if !provisional&&(part.name.0.is_null()||selection_kind_for(window,&part,&accept,None).is_none()){return;}
+        self.pending.remove(&key);self.known.insert(key);
+        let Some(source)=guard::Identity::capture(window)else{return;};let style=unsafe{GetWindowLongPtrW(window,GWL_EXSTYLE)}as u32;
+        if style&WS_EX_LAYERED.0!=0||!unsafe{IsWindowEnabled(window)}.as_bool(){return;}
+        self.serial=self.serial.wrapping_add(1).max(1);let token=self.serial;
+        let lease=Lease{source,token,style,started:now(),masked_at:None};
+        if self.output.try_send(Event::Prepared(lease.clone())).is_ok(){self.entries.insert(token,Entry{lease,hidden:false,picker:None,finishing:None});}
+    }
     fn tick(&mut self){
-        let pending:Vec<_>=self.pending.iter().map(|(key,stamp)|(*key,*stamp)).collect();
-        for (key,stamp) in pending{
-            let window=HWND(key as*mut _);
-            if !unsafe{IsWindow(Some(window))}.as_bool()||now().saturating_sub(stamp)>PREPARE_MS{self.pending.remove(&key);continue;}
-            let part=parts(window);
-            // The filename and acceptance controls exist before the Shell
-            // view finishes loading; masking must not wait for that view.
-            let accept=unsafe{GetDlgItem(Some(window),1)}.ok().and_then(text).map(|value|control_label(&value)).unwrap_or_default();
-            let provisional=part.native&&(open_label(&accept)||matches!(accept.as_str(),"上传"|"upload")
-                ||accept.starts_with("选择文件夹")||accept.starts_with("select folder"));
-            if !provisional&&(part.name.0.is_null()||dialog_kind(window,&part,None).is_none()){continue;}
-            self.pending.remove(&key);self.known.insert(key);
-            let Some(source)=guard::Identity::capture(window)else{continue;};let style=unsafe{GetWindowLongPtrW(window,GWL_EXSTYLE)}as u32;
-            if style&WS_EX_LAYERED.0!=0||!unsafe{IsWindowEnabled(window)}.as_bool(){continue;}
-            self.serial=self.serial.wrapping_add(1).max(1);let token=self.serial;
-            let lease=Lease{source,token,style,started:now()};
-            if self.output.try_send(Event::Prepared(lease.clone())).is_ok(){self.entries.insert(token,Entry{lease,hidden:false,picker:None,finishing:None});}
-        }
         let mut expired=Vec::new();
         for (token,entry) in &mut self.entries{
             if !entry.lease.source.matches(){expired.push(*token);continue;}
-            if let Some(picker)=entry.picker{
-                let window=HWND(picker as*mut _);
-                if unsafe{GetPropW(window,crate::window::picker::MARKER)}.0 as usize!=*token as usize{entry.finishing.get_or_insert(now());}
+            if let Some(picker)=entry.picker.as_mut(){
+                let window=HWND(picker.window as*mut _);
+                if unsafe{GetPropW(window,crate::window::picker::MARKER)}.0 as usize!=*token as usize{
+                    if picker.shown{entry.finishing.get_or_insert(now());}
+                }else if !picker.shown&&unsafe{IsWindowVisible(window)}.as_bool(){picker.shown=true;}
             }
             // Validation can temporarily disable the caller. A live custom
             // picker remains the visible owner until acceptance or cancellation.
             if entry.finishing.is_some_and(|at|now().saturating_sub(at)>=COMPLETE_MS)
-                ||(entry.picker.is_none()&&entry.finishing.is_none()&&now().saturating_sub(entry.lease.started)>=PREPARE_MS){expired.push(*token);}
+                ||(entry.picker.as_ref().is_none_or(|picker|!picker.shown)&&entry.finishing.is_none()&&entry.lease.masked_at.map_or_else(
+                    ||now().saturating_sub(entry.lease.started)>=PREPARE_MS,
+                    |at|now().saturating_sub(at)>=MASK_MS)){expired.push(*token);}
         }
         for token in expired{self.release(token);}
         self.known.retain(|key|unsafe{IsWindow(Some(HWND(*key as*mut _)))}.as_bool());
+        let pending:Vec<_>=self.pending.keys().copied().collect();
+        for key in pending{self.prepare(key);}
     }
     fn control(&mut self,value:Control)->bool{match value{
         Control::Enable(enabled)=>{self.heartbeat=now();if self.enabled!=enabled{self.clear();self.enabled=enabled;self.known.clear();
@@ -166,10 +197,15 @@ impl Watcher{
             unsafe extern "system" fn visit(window:HWND,value:LPARAM)->BOOL{if class(window)=="#32770"{unsafe{(*(value.0 as*mut HashSet<isize>)).insert(window.0 as isize);}}true.into()}
             let _=unsafe{EnumWindows(Some(visit),LPARAM(&mut self.known as*mut _ as isize))};}},
         Control::Heartbeat=>self.heartbeat=now(),
-        Control::Hide(token)=>{if let Some(entry)=self.entries.get_mut(&token){if !entry.hidden&&now().saturating_sub(entry.lease.started)<PREPARE_MS&&mask(&entry.lease){
-            entry.hidden=true;if self.output.try_send(Event::Hidden(entry.lease.clone())).is_ok(){return true;}}}self.release(token);},
+        Control::Hide(token)=>{if let Some(entry)=self.entries.get_mut(&token){if !entry.hidden&&now().saturating_sub(entry.lease.started)<PREPARE_MS{
+            let start=now();
+            if mask(&entry.lease){entry.hidden=true;entry.lease.masked_at=Some(start);
+                if self.output.try_send(Event::Hidden(entry.lease.clone())).is_ok(){return true;}}
+        }}self.release(token);},
         Control::Bind(token,picker)=>{if let Some(entry)=self.entries.get_mut(&token){let window=HWND(picker as*mut _);let mut pid=0;unsafe{GetWindowThreadProcessId(window,Some(&mut pid));}
-            if pid==self.parent&&unsafe{GetPropW(window,crate::window::picker::MARKER)}.0 as usize==token as usize{entry.picker=Some(picker);return true;}}self.release(token);},
+            if pid==self.parent&&entry.lease.remaining().is_some()
+                &&unsafe{GetPropW(window,crate::window::picker::MARKER)}.0 as usize==token as usize
+                &&unsafe{SetPropW(window,BOUND,Some(HANDLE(token as usize as*mut _)))}.is_ok(){entry.picker=Some(BoundPicker{window:picker,shown:false});return true;}}self.release(token);},
         Control::Complete(token)=>{if let Some(entry)=self.entries.get_mut(&token){entry.finishing=Some(now());}},
         Control::Restore(token)=>self.release(token),
         Control::Shutdown=>return false,
@@ -225,6 +261,65 @@ fn run()->Result<()>{
         fs::write(root.join("activation-alpha.json"),super::super::native_tests::FIRST_ACTIVATION_ALPHA.load(Ordering::Relaxed).to_string())?;Ok(())
     }
     fn wait_until(mut predicate:impl FnMut()->bool,message:&str)->Result<()>{let end=Instant::now()+Duration::from_secs(10);while !predicate(){ensure!(Instant::now()<end,"{message}");thread::sleep(Duration::from_millis(5));}Ok(())}
+    struct Source(Child,PathBuf);
+    impl Source{
+        fn spawn(root:&Path,mode:&str)->Result<Self>{
+            fs::create_dir_all(root)?;ensure!(!root.join("go").exists(),"fresh native fixture required");
+            fs::write(root.join("选择 中文.txt"),b"fixture")?;fs::create_dir_all(root.join("selected folder"))?;
+            let log=fs::File::create(root.join("source.log"))?;
+            let child=Command::new(std::env::current_exe()?).args(["native_early_dialog_source","--ignored","--nocapture","--test-threads=1"])
+                .env("ZSDESK_DIALOG_FIXTURE",root).env("ZSDESK_DIALOG_KIND",mode).stdout(log.try_clone()?).stderr(log).creation_flags(0x08000000).spawn()?;
+            Ok(Self(child,root.to_path_buf()))
+        }
+    }
+    impl Drop for Source{fn drop(&mut self){
+        if let Ok(value)=fs::read_to_string(self.1.join("source.json")){if let Ok(window)=value.parse::<isize>(){let hwnd=HWND(window as*mut _);let mut pid=0;unsafe{GetWindowThreadProcessId(hwnd,Some(&mut pid));}if pid==self.0.id(){let _=unsafe{PostMessageW(Some(hwnd),WM_COMMAND,WPARAM(2),LPARAM(0))};}}}
+        let end=Instant::now()+Duration::from_secs(3);while self.0.try_wait().ok().flatten().is_none()&&Instant::now()<end{thread::sleep(Duration::from_millis(10));}
+        if self.0.try_wait().ok().flatten().is_none(){let _=self.0.kill();let _=self.0.wait();}
+    }}
+    #[test]
+    #[ignore="Live picker and isolated native upload fixture; use a separate Windows desktop"]
+    fn native_upload_picker_first_show()->Result<()>{
+        let root=PathBuf::from(std::env::var_os("ZSDESK_NATIVE_TEST_OUTPUT").context("output")?).join("live-upload");
+        let executable=PathBuf::from(std::env::var_os("ZSDESK_GUARD_TEST_EXE").context("guard executable")?);
+        let mut source=Source::spawn(&root,"files")?;
+        let pid=source.0.id();let profile=root.join("explorer-session.json");
+        let mut session=crate::storage::default_session();session.ui.file_dialog_takeover=true;
+        crate::storage::save(&profile,&session)?;
+        let status=root.join("file-dialog-takeover-status.json");
+        let read_status=||fs::read(&status).ok().and_then(|bytes|serde_json::from_slice::<serde_json::Value>(&bytes).ok()).unwrap_or_default();
+        let stop=AtomicBool::new(false);
+        thread::scope(|scope|->Result<()>{
+            struct StopOnDrop<'a>(&'a AtomicBool);
+            impl Drop for StopOnDrop<'_>{fn drop(&mut self){self.0.store(true,Ordering::Release);}}
+            let bridge=scope.spawn(||run_with_watcher(&profile,&stop,||Connection::spawn_for(&executable,Some(pid))));
+            let _stop=StopOnDrop(&stop);
+            wait_until(||read_status()["early_masking"]==true,"bridge watcher was not ready")?;
+            let opened=Instant::now();fs::write(root.join("go"),b"go")?;
+            let mut picker=HWND::default();
+            wait_until(||{
+                unsafe extern "system" fn find(window:HWND,slot:LPARAM)->BOOL{
+                    let mut pid=0;unsafe{GetWindowThreadProcessId(window,Some(&mut pid));}
+                    if pid==std::process::id()&&unsafe{IsWindowVisible(window)}.as_bool()
+                        &&!unsafe{GetPropW(window,crate::window::picker::MARKER)}.0.is_null(){
+                        unsafe{*(slot.0 as*mut HWND)=window;}return false.into();
+                    }true.into()
+                }
+                let _=unsafe{EnumWindows(Some(find),LPARAM(&mut picker as*mut _ as isize))};
+                !picker.0.is_null()
+            },"ZSDesk picker did not become visible").with_context(||format!("bridge status: {}",read_status()))?;
+            let visible_ms=opened.elapsed().as_millis();
+            eprintln!("native upload picker visible after {visible_ms} ms");
+            unsafe{PostMessageW(Some(picker),WM_CLOSE,WPARAM(0),LPARAM(0))}?;
+            wait_until(||source.0.try_wait().ok().flatten().is_some(),"native caller did not cancel")?;
+            ensure!(source.0.wait()?.success(),"source failed");
+            let result:serde_json::Value=serde_json::from_slice(&fs::read(root.join("result.json"))?)?;
+            ensure!(result[2]==true,"native caller did not receive cancellation");
+            wait_until(||read_status()["last_confirmation"]=="cancelled","bridge did not confirm cancellation")?;
+            stop.store(true,Ordering::Release);
+            bridge.join().map_err(|_|anyhow::anyhow!("bridge panicked"))?
+        })
+    }
     #[test]
     #[ignore="Owned offscreen native upload dialogs and separate watcher process"]
     fn native_early_dialog_handoff_and_recovery()->Result<()>{
@@ -234,17 +329,8 @@ fn run()->Result<()>{
         struct Apartment;impl Drop for Apartment{fn drop(&mut self){unsafe{CoUninitialize();}}}let _apartment=Apartment;
         let automation:IUIAutomation=unsafe{CoCreateInstance(&CUIAutomation,None,CLSCTX_INPROC_SERVER)}?;
         let mut reports=Vec::new();
-        for mode in ["files","folder","cancel","disable","guard-failure","unclaimed"]{
-            let root=output.join(mode);fs::create_dir_all(&root)?;ensure!(!root.join("go").exists(),"fresh native fixture required");
-            fs::write(root.join("选择 中文.txt"),b"fixture")?;fs::create_dir_all(root.join("selected folder"))?;
-            let log=fs::File::create(root.join("source.log"))?;
-            let child=Command::new(std::env::current_exe()?).args(["native_early_dialog_source","--ignored","--nocapture","--test-threads=1"])
-                .env("ZSDESK_DIALOG_FIXTURE",&root).env("ZSDESK_DIALOG_KIND",mode).stdout(log.try_clone()?).stderr(log).creation_flags(0x08000000).spawn()?;
-            struct Source(Child,PathBuf);impl Drop for Source{fn drop(&mut self){
-                if let Ok(value)=fs::read_to_string(self.1.join("source.json")){if let Ok(window)=value.parse::<isize>(){let hwnd=HWND(window as*mut _);let mut pid=0;unsafe{GetWindowThreadProcessId(hwnd,Some(&mut pid));}if pid==self.0.id(){let _=unsafe{PostMessageW(Some(hwnd),WM_COMMAND,WPARAM(2),LPARAM(0))};}}}
-                let end=Instant::now()+Duration::from_secs(3);while self.0.try_wait().ok().flatten().is_none()&&Instant::now()<end{thread::sleep(Duration::from_millis(10));}
-                if self.0.try_wait().ok().flatten().is_none(){let _=self.0.kill();let _=self.0.wait();}
-            }}let mut source=Source(child,root.clone());
+        for mode in ["files","folder","cancel","disable","guard-failure","unclaimed","bound-hidden"]{
+            let root=output.join(mode);let mut source=Source::spawn(&root,mode)?;
             let mut watcher=Connection::spawn_for(&executable,Some(source.0.id()))?;watcher.enable(true)?;thread::sleep(Duration::from_millis(30));fs::write(root.join("go"),b"go")?;
             let mut claim=None;wait_until(||{watcher.heartbeat().ok();claim=watcher.claims().pop();claim.is_some()},"dialog was not masked")?;
             let claim=claim.unwrap();let identity=claim.source();let window=identity.hwnd();let token=claim.token();
@@ -253,14 +339,27 @@ fn run()->Result<()>{
             let mask_elapsed=now().saturating_sub(claim.lease.started);
             let mut first_show=0usize;wait_until(||{first_show=unsafe{GetPropW(window,w!("ZSDesk.Test.FirstShowAlpha"))}.0 as usize;first_show!=0},"initial show notification missing")?;
             ensure!(first_show==1,"system dialog was opaque on its initial show: {mode}, alpha={}",first_show-1);
-            if matches!(mode,"disable"|"guard-failure"|"unclaimed"){
+            let mut recovered_ms=None;
+            if matches!(mode,"disable"|"guard-failure"|"unclaimed"|"bound-hidden"){
+                struct HiddenPicker(HWND);
+                impl Drop for HiddenPicker{fn drop(&mut self){let _=unsafe{RemovePropW(self.0,BOUND)};let _=unsafe{RemovePropW(self.0,crate::window::picker::MARKER)};let _=unsafe{DestroyWindow(self.0)};}}
+                let _picker=if mode=="bound-hidden"{
+                    let picker=HiddenPicker(unsafe{CreateWindowExW(WS_EX_TOOLWINDOW,w!("Static"),None,WS_POPUP,-30000,-30000,1,1,None,None,None,None)}?);
+                    unsafe{SetPropW(picker.0,crate::window::picker::MARKER,Some(HANDLE(token as usize as*mut _)))}?;
+                    claim.bind(picker.0.0 as isize)?;
+                    Some(picker)
+                }else{None};
                 if mode=="disable"{watcher.enable(false)?;}else if mode=="guard-failure"{watcher.child.kill()?;watcher.child.wait()?;}
-                wait_until(||{if mode=="unclaimed"{watcher.heartbeat().ok();}!claim.active()},"original dialog was not restored")?;
+                wait_until(||{if matches!(mode,"unclaimed"|"bound-hidden"){watcher.heartbeat().ok();}!claim.active()},"original dialog was not restored")?;
+                let elapsed=now().saturating_sub(claim.lease.masked_at.unwrap());
+                recovered_ms=Some(elapsed);
+                ensure!(elapsed<=MASK_MS+500,"native dialog stayed masked for {elapsed} ms: {mode}");
+                ensure!((claim.show_check())().is_none(),"a released lease still permits a picker to show: {mode}");
                 ensure!(unsafe{IsWindow(Some(window))}.as_bool()&&unsafe{GetWindowLongPtrW(window,GWL_EXSTYLE)}as u32&MASK==claim.lease.style&MASK,"recovery changed native styles");
                 unsafe{PostMessageW(Some(window),WM_COMMAND,WPARAM(2),LPARAM(0))}?;drop(claim);
             }else{
                 let part=parts(window);let kind=dialog_kind(window,&part,Some(&automation)).context("masked dialog contract")?;
-                let mut selection_mode=None;wait_until(||{selection_mode=multiple(&automation,window);selection_mode.is_some()},"masked multi-selection")?;
+                let mut selection_mode=None;wait_until(||{selection_mode=multiple(&automation,parts(window).shell);selection_mode.is_some()},"masked multi-selection")?;
                 let multiple=selection_mode.unwrap();
                 let accept=unsafe{GetDlgItem(Some(window),1)}.ok().and_then(text).context("accept")?;
                 let mut session=Session{source:identity,name:part.name,types:if kind.folders(){HWND::default()}else{part.types},kind,multiple,accept,token,picker:None,guard:None,early:Some(claim),worker:None,fallback:false};
@@ -279,7 +378,7 @@ fn run()->Result<()>{
             let result:serde_json::Value=serde_json::from_slice(&fs::read(root.join("result.json"))?)?;
             ensure!(result[2]==serde_json::json!(!matches!(mode,"files"|"folder")),"caller cancellation contract changed");
             let activation_alpha=fs::read_to_string(root.join("activation-alpha.json"))?;
-            reports.push(serde_json::json!({"mode":mode,"masked_ms_after_claim":mask_elapsed,"first_show_alpha":first_show-1,"first_activation_alpha":activation_alpha,"result":result,"passed":true}));
+            reports.push(serde_json::json!({"mode":mode,"masked_ms_after_claim":mask_elapsed,"recovered_ms":recovered_ms,"first_show_alpha":first_show-1,"first_activation_alpha":activation_alpha,"result":result,"passed":true}));
         }
         fs::write(output.join("verification.current.json"),serde_json::to_vec_pretty(&reports)?)?;Ok(())
     }

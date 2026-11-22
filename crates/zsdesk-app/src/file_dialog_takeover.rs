@@ -14,7 +14,7 @@ fn wide(value:&str)->Vec<u16>{value.encode_utf16().chain(Some(0)).collect()}
 fn class(window:HWND)->String{let mut value=[0u16;128];let n=unsafe{GetClassNameW(window,&mut value)}.max(0)as usize;String::from_utf16_lossy(&value[..n])}
 fn send(window:HWND,message:u32,wp:usize,lp:isize)->Option<usize>{let mut result=0;(unsafe{SendMessageTimeoutW(window,message,WPARAM(wp),LPARAM(lp),SMTO_ABORTIFHUNG|SMTO_BLOCK,250,Some(&mut result))}.0!=0).then_some(result)}
 fn text(window:HWND)->Option<String>{let mut value=vec![0u16;32768];let n=send(window,WM_GETTEXT,value.len(),value.as_mut_ptr()as isize)?;Some(String::from_utf16_lossy(&value[..n.min(value.len()-1)]))}
-#[derive(Default)]struct Parts{name:HWND,types:HWND,address:HWND,shell:bool,native:bool,folder_label:bool}
+#[derive(Default)]struct Parts{name:HWND,types:HWND,address:HWND,shell:HWND,native:bool,folder_label:bool}
 // Child visibility is meaningful before the top-level dialog is first shown.
 // Do not mistake a hidden file-type control for a folder picker (or vice versa).
 fn control_visible(mut window:HWND)->bool{
@@ -52,7 +52,7 @@ fn parts(dialog:HWND)->Parts{
         if id==1136&&kind=="ComboBox"{value.types=window;}if id==1001&&kind=="ToolbarWindow32"{value.address=window;}
         if kind=="Static"&&control_visible(window)&&text(window).is_some_and(|value|directory_label(&value)){value.folder_label=true;}
         if kind=="DUIViewWndClassName"{value.native=true;}
-        if kind=="SHELLDLL_DefView"{value.shell=true;}true.into()}
+        if kind=="SHELLDLL_DefView"&&control_visible(window){value.shell=window;}true.into()}
     let mut value=Parts::default();let _=unsafe{EnumChildWindows(Some(dialog),Some(visit),LPARAM(&mut value as*mut _ as isize))};value
 }
 fn open_label(value:&str)->bool{let value=control_label(value);
@@ -77,12 +77,17 @@ fn folder_field_label(automation:&IUIAutomation,name:HWND)->bool{
     if unsafe{element.CurrentName()}.is_ok_and(|name|directory_label(&name.to_string())){return true;}
     unsafe{element.CurrentLabeledBy()}.and_then(|label|unsafe{label.CurrentName()}).is_ok_and(|name|directory_label(&name.to_string()))
 }
-fn dialog_kind(dialog:HWND,parts:&Parts,automation:Option<&IUIAutomation>)->Option<SelectionKind>{
-    let accept=unsafe{GetDlgItem(Some(dialog),1)}.ok().and_then(text)?;
+fn accept_label(dialog:HWND)->Option<String>{
+    unsafe{GetDlgItem(Some(dialog),1)}.ok().and_then(text)
+}
+fn selection_kind_for(dialog:HWND,parts:&Parts,accept:&str,automation:Option<&IUIAutomation>)->Option<SelectionKind>{
     let visible_types=control_visible(parts.types);
     let folder_field=parts.folder_label||text(dialog).is_some_and(|title|folder_title(&title))
         ||(!visible_types&&automation.is_some_and(|automation|folder_field_label(automation,parts.name)));
-    selection_kind(&accept,visible_types,folder_field)
+    selection_kind(accept,visible_types,folder_field)
+}
+fn dialog_kind(dialog:HWND,parts:&Parts,automation:Option<&IUIAutomation>)->Option<SelectionKind>{
+    selection_kind_for(dialog,parts,&accept_label(dialog)?,automation)
 }
 fn initial_location(value:&str)->Option<zsdesk_core::model::explorer::ShellLocation>{
     use zsdesk_core::model::explorer::ShellLocation;
@@ -103,18 +108,33 @@ fn types(window:HWND)->(Vec<FileType>,usize){
     if result.is_empty(){result.push(FileType{label:"所有文件 (*.*)".into(),pattern:"*".into()});}
     let index=send(window,CB_GETCURSEL,0,0).unwrap_or(0).min(result.len()-1);(result,index)
 }
-fn multiple(automation:&IUIAutomation,dialog:HWND)->Option<bool>{
-    let root=unsafe{automation.ElementFromHandle(dialog)}.ok()?;
+fn multiple(automation:&IUIAutomation,shell:HWND)->Option<bool>{
+    // Other lists in the dialog (such as navigation) do not define file selection.
+    if shell.0.is_null(){return None;}
+    let root=unsafe{automation.ElementFromHandle(shell)}.ok()?;
+    fn selection_mode(item:&IUIAutomationElement)->Option<bool>{
+        let selection=unsafe{item.GetCurrentPatternAs::<IUIAutomationSelectionPattern>(UIA_SelectionPatternId)}.ok()?;
+        unsafe{selection.CurrentCanSelectMultiple()}.ok().map(|value|value.as_bool())
+    }
+    if let Some(mode)=selection_mode(&root){return Some(mode);}
     let list=unsafe{automation.CreatePropertyCondition(UIA_ControlTypePropertyId,&VARIANT::from(UIA_ListControlTypeId.0))}.ok()?;
     let grid=unsafe{automation.CreatePropertyCondition(UIA_ControlTypePropertyId,&VARIANT::from(UIA_DataGridControlTypeId.0))}.ok()?;
     let condition=unsafe{automation.CreateOrCondition(&list,&grid)}.ok()?;
     let lists=unsafe{root.FindAll(TreeScope_Descendants,&condition)}.ok()?;
     for index in 0..unsafe{lists.Length()}.ok()?.min(32){let item=unsafe{lists.GetElement(index)}.ok()?;
-        if let Ok(selection)=unsafe{item.GetCurrentPatternAs::<IUIAutomationSelectionPattern>(UIA_SelectionPatternId)}{return unsafe{selection.CurrentCanSelectMultiple()}.ok().map(|value|value.as_bool());}}
+        if let Some(mode)=selection_mode(&item){return Some(mode);}}
     None
 }
 #[derive(Clone,PartialEq)]
-struct Contract{kind:SelectionKind,name:isize,types:isize,multiple:bool,accept:String,initial:zsdesk_core::model::explorer::ShellLocation}
+struct Contract{kind:SelectionKind,name:isize,types:isize,shell:isize,accept:String,initial:zsdesk_core::model::explorer::ShellLocation}
+fn read_contract(dialog:HWND,part:&Parts,automation:Option<&IUIAutomation>)->Option<Contract>{
+    if part.shell.0.is_null()||part.name.0.is_null(){return None;}
+    let accept=accept_label(dialog)?;
+    let kind=selection_kind_for(dialog,part,&accept,automation)?;
+    let initial=text(part.address).and_then(|value|initial_location(&value))?;
+    Some(Contract{kind,name:part.name.0 as isize,types:if kind.folders(){0}else{part.types.0 as isize},
+        shell:part.shell.0 as isize,accept,initial})
+}
 #[derive(Default)]struct StableContract(Option<(Contract,Instant)>);
 impl StableContract{
     fn observe(&mut self,value:Contract,now:Instant)->bool{
@@ -198,36 +218,47 @@ fn run(profile:&Path,stop:&AtomicBool)->Result<()>{
     use windows::Win32::{Foundation::{CloseHandle,GetLastError,ERROR_ALREADY_EXISTS},System::Threading::CreateMutexW};
     let mutex=unsafe{CreateMutexW(None,false,w!("Local\\ZSDesk.CommonFilePicker"))}?;let existing=unsafe{GetLastError()}==ERROR_ALREADY_EXISTS;
     struct Owned(windows::Win32::Foundation::HANDLE);impl Drop for Owned{fn drop(&mut self){let _=unsafe{CloseHandle(self.0)};}}let _owned=Owned(mutex);if existing{return Ok(());}
+    run_with_watcher(profile,stop,watcher::Connection::spawn)
+}
+fn run_with_watcher(profile:&Path,stop:&AtomicBool,mut spawn_watcher:impl FnMut()->Result<watcher::Connection>)->Result<()>{
     unsafe{CoInitializeEx(None,COINIT_MULTITHREADED)}.ok()?;struct Apartment;impl Drop for Apartment{fn drop(&mut self){unsafe{CoUninitialize();}}}let _apartment=Apartment;
     struct ActiveDialogs;impl Drop for ActiveDialogs{fn drop(&mut self){DIALOG_BUSY.store(false,std::sync::atomic::Ordering::Release);}}let _busy=ActiveDialogs;
     let mut automation:Option<IUIAutomation>=None;
     let(tx,rx)=mpsc::channel();let mut sessions=Vec::<Session>::new();let mut preparing=Vec::<watcher::Claim>::new();let mut contracts=HashMap::<u64,StableContract>::new();
     let mut watcher:Option<watcher::Connection>=None;let mut enabled=false;let mut returning=HashMap::<u64,PendingReturn>::new();
+    let mut profile_session=None;
     let mut refresh=Instant::now()-Duration::from_secs(3);let mut last_error=None::<String>;let mut previous=String::new();let mut completed=0u64;
     let mut last_kind=None::<&'static str>;let mut last_confirmation=None::<&'static str>;
     let mut preserved_native=0u64;let mut last_preservation=None::<&'static str>;
     while !stop.load(Ordering::Acquire){
         if refresh.elapsed()>=Duration::from_secs(1){
-            enabled=crate::storage::load(profile).is_ok_and(|session|session.ui.file_dialog_takeover);refresh=Instant::now();
+            profile_session=crate::storage::load(profile).ok().filter(|session|session.ui.file_dialog_takeover);
+            enabled=profile_session.is_some();refresh=Instant::now();
             if watcher.as_mut().is_some_and(watcher::Connection::exited){watcher.take();preparing.clear();}
-            if enabled&&watcher.is_none(){match watcher::Connection::spawn(){Ok(value)=>watcher=Some(value),Err(error)=>last_error=Some(error.to_string())}}
+            if enabled&&watcher.is_none(){match spawn_watcher(){Ok(value)=>watcher=Some(value),Err(error)=>last_error=Some(error.to_string())}}
             if let Some(watcher)=&watcher{let _=watcher.enable(enabled);let _=watcher.heartbeat();}
             if enabled&&automation.is_none(){match unsafe{CoCreateInstance(&CUIAutomation,None,CLSCTX_INPROC_SERVER)}{Ok(value)=>automation=Some(value),Err(error)=>last_error=Some(error.to_string())}}
             if !enabled{automation=None;preparing.clear();contracts.clear();}
         }
         for event in rx.try_iter(){match event{
-            Event::Ready{token,window}=>if let Some(session)=sessions.iter_mut().find(|session|session.token==token){
+            Event::Ready{token,window,show}=>if let Some(session)=sessions.iter_mut().find(|session|session.token==token){
                 session.picker=Some(window);
-                if enabled&&session.source.matches(){
-                    if let Some(reason)=capabilities::preservation(session.source.hwnd(),&parts(session.source.hwnd()),automation.as_ref()){
+                if enabled&&!session.fallback&&session.early.as_ref().is_some_and(watcher::Claim::preparing){
+                    let dialog=session.source.hwnd();
+                    let part=parts(dialog);
+                    let kind=dialog_kind(dialog,&part,automation.as_ref());
+                    if let Some(reason)=capabilities::preservation(dialog,&part,kind,automation.as_ref()){
                         session.close_picker();preserved_native+=1;last_preservation=Some(reason.key());last_kind=Some("native");last_confirmation=None;continue;
                     }
-                    let result=if let Some(early)=&session.early{early.bind(window)}else{guard::Guard::hide(session.source.clone(),window,token).map(|guard|session.guard=Some(guard))};
-                    if let Err(error)=result{last_error=Some(error.to_string());session.close_picker();}
-                }else{session.close_picker();}
+                    if kind==Some(session.kind)&&part.name==session.name&&(session.kind.folders()||part.types==session.types)
+                        &&accept_label(dialog).as_deref()==Some(session.accept.as_str())
+                        &&session.early.as_ref().is_some_and(|claim|claim.bind(window).is_ok())
+                        &&show.send(()).is_ok(){continue;}
+                }
+                session.close_picker();
             },
             Event::Submit{token,outcome}=>if let Some(session)=sessions.iter_mut().find(|session|session.token==token){
-                if session.fallback||!session.source.matches(){continue;}
+                if session.fallback||!session.source.matches()||session.early.as_ref().is_some_and(|claim|!claim.active()){continue;}
                 if returning.contains_key(&token)&&!matches!(outcome,Outcome::Cancelled){continue;}
                 let native=parts(session.source.hwnd());let folder_navigation=folder_navigation_pending(session.kind,&outcome,text(native.address).and_then(|value|initial_location(&value)));
                 match session.finish(outcome.clone()){
@@ -279,44 +310,41 @@ fn run(profile:&Path,stop:&AtomicBool)->Result<()>{
             session.poll(enabled);if session.fallback{returning.remove(&token);}index+=1;
         }
         if let Some(watcher)=&watcher{preparing.extend(watcher.claims());}
-        preparing.retain(watcher::Claim::active);
+        preparing.retain(watcher::Claim::preparing);
         contracts.retain(|token,_|preparing.iter().any(|claim|claim.token()==*token));
-        if enabled&&sessions.len()<4{
+        if let Some(profile_session)=profile_session.as_ref(){
             let mut index=0;
             while index<preparing.len()&&sessions.len()<4{
                 let source=preparing[index].source();let dialog=source.hwnd();let part=parts(dialog);let token=preparing[index].token();
-                if part.shell&&!part.name.0.is_null(){
-                    if let Some(reason)=capabilities::preservation(dialog,&part,automation.as_ref()){
-                        // Releasing an unbound claim restores the same native
-                        // window. No replica is opened and no choice is sent.
-                        contracts.remove(&token);drop(preparing.remove(index));
-                        preserved_native+=1;last_preservation=Some(reason.key());last_kind=Some("native");last_confirmation=None;continue;
-                    }
+                let observed=contracts.entry(token).or_default();
+                let Some(contract)=read_contract(dialog,&part,automation.as_ref())else{observed.reset();index+=1;continue;};
+                // Do not scan the accessibility tree while the caller is still
+                // switching between its initial file and folder controls.
+                if !observed.observe(contract.clone(),Instant::now()){index+=1;continue;}
+                let Some(multiple)=automation.as_ref().and_then(|uia|multiple(uia,part.shell))else{index+=1;continue;};
+                if let Some(reason)=capabilities::preservation(dialog,&part,Some(contract.kind),automation.as_ref()){
+                    contracts.remove(&token);drop(preparing.remove(index));
+                    preserved_native+=1;last_preservation=Some(reason.key());last_kind=Some("native");last_confirmation=None;continue;
                 }
-                let Some(kind)=dialog_kind(dialog,&part,automation.as_ref()).filter(|_|part.shell&&!part.name.0.is_null())else{contracts.entry(token).or_default().reset();index+=1;continue;};
-                if let(Some(initial),Some(multiple))=(text(part.address).and_then(|value|initial_location(&value)),automation.as_ref().and_then(|automation|multiple(automation,dialog))){
-                    let accept=unsafe{GetDlgItem(Some(dialog),1)}.ok().and_then(text).unwrap_or_default();
-                    let contract=Contract{kind,name:part.name.0 as isize,types:if kind.folders(){0}else{part.types.0 as isize},multiple,accept:accept.clone(),initial:initial.clone()};
-                    // Initialization may briefly expose the default file-mode
-                    // controls before applying FOS_PICKFOLDERS. Keep the native
-                    // window masked while its complete contract settles.
-                    if !contracts.entry(token).or_default().observe(contract,Instant::now()){index+=1;continue;}
-                    if let Some(reason)=capabilities::preservation(dialog,&part,automation.as_ref()){
-                        contracts.remove(&token);drop(preparing.remove(index));
-                        preserved_native+=1;last_preservation=Some(reason.key());last_kind=Some("native");last_confirmation=None;continue;
-                    }
-                    contracts.remove(&token);let early=preparing.remove(index);let(types,filter)=types(part.types);
-                    let initial_name=if kind.folders(){String::new()}else{text(part.name).filter(|name|!name.contains(['*','?'])).unwrap_or_default()};
-                    let options=Options{token,title:kind.title().into(),initial,multiple,kind,initial_name,types,filter,events:tx.clone()};
-                    let config=profile.to_path_buf();let report=tx.clone();
-                    let worker=thread::Builder::new().name("zsdesk-picker-window".into()).spawn(move||{
-                        let result=std::panic::catch_unwind(||crate::storage::load(&config).and_then(|session|crate::window::picker::run(session,config,options)))
-                            .map_err(|_|"文件选择窗口异常退出".to_owned()).and_then(|result|result.map_err(|error|format!("{error:#}")));
-                        let _=report.send(Event::Finished{token,result});
-                    })?;
-                    last_kind=Some(if kind.folders(){"folder"}else{"file"});last_confirmation=None;
-                    sessions.push(Session{source,name:part.name,types:if kind.folders(){HWND::default()}else{part.types},kind,multiple,accept,token,picker:None,guard:None,early:Some(early),worker:Some(worker),fallback:false});
-                }else{contracts.entry(token).or_default().reset();index+=1;}
+                let current=parts(dialog);
+                if read_contract(dialog,&current,automation.as_ref()).as_ref()!=Some(&contract){
+                    observed.reset();index+=1;continue;
+                }
+                let Contract{kind,accept,initial,..}=contract;
+                contracts.remove(&token);let early=preparing.remove(index);
+                let (types,filter)=if kind.folders(){(Vec::new(),0)}else{types(part.types)};
+                let initial_name=if kind.folders(){String::new()}else{text(part.name).filter(|name|!name.contains(['*','?'])).unwrap_or_default()};
+                if !early.preparing(){continue;}
+                let options=Options{token,title:kind.title().into(),initial,multiple,kind,initial_name,types,filter,events:tx.clone()};
+                let config=profile.to_path_buf();let report=tx.clone();
+                let profile_session=profile_session.clone();let time_to_show=early.show_check();
+                let worker=thread::Builder::new().name("zsdesk-picker-window".into()).spawn(move||{
+                    let result=std::panic::catch_unwind(||crate::window::picker::run(profile_session,config,options,time_to_show))
+                        .map_err(|_|"文件选择窗口异常退出".to_owned()).and_then(|result|result.map_err(|error|format!("{error:#}")));
+                    let _=report.send(Event::Finished{token,result});
+                })?;
+                last_kind=Some(if kind.folders(){"folder"}else{"file"});last_confirmation=None;
+                sessions.push(Session{source,name:part.name,types:if kind.folders(){HWND::default()}else{part.types},kind,multiple,accept,token,picker:None,guard:None,early:Some(early),worker:Some(worker),fallback:false});
             }
         }
         DIALOG_BUSY.store(!sessions.is_empty()||!returning.is_empty()||!preparing.is_empty(),std::sync::atomic::Ordering::Release);
@@ -351,10 +379,10 @@ fn run(profile:&Path,stop:&AtomicBool)->Result<()>{
     }
     #[test]fn folder_mode_must_settle_after_transient_file_controls(){
         let start=Instant::now();let mut observed=StableContract::default();
-        let file=Contract{kind:SelectionKind::Files,name:1,types:2,multiple:true,accept:"上传".into(),initial:zsdesk_core::model::explorer::ShellLocation::ThisPc};
+        let file=Contract{kind:SelectionKind::Files,name:1,types:2,shell:3,accept:"上传".into(),initial:zsdesk_core::model::explorer::ShellLocation::ThisPc};
         assert!(!observed.observe(file.clone(),start));
         assert!(!observed.observe(file.clone(),start+Duration::from_millis(100)));
-        let folder=Contract{kind:SelectionKind::Folders,types:0,multiple:false,..file};
+        let folder=Contract{kind:SelectionKind::Folders,types:0,..file};
         assert!(!observed.observe(folder.clone(),start+Duration::from_millis(120)));
         assert!(!observed.observe(folder.clone(),start+Duration::from_millis(269)));
         assert!(observed.observe(folder.clone(),start+Duration::from_millis(270)));
