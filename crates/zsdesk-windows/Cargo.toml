@@ -18,7 +18,9 @@ serde_json.workspace = true
 roxmltree = "0.20.0"
 
 [target.'cfg(windows)'.dependencies]
-zip = { version = "2.4.2", default-features = false, features = ["deflate"] }
+# ZIP writes use the standard Deflate level. Select its backend explicitly.
+zip = { version = "2.4.2", default-features = false, features = ["flate2", "deflate-flate2"] }
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 tempfile = "3"
 libloading = "0.8"
 windows-sys = { version = "0.59", features = [

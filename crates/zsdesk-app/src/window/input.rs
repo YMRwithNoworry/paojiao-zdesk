@@ -430,7 +430,11 @@ impl WindowState {
                 ]);
                 match popup(self.hwnd, &spec, None).as_deref() {
                     Some("open-tab") => unsafe { self.new_tab(target) },
-                    Some("copy") => set_clipboard_text(self.hwnd, &target.address()),
+                    Some("copy") => {
+                        if let Err(error) = zsdesk_windows::shell::file_transfer::set_text(self.hwnd, &target.address()) {
+                            self.show_message(error.to_string());
+                        }
+                    }
                     Some("edit") => unsafe { self.focus_address() },
                     _ => {}
                 }
@@ -697,8 +701,10 @@ impl WindowState {
         let mut paths = self.browser.as_ref().map(|b| b.selection_paths()).unwrap_or_default();
         if paths.is_empty() { paths.push(self.current_location().address()); }
         let text = paths.iter().map(|p| if p.contains(' ') { format!("\"{p}\"") } else { p.clone() }).collect::<Vec<_>>().join("\r\n");
-        set_clipboard_text(self.hwnd, &text);
-        self.show_message(zsdesk_core::tr_format!("已复制 {} 个路径", paths.len()));
+        match zsdesk_windows::shell::file_transfer::set_text(self.hwnd, &text) {
+            Ok(()) => self.show_message(zsdesk_core::tr_format!("已复制 {} 个路径", paths.len())),
+            Err(error) => self.show_message(error.to_string()),
+        }
     }
 
     fn open_terminal(&mut self) {
@@ -1079,25 +1085,6 @@ fn desktop_host_running() -> bool {
 
 fn open_folder_options() {
     let _ = std::process::Command::new("rundll32.exe").args(["shell32.dll,Options_RunDLL", "0"]).spawn();
-}
-
-pub(super) fn set_clipboard_text(owner: HWND, text: &str) {
-    use windows::Win32::{Foundation::HANDLE, System::{DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData},
-        Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE}, Ole::CF_UNICODETEXT}};
-    let data: Vec<u16> = text.encode_utf16().chain(Some(0)).collect();
-    unsafe {
-        if OpenClipboard(Some(owner)).is_err() { return; }
-        let _ = EmptyClipboard();
-        if let Ok(memory) = GlobalAlloc(GMEM_MOVEABLE, data.len() * 2) {
-            let target = GlobalLock(memory) as *mut u16;
-            if !target.is_null() {
-                std::ptr::copy_nonoverlapping(data.as_ptr(), target, data.len());
-                let _ = GlobalUnlock(memory);
-                let _ = SetClipboardData(CF_UNICODETEXT.0 as u32, Some(HANDLE(memory.0)));
-            }
-        }
-        let _ = CloseClipboard();
-    }
 }
 
 /// Shows a ZSUI menu spec as a Windows 11 style flyout. `anchor` (client

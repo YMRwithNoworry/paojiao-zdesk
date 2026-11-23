@@ -285,7 +285,13 @@ unsafe extern "system" fn procedure(hwnd:HWND,message:u32,wp:WPARAM,lp:LPARAM)->
         WM_COMMAND=>{
             match wp.0&0xffff {
                 REFRESH_ID=>request_report(hwnd,pointer),
-                COPY_ID=>{let text=unsafe{&*pointer}.text.clone();input::set_clipboard_text(hwnd,&text);},
+                COPY_ID=>{
+                    let text=unsafe{&*pointer}.text.clone();
+                    if let Err(error)=zsdesk_windows::shell::file_transfer::set_text(hwnd,&text){
+                        let message=wide(&error.to_string());
+                        unsafe{MessageBoxW(Some(hwnd),PCWSTR(message.as_ptr()),windows::core::w!("ZSDesk"),MB_OK|MB_ICONERROR);}
+                    }
+                },
                 CLOSE_ID=>post(hwnd,WM_CLOSE,0,0),_=>{},
             }LRESULT(0)
         }

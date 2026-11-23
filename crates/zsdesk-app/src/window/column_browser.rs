@@ -35,10 +35,15 @@ struct Loader {
     requests: mpsc::Sender<(u64, Option<PathBuf>, Visibility)>,
     replies: mpsc::Receiver<Reply>,
     latest: Arc<AtomicU64>,
+    worker: thread::JoinHandle<()>,
 }
 impl Drop for Loader {
     fn drop(&mut self) {
+        use std::os::windows::io::AsRawHandle;
+        use windows::Win32::{Foundation::HANDLE, System::IO::CancelSynchronousIo};
         self.latest.fetch_add(1, Ordering::Release);
+        // Interrupt a pending directory read. Dropping the sender also wakes an idle worker.
+        let _ = unsafe { CancelSynchronousIo(HANDLE(self.worker.as_raw_handle())) };
     }
 }
 impl Loader {
@@ -48,11 +53,14 @@ impl Loader {
         let latest = Arc::new(AtomicU64::new(0));
         let revision = latest.clone();
         let window = owner.0 as isize;
-        thread::Builder::new()
+        let worker = thread::Builder::new()
             .name("zsdesk-parent-column".into())
             .spawn(move || {
                 while let Ok(first) = rx.recv() {
                     let (id, parent, hidden) = rx.try_iter().last().unwrap_or(first);
+                    if revision.load(Ordering::Acquire) != id {
+                        continue;
+                    }
                     let load = || -> io::Result<Vec<Entry>> {
                         let mut rows = Vec::new();
                         if let Some(path) = parent {
@@ -88,6 +96,7 @@ impl Loader {
             requests,
             replies,
             latest,
+            worker,
         })
     }
 }
@@ -133,9 +142,7 @@ impl ParentColumn {
         if !self.list.is_invalid() {
             return Ok(());
         }
-        if self.loader.is_none() {
-            self.loader = Some(Loader::new(owner)?);
-        }
+        let loader = Loader::new(owner)?;
         self.list = unsafe {
             CreateWindowExW(
                 WINDOW_EX_STYLE::default(),
@@ -158,6 +165,7 @@ impl ParentColumn {
                 None,
             )
         }?;
+        self.loader = Some(loader);
         for (slot, id) in self.icons.iter_mut().zip([SIID_DOCNOASSOC, SIID_FOLDER]) {
             let mut info = SHSTOCKICONINFO {
                 cbSize: std::mem::size_of::<SHSTOCKICONINFO>() as u32,
@@ -219,10 +227,7 @@ impl ParentColumn {
         self.rows = Vec::new();
         self.placed = None;
         self.watch = None;
-        if let Some(loader) = &self.loader {
-            loader.latest.fetch_add(1, Ordering::AcqRel);
-            let _ = loader.replies.try_iter().count();
-        }
+        self.loader = None;
         if !self.list.is_invalid() {
             unsafe {
                 let _ = DestroyWindow(self.list);
@@ -606,6 +611,22 @@ impl WindowState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn clearing_columns_releases_the_worker_while_the_window_state_remains_alive() {
+        let mut column = ParentColumn::default();
+        for _ in 0..8 {
+            let loader = Loader::new(HWND::default()).unwrap();
+            let revision = Arc::downgrade(&loader.latest);
+            column.loader = Some(loader);
+            column.clear();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            while revision.upgrade().is_some() {
+                assert!(std::time::Instant::now() < deadline, "parent-column worker still alive");
+                thread::sleep(std::time::Duration::from_millis(2));
+            }
+        }
+    }
+
     #[test]
     fn folder_layouts_remember_explicit_single_dual_and_columns() {
         let mut map = std::collections::BTreeMap::new();
