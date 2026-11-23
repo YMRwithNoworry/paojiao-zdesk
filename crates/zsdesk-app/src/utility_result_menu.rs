@@ -80,6 +80,7 @@ impl Panel {
         let _ = unsafe { KillTimer(Some(self.hwnd), TIMER) };
     }
     pub(super) fn begin_result_menu(&mut self, position: LPARAM) -> Result<()> {
+        if self.awaiting_page {return Ok(());}
         let keyboard = position.0 == -1;
         let (row, point) = if keyboard {
             let Some(row) = report_list::selected(self.list) else {

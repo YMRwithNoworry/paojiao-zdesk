@@ -104,7 +104,8 @@ impl WindowState{
         let paths=self.browser.as_ref().map(|b|b.item_paths_limit(128)).unwrap_or_default();
         let selected=self.browser.as_ref().map(|b|b.selection_paths_limit(128)).unwrap_or_default();
         let status=self.browser.as_ref().map(|b|b.status()).unwrap_or_default();
-        let value=serde_json::json!({"schema":"ZSDesk.Diagnostics.v1","request_id":request.request_id,
+        let button_geometry=self.caption_buttons().map(|[min,max,close]|[self.layout.tab_list,self.layout.app_menu,min,max,close].map(|r|[r.x,r.y,r.width,r.height]));
+        let value=serde_json::json!({"caption_buttons":button_geometry,"quick_search_layout":crate::fast_search::mapped::diagnostics(),"schema":"ZSDesk.Diagnostics.v1","request_id":request.request_id,
             "pid":std::process::id(),"hwnd":self.hwnd.0 as usize,"version":env!("CARGO_PKG_VERSION"),"location":self.current_location(),
             "native_view":self.browser.as_ref().and_then(|b|b.view_mode()),"fullscreen":self.fullscreen_restore.is_some(),
             "navigation_pending":self.pending.is_some(),"items":status.items,"selected":status.selected,

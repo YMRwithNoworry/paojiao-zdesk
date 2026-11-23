@@ -3,6 +3,7 @@ mod ntfs;
 mod metadata;
 mod native_scan;
 mod snapshot;
+pub(crate) mod mapped;
 pub(crate) mod query;
 mod native;
 pub(crate) mod network;
@@ -41,7 +42,7 @@ pub struct SearchEvent{
 }
 #[derive(Clone)]struct Request{generation:u64,query:String,preferred:Option<PathBuf>,invalid:Option<String>,offset:u32,limit:u32,sort:everything::SearchSort}
 #[derive(Clone,Copy,Default,PartialEq)]enum ScanAction{#[default]None,Refresh,Rebuild}
-#[derive(Default)]struct Control{request:Option<Request>,action:ScanAction,warm_snapshot:bool,release_idle:bool,settings_changed:bool}
+#[derive(Default)]struct Control{request:Option<Request>,action:ScanAction,warm_snapshot:bool,release_private:bool,release_idle:bool,settings_changed:bool}
 struct Shared{
     control:Mutex<Control>,wake:Condvar,stop:AtomicBool,engine_stop:AtomicBool,generation:AtomicU64,notified:AtomicBool,
     hwnd:isize,message:u32,notifier:Option<Arc<dyn Fn()+Send+Sync>>,maintenance_role:AtomicU64,query_active:AtomicBool,
@@ -88,16 +89,39 @@ pub fn settings_changed(profile:&Path){
 }
 
 pub struct FastSearch{shared:Arc<Shared>,events:Receiver<SearchEvent>,worker:Option<JoinHandle<()>>}
+fn snapshot_path(profile:&Path)->Result<PathBuf>{
+        #[cfg(not(test))]use sha2::{Digest,Sha256};
+        #[cfg(test)]let path=profile.with_file_name("search-index.zsi");
+        #[cfg(not(test))]let path={let identity=fs::canonicalize(&profile).map(|p|path_key_native(&p)).unwrap_or_else(|_|profile.to_path_buf());
+            let hash=format!("{:x}",Sha256::digest(identity.to_string_lossy().as_bytes()));
+            dirs::cache_dir().context("无法定位本地搜索缓存目录")?.join(crate::edition::profile_name()).join("search").join(hash).join("index.zsi")};
+        Ok(path)
+}
+static SHORTCUT_EPOCH:AtomicU64=AtomicU64::new(0);
+pub(crate) fn release_shortcut_layout(profile:&Path){SHORTCUT_EPOCH.fetch_add(1,Ordering::AcqRel);if let Ok(path)=snapshot_path(profile){mapped::invalidate(&path);}}
+pub(crate) fn prime_shortcut(profile:&Path){
+    let epoch=SHORTCUT_EPOCH.load(Ordering::Acquire);
+    let profile=profile.to_owned();
+    let permit=WorkerPermit::new();
+    let _=thread::Builder::new().name("zsdesk-search-layout".into()).spawn(move||{
+        let _permit=permit;
+        if let Ok(session)=crate::storage::load(&profile){
+            let options=SearchOptions::from_ui(&session.ui);
+            if options.backend.is_builtin(){if let Ok(path)=snapshot_path(&profile){mapped::prime(&path,&options,&||crate::runtime::exiting()||epoch!=SHORTCUT_EPOCH.load(Ordering::Acquire));}}
+        }
+    });
+}
+fn another_query_active(profile:&Path,owner:&Arc<Shared>)->bool{
+    CLIENTS.get().is_some_and(|r|r.lock().unwrap_or_else(|e|e.into_inner()).get(profile).is_some_and(|clients|
+        clients.iter().filter_map(Weak::upgrade).any(|c|!Arc::ptr_eq(&c,owner)&&c.query_active.load(Ordering::Acquire))))
+}
 impl FastSearch{
     pub fn new(path:PathBuf,hwnd:HWND,message:u32)->Result<Self>{Self::new_with_options(path,hwnd,message,SearchOptions::default())}
     pub fn new_with_options(path:PathBuf,hwnd:HWND,message:u32,options:SearchOptions)->Result<Self>{Self::create(path,hwnd,message,options,None,None,None)}
     pub fn new_with_notifier(path:PathBuf,options:SearchOptions,notifier:Arc<dyn Fn()+Send+Sync>)->Result<Self>{Self::create(path,HWND::default(),0,options,None,Some(notifier),None)}
     pub fn for_profile(profile:&Path,hwnd:HWND,message:u32,options:SearchOptions)->Result<Self>{
-        use sha2::{Digest,Sha256};let profile=std::path::absolute(profile)?;
-        #[cfg(test)]let path=profile.with_file_name("search-index.zsi");
-        #[cfg(not(test))]let path={let identity=fs::canonicalize(&profile).map(|p|path_key_native(&p)).unwrap_or_else(|_|profile.clone());
-            let hash=format!("{:x}",Sha256::digest(identity.to_string_lossy().as_bytes()));
-            dirs::cache_dir().context("无法定位本地搜索缓存目录")?.join(crate::edition::profile_name()).join("search").join(hash).join("index.zsi")};
+        let profile=std::path::absolute(profile)?;
+        let path=snapshot_path(&profile)?;
         Self::create(path,hwnd,message,options,None,None,Some(profile))
     }
     #[cfg(test)]pub(crate) fn new_with_roots_for_test(path:PathBuf,roots:Vec<PathBuf>)->Result<Self>{Self::create(path,HWND::default(),0,SearchOptions{backend:BackendPreference::DirectoryScan,..Default::default()},Some(roots),None,None)}
@@ -132,6 +156,7 @@ impl FastSearch{
             self.shared.wake.notify_one();
         }
     }
+    pub fn hide_popup(&self){self.cancel();let mut c=self.shared.control.lock().unwrap_or_else(|e|e.into_inner());c.release_private=true;drop(c);self.shared.wake.notify_one();}
     pub fn cancel(&self){self.shared.query_active.store(false,Ordering::Release);self.shared.generation.fetch_add(1,Ordering::AcqRel);self.shared.engine_stop.store(true,Ordering::Release);network::cancel(&self.shared);
         let mut control=self.shared.control.lock().unwrap_or_else(|e|e.into_inner());control.request=None;control.warm_snapshot=false;control.action=ScanAction::None;control.release_idle=true;drop(control);self.discard_events();self.shared.wake.notify_all();}
     /// Changing the query cancels results, not the shared catalog's progress.
@@ -161,14 +186,19 @@ fn worker_loop(path:PathBuf,profile:PathBuf,initial:SearchOptions,roots:Option<V
     let mut native_generation=None;
     let mut configured = initial;
     let mut warm_only = false;
+    let mut popup = false;
+    let mut release_private = false;
     loop{
         let control={let mut guard=shared.control.lock().unwrap_or_else(|e|e.into_inner());
-            if guard.request.is_none()&&guard.action==ScanAction::None&&!guard.settings_changed&&!guard.warm_snapshot&&!shared.stop.load(Ordering::Acquire){
+            if guard.request.is_none()&&guard.action==ScanAction::None&&!guard.settings_changed&&!guard.warm_snapshot&&!guard.release_private&&!shared.stop.load(Ordering::Acquire){
                 let wait=if !warm_only && core.as_ref().is_some_and(native::pending){Duration::from_millis(100)}else{Duration::from_secs(1)};
                 let result=shared.wake.wait_timeout(guard,wait).unwrap_or_else(|e|e.into_inner());guard=result.0;
             }
             if shared.stop.load(Ordering::Acquire){break;}std::mem::take(&mut *guard)
         };
+        popup |= control.warm_snapshot;
+        if control.release_private{release_private=true;}
+        if control.request.is_some()||control.warm_snapshot||control.action!=ScanAction::None{release_private=false;}
         let has_work = control.request.is_some() || control.action != ScanAction::None || control.settings_changed || control.warm_snapshot;
         if core.is_none() && !has_work {continue;}
         if roots.is_none() && has_work {
@@ -197,14 +227,22 @@ fn worker_loop(path:PathBuf,profile:PathBuf,initial:SearchOptions,roots:Option<V
         }
         if !options.backend.is_builtin() {core=None;}
         else if !has_work || control.release_idle {
-            if let Some(core)=&core {native::evict_if_idle(core,options.idle_seconds);}
+            if let Some(core)=&core {
+                if release_private && !another_query_active(&profile,&shared){
+                    native::evict(core,0,&||!shared.engine_stop.load(Ordering::Acquire));
+                    if native::can_read_snapshot(core){
+                        release_private=false;
+                        mapped::prime(&path,&options,&||shared.stop.load(Ordering::Acquire)||shared.query_active.load(Ordering::Acquire));
+                    }
+                }else{native::evict_if_idle(core,options.idle_seconds);}
+            }
         }
         if control.request.is_some() || control.action!=ScanAction::None {warm_only=false;}
         if control.settings_changed{core=None;}
         let Some(request)=control.request else{
             if control.warm_snapshot && configured.backend.is_builtin() && control.action==ScanAction::None && !shared.cancelled(){
                 warm_only=true;
-                native::warm_existing(core.get_or_insert_with(||native::shared(&path)), &options, &shared);
+                mapped::prime(&path,&options,&||shared.cancelled());
             } else if control.action!=ScanAction::None&&options.backend.is_builtin(){
                 let generation=shared.generation.load(Ordering::Acquire);shared.maintenance_role.store(1,Ordering::Release);
                 let core=core.get_or_insert_with(||native::shared(&path));
@@ -230,7 +268,27 @@ fn worker_loop(path:PathBuf,profile:PathBuf,initial:SearchOptions,roots:Option<V
             shared.maintenance_role.store(1,Ordering::Release);let core=core.get_or_insert_with(||native::shared(&path));
             if control.action==ScanAction::Rebuild{native::invalidate(core);}
             let refresh=native_generation!=Some(request.generation)||native::pending(core);
-            match native::execute_cached(core,&options,roots.as_deref(),&shared,&sender,&request){
+            let cold_preview=popup && refresh && native::can_read_snapshot(core) &&
+                matches!(request.sort,everything::SearchSort::NameAsc|everything::SearchSort::NameDesc);
+            let page=if cold_preview{mapped::search(&path,&options,&request,&||!shared.current(request.generation)||shared.cancelled()).ok()}else{None};
+            let first=if let Some(mut page)=page{
+                let truncated=u64::from(request.offset)+ (page.paths.len() as u64)<page.total;
+                *shared.native_page.lock().unwrap_or_else(|e|e.into_inner())=Some((request.generation,page.paths.clone()));
+                emit(&shared,&sender,SearchEvent{generation:request.generation,paths:std::mem::take(&mut page.paths),scanned:page.scanned,indexed:page.total,
+                    denied:0,skipped_reparse:0,scanning:true,finished:false,truncated,error:None,reset:true,backend:page.backend,
+                    phase:IndexPhase::CatchingUp,volumes:Vec::new(),read_only:true});
+                if shared.current(request.generation) && page.current(roots.as_deref(), &shared.engine_stop){
+                    emit(&shared,&sender,SearchEvent{generation:request.generation,paths:Vec::new(),scanned:page.scanned,indexed:page.total,
+                        denied:0,skipped_reparse:0,scanning:false,finished:true,truncated,error:None,reset:false,backend:page.backend,
+                        phase:IndexPhase::Ready,volumes:Vec::new(),read_only:true});
+                    shared.maintenance_role.store(0,Ordering::Release);continue;
+                }
+                // Let the user finish typing before opening the editable catalog for journal reconciliation.
+                let guard=shared.control.lock().unwrap_or_else(|e|e.into_inner());
+                let _quiet=shared.wake.wait_timeout_while(guard,Duration::from_millis(200),|_|shared.current(request.generation)&&!shared.cancelled()).unwrap_or_else(|e|e.into_inner());
+                Ok(())
+            }else if shared.current(request.generation){native::execute_cached(core,&options,roots.as_deref(),&shared,&sender,&request)}else{continue;};
+            match first{
                 Err(error)=>if shared.current(request.generation){emit(&shared,&sender,failure(request.generation,BackendKind::DirectoryScan,format!("{error:#}")));},
                 Ok(())=>{native_generation=Some(request.generation);
                     if refresh&&shared.current(request.generation){

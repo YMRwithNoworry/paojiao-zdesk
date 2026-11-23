@@ -38,6 +38,7 @@ fn configure(hwnd:HWND,state:&mut State)->Result<bool>{
                     }
                 }
                 state.registration_id=next_id;state.registered=true;state.hotkey=prefs.hotkey.clone();
+                crate::fast_search::prime_shortcut(&state.profile);
             },
             Err(error)=>{
                 let reason=match error.code().0 as u32{
@@ -55,7 +56,7 @@ fn configure(hwnd:HWND,state:&mut State)->Result<bool>{
                 if !state.registered{state.hotkey=prefs.hotkey.clone();}
             },
         }
-    }else{if state.registered{unsafe{UnregisterHotKey(Some(hwnd),state.registration_id)}?;state.registered=false;}state.hotkey=prefs.hotkey.clone();}
+    }else{if state.registered{unsafe{UnregisterHotKey(Some(hwnd),state.registration_id)}?;state.registered=false;crate::fast_search::release_shortcut_layout(&state.profile);}state.hotkey=prefs.hotkey.clone();}
     control::write_status(&state.profile,state.error.as_deref(),false,&state.hotkey,state.registered);
     Ok(prefs.enabled||super::needs_background(&state.profile))
 }
@@ -103,6 +104,7 @@ unsafe extern "system" fn proc(hwnd:HWND,message:u32,wp:WPARAM,lp:LPARAM)->LRESU
         return LRESULT(0);
     }
     if message==WM_DESTROY{
+        let state=unsafe{&*pointer};crate::fast_search::release_shortcut_layout(&state.profile);
         super::popup::close();let _=unsafe{KillTimer(Some(hwnd),LIFETIME_TIMER)};
         let state=unsafe{&mut*pointer};if state.registered{let _=unsafe{UnregisterHotKey(Some(hwnd),state.registration_id)};state.registered=false;}
         control::write_status(&state.profile,state.error.as_deref(),false,&state.hotkey,false);unsafe{PostQuitMessage(0)};return LRESULT(0);

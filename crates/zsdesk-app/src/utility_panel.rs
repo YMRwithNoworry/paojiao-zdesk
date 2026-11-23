@@ -23,7 +23,7 @@ fn panel_title(kind:Kind)->&'static str{
 }
 struct UpdateReply{alive:AtomicBool,value:Mutex<Option<Result<crate::update_check::Outcome,String>>>}
 struct Panel{hwnd:HWND,edit:HWND,list:HWND,action:HWND,close:HWND,font:HFONT,title_font:HFONT,brush:HBRUSH,input_brush:HBRUSH,
-    dpi:u32,palette:Palette,kind:Kind,profile:PathBuf,body:String,status:String,paths:Vec<PathBuf>,engine:Option<FastSearch>,generation:u64,reply:Arc<UpdateReply>,adopted:bool,
+    dpi:u32,palette:Palette,kind:Kind,profile:PathBuf,body:String,status:String,paths:Vec<PathBuf>,awaiting_page:bool,engine:Option<FastSearch>,generation:u64,reply:Arc<UpdateReply>,adopted:bool,
     result_menu:Option<result_menu::Session>,rename_target:Option<result_menu::Target>,search_view:SearchView,sort:SearchSort,offset:u32,has_next:bool,detail_reader:Option<details::Reader>,
     info:Vec<InfoRow>,scroll:i32,busy:bool,search_error:bool,update_release:Option<crate::update_check::Release>,update_package:Option<(PathBuf,bool,String)>}
 impl Drop for Panel{fn drop(&mut self){self.reply.alive.store(false,Ordering::Release);if let Some(engine)=&self.engine{engine.cancel();}
@@ -56,15 +56,17 @@ pub(crate) fn show_search(profile:&Path)->Result<()>{
         let dark=match ui.appearance.color_scheme{zsdesk_core::model::explorer::ColorScheme::Dark=>true,zsdesk_core::model::explorer::ColorScheme::Light=>false,_=>zsdesk_windows::theme::system_dark_mode()};
         let dark=dark&&!zsdesk_windows::theme::high_contrast();
         let pointer=unsafe{GetWindowLongPtrW(hwnd,GWLP_USERDATA)}as*const RefCell<Panel>;let slot=unsafe{&*pointer};
-        {let mut panel=slot.borrow_mut();panel.warm_search(&ui);let palette=search_ui::palette(dark);
-            if palette!=panel.palette{panel.palette=palette;unsafe{DeleteObject(panel.brush.into());DeleteObject(panel.input_brush.into());}
+        let theme_changed={let mut panel=slot.borrow_mut();panel.warm_search(&ui);let palette=search_ui::palette(dark);
+            let changed=palette!=panel.palette;
+            if changed{panel.palette=palette;unsafe{DeleteObject(panel.brush.into());DeleteObject(panel.input_brush.into());}
                 panel.brush=unsafe{CreateSolidBrush(rgb(palette.layer))};panel.input_brush=unsafe{CreateSolidBrush(rgb(palette.input_focused))};panel.style_list();}
             if (!panel.search_view.last_query.is_empty()||panel.search_view.filter!=0) && text(panel.edit).is_empty(){let last=panel.search_view.last_query.clone();set_text(panel.edit,&last);panel.search();}
             unsafe{SendMessageW(panel.edit,EM_SETSEL,Some(WPARAM(0)),Some(LPARAM(-1)));}
-        }
-        zsdesk_windows::theme::set_dark_frame(hwnd,dark);
+            changed
+        };
+        if theme_changed{zsdesk_windows::theme::set_dark_frame(hwnd,dark);unsafe{let _=RedrawWindow(Some(hwnd),None,None,RDW_INVALIDATE|RDW_ALLCHILDREN);}}
         let activate=true;#[cfg(test)]let activate=activate&&!TEST_NO_ACTIVATE.with(Cell::get);
-        unsafe{let _=ShowWindow(hwnd,if activate && IsZoomed(hwnd).as_bool(){SW_SHOWMAXIMIZED}else if activate{SW_SHOWNORMAL}else{SW_SHOWNOACTIVATE});RedrawWindow(Some(hwnd),None,None,RDW_INVALIDATE|RDW_ALLCHILDREN|RDW_ERASE);
+        unsafe{let _=ShowWindow(hwnd,if activate && IsZoomed(hwnd).as_bool(){SW_SHOWMAXIMIZED}else if activate{SW_SHOWNORMAL}else{SW_SHOWNOACTIVATE});
             if activate{let _=SetForegroundWindow(hwnd);PostMessageW(Some(hwnd),WM_APPPLUS_FOCUS,WPARAM(0),LPARAM(0)).ok();}}
         return Ok(());
     }
@@ -96,7 +98,7 @@ fn show(owner:HWND,profile:&Path,kind:Kind,body:String)->Result<HWND>{
     let info=if kind==Kind::Shortcuts{content::shortcut_rows(&body)}else{Vec::new()};
     let state=Rc::new(RefCell::new(Panel{hwnd:HWND::default(),edit:HWND::default(),list:HWND::default(),action:HWND::default(),close:HWND::default(),
         font:HFONT::default(),title_font:HFONT::default(),brush:HBRUSH::default(),input_brush:HBRUSH::default(),dpi:96,palette,kind,profile:profile.into(),body,
-        status:match kind{Kind::Search=>String::new(),Kind::Shortcuts=>zsdesk_core::i18n::text("滚动查看全部快捷键 · Esc 关闭").into(),Kind::About=>String::new()},paths:Vec::new(),engine:None,generation:0,
+        status:match kind{Kind::Search=>String::new(),Kind::Shortcuts=>zsdesk_core::i18n::text("滚动查看全部快捷键 · Esc 关闭").into(),Kind::About=>String::new()},paths:Vec::new(),awaiting_page:false,engine:None,generation:0,
         reply:Arc::new(UpdateReply{alive:AtomicBool::new(true),value:Mutex::new(None)}),adopted:false,result_menu:None,rename_target:None,search_view:if kind==Kind::Search{SearchView::load(profile)}else{SearchView::default()},sort:SearchSort::NameAsc,offset:0,has_next:false,detail_reader:None,info,scroll:0,busy:false,search_error:false,update_release:None,update_package:None}));
     let pointer=Rc::into_raw(state.clone());
     let result=unsafe{CreateWindowExW(WINDOW_EX_STYLE::default(),w!("ZSDesk.UtilityPanel"),PCWSTR(wide(caption).as_ptr()),WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU|WS_THICKFRAME|WS_CLIPCHILDREN|if kind==Kind::Search{WS_MAXIMIZEBOX|WS_MINIMIZEBOX}else{WINDOW_STYLE(0)},
@@ -112,7 +114,7 @@ fn show(owner:HWND,profile:&Path,kind:Kind,body:String)->Result<HWND>{
     let scale=|n:i32|n*unsafe{GetDpiForWindow(hwnd)}.max(96)as i32/96;
     let width=scale(match kind{Kind::About=>560,Kind::Shortcuts=>800,Kind::Search=>960}).min(info.rcWork.right-info.rcWork.left);
     let height=scale(match kind{Kind::About=>430,Kind::Shortcuts=>640,Kind::Search=>540}).min(info.rcWork.bottom-info.rcWork.top);
-    unsafe{SetWindowPos(hwnd,None,info.rcWork.left+(info.rcWork.right-info.rcWork.left-width)/2,info.rcWork.top+(info.rcWork.bottom-info.rcWork.top-height)/3,width,height,SWP_NOZORDER)?;}
+    unsafe{SetWindowPos(hwnd,None,info.rcWork.left+(info.rcWork.right-info.rcWork.left-width)/2,info.rcWork.top+(info.rcWork.bottom-info.rcWork.top-height)/3,width,height,SWP_NOZORDER|SWP_NOACTIVATE)?;}
     if kind==Kind::Search{state.borrow_mut().warm_search(&ui);SEARCH.with(|slot|slot.set(hwnd.0 as isize));}
     let activate=true;
     #[cfg(test)]let activate=activate&&!TEST_NO_ACTIVATE.with(Cell::get);
@@ -127,10 +129,11 @@ impl Panel{
         if let Some(engine)=&self.engine{engine.warm_snapshot();}
     }
     fn hide_search(&mut self){
+        unsafe{let _=ShowWindow(self.hwnd,SW_HIDE);}self.awaiting_page=false;
         self.cancel_result_menu();let _=unsafe{KillTimer(Some(self.hwnd),DEBOUNCE)};
-        if let Some(engine)=&self.engine{engine.cancel();}
+        if let Some(engine)=&self.engine{engine.hide_popup();}
         self.generation=0;self.paths.clear();self.busy=false;self.search_error=false;self.status=zsdesk_core::i18n::text("输入关键词搜索文件和文件夹").into();
-        self.search_view.last_query=text(self.edit);self.offset=0;self.has_next=false;if let Some(reader)=&self.detail_reader{reader.reset(0);}report_list::clear(self.list);set_text(self.edit,"");unsafe{let _=EnableWindow(self.action,false);let _=ShowWindow(self.hwnd,SW_HIDE);}
+        self.search_view.last_query=text(self.edit);self.offset=0;self.has_next=false;if let Some(reader)=&self.detail_reader{reader.reset(0);}report_list::clear(self.list);set_text(self.edit,"");unsafe{let _=EnableWindow(self.action,false);}
     }
     fn s(&self,n:i32)->i32{n*self.dpi as i32/96}
     fn child(&self,class:PCWSTR,label:&str,id:usize,style:WINDOW_STYLE)->Result<HWND>{
@@ -220,10 +223,11 @@ impl Panel{
     }
     fn search(&mut self){
         self.cancel_result_menu();
-        let query=search_ui::filtered_query(&text(self.edit),self.search_view.filter);self.paths.clear();report_list::clear(self.list);self.has_next=false;self.page_buttons();
-        if query.trim().is_empty(){if let Some(engine)=&self.engine{engine.cancel_query();}self.busy=false;self.search_error=false;self.status.clear();return;}
+        let query=search_ui::filtered_query(&text(self.edit),self.search_view.filter);self.paths.clear();self.awaiting_page=true;self.has_next=false;self.page_buttons();
+        let _=unsafe{EnableWindow(self.action,false)};
+        if query.trim().is_empty(){self.clear_pending_page();self.page_buttons();if let Some(engine)=&self.engine{engine.cancel_query();}self.busy=false;self.search_error=false;self.status.clear();return;}
         if self.engine.is_none(){match crate::storage::load(&self.profile).and_then(|session|FastSearch::for_profile(&self.profile,self.hwnd,RESULTS,SearchOptions::from_ui(&session.ui))){
-            Ok(engine)=>self.engine=Some(engine),Err(error)=>{self.busy=false;self.search_error=true;self.status=zsdesk_core::tr_format!("搜索不可用：{error:#}" , error=error);return;}}}
+            Ok(engine)=>self.engine=Some(engine),Err(error)=>{self.clear_pending_page();self.page_buttons();self.busy=false;self.search_error=true;self.status=zsdesk_core::tr_format!("搜索不可用：{error:#}" , error=error);return;}}}
         self.busy=true;self.search_error=false;self.generation=self.engine.as_ref().unwrap().start_page(&query,None,self.offset,PAGE_SIZE,self.sort);if let Some(rd)=&self.detail_reader{rd.reset(self.generation);}self.status=zsdesk_core::i18n::text("正在搜索…").into();
     }
     fn invalidate_query(&mut self){
@@ -231,7 +235,7 @@ impl Panel{
         self.generation=0;if let Some(engine)=&self.engine{engine.cancel_query();}self.paths.clear();
         self.busy=self.search_view.filter!=0||!text(self.edit).trim().is_empty();self.search_error=false;
         let _=unsafe{EnableWindow(self.action,false)};
-        report_list::clear(self.list);self.offset=0;self.has_next=false;self.page_buttons();if let Some(rd)=&self.detail_reader{rd.reset(0);}self.status=zsdesk_core::i18n::text("正在等待输入…").into();
+        self.awaiting_page=true;if !self.busy{self.clear_pending_page();}self.offset=0;self.has_next=false;self.page_buttons();if let Some(rd)=&self.detail_reader{rd.reset(0);}self.status=zsdesk_core::i18n::text("正在等待输入…").into();
     }
     fn dpi_changed(&mut self,dpi:u32,rect:RECT){
         self.scroll=self.scroll*dpi.max(96)as i32/self.dpi.max(96)as i32;self.dpi=dpi.max(96);let old=self.font;let old_title=self.title_font;
@@ -253,8 +257,15 @@ impl Panel{
         draw_text(dc,&self.status,RECT{left:self.s(22),top:r.bottom-self.s(77),right:r.right-self.s(20),bottom:r.bottom-self.s(52)},self.font,
             if self.search_error{rgb(self.palette.danger)}else{composite(self.palette.text_secondary,self.palette.layer)});
     }
-    fn results(&mut self){let Some(engine)=&self.engine else{return;};for event in engine.poll(){
-        if event.generation!=self.generation{continue;}if event.reset{self.paths.clear();report_list::clear(self.list);if let Some(rd)=&self.detail_reader{rd.reset(self.generation);}}
+    fn clear_pending_page(&mut self){
+        self.awaiting_page=false;report_list::clear(self.list);
+    }
+    fn results(&mut self){let Some(engine)=&self.engine else{return;};let events=engine.poll();
+        let batch=events.iter().any(|e|e.generation==self.generation && (e.reset||!e.paths.is_empty()||self.awaiting_page&&e.finished));
+        let redraw=batch && unsafe{GetWindowLongW(self.list,GWL_STYLE)} as u32&WS_VISIBLE.0!=0;
+        if redraw{unsafe{SendMessageW(self.list,WM_SETREDRAW,Some(WPARAM(0)),None);}}
+        for event in events{
+        if event.generation!=self.generation{continue;}if event.reset || (self.awaiting_page && (event.finished || !event.paths.is_empty())){self.paths.clear();self.clear_pending_page();if let Some(rd)=&self.detail_reader{rd.reset(self.generation);}}
         self.busy=!event.finished;self.search_error=event.error.is_some()&&event.paths.is_empty()&&self.paths.is_empty();
         for path in event.paths{if self.paths.len()>=PAGE_SIZE as usize{break;}if self.paths.contains(&path){continue;}
             let row=self.paths.len();
@@ -268,7 +279,9 @@ impl Panel{
             else if event.scanning{if event.volumes.len()==1{zsdesk_core::tr_format!("补充 {} · 已处理 {} 项 · {} 个结果" , event.volumes[0].root.display(), event.scanned, self.paths.len())}
                 else{zsdesk_core::tr_format!("{} 个结果 · 索引仍在更新" , self.paths.len())}}
             else{zsdesk_core::tr_format!("正在搜索 · {} 个结果" , self.paths.len())});
-    }if !self.paths.is_empty()&&report_list::selected(self.list).is_none(){report_list::select_first(self.list);}self.page_buttons();
+    }
+        if redraw{unsafe{SendMessageW(self.list,WM_SETREDRAW,Some(WPARAM(1)),None);let _=InvalidateRect(Some(self.list),None,false);}}
+        if !self.paths.is_empty()&&report_list::selected(self.list).is_none(){report_list::select_first(self.list);}self.page_buttons();
         let _=unsafe{EnableWindow(self.action,!self.paths.is_empty())};
     }
     fn style_list(&self){zsdesk_windows::theme::theme_control(self.list,self.palette.mode==Mode::Dark);
@@ -280,7 +293,7 @@ impl Panel{
             report_list::heading(self.list,col,&format!("{}{arrow}",zsdesk_core::i18n::text(title)),0,false);}
     }
     fn page_buttons(&self){
-        let visible=!self.paths.is_empty();
+        let visible=!self.paths.is_empty() || (self.awaiting_page && unsafe{SendMessageW(self.list,LVM_GETITEMCOUNT,None,None)}.0>0);
         if ((unsafe{GetWindowLongW(self.list,GWL_STYLE)} as u32 & WS_VISIBLE.0)!=0)!=visible{
             let _=unsafe{ShowWindow(self.list,if visible{SW_SHOWNA}else{SW_HIDE})};
         }
@@ -358,7 +371,13 @@ unsafe extern "system" fn procedure(hwnd:HWND,msg:u32,wp:WPARAM,lp:LPARAM)->LRES
         WM_APPPLUS_SCROLL=>state.scroll_info(wp.0 as u32,lp.0 as i32),
         WM_CTLCOLOREDIT|WM_CTLCOLORSTATIC=>{let dc=HDC(wp.0 as*mut _);unsafe{SetTextColor(dc,rgb(state.palette.text));SetBkColor(dc,rgb(state.palette.input_focused));}return LRESULT(state.input_brush.0 as isize);},
         WM_CTLCOLORLISTBOX=>return LRESULT(state.input_brush.0 as isize),
-        WM_PAINT=>{let mut ps=PAINTSTRUCT::default();let dc=unsafe{BeginPaint(hwnd,&mut ps)};state.paint(dc);unsafe{EndPaint(hwnd,&ps);}},
+        WM_PAINT=>{let mut ps=PAINTSTRUCT::default();let dc=unsafe{BeginPaint(hwnd,&mut ps)};let band=windows_sys::Win32::Foundation::RECT{left:ps.rcPaint.left,top:ps.rcPaint.top,right:ps.rcPaint.right,bottom:ps.rcPaint.bottom};
+            if state.kind==Kind::Search {
+                let buffer=unsafe{zsui::WindowsBufferedPaint::begin(dc.0,&band)};
+                state.paint(buffer.as_ref().map_or(dc,|b|HDC(b.hdc())));
+                drop(buffer);
+            }else{state.paint(dc);}
+            unsafe{EndPaint(hwnd,&ps);}},
         WM_PRINTCLIENT=>{state.paint(HDC(wp.0 as*mut _));return LRESULT(0);},
         result_menu::BACKGROUND if state.kind==Kind::Search=>{
             let profile=state.profile.clone();let dark=state.palette.mode==Mode::Dark;
@@ -485,7 +504,7 @@ unsafe extern "system" fn procedure(hwnd:HWND,msg:u32,wp:WPARAM,lp:LPARAM)->LRES
         WM_APPPLUS_OPEN=>state.open_selected(wp.0!=0),
         _=>{drop(state);return unsafe{DefWindowProcW(hwnd,msg,wp,lp)};},
     }
-    if !matches!(msg,WM_PAINT|WM_ERASEBKGND){let _=unsafe{InvalidateRect(Some(hwnd),None,false)};if !state.list.0.is_null(){let _=unsafe{InvalidateRect(Some(state.list),None,false)};}if !state.action.0.is_null(){let _=unsafe{InvalidateRect(Some(state.action),None,false)};}}
+    if !matches!(msg,WM_PAINT|WM_ERASEBKGND){let _=unsafe{InvalidateRect(Some(hwnd),None,false)};if state.kind!=Kind::Search && !state.list.0.is_null(){let _=unsafe{InvalidateRect(Some(state.list),None,false)};}if state.kind!=Kind::Search && !state.action.0.is_null(){let _=unsafe{InvalidateRect(Some(state.action),None,false)};}}
     drop(state);
     if unsafe{RemovePropW(hwnd,w!("ZSDesk.Utility.ClosePending"))}.is_ok_and(|value|!value.0.is_null()){let _=unsafe{PostMessageW(Some(hwnd),WM_CLOSE,WPARAM(0),LPARAM(0))};}
     LRESULT(0)

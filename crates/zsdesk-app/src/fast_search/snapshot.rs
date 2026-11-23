@@ -3,13 +3,13 @@ use std::{fs::{self,File,OpenOptions},io::{self,Read,Write,BufReader,BufWriter},
 use anyhow::{Result,ensure,Context};
 use sha2::{Digest,Sha256};
 use super::metadata::{Index,Names,Attributes,VolumeIndex,MAX_ROWS};
-const LEGACY_MAGIC:&[u8;8]=b"ZSDIDX01";
-const MAGIC:&[u8;8]=b"ZSDIDX02";
+pub(super) const LEGACY_MAGIC:&[u8;8]=b"ZSDIDX01";
+pub(super) const MAGIC:&[u8;8]=b"ZSDIDX02";
 // Increment when the built-in exclusion policy changes without a format change.
 const FILTER_REVISION:u32=1;
 const MAX_BYTES:u64=2*1024*1024*1024;
 pub struct Policy{pub development:bool,pub metadata:bool}
-impl Policy{fn bits(&self)->u32{u32::from(self.development)|(u32::from(self.metadata)<<1)|(FILTER_REVISION<<8)}}
+impl Policy{pub(super) fn bits(&self)->u32{u32::from(self.development)|(u32::from(self.metadata)<<1)|(FILTER_REVISION<<8)}}
 struct HashWriter{file:File,hash:Sha256,bytes:u64}
 impl Write for HashWriter{
     fn write(&mut self,bytes:&[u8])->io::Result<usize>{if self.bytes+bytes.len()as u64>MAX_BYTES{return Err(io::Error::other("索引快照超过 2 GiB 容量"));}
@@ -127,6 +127,34 @@ pub fn load(path:&Path,policy:&Policy,cancel:&impl Fn()->bool)->Result<Vec<Volum
 
 #[cfg(test)]mod tests{
     use super::*;
+    #[test]
+    fn mapped_legacy_spelling_and_atomic_replacement()->Result<()>{
+        use crate::fast_search::{self as search,everything::SearchSort};
+        let dir=std::env::temp_dir().join(format!("zsdesk-legacy-map-{}",std::process::id()));
+        fs::create_dir_all(&dir)?;let path=dir.join("index.zsi");
+        let mut raw=Vec::new();raw.extend_from_slice(LEGACY_MAGIC);
+        let policy=Policy{development:false,metadata:false};scalar(&mut raw,policy.bits())?;scalar(&mut raw,1u32)?;
+        let write=|s:&str|s.encode_utf16().collect::<Vec<_>>();
+        let cancel=||false;
+        column(&mut raw,&write(r"C:\"),&cancel)?;scalar(&mut raw,1u32)?;scalar(&mut raw,0u64)?;scalar(&mut raw,0i64)?;
+        scalar(&mut raw,0u32)?;scalar(&mut raw,0u64)?;column(&mut raw,&[5u64,8,9],&cancel)?;
+        column(&mut raw,&[u32::MAX,0,0],&cancel)?;column(&mut raw,&[0u32,1,2],&cancel)?;
+        bytes(&mut raw,&[1,0,0])?;let mut spell=write("K");spell.push(0xd800);
+        column(&mut raw,&spell,&cancel)?;column(&mut raw,&[0u32,0,1,2],&cancel)?;bytes(&mut raw,"k�".as_bytes())?;
+        column(&mut raw,&[0u32,0,1,4],&cancel)?;raw.extend_from_slice(&Sha256::digest(&raw));fs::write(&path,&raw)?;
+        let options=search::SearchOptions::default();
+        let req=search::Request{generation:1,query:"*".into(),preferred:None,invalid:None,offset:0,limit:10,sort:SearchSort::NameAsc};
+        for _ in 0..2{
+            search::mapped::prime(&path,&options,&cancel);
+            let page=search::mapped::search(&path,&options,&req,&cancel)?;
+            assert_eq!(page.total,2);assert_eq!(page.paths[0],Path::new(r"C:\K"));
+            assert_eq!(page.paths[1].file_name().unwrap().encode_wide().collect::<Vec<_>>(),[0xd800]);
+            let volumes=load(&path,&policy,&cancel)?;save(&path,&policy,&volumes,&cancel)?;
+        }
+        let mut damaged=fs::read(&path)?;damaged[20]^=1;fs::write(&path,damaged)?;
+        assert!(search::mapped::search(&path,&options,&req,&cancel).is_err());
+        search::mapped::invalidate(&path);fs::remove_file(path)?;fs::remove_dir(dir)?;Ok(())
+    }
     #[test]
     fn original_spellings_survive_snapshot_and_incremental_updates()->Result<()>{
         let root=std::env::temp_dir().join(format!("zsdesk-original-spellings-{}",std::process::id()));

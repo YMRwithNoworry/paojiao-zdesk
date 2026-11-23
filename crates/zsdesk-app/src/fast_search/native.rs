@@ -27,12 +27,16 @@ fn lock<'a>(core:&'a Core,shared:&Shared)->Result<MutexGuard<'a,Store>>{
 }
 pub(super) fn invalidate(core:&Core){if let Ok(mut store)=core.lock(){store.volumes=None;store.force=true;store.dirty=false;store.backoff.clear();store.last_use=Instant::now();}}
 pub(super) fn refresh(core:&Core){if let Ok(mut store)=core.lock(){store.last_check=Instant::now()-DIRECTORY_REFRESH;store.backoff.clear();store.last_use=Instant::now();}}
+pub(super) fn can_read_snapshot(core:&Core)->bool{
+    core.try_lock().is_ok_and(|store|store.volumes.is_none()&&!store.force)
+}
 pub(super) fn pending(core:&Core)->bool{core.try_lock().is_ok_and(|store|store.pending)}
 pub(super) fn persist(core:&Core){if let Ok(mut store)=core.try_lock(){if store.dirty{if let Err(error)=store.save(&||false){crate::window::diagnostics::record("search",&format!("native-snapshot-save-failed: {error:#}"),None);}}}}
-pub(super) fn evict_if_idle(core:&Core,seconds:u32){
+pub(super) fn evict_if_idle(core:&Core,seconds:u32){evict(core,seconds,&||false);}
+pub(super) fn evict(core:&Core,seconds:u32,cancel:&impl Fn()->bool){
     let Ok(mut store)=core.try_lock()else{return;};if store.volumes.is_none()||store.last_use.elapsed()<Duration::from_secs(u64::from(seconds)){return;}
     if store.save_retry.is_some_and(|at|Instant::now()<at){return;}
-    if store.dirty{if let Err(error)=store.save(&||false){store.save_retry=Some(Instant::now()+FAILED_BUILD_RETRY);crate::window::diagnostics::record("search",&format!("native-snapshot-save-failed: {error:#}"),None);return;}}
+    if store.dirty{if let Err(error)=store.save(cancel){if cancel(){store.snapshot_warning=None;return;}store.save_retry=Some(Instant::now()+FAILED_BUILD_RETRY);crate::window::diagnostics::record("search",&format!("native-snapshot-save-failed: {error:#}"),None);return;}}
     store.volumes=None;store.dirty=false;store.pending=false;
 }
 #[cfg(test)]pub(super) fn set_idle_for_test(core:&Core,age:Duration)->Instant{
@@ -49,6 +53,7 @@ pub(super) fn diagnostics()->serde_json::Value{
         Err(_)=>serde_json::json!({"busy":true}),
     }).collect())
 }
+#[cfg(test)]
 pub(super) fn warm_existing(core:&Core,options:&SearchOptions,shared:&Shared) {
     let Ok(mut store)=lock(core,shared) else {return;};
     if store.volumes.is_some(){store.last_use=Instant::now();return;}
@@ -71,7 +76,7 @@ impl Store{
     fn save_inner(&mut self,cancel:&impl Fn()->bool)->Result<()>{
         let Some(volumes)=self.volumes.as_mut()else{return Ok(());};let Some((development,metadata))=self.policy else{return Ok(());};
         for volume in volumes.iter_mut(){ensure!(!cancel(),"快照保存已取消");volume.index.compact()?;}
-        snapshot::save(&self.path,&snapshot::Policy{development,metadata},volumes,cancel)?;self.dirty=false;self.save_retry=None;self.last_save=Instant::now();Ok(())
+        snapshot::save(&self.path,&snapshot::Policy{development,metadata},volumes,cancel)?;super::mapped::invalidate(&self.path);self.dirty=false;self.save_retry=None;self.last_save=Instant::now();Ok(())
     }
     fn prepare(&mut self,options:&SearchOptions,roots:Option<&[PathBuf]>,shared:&Shared,sender:&SyncSender<SearchEvent>,load_only:bool)->Result<()>{
         let generation=shared.generation.load(Ordering::Acquire);let signature=(options.include_development,options.index_metadata);
@@ -79,9 +84,9 @@ impl Store{
         let cold=self.volumes.is_none();
         if cold&&!self.force{
             if self.path.is_file(){progress(shared,sender,&self.path,0,IndexPhase::Snapshot,false);}
-            match snapshot::load(&self.path,&policy(options),&||shared.cancelled()){
+            match snapshot::load(&self.path,&policy(options),&||shared.cancelled()||!shared.current(generation)){
                 Ok(volumes)=>self.volumes=Some(volumes),
-                Err(error)=>{if shared.cancelled(){return Err(error);}if self.path.is_file(){crate::window::diagnostics::record("search",&format!("native-snapshot-load-failed: {error:#}"),None);}}
+                Err(error)=>{if shared.cancelled()||!shared.current(generation){return Err(error);}if self.path.is_file(){crate::window::diagnostics::record("search",&format!("native-snapshot-load-failed: {error:#}"),None);}}
             }self.last_save=Instant::now();
         }
         if load_only&&!self.force&&self.volumes.as_ref().is_some_and(|volumes|!volumes.is_empty()){
@@ -320,6 +325,7 @@ fn execute_inner(core:&Core,options:&SearchOptions,roots:Option<&[PathBuf]>,shar
             }
             if probe==1 || (probe==3&&!index.path(&volume.root,row).is_some_and(|path|
                 query.matches(index.names.folded(id),dir,&path.to_string_lossy().to_lowercase()))){continue;}
+            #[cfg(test)]super::runtime_regression::observe_hit(which,row as usize);
             total+=1;
             let value=match request.sort{
                 everything::SearchSort::NameAsc|everything::SearchSort::NameDesc=>0,
@@ -393,7 +399,7 @@ fn compare_rows(volumes:&[VolumeIndex],sort:everything::SearchSort,a:&RankedRow,
     }
 }
 fn decode(hit:u64)->(usize,usize){((hit>>32)as usize,(hit as u32)as usize)}
-fn select_page<T>(values:&mut[T],begin:usize,end:usize,mut compare:impl FnMut(&T,&T)->std::cmp::Ordering){
+pub(super) fn select_page<T>(values:&mut[T],begin:usize,end:usize,mut compare:impl FnMut(&T,&T)->std::cmp::Ordering){
     if begin==end{return;}if end<values.len(){values.select_nth_unstable_by(end,|a,b|compare(a,b));}
     if begin>0{values[..end].select_nth_unstable_by(begin,|a,b|compare(a,b));}values[begin..end].sort_unstable_by(compare);
 }

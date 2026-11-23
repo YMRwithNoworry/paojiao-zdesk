@@ -305,11 +305,11 @@ impl ChromeLayout {
         let button_h = caption.map_or(s(STRIP_H), |r| r.height);
         let button_y = caption.map_or(0, |r| r.y);
         let caption_left = caption.map_or(width - input.caption_width.max(0), |r| r.x).clamp(0, width);
-        let right_edge = (caption_left - s(4)).max(0);
+        let right_edge = caption_left;
         if right_edge >= button {
             layout.app_menu = Rect::clamped(right_edge - button, button_y, button, button_h);
-            if input.show_tab_list && layout.app_menu.x >= button + s(2) {
-                layout.tab_list = Rect::clamped(layout.app_menu.x - s(2) - button, button_y, button, button_h);
+            if input.show_tab_list && layout.app_menu.x >= button {
+                layout.tab_list = Rect::clamped(layout.app_menu.x - button, button_y, button, button_h);
             }
         }
         let drag_space = s(40);
@@ -940,8 +940,11 @@ mod tests {
                 assert_eq!(rect.y, caption.y);
                 assert_eq!(rect.height, caption.height);
                 assert_eq!(rect.y * 2 + rect.height, caption.y * 2 + caption.height);
-                assert!(rect.right() < caption.x);
+                assert!(rect.right() <= caption.x);
+                assert_eq!(rect.width,caption.width);
             }
+            assert_eq!(l.tab_list.right(),l.app_menu.x);
+            assert_eq!(l.app_menu.right(),caption.x);
         }
     }
 

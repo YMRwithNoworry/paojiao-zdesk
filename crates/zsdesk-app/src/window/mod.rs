@@ -950,6 +950,19 @@ fn caption_rects(hwnd:HWND)->Option<[LayoutRect;3]>{
     if client.right<=0{return None;}
     let dpi=unsafe{GetDpiForWindow(hwnd)}.max(96);
     if !window_actions::fullscreen(hwnd){
+        // DWM's group bounds can include the invisible resize frame. Use the
+        // actual minimize/maximize/close rectangles when Windows supplies them.
+        let mut info = TITLEBARINFOEX { cbSize: std::mem::size_of::<TITLEBARINFOEX>() as u32, ..Default::default() };
+        unsafe { DefWindowProcW(hwnd, WM_GETTITLEBARINFOEX, WPARAM(0), LPARAM(&mut info as *mut _ as isize)); }
+        let mut origin = POINT::default();
+        if unsafe { ClientToScreen(hwnd,&mut origin) }.as_bool() {
+            let rects=[2,3,5].map(|i| {let r=info.rgrect[i];LayoutRect::new(r.left-origin.x,(r.top-origin.y).max(0),r.right-r.left,r.bottom-r.top)});
+            let [min,max,close]=rects;
+            if min.x>=0 && min.width>0 && min.height>0 && max.width>0 && close.width>0 &&
+                min.right().abs_diff(max.x)<=1 && max.right().abs_diff(close.x)<=1 && close.x<client.right {
+                return Some(rects);
+            }
+        }
         if let Some(bounds)=theme::caption_button_bounds(hwnd){
             let mut window=RECT::default();unsafe{GetWindowRect(hwnd,&mut window)}.ok()?;
             let mut origin=POINT::default();unsafe{ClientToScreen(hwnd,&mut origin)}.ok().ok()?;
