@@ -1119,6 +1119,13 @@ impl IContextMenu_Impl for Compact_Impl {
             return unsafe{ctx.GetCommandString(offset-OPEN_WITH_FIRST as usize,kind,Some(reserved),target,count)};
         }
         if (SYSTEM_START as usize..RESERVED as usize).contains(&offset) {
+            // The system ZIP command has a stable canonical identity irrespective of display language.
+            let command = self.sys_nodes.borrow().get(offset - SYSTEM_START as usize).cloned();
+            let is_zip = command.and_then(|node| unsafe { node.GetCanonicalName() }.ok())
+                == Some(GUID::from_u128(0x888dca60_fc0a_11cf_8f0f_00c04fd7d062));
+            if is_zip && matches!(kind, GCS_VERBA | GCS_VERBW) {
+                return unsafe { super::packaged_overlay::write_command_text(target,count,"zsdesk.compresszip",kind == GCS_VERBW) };
+            }
             return Err(Error::from_hresult(windows::Win32::Foundation::E_NOTIMPL));
         }
         let id = self.first.get().saturating_add(offset as u32);

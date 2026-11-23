@@ -316,7 +316,7 @@ pub fn run(profile:PathBuf,args:Vec<OsString>)->Result<()>{
         // COM/TLS finalizers can still need the first STA after component code
         // returns. Keep pumping while the OS thread finishes; never block it.
         if shutting_down{crate::context_menu_process::shutdown_idle_worker();}
-        let retiring_menus=crate::desktop::pending_menu_threads()+zsdesk_windows::shell::file_transfer::pending_operations()+crate::context_menu_process::pending_workers()+zsdesk_windows::shell::pending_packaged_state_workers()
+        let retiring_menus=crate::window::archive_actions::pending_operations()+crate::desktop::pending_menu_threads()+zsdesk_windows::shell::file_transfer::pending_operations()+crate::context_menu_process::pending_workers()+zsdesk_windows::shell::pending_packaged_state_workers()
             +if shutting_down{crate::fast_search::pending_workers()}else{0};
         unsafe{if workers.iter().any(|worker|worker.ending)||pool.iter().any(|worker|worker.ending)||retiring_menus>0{SetTimer(Some(hwnd),1,25,None);}else{let _=KillTimer(Some(hwnd),1);}}
         status(&profile,&workers,&pool,queued.len(),last_error.as_deref(),&mut previous_status);

@@ -171,6 +171,7 @@ impl WindowState {
         if self.queued.is_none() && self.shown_tab!=Some(self.session.active_tab().id) {
             self.queued=Some(NavigationRequest::new(self.session.active_tab().clone()));
         }
+        self.publish_listary_folder();
         self.save();
         unsafe {self.rebuild_tabs();}
         if self.queued.is_none() {

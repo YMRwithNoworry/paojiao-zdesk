@@ -21,6 +21,16 @@ pub(super) fn sync_column_header(view:&IFolderView2)->windows::core::Result<()>{
     Ok(())
 }
 
+fn layout_columns(shell: &IShellView) -> Vec<ViewColumn> {
+    let mut columns = shell.cast::<IColumnManager>().ok().and_then(|manager| read_columns(&manager)).unwrap_or_default();
+    for column in &mut columns {
+        if let Some(key) = decode_key(&column.key) {
+            column.key = encode_key(super::folder_totals::logical_column_key(shell, key));
+        }
+    }
+    columns
+}
+
 /// View-only settings for an isolated background menu; no selection or paths.
 pub fn capture_view_layout(shell:&IShellView)->Option<ShellViewState> {
     let view:IFolderView2=shell.cast().ok()?;
@@ -30,6 +40,12 @@ pub fn capture_view_layout(shell:&IShellView)->Option<ShellViewState> {
         sort_columns:super::folder_totals::base_sort_columns(shell,read_sort_columns(&view).unwrap_or_default()).into_iter().map(|column|ViewSortColumn{key:encode_key(super::folder_totals::logical_sort_key(shell,column.propkey)),ascending:column.direction==SORT_ASCENDING}).collect(),
         grouping:read_grouping(&view).map(|(key,ascending)|ViewGrouping{key:(key!=NULL_KEY).then(||encode_key(super::folder_totals::logical_sort_key(shell,key))),ascending}),
         ..Default::default()})
+}
+pub fn capture_background_layout(shell: &IShellView) -> Option<ShellViewState> {
+    let mut layout = capture_view_layout(shell)?;
+    layout.columns = layout_columns(shell);
+    if !layout.columns.is_empty() { layout.column_dpi = view_dpi(shell); }
+    Some(layout)
 }
 /// Restores menu-controlled layout without clearing selection or moving focus.
 pub fn restore_view_layout(shell:&IShellView,state:&ShellViewState) {
@@ -126,8 +142,7 @@ impl ExplorerBrowserHost {
         let first_visible=if visible_status==HRESULT(0) && visible_index>=0 {unsafe {item_bytes(&view,visible_index)}}else{None};
         let sort_columns=super::folder_totals::base_sort_columns(&shell,read_sort_columns(&view).unwrap_or_default()).into_iter()
             .map(|column|ViewSortColumn{key:encode_key(super::folder_totals::logical_sort_key(&shell,column.propkey)),ascending:column.direction==SORT_ASCENDING}).collect();
-        let mut columns=shell.cast::<IColumnManager>().ok().and_then(|manager|read_columns(&manager)).unwrap_or_default();
-        for column in &mut columns{if let Some(key)=decode_key(&column.key){column.key=encode_key(super::folder_totals::logical_column_key(&shell,key));}}
+        let columns=layout_columns(&shell);
         let grouping=read_grouping(&view).map(|(key,ascending)|ViewGrouping{
             key:(key!=NULL_KEY).then(||encode_key(super::folder_totals::logical_sort_key(&shell,key))),ascending});
         let column_dpi=if columns.is_empty(){0}else{view_dpi(&shell)};

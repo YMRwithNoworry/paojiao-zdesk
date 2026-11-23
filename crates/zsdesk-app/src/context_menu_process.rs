@@ -435,7 +435,9 @@ impl Client{
                     &&idle.within_lifetime(Duration::from_secs(2));
                 // The child retains its own STA; changing the parent window
                 // sends a fresh serialized request, never a COM interface.
-                let index=pool.iter().position(|idle|idle.thread==thread&&compatible(idle))
+                let style_matches=|idle:&IdleWorker| compatible(idle) && idle.prepared_drawn == options.drawn;
+                let index=pool.iter().position(|idle|idle.thread==thread && style_matches(idle))
+                    .or_else(||pool.iter().position(style_matches))
                     .or_else(||pool.iter().position(compatible));
                 index.map(|index|pool.swap_remove(index))};
             let Some(idle)=cached else{break;};
@@ -1008,7 +1010,7 @@ fn run_request(path:&Path,request:Request,events:&EventSet,com_us:u64,fault_repo
             }else{None};
         state.status.timing.background_view_reused=is_background&&background_view.is_some()&&background_view::reused();
         if is_background{if let (Some(host),Some(layout))=(&background_view,&request.layout){zsdesk_windows::shell::restore_view_layout(&host.view,layout);}}
-        let initial_layout=background_view.as_ref().filter(|_|is_background).and_then(|host|zsdesk_windows::shell::capture_view_layout(&host.view));
+        let initial_layout=background_view.as_ref().filter(|_|is_background).and_then(|host|zsdesk_windows::shell::capture_background_layout(&host.view));
         let full_context=matches!(request.mode,Mode::More|Mode::Background|Mode::CatalogSelection|Mode::CatalogBackground);
         let classic_gesture=request.extended&&!request.view_context.as_ref().is_some_and(|context|context.keyboard&&context.f10);
         let packaged=full_context&&(effective_options.drawn||!effective_options.modern||classic_gesture||matches!(request.mode,Mode::CatalogSelection|Mode::CatalogBackground));
@@ -1102,13 +1104,20 @@ fn run_request(path:&Path,request:Request,events:&EventSet,com_us:u64,fault_repo
             else if let Some(host)=&background_view{menu.track_selected_in_view_before(window,point,&request.pidls,&host.browser,
                 MenuInterceptions{rename:request.rename,open:request.open,file_actions},&mut||state.allow(true))?}
             else{menu.track_selected_before(window,point,&request.pidls,0,MenuInterceptions{rename:request.rename,open:request.open,file_actions},&mut||state.allow(true))?};
+        if outcome == MenuOutcome::CompressZip {
+            state.allow(true)?;
+            let paths = zsdesk_windows::shell::file_transfer::paths_from_pidls(&request.pidls)?;
+            let path = zsdesk_windows::archive::compress_zip(&paths)?;
+            state.status.created.push(zsdesk_windows::shell::new_menu::CreatedItem { path, rename:false });
+            return Ok(MenuOutcome::ShellInvoked);
+        }
         if matches!(outcome,MenuOutcome::ShellInvoked|MenuOutcome::NativeHandled){
             pump(150);
             // ShellNew can open a modeless shortcut/template wizard. Its site
             // must remain alive until the wizard finishes its create callback.
-            if creation.is_some(){while process_visible_windows(std::process::id(),window){pump(50);}}
+            if creation.is_some() || is_background {while process_visible_windows(std::process::id(),window){pump(50);}}
             if let Some(creation)=&creation{state.status.created=creation.take();}
-            let layout=background_view.as_ref().filter(|_|is_background).and_then(|host|zsdesk_windows::shell::capture_view_layout(&host.view));
+            let layout=background_view.as_ref().filter(|_|is_background).and_then(|host|zsdesk_windows::shell::capture_background_layout(&host.view));
             if layout!=initial_layout{
                 state.status.layout_sort_changed=layout.as_ref().zip(initial_layout.as_ref()).is_some_and(|(after,before)|after.sort_columns!=before.sort_columns);
                 state.status.layout=layout;

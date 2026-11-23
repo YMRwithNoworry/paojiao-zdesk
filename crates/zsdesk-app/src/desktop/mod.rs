@@ -174,6 +174,7 @@ thread_local! {
     static ALLOW_Z: Cell<bool> = const { Cell::new(false) };
     static LAYER_EVENTS: RefCell<std::collections::VecDeque<(u64, HWND, u32, u32)>> = const { RefCell::new(std::collections::VecDeque::new()) };
     static NEXT_LAYER_EVENT: Cell<u64> = const { Cell::new(1) };
+    static RAISE_CANDIDATE: Cell<Option<(isize,std::time::Instant)>> = const { Cell::new(None) };
     static LAYER_SETTLE_UNTIL: Cell<Option<std::time::Instant>> = const { Cell::new(None) };
     static MENU_WORKER: RefCell<Option<menu_worker::Worker>> = const { RefCell::new(None) };
     static DEFERRED_QUIT: Cell<bool> = const { Cell::new(false) };
@@ -233,7 +234,13 @@ fn settle_layer(host:HWND){
     LAYER_SETTLE_UNTIL.with(|until|until.set(Some(std::time::Instant::now()+std::time::Duration::from_millis(800))));
     unsafe{SetTimer(Some(host),TIMER_REPAIR_LAYER,100,None);}
 }
-pub(super) fn schedule_desktop_raise(host:HWND){unsafe{SetTimer(Some(host),TIMER_RAISE,180,None);}}
+fn observe_desktop_foreground(host: HWND, window: HWND) {
+    let _ = unsafe { KillTimer(Some(host), TIMER_RAISE) };
+    let desktop = unsafe { GetForegroundWindow() } == window
+        && matches!(class_name(window).as_str(), "WorkerW" | "Progman");
+    RAISE_CANDIDATE.with(|candidate| candidate.set(desktop.then(|| (window.0 as isize, std::time::Instant::now()))));
+    if desktop { unsafe { SetTimer(Some(host), TIMER_RAISE, 180, None); } }
+}
 
 struct MenuLayerRepair;
 impl Drop for MenuLayerRepair { fn drop(&mut self) { request_layer_repair(); } }
@@ -297,7 +304,8 @@ fn forward(key: &[u16], command: &DesktopCommand) -> Result<()> {
             if unsafe { GetPropW(hwnd, PCWSTR(key.as_ptr())) }.0 as usize != 1 { continue; }
             let data = COPYDATASTRUCT { dwData: DESKTOP_MAGIC, cbData: bytes.len() as u32, lpData: bytes.as_ptr() as *mut _ };
             let mut result = 0;
-            unsafe { SendMessageTimeoutW(hwnd, WM_COPYDATA, WPARAM(0), LPARAM(&data as *const COPYDATASTRUCT as isize), SMTO_ABORTIFHUNG, 3000, Some(&mut result)) };
+            let sent = unsafe { SendMessageTimeoutW(hwnd, WM_COPYDATA, WPARAM(0), LPARAM(&data as *const COPYDATASTRUCT as isize), SMTO_ABORTIFHUNG, 3000, Some(&mut result)) };
+            anyhow::ensure!(sent.0 != 0 && result == 1, "{}", zsdesk_core::i18n::text("桌面格子未确认接收命令"));
             return Ok(());
         }
         std::thread::sleep(std::time::Duration::from_millis(60));
@@ -306,6 +314,7 @@ fn forward(key: &[u16], command: &DesktopCommand) -> Result<()> {
 }
 
 fn run_host(config_path: PathBuf, explorer_config: PathBuf, command: DesktopCommand, key: &[u16]) -> Result<()> {
+    let config = host::load_config(&config_path).with_context(|| format!("无法读取桌面格子布局 {}", config_path.display()))?;
     if let Ok(session)=crate::storage::load(&explorer_config){crate::context_preferences::register(&explorer_config,&session.ui.context_menu);}
     let instance = HINSTANCE(unsafe { GetModuleHandleW(None)? }.0);
     let host_class = wide(HOST_CLASS);
@@ -320,7 +329,6 @@ fn run_host(config_path: PathBuf, explorer_config: PathBuf, command: DesktopComm
     HOST_HWND.with(|h| h.set(hwnd.0 as isize));
     let (family, _) = zsdesk_windows::gfx::system_ui_font(None);
     let gfx = Gfx::new(&family).context(zsdesk_core::i18n::text("Direct2D 初始化失败"))?;
-    let config = host::load_config(&config_path);
     HOST.with(|h| *h.borrow_mut() = Some(DesktopHost::new(hwnd, config_path, explorer_config, config, gfx)));
     with_host(|h| h.start());
     let _clipboard=clipboard::Listener::new(hwnd).ok();
@@ -330,6 +338,7 @@ fn run_host(config_path: PathBuf, explorer_config: PathBuf, command: DesktopComm
     let layer_hooks=[(EVENT_OBJECT_SHOW,EVENT_OBJECT_HIDE),(EVENT_OBJECT_REORDER,EVENT_OBJECT_REORDER),
         (EVENT_SYSTEM_MINIMIZESTART,EVENT_SYSTEM_MINIMIZEEND),(EVENT_OBJECT_CLOAKED,EVENT_OBJECT_UNCLOAKED)]
         .map(|(first,last)|unsafe{windows::Win32::UI::Accessibility::SetWinEventHook(first,last,None,Some(layer_window_hook),0,0,WINEVENT_OUTOFCONTEXT)});
+    observe_desktop_foreground(hwnd, unsafe { GetForegroundWindow() });
     execute(command);
     let mut msg = MSG::default();
     while unsafe { GetMessageW(&mut msg, None, 0, 0) }.0 > 0 {
@@ -340,6 +349,7 @@ fn run_host(config_path: PathBuf, explorer_config: PathBuf, command: DesktopComm
     external_drop::shutdown();
     if !foreground.is_invalid() { let _ = unsafe { windows::Win32::UI::Accessibility::UnhookWinEvent(foreground) }; }
     for hook in layer_hooks{if !hook.is_invalid(){let _=unsafe{windows::Win32::UI::Accessibility::UnhookWinEvent(hook)};}}
+    RAISE_CANDIDATE.with(|candidate|candidate.set(None));
     LAYER_SETTLE_UNTIL.with(|until|until.set(None));
     if let Some(mut host) = HOST.with(|h| h.borrow_mut().take()) { host.shutdown(); }
     let menu = MENU_WORKER.with(|worker| worker.borrow_mut().take());
@@ -398,7 +408,7 @@ pub fn guard(config_path: PathBuf, pid: u32, desktop_thread: Option<u32>) -> Res
     let waited=unsafe { WaitForMultipleObjects(&handles, false, INFINITE) }.0;
     anyhow::ensure!((waited as usize)<handles.len(), "{}", zsdesk_core::tr_format!("桌面监护等待失败：{waited:#x}" , waited=waited));
     drop(thread);drop(process);
-    let mut config = host::load_config(&config_path);
+    let mut config = host::load_config(&config_path)?;
     if config.settings.icons_hidden_by_zsdesk {
         unsafe { OleInitialize(None)?; }
         let restored=desktop::set_icons_visible(true);
@@ -440,9 +450,11 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             let data = unsafe { &*(lp.0 as *const COPYDATASTRUCT) };
             if data.dwData != DESKTOP_MAGIC || data.cbData > 65536 || data.lpData.is_null() { return LRESULT(0); }
             let bytes = unsafe { std::slice::from_raw_parts(data.lpData.cast::<u8>(), data.cbData as usize) };
-            if let Ok(command) = serde_json::from_slice::<DesktopCommand>(bytes) {
-                let payload = Box::into_raw(Box::new(command));
-                if unsafe { PostMessageW(Some(hwnd), WM_COMMAND_REQUEST, WPARAM(0), LPARAM(payload as isize)) }.is_err() { unsafe { drop(Box::from_raw(payload)); } }
+            let Ok(command) = serde_json::from_slice::<DesktopCommand>(bytes) else { return LRESULT(0) };
+            let payload = Box::into_raw(Box::new(command));
+            if unsafe { PostMessageW(Some(hwnd), WM_COMMAND_REQUEST, WPARAM(0), LPARAM(payload as isize)) }.is_err() {
+                unsafe { drop(Box::from_raw(payload)); }
+                return LRESULT(0);
             }
             return LRESULT(1);
         }
@@ -469,9 +481,13 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             return LRESULT(0);
         }
         WM_TIMER if wp.0 == TIMER_RAISE => {
-            let _ = unsafe { KillTimer(Some(hwnd), TIMER_RAISE) };
             let window = unsafe { GetForegroundWindow() };
-            if matches!(class_name(window).as_str(), "WorkerW" | "Progman") { with_host(|h| h.raise_above(window)); }
+            if let Some((expected, since)) = RAISE_CANDIDATE.with(Cell::get) {
+                if window.0 as isize == expected && (since.elapsed() < std::time::Duration::from_millis(180)
+                    || with_host(|host| host.raise_above(window)).is_none()) { return LRESULT(0); }
+            }
+            RAISE_CANDIDATE.with(|candidate| candidate.set(None));
+            let _ = unsafe { KillTimer(Some(hwnd), TIMER_RAISE) };
             return LRESULT(0);
         }
         WM_TIMER if wp.0 == TIMER_FOREGROUND => { flush_foreground(hwnd); return LRESULT(0); }
@@ -513,13 +529,9 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
         }
         WM_FOREGROUND => {
             let window = HWND(lp.0 as *mut _);
-            let class = class_name(window);
+            observe_desktop_foreground(hwnd, window);
             queue_foreground(hwnd,window);
             settle_layer(hwnd);
-            if class == "WorkerW" || class == "Progman" {
-                // "显示桌面" may finish raising its WorkerW after the event: raise again shortly.
-                unsafe { SetTimer(Some(hwnd), TIMER_RAISE, 180, None); }
-            }
             return LRESULT(0);
         }
         crate::language::CHANGED=>{with_host(|host|host.render_all());return LRESULT(0);}

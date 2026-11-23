@@ -158,7 +158,7 @@ extern "C" { fn zs_menu_shared_host(enabled:i32); fn zs_menu_set_working_directo
 const CMIC_MASK_UNICODE: u32 = 0x4000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum MenuOutcome { Dismissed, Application(u32), Rename, Open, Explore, ShellInvoked, NativeHandled, Copy, Cut, Paste, PinInExplorer, ChooseApplication, Share, Delete{permanent:bool} }
+pub enum MenuOutcome { Dismissed, Application(u32), Rename, Open, Explore, ShellInvoked, NativeHandled, CompressZip, Copy, Cut, Paste, PinInExplorer, ChooseApplication, Share, Delete{permanent:bool} }
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct MenuInterceptions { pub rename: bool, pub open: bool, pub file_actions:bool }
@@ -179,6 +179,7 @@ fn application_ids(count: usize) -> Result<Vec<u32>> {
 }
 fn intercepted_verb(verb: Option<&str>, intercept: MenuInterceptions,shift:bool) -> Option<MenuOutcome> {
     match verb {
+        Some(verb) if intercept.file_actions && verb == "zsdesk.compresszip" => Some(MenuOutcome::CompressZip),
         Some(verb) if intercept.rename && verb.eq_ignore_ascii_case("rename") => Some(MenuOutcome::Rename),
         Some(verb) if intercept.open && verb.eq_ignore_ascii_case("open") => Some(MenuOutcome::Open),
         Some(verb) if intercept.open && verb.eq_ignore_ascii_case("explore") => Some(MenuOutcome::Explore),

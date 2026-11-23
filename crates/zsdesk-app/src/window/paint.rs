@@ -323,6 +323,7 @@ impl WindowState {
         for (id, rect) in &l.commands {
             let enabled = match id {
                 CommandId::Cut | CommandId::Copy | CommandId::Rename | CommandId::Delete | CommandId::Share => selected,
+                CommandId::ExtractHere => selected && self.current_location().as_path().is_some(),
                 CommandId::Paste => can_paste,
                 _ => true,
             };
@@ -333,7 +334,7 @@ impl WindowState {
             let color = if enabled { c(p.text) } else { c(p.text_disabled) };
             let r = rf(*rect);
             let g = match id {
-                CommandId::NewFolder => "\u{E8F4}",
+                CommandId::ExtractHere => "\u{E8B7}", CommandId::NewFolder => "\u{E8F4}",
                 CommandId::New => glyph::ADD, CommandId::Cut => glyph::CUT, CommandId::Copy => glyph::COPY,
                 CommandId::Paste => glyph::PASTE, CommandId::Rename => glyph::RENAME, CommandId::Share => glyph::SHARE,
                 CommandId::Delete => glyph::DELETE, CommandId::Sort => glyph::SORT, CommandId::View => glyph::VIEW,

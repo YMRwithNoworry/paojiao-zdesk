@@ -36,12 +36,12 @@ pub fn scale(value: i32, dpi: u32) -> i32 {
 
 /// Command bar entries, left to right.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum CommandId { New, NewFolder, Cut, Copy, Paste, Rename, Share, Delete, Sort, View, More, PreviewPane, DetailsPane }
+pub enum CommandId { New, NewFolder, Cut, Copy, Paste, Rename, Share, Delete, ExtractHere, Sort, View, More, PreviewPane, DetailsPane }
 
 impl CommandId {
     pub const fn preference(self) -> CommandBarItem {
         match self {
-            Self::New => CommandBarItem::New, Self::NewFolder => CommandBarItem::NewFolder, Self::Cut => CommandBarItem::Cut, Self::Copy => CommandBarItem::Copy,
+            Self::ExtractHere => CommandBarItem::ExtractHere, Self::New => CommandBarItem::New, Self::NewFolder => CommandBarItem::NewFolder, Self::Cut => CommandBarItem::Cut, Self::Copy => CommandBarItem::Copy,
             Self::Paste => CommandBarItem::Paste, Self::Rename => CommandBarItem::Rename, Self::Share => CommandBarItem::Share,
             Self::Delete => CommandBarItem::Delete, Self::Sort => CommandBarItem::Sort, Self::View => CommandBarItem::View,
             Self::More => CommandBarItem::More, Self::PreviewPane => CommandBarItem::PreviewPane, Self::DetailsPane => CommandBarItem::DetailsPane,
@@ -50,13 +50,13 @@ impl CommandId {
     /// Label shown next to the icon; icon-only buttons return `None`.
     pub fn label(self) -> Option<&'static str> {
         match self {
-            Self::New => Some("新建"), Self::Sort => Some("排序"), Self::View => Some("查看"),
+            Self::ExtractHere => Some("解压"), Self::New => Some("新建"), Self::Sort => Some("排序"), Self::View => Some("查看"),
             Self::PreviewPane => Some("预览"), Self::DetailsPane => Some("详细信息"), _ => None,
         }.map(zsdesk_core::i18n::text)
     }
     pub fn tooltip(self) -> &'static str {
         zsdesk_core::i18n::text(match self {
-            Self::New => "新建项目", Self::NewFolder => "新建文件夹 (Ctrl+Shift+N)", Self::Cut => "剪切 (Ctrl+X)", Self::Copy => "复制 (Ctrl+C)",
+            Self::ExtractHere => "解压到当前文件夹", Self::New => "新建项目", Self::NewFolder => "新建文件夹 (Ctrl+Shift+N)", Self::Cut => "剪切 (Ctrl+X)", Self::Copy => "复制 (Ctrl+C)",
             Self::Paste => "粘贴 (Ctrl+V)", Self::Rename => "重命名 (F2)", Self::Share => "共享",
             Self::Delete => "删除 (Del)", Self::Sort => "排序方式", Self::View => "布局和视图选项",
             Self::More => "查看更多", Self::PreviewPane => "预览窗格 (Alt+P)", Self::DetailsPane => "详细信息窗格 (Alt+Shift+P)",
@@ -64,14 +64,14 @@ impl CommandId {
     }
     pub const fn has_dropdown(self) -> bool { matches!(self, Self::New | Self::Sort | Self::View) }
     const fn width(self) -> i32 {
-        match self { Self::New | Self::Sort | Self::View => 82, Self::PreviewPane => 72, Self::DetailsPane => 100, _ => 40 }
+        match self { Self::New | Self::Sort | Self::View => 82, Self::PreviewPane | Self::ExtractHere => 72, Self::DetailsPane => 100, _ => 40 }
     }
 }
 
 const COMMAND_GROUPS: &[&[CommandId]] = &[
     &[CommandId::New, CommandId::NewFolder],
     &[CommandId::Cut, CommandId::Copy, CommandId::Paste, CommandId::Rename, CommandId::Share, CommandId::Delete],
-    &[CommandId::Sort, CommandId::View],
+    &[CommandId::ExtractHere, CommandId::Sort, CommandId::View],
     &[CommandId::More],
     &[CommandId::PreviewPane],
 ];

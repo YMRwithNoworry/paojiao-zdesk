@@ -1,4 +1,12 @@
 {
+  "已解压到 {}": "Extracted to {}",
+  "已解压 {completed}/{count} 个压缩包。{error}": "Extracted {completed}/{count} archives. {error}",
+  "已解压 {} 个压缩包": "Extracted {} archives",
+  "桌面格子未确认接收命令": "The desktop host did not acknowledge the command",
+  "解压": "Extract",
+  "解压到当前文件夹": "Extract to current folder",
+  "正在解压…": "Extracting…",
+  "请选择当前文件夹中的压缩包": "Select an archive in the current folder",
   "其他上传方式…": "Other upload options…",
   "选择其他应用": "Choose another app",
   "管理应用扩展…": "Manage app extensions…",

@@ -42,6 +42,7 @@ English UI is available. Non-Chinese Windows systems use English by default. Cho
 | 新窗口 | Ctrl+N |
 | 单击或双击文件夹空白处返回上一级 | 在“预览与操作”中选择，单击返回默认关闭 |
 | 新建文件夹 | 命令栏的文件夹按钮或 Ctrl+Shift+N |
+| 解压到当前文件夹 | 选中压缩包，点击命令栏的“解压”。包内只有一个顶层文件夹时保留该文件夹，其余布局放入与压缩包同名的新文件夹。目标重名时自动编号。 |
 | 显示文件夹总大小并排序 | 排序 → 计算并按总大小排序 |
 | 检查版本更新 | 关于 ZSDesk → 检查更新 |
 

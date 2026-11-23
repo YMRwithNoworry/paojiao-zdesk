@@ -84,10 +84,12 @@ impl ChildPidl{
 }
 struct VisualSelection{folder:Vec<u8>,children:Vec<Vec<u8>>,focused:Option<Vec<u8>>}
 impl VisualSelection{
-    fn capture(view:&IShellView,expected:&[Vec<u8>])->windows::core::Result<Self>{
+    fn capture(view:&IShellView)->windows::core::Result<(Self, Vec<Vec<u8>>)>{
         let folder_view:IFolderView2=view.cast()?;let folder:IShellFolder=unsafe{folder_view.GetFolder()?};
         let root=background_pidl(view)?;let selected:IEnumIDList=unsafe{folder_view.Items(SVGIO_SELECTION)?};
-        let mut children=Vec::with_capacity(expected.len());let mut absolute=Vec::with_capacity(expected.len());let mut bytes=0usize;
+        let count=unsafe{folder_view.ItemCount(SVGIO_SELECTION)}?;
+        if !(1..=8192).contains(&count){return Err(failure(zsdesk_core::i18n::text("菜单选区数量过多")));}
+        let mut children=Vec::with_capacity(count as usize);let mut absolute=Vec::with_capacity(count as usize);let mut bytes=0usize;
         loop{
             let mut raw=[std::ptr::null_mut()];let mut fetched=0;
             let status=unsafe{selected.Next(&mut raw,Some(&mut fetched))};let child=ChildPidl(raw[0]);status.ok()?;
@@ -98,11 +100,11 @@ impl VisualSelection{
             absolute.push(zsdesk_windows::shell::pidl::item_pidl(&item).ok_or_else(||failure(zsdesk_core::i18n::text("无法确认菜单选区标识")))?);
             children.push(id);
         }
-        if !same_identities(expected,&absolute){return Err(failure(zsdesk_core::i18n::text("菜单选区在读取期间已改变")));}
+        if absolute.len()!=count as usize || unsafe{folder_view.ItemCount(SVGIO_SELECTION)}? != count {return Err(failure(zsdesk_core::i18n::text("菜单选区在读取期间已改变")));}
         let focused=unsafe{folder_view.GetFocusedItem()}.ok().filter(|index|*index>=0)
             .and_then(|index|unsafe{folder_view.Item(index)}.ok()).and_then(|item|ChildPidl(item).bytes().ok())
             .filter(|item|children.contains(item));
-        Ok(Self{folder:root,children,focused})
+        Ok((Self{folder:root,children,focused},absolute))
     }
     fn restore_if_cleared(&self,view:&IShellView,expected:&[Vec<u8>],permit:&dyn Fn()->bool)->bool{
         let restore=(||->windows::core::Result<bool>{
@@ -180,7 +182,14 @@ fn start(owner:HWND,window:HWND,view:&IShellView,identity:super::pane_input::Ide
     // Repeated clicks on an unchanged target must not cancel a slow first
     // request and restart Shell/XAML initialization from scratch.
     let input=super::global_search::InputWatch::new();
-    let pidls=if new||background_click{Vec::new()}else{snapshot(view)?};
+    // Capture both forms in one enumeration. The independent live snapshot at
+    // each worker authorization barrier still verifies every absolute identity.
+    let (visual,pidls)=if new||background_click {
+        (None,Vec::new())
+    }else if let Some((saved,items))=input.as_ref().and_then(|_|VisualSelection::capture(view).ok()) {
+        (Some(saved),items)
+    }else{(None,snapshot(view)?)};
+
     let source_folder=background_pidl(view)?;
     let background=pidls.is_empty().then(||source_folder.clone());
     let repeated=if !new&&!catalog&&!keyboard{
@@ -200,7 +209,6 @@ fn start(owner:HWND,window:HWND,view:&IShellView,identity:super::pane_input::Ide
     // and before any command is authorized. Frozen targets alone are not proof
     // that the visible selection still agrees with the command.
     let folder=file_transfer::folder_path(view).ok();
-    let visual=if !pidls.is_empty()&&input.is_some(){VisualSelection::capture(view,&pidls).ok()}else{None};
     let options=if let Some((_,options))=&captured{options.clone()}else{
         let pointer=unsafe{GetWindowLongPtrW(owner,GWLP_USERDATA)}as*const Slot;
         let profile=if pointer.is_null(){None}else{unsafe{&*pointer}.try_borrow().ok().and_then(|slot|slot.as_ref().map(|state|state.config_path.clone()))};
@@ -208,7 +216,7 @@ fn start(owner:HWND,window:HWND,view:&IShellView,identity:super::pane_input::Ide
     };
     let mut mode=if catalog{WorkerMode::CatalogSelection}else{WorkerMode::More};
     let targets=if pidls.is_empty(){mode=if new{WorkerMode::New}else if catalog{WorkerMode::CatalogBackground}else{WorkerMode::Background};background.clone().into_iter().collect()}else{pidls.clone()};
-    let layout=zsdesk_windows::shell::capture_view_layout(view);
+    let layout=if pidls.is_empty(){zsdesk_windows::shell::capture_background_layout(view)}else{zsdesk_windows::shell::capture_view_layout(view)};
     let pointer=unsafe{GetWindowLongPtrW(owner,GWLP_USERDATA)}as*const Slot;
     let results=captured.as_ref().map(|(results,_)|*results).or_else(||if pointer.is_null(){None}else{unsafe{&*pointer}.try_borrow().ok().and_then(|slot|slot.as_ref().and_then(|state|state.menu_source_is_results(identity.source)))})
         .ok_or_else(||failure(zsdesk_core::i18n::text("菜单源视图已改变")))?;

@@ -209,17 +209,17 @@ pub struct WindowPlacement {
 /// Individually configurable actions in the Explorer command bar.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "kebab-case")]
-pub enum CommandBarItem { New, NewFolder, Cut, Copy, Paste, Rename, Share, Delete, Sort, View, More, PreviewPane, DetailsPane }
+pub enum CommandBarItem { New, NewFolder, Cut, Copy, Paste, Rename, Share, Delete, ExtractHere, Sort, View, More, PreviewPane, DetailsPane }
 
 impl CommandBarItem {
-    pub const ALL: [Self; 12] = [Self::New, Self::NewFolder, Self::Cut, Self::Copy, Self::Paste, Self::Rename, Self::Share,
-        Self::Delete, Self::Sort, Self::View, Self::More, Self::PreviewPane];
+    pub const ALL: [Self; 13] = [Self::New, Self::NewFolder, Self::Cut, Self::Copy, Self::Paste, Self::Rename, Self::Share,
+        Self::Delete, Self::ExtractHere, Self::Sort, Self::View, Self::More, Self::PreviewPane];
 
     pub const fn key(self) -> &'static str {
         match self {
             Self::New => "new", Self::NewFolder => "new-folder", Self::Cut => "cut", Self::Copy => "copy", Self::Paste => "paste",
             Self::Rename => "rename", Self::Share => "share", Self::Delete => "delete", Self::Sort => "sort",
-            Self::View => "view", Self::More => "more", Self::PreviewPane => "preview-pane", Self::DetailsPane => "details-pane",
+            Self::ExtractHere => "extract-here", Self::View => "view", Self::More => "more", Self::PreviewPane => "preview-pane", Self::DetailsPane => "details-pane",
         }
     }
 

@@ -22,7 +22,7 @@ pub mod pidl;
 mod search;
 mod shell_item;
 mod view_state;
-pub use view_state::{capture_view_layout,restore_view_layout};
+pub use view_state::{capture_background_layout,capture_view_layout,restore_view_layout};
 pub use search::search_location;
 
 pub use events::{

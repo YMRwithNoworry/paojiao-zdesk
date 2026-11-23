@@ -14,6 +14,7 @@ mod keyboard;
 mod routing_settings;
 mod navigation;
 mod address_input;
+pub(crate) mod archive_actions;
 mod terminal;
 mod quick_preview;
 mod quicklook;

@@ -397,8 +397,7 @@ impl DesktopHost {
         self.add_tray();
         // A previous crash may have left icons hidden while organize mode is off.
         if self.config.settings.icons_hidden_by_zsdesk && !self.config.settings.organize {
-            desktop::set_icons_visible(true);
-            self.config.settings.icons_hidden_by_zsdesk = false;
+            self.config.settings.icons_hidden_by_zsdesk = !desktop::set_icons_visible(true);
             self.save_now();
         }
         if self.config.settings.organize && !self.hide_icons() {
@@ -1057,7 +1056,14 @@ impl DesktopHost {
         // A screenshot/menu overlay may temporarily cover that desktop, but it
         // must never turn a background desktop into the exposed desktop.
         if self.desktop_exposed&&transient {
-            if let Some(anchor)=anchor {self.place_above_desktop(anchor.hwnd);return;}
+            if let Some(anchor)=anchor {
+                // During overlay dismissal the Shell transiently reorders its owner.
+                // Retain the existing band until an actual desktop/fence takes focus.
+                if foreground == anchor.hwnd || self.fences.iter().any(|f| f.hwnd == foreground) {
+                    self.place_above_desktop(anchor.hwnd);
+                }
+                return;
+            }
         }
         self.desktop_exposed=false;
         self.place_below_applications(anchor);
@@ -1112,13 +1118,7 @@ impl DesktopHost {
         let anchor = self.desktop_anchor.filter(|value| value.valid())
             .or_else(DesktopAnchor::current);
         let foreground = unsafe { GetForegroundWindow() };
-        let class = super::class_name(foreground);
         self.desktop_anchor=anchor;
-        if matches!(class.as_str(),"WorkerW"|"Progman") {
-            // Screenshot and task-switching windows can briefly activate the
-            // shell while closing. Wait for the foreground to settle first.
-            super::schedule_desktop_raise(self.hwnd);
-        }
         self.lower_all(foreground);
     }
 
@@ -2995,10 +2995,14 @@ pub fn from_screen(rect: RECT, keep_height: Option<i32>) -> Placement {
     }
 }
 
-pub fn load_config(path: &Path) -> DesktopConfig {
-    let mut config: DesktopConfig = std::fs::read_to_string(path).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+pub fn load_config(path: &Path) -> std::io::Result<DesktopConfig> {
+    let mut config: DesktopConfig = match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(std::io::Error::other)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => DesktopConfig::default(),
+        Err(error) => return Err(error),
+    };
     config.normalize();
-    config
+    Ok(config)
 }
 
 pub fn save_config(path: &Path, config: &DesktopConfig) -> std::io::Result<()> {
@@ -3012,6 +3016,21 @@ pub fn save_config(path: &Path, config: &DesktopConfig) -> std::io::Result<()> {
 mod shortcut_tests {
     use super::*;
     use windows::Win32::UI::Input::KeyboardAndMouse::{VK_C, VK_Y, VK_Z};
+    #[test]
+    fn damaged_desktop_layout_is_preserved() -> anyhow::Result<()> {
+        let path = std::env::temp_dir().join(format!("zsdesk-layout-invalid-{}.json",std::process::id()));
+        let mut file = std::fs::File::create_new(&path)?;
+        use std::io::Write;
+        file.write_all(b"{")?;
+        drop(file);
+        let result=load_config(&path);
+        let contents=std::fs::read(&path)?;
+        std::fs::remove_file(&path)?;
+        assert!(result.is_err());
+        assert_eq!(contents,b"{");
+        assert!(load_config(&path)?.fences.is_empty());
+        Ok(())
+    }
     fn keyboard_selection()->FenceWin{
         let mut window=FenceWin::new(1);
         window.entries=["A","B"].into_iter().map(|name|ShellEntry{key:name.into(),name:name.into(),pidl:vec![0,0],

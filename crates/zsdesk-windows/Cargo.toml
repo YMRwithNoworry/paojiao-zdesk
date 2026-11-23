@@ -10,6 +10,7 @@ description = "ZSDesk Win32 / Shell / COM / Direct2D / DWM platform layer."
 menu-visual-qa = []
 
 [dependencies]
+anyhow.workspace = true
 zsdesk-core = { path = "../zsdesk-core" }
 zsdesk-platform = { path = "../zsdesk-platform" }
 serde.workspace = true
@@ -17,6 +18,9 @@ serde_json.workspace = true
 roxmltree = "0.20.0"
 
 [target.'cfg(windows)'.dependencies]
+zip = { version = "2.4.2", default-features = false, features = ["deflate"] }
+tempfile = "3"
+libloading = "0.8"
 windows-sys = { version = "0.59", features = [
   "Win32_Foundation",
   "Win32_System_Com",
@@ -78,5 +82,5 @@ sha2 = "0.10.9"
 cc = "1"
 
 [dev-dependencies]
-anyhow.workspace = true
+tar = { version = "0.4", default-features = false }
 sha2 = "0.10.9"

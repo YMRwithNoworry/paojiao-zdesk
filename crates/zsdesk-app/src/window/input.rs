@@ -465,13 +465,14 @@ impl WindowState {
     // ---- command bar ----------------------------------------------------
 
     pub(super) unsafe fn command(&mut self, id: CommandId) {
-        if (self.pending.is_some()||self.queued.is_some())&&matches!(id,CommandId::New|CommandId::NewFolder|CommandId::Cut|CommandId::Copy|CommandId::Paste|CommandId::Rename|CommandId::Share|CommandId::Delete){
+        if (self.pending.is_some()||self.queued.is_some())&&matches!(id,CommandId::ExtractHere|CommandId::New|CommandId::NewFolder|CommandId::Cut|CommandId::Copy|CommandId::Paste|CommandId::Rename|CommandId::Share|CommandId::Delete){
             self.show_message(zsdesk_core::i18n::text("文件夹正在加载，请完成后再操作").into());return;
         }
         zsdesk_windows::shell::file_transfer::note_user_input(self.view_hwnd);
         let shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
         let hwnd = self.hwnd;
         match id {
+            CommandId::ExtractHere => self.extract_selected_archives(),
             CommandId::NewFolder => unsafe { self.execute(Command::NewFolder); },
             CommandId::New => {
                 let rect = self.layout.command_rect(id).unwrap_or_default();

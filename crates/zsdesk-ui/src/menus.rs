@@ -154,7 +154,7 @@ pub fn command_glyph(id: &str) -> Option<(&'static str, bool)> {
 pub const COMMAND_BAR_CHOICES: &[(&str, CommandBarItem)] = &[
     ("新建", CommandBarItem::New), ("新建文件夹", CommandBarItem::NewFolder), ("剪切", CommandBarItem::Cut), ("复制", CommandBarItem::Copy),
     ("粘贴", CommandBarItem::Paste), ("重命名", CommandBarItem::Rename), ("共享", CommandBarItem::Share),
-    ("删除", CommandBarItem::Delete), ("排序", CommandBarItem::Sort), ("查看", CommandBarItem::View),
+    ("删除", CommandBarItem::Delete), ("解压到当前文件夹", CommandBarItem::ExtractHere), ("排序", CommandBarItem::Sort), ("查看", CommandBarItem::View),
     ("更多", CommandBarItem::More), ("预览", CommandBarItem::PreviewPane),
 ];
 

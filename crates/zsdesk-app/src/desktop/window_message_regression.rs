@@ -86,7 +86,7 @@ fn placement(host:&OwnedHost)->Result<serde_json::Value>{
     ensure!((restored.left-moved.left).abs()<=1&&(restored.top-moved.top).abs()<=1,"capture cancellation lost moved position");
     ensure!(with_host(|state|state.config.fence(1).unwrap().placement.height)==Some(460),"collapsed drag changed expanded height");
     with_host(|state|state.save_now());
-    let config=host::load_config(&with_host(|state|state.config_path.clone()).unwrap());
+    let config=host::load_config(&with_host(|state|state.config_path.clone()).unwrap())?;
     let saved=host::to_screen(&config.fence(1).unwrap().placement,true);
     ensure!((saved.left-moved.left).abs()<=1&&(saved.top-moved.top).abs()<=1,"saved position differs after restart");
     Ok(serde_json::json!({"collapsed_drag_uses_title_height":true,"pointer_offset_preserved":true,"capture_cancel_keeps_position":true,"saved_position_matches":true,"expanded_height_preserved":true}))
