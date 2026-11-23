@@ -152,7 +152,13 @@ impl Index {
         self.rebuild_children();Ok(())
     }
     pub fn rebuild_children(&mut self){
-        self.first=vec![NONE;self.len()];self.next=vec![NONE;self.len()];
+        let rows=self.len();
+        for links in [&mut self.first,&mut self.next] {
+            links.clear();
+            links.reserve_exact(rows);
+            links.resize(rows,NONE);
+            links.shrink_to_fit();
+        }
         for row in 1..self.len(){let parent=self.parent[row]as usize;if parent<self.len(){self.next[row]=self.first[parent];self.first[parent]=row as u32;}}
     }
     pub fn path(&self,root:&Path,row:u32)->Option<PathBuf>{
@@ -202,8 +208,15 @@ impl Index {
         ensure!(self.flags.iter().all(|f|f&!(DIRECTORY|REPARSE|DEAD|EXCLUDED|BLOCKED)==0),"快照属性无效");
         ensure!(self.parent.iter().enumerate().skip(1).all(|(i,p)|(*p as usize)<n&&*p as usize!=i&&self.flags[*p as usize]&DIRECTORY!=0),"快照父节点无效");
         let mut seen=vec![0u8;n];seen[0]=2;
-        for start in 1..n{let mut at=start;let mut trail=Vec::new();while seen[at]==0{seen[at]=1;trail.push(at);at=self.parent[at]as usize;}
-            ensure!(seen[at]==2,"快照目录循环");for row in trail{seen[row]=2;}}
+        for start in 1..n {
+            let mut at=start;
+            while seen[at]==0 {seen[at]=1;at=self.parent[at] as usize;}
+            ensure!(seen[at]==2,"快照目录循环");
+            // Walk the same parent links to mark completion without allocating a path per row.
+            at=start;
+            while seen[at]==1 {seen[at]=2;at=self.parent[at] as usize;}
+        }
+        drop(seen);
         if let Some(attrs)=&self.attributes{ensure!(attrs.size.len()==n&&attrs.modified.len()==n,"快照属性列长度无效");}
         self.reindex();self.rebuild_children();Ok(())
     }
@@ -246,5 +259,16 @@ pub fn excluded_name(name:&str)->bool{matches!(name,".git"|".hg"|".svn"|"node_mo
     #[test]fn snapshot_graph_validation_rejects_cycles_and_bad_names(){
         let mut index=Index::new(5,false);index.append(6,0,OsStr::new("a"),DIRECTORY).unwrap();index.append(7,1,OsStr::new("b"),DIRECTORY).unwrap();
         index.parent[1]=2;assert!(index.validate().is_err());assert!(index.names.intern(OsStr::new("../bad")).is_err());
+    }
+    #[test]fn snapshot_accepts_forward_parent_chains_and_reuses_child_links(){
+        let mut index=Index::new(5,false);
+        for row in 1..=512 {index.append(5+row,0,OsStr::new("folder"),DIRECTORY).unwrap();}
+        for row in 1..512 {index.parent[row]=(row+1) as u32;}
+        index.validate().unwrap();
+        let buffers=(index.first.as_ptr(),index.next.as_ptr());
+        index.rebuild_children();
+        assert_eq!(buffers,(index.first.as_ptr(),index.next.as_ptr()));
+        assert_eq!(index.children(0),[512]);
+        assert_eq!(index.children(512),[511]);
     }
 }

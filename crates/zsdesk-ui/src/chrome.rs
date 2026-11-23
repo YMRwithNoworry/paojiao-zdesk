@@ -328,7 +328,7 @@ impl ChromeLayout {
             x += natural;
         }
         if x + s(4) + button <= utility_left {
-            layout.new_tab = Rect::clamped(x + s(4), button_y, button, button_h);
+            layout.new_tab = Rect::clamped(x + s(4), tab_y, button, tab_h);
         }
 
         let full_width=width;
@@ -929,7 +929,10 @@ mod tests {
         for dpi in [96, 120, 144, 192] {
             let caption = Rect::new(1600 - scale(138, dpi), scale(3, dpi), scale(46, dpi), scale(30, dpi));
             let l = ChromeLayout::new(&ChromeInput { caption_button: Some(caption), ..input(1600, 2, 0, dpi) });
-            for rect in [l.new_tab, l.tab_list, l.app_menu] {
+            let tab = l.tabs[0].rect;
+            assert_eq!((l.new_tab.y, l.new_tab.height), (tab.y, tab.height));
+            assert_eq!(l.hit(l.new_tab.x + l.new_tab.width / 2, tab.y + tab.height / 2), Hit::NewTab);
+            for rect in [l.tab_list, l.app_menu] {
                 assert_eq!(rect.y, caption.y);
                 assert_eq!(rect.height, caption.height);
                 assert_eq!(rect.y * 2 + rect.height, caption.y * 2 + caption.height);

@@ -1403,7 +1403,9 @@ impl WindowState {
             WM_SETTINGCHANGE => {
                 let area = if lp.0 != 0 { unsafe { PCWSTR(lp.0 as *const u16).to_string() }.unwrap_or_default() } else { String::new() };
                 if theme_setting_changed(wp,lp) {self.refresh_system_theme();self.icons.clear();}
-                if let Some(tree) = &self.tree { tree.refresh_metrics(); }
+                if self.tree.as_ref().is_some_and(NamespaceTreeHost::libraries_preference_changed) {
+                    self.rebuild_navigation_tree();
+                } else if let Some(tree) = &self.tree { tree.refresh_metrics(); }
                 if area == "ShellState" || area.is_empty() { self.invalidate(); }
             }
             WM_THEMECHANGED | WM_DWMCOMPOSITIONCHANGED | WM_DWMCOLORIZATIONCOLORCHANGED | WM_SYSCOLORCHANGE => self.refresh_system_theme(),

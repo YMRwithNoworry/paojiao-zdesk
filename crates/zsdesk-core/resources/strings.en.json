@@ -4,6 +4,7 @@
   "已解压 {} 个压缩包": "Extracted {} archives",
   "桌面格子未确认接收命令": "The desktop host did not acknowledge the command",
   "解压": "Extract",
+  "已有四批解压任务正在进行，请稍后重试": "Four extraction jobs are running. Try again when a job finishes.",
   "解压到当前文件夹": "Extract to current folder",
   "正在解压…": "Extracting…",
   "请选择当前文件夹中的压缩包": "Select an archive in the current folder",

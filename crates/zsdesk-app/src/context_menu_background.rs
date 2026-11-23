@@ -94,7 +94,7 @@ pub(super) fn selection_origin(request:&Request)->SelectionOrigin<'_>{
     }
 }
 
-pub(super) fn compact_selection(owner:HWND,request:&Request,options:&ContextMenuOptions)->Result<Option<ShellMenu>>{
+pub(super) fn compact_selection(owner:HWND,request:&Rc<Request>,options:&ContextMenuOptions)->Result<Option<ShellMenu>>{
     use windows::Win32::System::SystemServices::SFGAO_FILESYSTEM;
     if request.mode!=Mode::More || !options.drawn || request.extended || request.pidls.is_empty()
         || options.native_first_page_apps.as_ref().is_some_and(|apps|!apps.is_empty()){

@@ -17,8 +17,8 @@ use windows::{
         System::{
             Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_INPROC_SERVER},
             Ole::IOleWindow,
-            Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD},
-            SystemServices::SFGAO_STREAM,
+            Registry::{RegGetValueW, HKEY, HKEY_CLASSES_ROOT, HKEY_CURRENT_USER, RRF_RT_REG_DWORD},
+            SystemServices::{SFGAO_NONENUMERATED, SFGAO_STREAM},
         },
         UI::{
             Controls::{TVGN_CARET, TVM_SELECTITEM, TVM_SETBKCOLOR, TVM_SETTEXTCOLOR, TVM_SETEXTENDEDSTYLE,
@@ -83,6 +83,27 @@ fn root_style(root:InitialRoot,initial:InitialRoot)->u32 {
     (NSTCRS_VISIBLE.0 | if root==initial {NSTCRS_EXPANDED.0}else{0}) as u32
 }
 
+fn registry_dword(hive: HKEY, key: PCWSTR, name: PCWSTR) -> Option<u32> {
+    let mut value = 0u32;
+    let mut bytes = 4u32;
+    unsafe { RegGetValueW(hive, key, name, RRF_RT_REG_DWORD, None, Some((&mut value as *mut u32).cast()), Some(&mut bytes)) }
+        .is_ok().then_some(value)
+}
+
+fn show_libraries(attributes: Option<u32>, pinned: Option<u32>, show_all: bool, legacy_default: bool) -> bool {
+    !attributes.is_some_and(|bits| bits & SFGAO_NONENUMERATED.0 != 0)
+        && (show_all || pinned.map_or(legacy_default, |value| value != 0))
+}
+
+fn system_libraries_visible() -> bool {
+    use windows::core::w;
+    // HKCR is the effective Classes view for the current user and the native architecture.
+    let attributes = registry_dword(HKEY_CLASSES_ROOT, w!(r"CLSID\{031E4825-7B94-4DC3-B131-E946B44C8DD5}\ShellFolder"), w!("Attributes"));
+    let pinned = registry_dword(HKEY_CLASSES_ROOT, w!(r"CLSID\{031E4825-7B94-4DC3-B131-E946B44C8DD5}"), w!("System.IsPinnedToNameSpaceTree"));
+    let show_all = registry_dword(HKEY_CURRENT_USER, w!(r"Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced"), w!("NavPaneShowAllFolders"));
+    show_libraries(attributes, pinned, show_all.unwrap_or(0) != 0, crate::theme::windows10_shell(crate::theme::os_build()))
+}
+
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
 pub struct NamespaceTreeOptions {
     pub show_recycle_bin:bool,
@@ -118,6 +139,7 @@ pub struct NamespaceTreeHost {
     syncing: Rc<Cell<u32>>,
     pending_sync:Rc<PendingTreeSync>,
     bounds:Cell<RECT>,
+    libraries_visible: bool,
 }
 
 impl NamespaceTreeHost {
@@ -183,7 +205,8 @@ impl NamespaceTreeHost {
         let this_pc_style=options.expand_this_pc.map_or_else(||root_style(InitialRoot::ThisPc,initial),|expanded|
             (NSTCRS_VISIBLE.0 | if expanded{NSTCRS_EXPANDED.0}else{0})as u32);
         unsafe { tree.AppendRoot(&this_pc, enum_flags, this_pc_style, &filter)?; }
-        if windows10 {
+        let libraries_visible = system_libraries_visible();
+        if libraries_visible {
             if let Ok(libraries) = unsafe { SHGetKnownFolderItem::<IShellItem>(&FOLDERID_Libraries, KF_FLAG_DEFAULT, None) } {
                 let _ = unsafe { tree.AppendRoot(&libraries, enum_flags, NSTCRS_VISIBLE.0 as u32, None) };
             }
@@ -203,7 +226,7 @@ impl NamespaceTreeHost {
         let advise_cookie = unsafe { tree.TreeAdvise(&events)? };
         PENDING_SYNCS.with(|pending|{pending.borrow_mut().insert(hwnd.0 as isize,Rc::downgrade(&pending_sync));});
         let host = Self { tree, events, _filter: filter, advise_cookie, hwnd, last_location,
-            last_auto_expand: Cell::new(false), syncing,pending_sync,bounds:Cell::new(bounds) };
+            last_auto_expand: Cell::new(false), syncing,pending_sync,bounds:Cell::new(bounds),libraries_visible };
         if let Some(view) = host.tree_view() {
             unsafe {SetWindowSubclass(view,Some(tree_sync_subclass),SYNC_TIMER,hwnd.0 as usize)}.ok()?;
             host.pending_sync.native_tree.set(view);
@@ -226,6 +249,8 @@ impl NamespaceTreeHost {
     }
 
     pub fn hwnd(&self) -> HWND { self.hwnd }
+
+    pub fn libraries_preference_changed(&self) -> bool { self.libraries_visible != system_libraries_visible() }
 
     /// Re-read display preferences without changing any Windows settings.
     pub fn refresh_metrics(&self) {
@@ -735,6 +760,19 @@ mod tests {
         fn GetAttributes(&self,mask:SFGAO_FLAGS)->Result<SFGAO_FLAGS>{self.attributes.map(|value|SFGAO_FLAGS(value&mask.0))
             .ok_or_else(||Error::from_hresult(HRESULT(0x80070035u32 as i32)))}
         fn Compare(&self,_:Ref<IShellItem>,_:u32)->Result<i32>{Err(Error::from_hresult(HRESULT(0x80004001u32 as i32)))}
+    }
+
+    #[test]
+    fn libraries_follow_the_current_shell_registration() {
+        let visible = Some(0xb080010d);
+        let hidden = Some(0xb090010d);
+        for default in [false, true] {
+            assert!(!show_libraries(hidden, Some(1), true, default));
+            assert!(!show_libraries(visible, Some(0), false, default));
+            assert!(show_libraries(visible, Some(1), false, default));
+            assert!(show_libraries(visible, Some(0), true, default));
+            assert_eq!(show_libraries(visible, None, false, default), default);
+        }
     }
 
     #[test]

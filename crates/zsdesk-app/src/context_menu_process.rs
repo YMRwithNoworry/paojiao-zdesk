@@ -752,10 +752,10 @@ impl Drop for AsyncClient {fn drop(&mut self){
     }
 }}
 
-struct Worker<'a>{request:Request,path:PathBuf,status:Status,events:&'a EventSet}
+struct Worker<'a>{request:std::rc::Rc<Request>,path:PathBuf,status:Status,events:&'a EventSet}
 struct Watch{
     #[cfg(test)]visual_step:std::cell::Cell<usize>,
-    request:Request,path:PathBuf,status_event:usize,cancel_event:usize,dismiss_event:usize,worker_started:u64,
+    request:std::rc::Rc<Request>,path:PathBuf,status_event:usize,cancel_event:usize,dismiss_event:usize,worker_started:u64,
     menu_open:std::cell::Cell<bool>,
     tracking_started:std::cell::Cell<u64>,
     #[cfg(test)]command:std::cell::Cell<Option<u32>>,
@@ -924,7 +924,7 @@ fn run_request(path:&Path,request:Request,events:&EventSet,com_us:u64,fault_repo
     let setup=Instant::now();let worker_started=monotonic_us();
     let mut state=Box::new(Worker{status:Status{token:request.token.clone(),pid:std::process::id(),window:0,phase:"starting".into(),validation:0,before_invoke:false,outcome:None,error:None,error_hresult:None,error_phase:None,bind_microseconds:0,populate_microseconds:0,
         reusable:false,layout:None,layout_sort_changed:false,created:Vec::new(),catalog:Vec::new(),timing:MenuTimings{worker_thread:unsafe{windows::Win32::System::Threading::GetCurrentThreadId()},fault_report_available,com_microseconds:com_us,..Default::default()},native_menu:serde_json::Value::Null,
-        #[cfg(test)]probe_menu_open:false,#[cfg(test)]probe_classic_loop:false,#[cfg(test)]probe_expanded_requested:false,#[cfg(test)]probe_command_messages:0,#[cfg(test)]probe_clipboard_after_invoke:serde_json::Value::Null},request,path:path.into(),events});
+        #[cfg(test)]probe_menu_open:false,#[cfg(test)]probe_classic_loop:false,#[cfg(test)]probe_expanded_requested:false,#[cfg(test)]probe_command_messages:0,#[cfg(test)]probe_clipboard_after_invoke:serde_json::Value::Null},request:request.into(),path:path.into(),events});
     state.state("starting")?;
     #[cfg(test)]if state.request.probe.as_deref()==Some("crash"){unsafe{RaiseException(0xc0000005,1,0,std::ptr::null());}std::process::exit(0x51);}
     #[cfg(test)]if state.request.probe.as_deref()==Some("memory-limit"){

@@ -8,10 +8,17 @@ pub(crate) fn pending_operations() -> usize {
     ACTIVE.load(Ordering::Acquire)
 }
 
-struct Operation;
-impl Drop for Operation {
+struct Operation<'a>(&'a AtomicUsize);
+impl<'a> Operation<'a> {
+    fn acquire(active: &'a AtomicUsize) -> Option<Self> {
+        // Match the file-transfer worker limit across all file windows.
+        active.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| (n < 4).then_some(n + 1)).ok()?;
+        Some(Self(active))
+    }
+}
+impl Drop for Operation<'_> {
     fn drop(&mut self) {
-        ACTIVE.fetch_sub(1, Ordering::AcqRel);
+        self.0.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -43,8 +50,10 @@ impl WindowState {
             return;
         };
         let owner = self.hwnd.0 as isize;
-        ACTIVE.fetch_add(1, Ordering::AcqRel);
-        let operation = Operation;
+        let Some(operation) = Operation::acquire(&ACTIVE) else {
+            self.show_message(zsdesk_core::i18n::text("已有四批解压任务正在进行，请稍后重试").into());
+            return;
+        };
         let started = std::thread::Builder::new()
             .name("zsdesk-extract".into())
             .spawn(move || {
@@ -87,5 +96,20 @@ impl WindowState {
             Ok(_) => self.show_message(zsdesk_core::i18n::text("正在解压…").into()),
             Err(error) => self.show_message(error.to_string()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn concurrent_extraction_releases_capacity_after_a_job_finishes() {
+        let active = AtomicUsize::new(0);
+        let mut jobs: Vec<_> = (0..4).map(|_| Operation::acquire(&active).unwrap()).collect();
+        assert!(Operation::acquire(&active).is_none());
+        drop(jobs.pop());
+        assert!(Operation::acquire(&active).is_some());
+        drop(jobs);
+        assert_eq!(active.load(Ordering::Acquire), 0);
     }
 }

@@ -505,7 +505,7 @@ impl Tooltip{
             SendMessageW(self.hwnd,TTM_TRACKACTIVATE,Some(WPARAM(1)),Some(LPARAM((&info as*const TTTOOLINFOW)as isize)));}}
 }
 impl Drop for Tooltip{fn drop(&mut self){self.hide();let _=unsafe{DestroyWindow(self.hwnd)};}}
-struct Session{provider:Provider,owner:HWND,anchor:POINT,levels:Vec<Level>,entered:bool,revision:u64,tooltip:Option<Tooltip>,tip_target:Option<(usize,usize,Instant)>,tip_shown:bool}
+struct Session{provider:Provider,owner:HWND,anchor:POINT,levels:Vec<Level>,entered:bool,revision:u64,tooltip:Option<Tooltip>,tip_target:Option<(usize,usize,Instant)>,tip_shown:bool,capture_snapshot:bool}
 impl Session{
     fn hide_tooltip(&mut self){if let Some(tip)=&mut self.tooltip{tip.hide();}self.tip_target=None;self.tip_shown=false;}
     fn schedule_tooltip(&mut self,target:Option<(usize,usize)>){
@@ -532,7 +532,7 @@ impl Session{
             "toolbar":level.toolbar.iter().enumerate().map(|(slot,index)|{let rect=level.toolbar_rect(slot);let item=&level.items[*index];serde_json::json!({"row":index,"id":item.id,"position":item.position,"label":item.label,"enabled":item.enabled,"rect":[rect.x,rect.y,rect.w,rect.h],"action":format!("{:?}",item.action)})}).collect::<Vec<_>>(),
             "rows":level.items.iter().zip(&level.layout.rows).map(|(item,row)|serde_json::json!({"id":item.id,"label":item.label,"position":item.position,"submenu":item.cascade(),"enabled":item.enabled,"checked":item.checked,"radio":item.radio,"default":item.default,"owner_draw":item.owner_draw,"y":row.y,"height":row.h})).collect::<Vec<_>>()})
         ).collect::<Vec<_>>()}));}
-    fn present(&mut self,depth:usize,gfx:&Gfx,colors:&Palette)->Result<()>{if !self.levels[depth].suspended{present(&self.provider,&mut self.levels[depth],gfx,colors)?;}self.snapshot();Ok(())}
+    fn present(&mut self,depth:usize,gfx:&Gfx,colors:&Palette)->Result<()>{if !self.levels[depth].suspended{present(&self.provider,&mut self.levels[depth],gfx,colors)?;}if self.capture_snapshot {self.snapshot();}Ok(())}
     fn rebuild_level(&mut self,depth:usize,gfx:&Gfx,colors:&Palette)->Result<Step>{
         self.hide_tooltip();
         let level=&self.levels[depth];let menu=level.menu;let metrics=level.metrics;let body=level.body;let text_left_dip=level.text_left_dip;
@@ -714,7 +714,9 @@ pub(super) fn track_initialized(owner:HWND,menu:HMENU,point:POINT,context:&ICont
     let colors=palette(crate::theme::menus_dark());
     provider.message(WM_INITMENU,WPARAM(menu.0 as usize),LPARAM(0));
     let Some(root)=open_level(&provider,&gfx,owner,menu,0,Place::Root(point),root_initialized,None)?else{return Ok(None);};
-    let mut session=Session{provider,owner,anchor:point,levels:vec![root],entered:false,revision:0,tooltip:None,tip_target:None,tip_shown:false};let root=session.levels[0].hwnd;ROOT.with(|value|value.set(root));
+    let capture_snapshot=cfg!(any(test,feature="menu-visual-qa")) || std::env::var_os("ZSDESK_NATIVE_TEST_OUTPUT").is_some();
+    SNAPSHOT.with(|snapshot| *snapshot.borrow_mut()=serde_json::Value::Null);
+    let mut session=Session{provider,owner,anchor:point,levels:vec![root],entered:false,revision:0,tooltip:None,tip_target:None,tip_shown:false,capture_snapshot};let root=session.levels[0].hwnd;ROOT.with(|value|value.set(root));
     if CANCEL.with(Cell::get)||!unsafe{IsWindow(Some(owner))}.as_bool(){return Ok(None);}
     session.present(0,&gfx,&colors)?;session.entered=true;
     unsafe{SendMessageW(owner,WM_ENTERMENULOOP,Some(WPARAM(1)),Some(LPARAM(0)));SetCapture(root);}
