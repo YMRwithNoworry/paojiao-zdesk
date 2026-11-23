@@ -20,7 +20,7 @@ sha2 = "0.10.9"
 blake3 = "=1.8.2"
 aes = "0.8.4"
 pinyin = { version = "=0.11.0", default-features = false, features = ["plain"] }
-zsui = { path = "../../../zsui", default-features = false, features = ["auto-suggest", "toggle-button", "table", "windows-gdi"] }
+zsui = { path = "../../../zsui", default-features = false, features = ["button", "auto-suggest", "toggle-button", "table", "windows-gdi"] }
 
 [features]
 menu-visual-qa = ["zsdesk-windows/menu-visual-qa"]

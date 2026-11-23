@@ -52,7 +52,7 @@ pub(super) fn palette(dark: bool) -> Palette {
 }
 #[derive(Default)]
 pub(super) struct SearchView {
-    pub filter: usize,
+    pub buttons:Rc<search_buttons::Buttons>,
     pub table:Rc<result_table::Table>,
     pub staged:Option<(Vec<PathBuf>,std::time::Instant)>,
     widths: [Option<i32>; 4],
@@ -276,43 +276,6 @@ impl Panel {
         self.draw_plan(dc, surface(self.palette), &plan);
     }
 
-    pub(super) fn draw_search_button(&self, d: &DRAWITEMSTRUCT) -> bool {
-        let id = d.CtlID as i32;
-        if ![12,16,17].contains(&id) && !(FIRST_FILTER..FIRST_FILTER+FILTERS.len() as i32).contains(&id) { return false; }
-        let r=d.rcItem;
-        let rect=windows_sys::Win32::Foundation::RECT{left:r.left,top:r.top,right:r.right,bottom:r.bottom};
-        let buffer=unsafe{zsui::WindowsBufferedPaint::begin(d.hDC.0,&rect)};
-        let dc=buffer.as_ref().map_or(d.hDC,|b|HDC(b.hdc()));
-        let mut colors = surface(self.palette);
-        let mut cursor = POINT::default();
-        let hovered = unsafe { GetCursorPos(&mut cursor) }.is_ok() && unsafe { WindowFromPoint(cursor) } == d.hwndItem;
-        let disabled = d.itemState.0 & ODS_DISABLED.0 != 0;
-        if disabled {
-            colors.primary_text = colors.disabled_text;
-        } else if hovered || d.itemState.0 & ODS_SELECTED.0 != 0 {
-            let fg = if d.itemState.0 & ODS_SELECTED.0 != 0 {self.palette.pressed} else {self.palette.hover};
-            let value = composite(fg,self.palette.layer).0;
-            colors.control = Color::rgb(value as u8,(value>>8) as u8,(value>>16) as u8);
-        }
-        let bounds = Rect {x:r.left+1,y:r.top+1,width:(r.right-r.left-2).max(1),height:(r.bottom-r.top-2).max(1)};
-        let geometry = zsui::zs_toggle_button_render_plan(bounds, id == FIRST_FILTER + self.search_view.filter as i32,
-            ZsPlatformStyle::current(), Dpi::new(self.dpi as f32));
-        let mut plan = zsui::zs_toggle_button_native_draw_plan(&geometry, &text(d.hwndItem));
-        for command in &mut plan.commands {
-            if let NativeDrawCommand::Text(text) = command {
-                text.style.horizontal_align = HorizontalAlign::Center;
-                text.bounds.x = bounds.x + self.s(2);
-                text.bounds.width = bounds.width - self.s(4);
-            }
-        }
-        unsafe { FillRect(dc,&r,self.brush); }
-        self.draw_plan(dc, colors, &plan);
-        if d.itemState.0 & ODS_FOCUS.0 != 0 && d.itemState.0 & ODS_NOFOCUSRECT.0 == 0 {
-            let mut focus=r;
-            unsafe {let _=InflateRect(&mut focus,-self.s(3),-self.s(3));let _=DrawFocusRect(dc,&focus);}
-        }
-        true
-    }
     pub(super) fn move_selection(&self, step: isize) {
         if self.awaiting_page || self.paths.is_empty() {
             return;
