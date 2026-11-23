@@ -136,6 +136,8 @@ impl WindowState {
             let touches = |h: Hit| self.row_of(h) == Some(row);
             if touches(old) || touches(hit) { self.invalidate_rect(row); }
         }
+        for h in [old,hit]{if let Hit::ColumnDivider(i)=h{self.invalidate_rect(self.column_divider(i));}}
+        if old==Hit::PaneSplitter||hit==Hit::PaneSplitter{self.invalidate_rect(self.layout.pane_splitter);}
         if matches!(old, Hit::Splitter) || matches!(hit, Hit::Splitter) { self.invalidate_rect(self.layout.splitter); }
         if matches!(old,Hit::BookmarkSplitter)||matches!(hit,Hit::BookmarkSplitter){self.invalidate_rect(self.layout.bookmark_splitter);}
         if matches!(old,Hit::TabSplitter)||matches!(hit,Hit::TabSplitter){self.invalidate_rect(self.layout.tab_splitter);}
@@ -143,6 +145,7 @@ impl WindowState {
 
     fn row_of(&self, hit: Hit) -> Option<LayoutRect> {
         Some(match hit {
+            Hit::ColumnDivider(i)=>self.column_divider(i),
             Hit::None | Hit::Splitter | Hit::PaneSplitter | Hit::TabSplitter | Hit::BookmarkSplitter => return None,
             Hit::TabScrollbar=>self.layout.tab_panel,
             Hit::PaneHeader(index)=>self.layout.pane_headers[index],
@@ -152,7 +155,9 @@ impl WindowState {
             Hit::SearchPanel(_) => self.layout.search,
             Hit::Back | Hit::Forward | Hit::Up | Hit::Refresh | Hit::ToggleCommandBar | Hit::Address | Hit::Search => self.layout.nav_row,
             Hit::Command(_) => self.layout.command_row,
-            Hit::Bookmark(_) | Hit::BookmarkOverflow | Hit::BookmarksBar => self.layout.bookmarks_row,
+            Hit::BookmarkOverflow if self.layout.bookmarks_row.is_empty()=>self.layout.nav_row,
+            Hit::BookmarkOverflow=>self.layout.bookmarks_row,
+            Hit::Bookmark(_) | Hit::BookmarksBar => self.layout.bookmarks_row,
             Hit::StatusDetails | Hit::StatusTiles | Hit::StatusDualPane | Hit::StatusColumns | Hit::Status => self.layout.status,
         })
     }
@@ -196,7 +201,8 @@ impl WindowState {
                 }
             }
             Hit::Command(id) => (id.tooltip().into(), self.layout.command_rect(id).unwrap_or_default()),
-            Hit::Bookmark(i) => (self.bookmark_index(i).and_then(|index|self.session.bookmarks.get(index)).map(|b|if b.is_folder{zsdesk_core::tr_format!("{}：点击展开或折叠，拖入项目可分类", b.display_name)}else{b.target.address()}).unwrap_or_default(), self.layout.bookmarks.get(i).copied().unwrap_or_default()),
+            Hit::BookmarkOverflow=>(zsdesk_core::i18n::text("收藏夹").into(),self.layout.bookmark_overflow),
+            Hit::Bookmark(i) => (self.bookmark_index(i).and_then(|index|self.session.bookmarks.get(index)).map(|b|if b.is_folder{if self.session.ui.bookmark_display==zsdesk_core::model::explorer::BookmarkDisplay::Categories{b.display_name.clone()}else{zsdesk_core::tr_format!("{}：点击展开或折叠，拖入项目可分类", b.display_name)}}else{b.target.address()}).unwrap_or_default(), self.layout.bookmarks.get(i).copied().unwrap_or_default()),
             Hit::StatusDetails => (zsdesk_core::i18n::text("在窗口中显示每一项的相关信息 (Ctrl+Shift+6)").into(), self.layout.status_details),
             Hit::StatusTiles => (zsdesk_core::i18n::text("使用大缩略图显示项 (Ctrl+Shift+2)").into(), self.layout.status_tiles),
             Hit::StatusColumns => (zsdesk_core::i18n::text("多栏显示（父文件夹、当前文件夹、预览）").into(),self.layout.status_columns),
@@ -223,7 +229,7 @@ impl WindowState {
         }
         if let Some((start_x,start_width))=self.bookmark_resize {
             let width=(start_width+start_x-p.x).max(self.s(120));
-            self.session.ui.bookmarks_width=((i64::from(width)*96/i64::from(self.dpi))as i32).clamp(120,600);
+            self.session.ui.bookmarks_width=((i64::from(width)*96/i64::from(self.interface_dpi()))as i32).clamp(120,600);
             self.relayout();self.position_children();self.invalidate();return;
         }
         if let Some((start_x,ratio))=self.pane_splitter_drag {
@@ -240,7 +246,7 @@ impl WindowState {
         }
         if let Some((start_x, start_w)) = self.splitter_drag {
             let width = (start_w + p.x - start_x).max(self.s(zsdesk_ui::chrome::MIN_TREE_W));
-            let dip = (width as i64 * 96 / self.dpi as i64) as i32;
+            let dip = (width as i64 * 96 / self.interface_dpi() as i64) as i32;
             if dip != self.session.ui.tree_width {
                 self.session.ui.tree_width = dip.clamp(120, 800);
                 self.relayout();
@@ -574,7 +580,7 @@ impl WindowState {
             }
             Some("show-preview") => self.set_panes(!show.preview, false),
             Some("show-details") => self.set_panes(false, !show.details),
-            Some("show-bookmarks") => { self.session.ui.show_bookmarks = !show.bookmarks; self.save(); unsafe { self.resize(); } }
+            Some("show-bookmarks") => { self.session.ui.show_bookmarks = !show.bookmarks; self.save(); unsafe { self.rebuild_bookmarks(); } }
             Some("show-checkboxes") => { if let Some(b) = &self.browser { let _ = b.set_checkboxes(!show.checkboxes); } }
             Some("show-extensions") => { set_folder_settings(None, Some(!show.extensions)); unsafe { self.execute(Command::Refresh); } }
             Some("show-hidden") => { set_folder_settings(Some(!show.hidden), None); unsafe { self.execute(Command::Refresh); } }
@@ -776,6 +782,10 @@ impl WindowState {
             Some("quick-search-shortcut") => match crate::quick_search::shortcut::edit(self.hwnd,&self.config_path) {
                 Ok(Some(message))=>self.show_message(message), Err(error)=>self.show_message(error.to_string()), _=>{}
             },
+            Some("system-text-size")=>{
+                let result=unsafe{windows::Win32::UI::Shell::ShellExecuteW(Some(self.hwnd),windows::core::w!("open"),windows::core::w!("ms-settings:easeofaccess-display"),None,None,SW_SHOWNORMAL)};
+                if result.0 as isize<=32{self.show_message(zsdesk_core::i18n::text("无法打开 Windows 文字大小设置").into());}
+            },
             Some("quick-search-settings") => unsafe { self.search_settings_menu(); },
             Some("quick-search-open")=>if let Err(error)=crate::quick_search::launch(&self.config_path,false){self.show_message(zsdesk_core::tr_format!("无法打开快速搜索：{error:#}", error=error));},
             Some("manage-context-commands")=>self.load_context_catalog(),
@@ -882,6 +892,17 @@ impl WindowState {
         let _=unsafe{EnumWindows(Some(each),LPARAM(&target as*const Target as isize))};
     }
     pub(super) fn apply_interface_choice(&mut self, id: &str) {
+        if id.starts_with("bookmarks-display-")||id.starts_with("navigation-divider-")||id.starts_with("interface-text-"){
+            match storage::update_shared_ui(&self.config_path,|ui|{menus::apply_interface_setting(ui,id);(ui.bookmark_display,ui.navigation_divider,ui.interface_text_percent)}){
+                Ok((display,divider,percent))=>{
+                    unsafe{self.commit_bookmark_rename();}self.session.ui.bookmark_display=display;self.session.ui.navigation_divider=divider;
+                    if self.session.ui.interface_text_percent!=percent{self.session.ui.interface_text_percent=percent;unsafe{self.update_font();}self.crumbs_for=None;}
+                    self.measure_bookmarks();unsafe{self.resize();}self.invalidate();self.publish_input_preferences();
+                },
+                Err(e)=>self.show_message(zsdesk_core::tr_format!("保存会话失败：{e}",e=e)),
+            }
+            return;
+        }
         if matches!(id, "single-click-blank-up" | "double-click-blank-up") {
             match storage::update_shared_ui(&self.config_path, |ui| {
                 menus::apply_interface_setting(ui, id);

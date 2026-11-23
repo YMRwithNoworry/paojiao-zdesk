@@ -516,7 +516,7 @@ impl WindowState {
                             let mut list = original.clone();
                             list.mode = 4;
                             list.icon_size = 16;
-                            list.column_dpi = self.dpi;
+                            list.column_dpi = self.session.ui.interface_dpi(self.dpi);
                             list.columns = vec![ViewColumn {
                                 key: ViewPropertyKey {
                                     format_id: format!("{:?}", key.fmtid),

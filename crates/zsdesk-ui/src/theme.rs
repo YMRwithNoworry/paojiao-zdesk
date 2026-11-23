@@ -66,7 +66,7 @@ impl Palette {
             danger: Color::rgb(0xC4, 0x2B, 0x1C),
             inactive_tab_separator: Color::rgba(0, 0, 0, 0x24),
             emphasized_tab_fill: Color::rgb(0xFF,0xFF,0xFF),
-            emphasized_tab_border: Color::rgb(0x7A,0x7A,0x7A),
+            emphasized_tab_border: Color::rgb(0x50,0x50,0x50),
             emphasized_tab_text: Color::rgb(0x20,0x20,0x20),
         }
     }
@@ -93,7 +93,7 @@ impl Palette {
             danger: Color::rgb(0xC4, 0x2B, 0x1C),
             inactive_tab_separator: Color::rgba(0xFF, 0xFF, 0xFF, 0x28),
             emphasized_tab_fill: Color::rgb(0x40,0x40,0x40),
-            emphasized_tab_border: Color::rgb(0xA0,0xA0,0xA0),
+            emphasized_tab_border: Color::rgb(0xCA,0xCA,0xCA),
             emphasized_tab_text: Color::rgb(0xFF,0xFF,0xFF),
         }
     }
@@ -117,8 +117,12 @@ impl Palette {
     }
 
     pub fn tab_appearance(&self,selected:bool,window_active:bool,emphasis:bool)->TabAppearance{
-        if selected&&emphasis{
-            TabAppearance{fill:Some(self.emphasized_tab_fill),border:Some(self.emphasized_tab_border),text:self.emphasized_tab_text,weight:600}
+        if selected{
+            let tint=if emphasis{32}else{20};
+            let mix=|base:u8,accent:u8|((u32::from(base)*(100-tint)+u32::from(accent)*tint+50)/100) as u8;
+            let base=self.emphasized_tab_fill;let accent=self.accent;
+            let fill=Color::rgb(mix(base.r,accent.r),mix(base.g,accent.g),mix(base.b,accent.b));
+            TabAppearance{fill:Some(fill),border:emphasis.then_some(self.emphasized_tab_border),text:self.emphasized_tab_text,weight:600}
         }else{
             TabAppearance{fill:selected.then_some(self.layer),border:None,text:if window_active{self.text}else{self.text_secondary},weight:400}
         }
@@ -280,11 +284,11 @@ mod tests {
         let luminance=|c:Color|{let f=|v:u8|{let v=f64::from(v)/255.0;if v<=0.04045{v/12.92}else{((v+0.055)/1.055).powf(2.4)}};0.2126*f(c.r)+0.7152*f(c.g)+0.0722*f(c.b)};
         let(a,b)=(luminance(a),luminance(b));(a.max(b)+0.05)/(a.min(b)+0.05)
     }
-    #[test]fn disabled_tab_emphasis_preserves_existing_focused_and_unfocused_styles(){
+    #[test]fn selected_and_inactive_tabs_remain_distinct_with_or_without_extra_border(){
         for p in [Palette::light(),Palette::dark()]{for active in [true,false]{for selected in [true,false]{
             let style=p.tab_appearance(selected,active,false);
-            assert_eq!(style.fill,selected.then_some(p.layer));assert_eq!(style.border,None);assert_eq!(style.weight,400);
-            assert_eq!(style.text,if active{p.text}else{p.text_secondary});
+            assert_eq!(style.fill.is_some(),selected);if let Some(fill)=style.fill{assert_ne!(fill,p.strip);assert!(contrast(fill,style.text)>=4.5);}assert_eq!(style.border,None);assert_eq!(style.weight,if selected{600}else{400});
+            assert_eq!(style.text,if selected{p.emphasized_tab_text}else if active{p.text}else{p.text_secondary});
             if !selected{assert_eq!(style,p.tab_appearance(false,active,true));}
         }}}
     }
@@ -293,8 +297,11 @@ mod tests {
             let active=p.tab_appearance(true,true,true);let inactive=p.tab_appearance(true,false,true);
             assert_eq!(active,inactive);assert!(contrast(active.text,active.fill.unwrap())>=4.5);
             assert!(contrast(active.border.unwrap(),active.fill.unwrap())>=3.0);
-            assert_eq!(active,p.with_accent([0,95,184]).tab_appearance(true,true,true));
-            assert_eq!(active,p.with_accent([232,17,35]).tab_appearance(true,true,true));
+            for rgb in [[0,95,184],[232,17,35]]{
+                let custom=p.with_accent(rgb).tab_appearance(true,true,true);
+                assert!(contrast(custom.text,custom.fill.unwrap())>=4.5);
+                assert!(contrast(custom.border.unwrap(),custom.fill.unwrap())>=3.0);
+            }
             let border=active.border.unwrap();assert_eq!(border.r,border.g);assert_eq!(border.g,border.b);
         }
     }

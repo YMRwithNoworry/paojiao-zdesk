@@ -1,6 +1,6 @@
 //! Menu definitions shared by the native Explorer chrome and desktop fences.
 pub use zsui::{core::Command as UiCommand, menu::{MenuItemSpec, MenuSpec}};
-use zsdesk_core::model::explorer::{AppearancePreferences, BackdropStyle, ColorScheme, CommandBarItem, CommandBarPreferences, ContextMenuMode, ContextMenuPreferences, ExplorerUi, PreviewProviderPreference, SearchBackendPreference};
+use zsdesk_core::model::explorer::{BookmarkDisplay, NavigationDivider, AppearancePreferences, BackdropStyle, ColorScheme, CommandBarItem, CommandBarPreferences, ContextMenuMode, ContextMenuPreferences, ExplorerUi, PreviewProviderPreference, SearchBackendPreference};
 
 pub fn entry(label: &str, id: &str, enabled: bool, checked: bool) -> MenuItemSpec {
     let item = MenuItemSpec::command(label, UiCommand::custom(id)).checked(checked);
@@ -188,8 +188,20 @@ fn layout_settings(ui: &ExplorerUi) -> MenuItemSpec {
     group(zsdesk_core::i18n::text("布局"), "settings-layout", vec![
         entry(zsdesk_core::i18n::text("命令栏"), "command-bar-visible", true, ui.command_bar.visible),
         submenu(zsdesk_core::i18n::text("命令栏按钮"), buttons),
+        submenu(zsdesk_core::i18n::text("界面字号"),vec![
+            entry("100%","interface-text-100",true,ui.interface_text_percent==100),
+            entry("115%","interface-text-115",true,ui.interface_text_percent==115),
+            entry("130%","interface-text-130",true,ui.interface_text_percent==130),
+            entry("150%","interface-text-150",true,ui.interface_text_percent==150),
+            MenuItemSpec::Separator,item(zsdesk_core::i18n::text("Windows 原生视图文字大小…"),"system-text-size"),
+        ]),
         entry(zsdesk_core::i18n::text("收藏栏"), "interface-bookmarks", true, ui.show_bookmarks),
         entry(zsdesk_core::i18n::text("资源管理器托盘图标"), "explorer-tray", true, ui.explorer_tray),
+        submenu(zsdesk_core::i18n::text("收藏栏样式"),vec![
+            entry(zsdesk_core::i18n::text("栏内展开分类"),"bookmarks-display-expanded",true,ui.bookmark_display==BookmarkDisplay::Expanded),
+            entry(zsdesk_core::i18n::text("分类下拉菜单"),"bookmarks-display-categories",true,ui.bookmark_display==BookmarkDisplay::Categories),
+            entry(zsdesk_core::i18n::text("单个收藏下拉按钮"),"bookmarks-display-dropdown",true,ui.bookmark_display==BookmarkDisplay::Dropdown),
+        ]),
         submenu(zsdesk_core::i18n::text("收藏栏位置"),vec![
             entry(zsdesk_core::i18n::text("上方"),"bookmarks-placement-top",true,!ui.bookmarks_on_right),
             entry(zsdesk_core::i18n::text("右侧"),"bookmarks-placement-right",true,ui.bookmarks_on_right),
@@ -199,6 +211,11 @@ fn layout_settings(ui: &ExplorerUi) -> MenuItemSpec {
         entry(zsdesk_core::i18n::text("双栏布局"), "dual-pane", true, ui.dual_pane),
         MenuItemSpec::Separator,
         entry(zsdesk_core::i18n::text("导航窗格"), "interface-navigation", true, ui.show_tree),
+            submenu(zsdesk_core::i18n::text("窗格分割线"),vec![
+                entry(zsdesk_core::i18n::text("仅悬停时显示"),"navigation-divider-hover",true,ui.navigation_divider==NavigationDivider::Hover),
+                entry(zsdesk_core::i18n::text("始终显示"),"navigation-divider-always",true,ui.navigation_divider==NavigationDivider::Always),
+                entry(zsdesk_core::i18n::text("隐藏分割线"),"navigation-divider-hidden",true,ui.navigation_divider==NavigationDivider::Hidden),
+            ]),
         submenu(zsdesk_core::i18n::text("导航窗格选项"), vec![
             entry(zsdesk_core::i18n::text("展开到当前文件夹"), "navigation-auto-expand", true, ui.navigation_auto_expand.unwrap_or(false)),
             entry(zsdesk_core::i18n::text("显示回收站"), "navigation-recycle-bin", true, ui.navigation_show_recycle_bin),
@@ -292,7 +309,7 @@ pub fn interface_requires_dialog(choice:&str)->bool{matches!(choice,"search-ever
 
 /// Settings entries that run an action instead of toggling a preference.
 pub fn interface_action(choice:&str)->bool{
-    matches!(choice,"search-rebuild-index"|"search-index-settings"|"search-everything-service"|"search-engine-status"|"dual-pane"|"startup-restore"|"startup-this-pc"|"new-tab-this-pc"|"new-tab-current")||interface_requires_dialog(choice)
+    matches!(choice,"system-text-size"|"search-rebuild-index"|"search-index-settings"|"search-everything-service"|"search-engine-status"|"dual-pane"|"startup-restore"|"startup-this-pc"|"new-tab-this-pc"|"new-tab-current")||interface_requires_dialog(choice)
 }
 
 pub fn apply_interface_setting(ui: &mut ExplorerUi, choice: &str) -> bool {
@@ -312,6 +329,16 @@ pub fn apply_interface_setting(ui: &mut ExplorerUi, choice: &str) -> bool {
         "language-en"=>ui.language=zsdesk_core::i18n::LanguagePreference::English,
         "explorer-tray" => ui.explorer_tray=!ui.explorer_tray,
         "interface-bookmarks" => ui.show_bookmarks = !ui.show_bookmarks,
+        "interface-text-100"=>ui.interface_text_percent=100,
+        "interface-text-115"=>ui.interface_text_percent=115,
+        "interface-text-130"=>ui.interface_text_percent=130,
+        "interface-text-150"=>ui.interface_text_percent=150,
+        "bookmarks-display-expanded"=>ui.bookmark_display=BookmarkDisplay::Expanded,
+        "bookmarks-display-categories"=>ui.bookmark_display=BookmarkDisplay::Categories,
+        "bookmarks-display-dropdown"=>ui.bookmark_display=BookmarkDisplay::Dropdown,
+        "navigation-divider-hover"=>ui.navigation_divider=NavigationDivider::Hover,
+        "navigation-divider-always"=>ui.navigation_divider=NavigationDivider::Always,
+        "navigation-divider-hidden"=>ui.navigation_divider=NavigationDivider::Hidden,
         "bookmarks-placement-top"=>ui.bookmarks_on_right=false,
         "bookmarks-placement-right"=>ui.bookmarks_on_right=true,
         "dual-pane" => ui.dual_pane = !ui.dual_pane,
@@ -524,6 +551,18 @@ pub fn tab_list_menu(titles: &[String], active: usize, can_restore: bool) -> Men
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]fn all_bookmark_and_divider_modes_and_font_presets_apply_and_roundtrip(){
+        let mut ui=ExplorerUi::default();
+        for (id,mode) in [("expanded",BookmarkDisplay::Expanded),("categories",BookmarkDisplay::Categories),("dropdown",BookmarkDisplay::Dropdown)]{
+            assert!(apply_interface_setting(&mut ui,&format!("bookmarks-display-{id}")));assert_eq!(ui.bookmark_display,mode);
+        }
+        for (id,idle,hover) in [("always",true,true),("hover",false,true),("hidden",false,false)]{
+            assert!(apply_interface_setting(&mut ui,&format!("navigation-divider-{id}")));
+            assert_eq!(ui.navigation_divider.visible(false,false),idle);assert_eq!(ui.navigation_divider.visible(true,false),hover);
+            assert_eq!(ui.navigation_divider.visible(false,true),hover);
+        }
+        for percent in [100,115,130,150]{assert!(apply_interface_setting(&mut ui,&format!("interface-text-{percent}")));assert_eq!(ui.interface_dpi(192),(192*percent+50)/100);}
+    }
     #[test]
     fn english_menus_keep_commands_and_user_names_intact() {
         let _language=zsdesk_core::i18n::Scope::english(true);

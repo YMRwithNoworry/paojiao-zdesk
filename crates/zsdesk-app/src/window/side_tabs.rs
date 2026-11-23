@@ -24,7 +24,7 @@ impl WindowState{
             let direction=if self.session.ui.tab_placement==zsdesk_core::model::explorer::TabPlacement::Left{1}else{-1};
             let maximum=(self.client_size().0-self.s(440)).max(self.s(120)).min(self.s(420));
             let pixels=(width+direction*(point.x-start)).clamp(self.s(120),maximum);
-            let dip=((pixels as i64*96+self.dpi as i64/2)/self.dpi.max(96)as i64)as i32;
+            let dip=((pixels as i64*96+self.interface_dpi() as i64/2)/self.interface_dpi() as i64)as i32;
             if self.session.ui.side_tabs_width!=dip{self.session.ui.side_tabs_width=dip;self.relayout();self.position_children();self.invalidate();}
             return true;
         }

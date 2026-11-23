@@ -248,6 +248,17 @@ impl NamespaceTreeHost {
         (!found.0.is_null()).then_some(found)
     }
 
+    pub fn set_label_font(&self,font:windows::Win32::Graphics::Gdi::HFONT,custom:bool){
+        use windows::Win32::UI::WindowsAndMessaging::{GetPropW,SetPropW,RemovePropW,WM_SETFONT};
+        let Some(view)=self.tree_view()else{return;};let key=windows::core::w!("ZSDesk.CustomViewFont");
+        if !custom && unsafe{GetPropW(view,key)}.is_invalid(){return;}
+        let wanted=if custom{font.0 as isize}else{0};
+        if unsafe{SendMessageW(view,WM_GETFONT,None,None)}.0!=wanted{
+            unsafe{SendMessageW(view,WM_SETFONT,Some(WPARAM(wanted as usize)),Some(LPARAM(1)));}self.refresh_metrics();
+        }
+        if custom{unsafe{let _=SetPropW(view,key,Some(windows::Win32::Foundation::HANDLE(1usize as _)));}}
+        else{unsafe{let _=RemovePropW(view,key);}}
+    }
     pub fn hwnd(&self) -> HWND { self.hwnd }
 
     pub fn libraries_preference_changed(&self) -> bool { self.libraries_visible != system_libraries_visible() }

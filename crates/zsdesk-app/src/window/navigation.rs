@@ -103,6 +103,7 @@ impl WindowState {
         if tab.navigate(location)||replacing_pending_search {unsafe {self.request_navigation(NavigationRequest{tab,from_tree});}}
     }
     pub(super) unsafe fn navigation_completed(&mut self,location:ShellLocation) {
+        self.apply_content_font();
         self.navigation_epoch=self.navigation_epoch.wrapping_add(1);
         self.view_hwnd=self.browser.as_ref().and_then(|b|b.view_window()).unwrap_or_default();
         if let Some(identity)=self.identity_for_source(self.browser_source){wheel_input::install(self.view_hwnd,self.hwnd,identity);

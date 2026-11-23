@@ -25,7 +25,7 @@ fn panel_title(kind:Kind)->&'static str{
 }
 struct UpdateReply{alive:AtomicBool,value:Mutex<Option<Result<crate::update_check::Outcome,String>>>}
 struct Panel{hwnd:HWND,edit:HWND,list:HWND,action:HWND,close:HWND,font:HFONT,title_font:HFONT,brush:HBRUSH,input_brush:HBRUSH,
-    dpi:u32,palette:Palette,kind:Kind,profile:PathBuf,body:String,status:String,paths:Vec<PathBuf>,incoming:Vec<PathBuf>,awaiting_page:bool,engine:Option<FastSearch>,generation:u64,reply:Arc<UpdateReply>,adopted:bool,
+    dpi:u32,text_percent:u16,palette:Palette,kind:Kind,profile:PathBuf,body:String,status:String,paths:Vec<PathBuf>,incoming:Vec<PathBuf>,awaiting_page:bool,engine:Option<FastSearch>,generation:u64,reply:Arc<UpdateReply>,adopted:bool,
     result_menu:Option<result_menu::Session>,rename_target:Option<result_menu::Target>,search_view:SearchView,sort:SearchSort,offset:u32,has_next:bool,detail_reader:Option<details::Reader>,
     info:Vec<InfoRow>,scroll:i32,busy:bool,search_error:bool,update_release:Option<crate::update_check::Release>,update_package:Option<(PathBuf,bool,String)>}
 impl Drop for Panel{fn drop(&mut self){self.reply.alive.store(false,Ordering::Release);if let Some(engine)=&self.engine{engine.cancel();}
@@ -58,7 +58,12 @@ pub(crate) fn show_search(profile:&Path)->Result<()>{
         let dark=match ui.appearance.color_scheme{zsdesk_core::model::explorer::ColorScheme::Dark=>true,zsdesk_core::model::explorer::ColorScheme::Light=>false,_=>zsdesk_windows::theme::system_dark_mode()};
         let dark=dark&&!zsdesk_windows::theme::high_contrast();
         let pointer=unsafe{GetWindowLongPtrW(hwnd,GWLP_USERDATA)}as*const RefCell<Panel>;let slot=unsafe{&*pointer};
-        let theme_changed={let mut panel=slot.borrow_mut();panel.warm_search(&ui);let palette=search_ui::palette(dark);
+        let theme_changed={let mut panel=slot.borrow_mut();panel.warm_search(&ui);
+            if panel.text_percent!=ui.interface_text_percent{
+                panel.text_percent=ui.interface_text_percent;zsdesk_windows::flyout::set_text_percent(hwnd,panel.text_percent);
+                let mut r=RECT::default();if unsafe{GetWindowRect(hwnd,&mut r)}.is_ok(){panel.dpi_changed(unsafe{GetDpiForWindow(hwnd)},r);}
+            }
+            let palette=search_ui::palette(dark);
             let changed=palette!=panel.palette;
             if changed{panel.palette=palette;panel.search_view.buttons.appearance(palette,panel.dpi);unsafe{DeleteObject(panel.brush.into());DeleteObject(panel.input_brush.into());}
                 panel.brush=unsafe{CreateSolidBrush(rgb(palette.layer))};panel.input_brush=unsafe{CreateSolidBrush(rgb(palette.input_focused))};panel.style_list();}
@@ -99,7 +104,7 @@ fn show(owner:HWND,profile:&Path,kind:Kind,body:String)->Result<HWND>{
     let caption=panel_title(kind);
     let info=if kind==Kind::Shortcuts{content::shortcut_rows(&body)}else{Vec::new()};
     let state=Rc::new(RefCell::new(Panel{hwnd:HWND::default(),edit:HWND::default(),list:HWND::default(),action:HWND::default(),close:HWND::default(),
-        font:HFONT::default(),title_font:HFONT::default(),brush:HBRUSH::default(),input_brush:HBRUSH::default(),dpi:96,palette,kind,profile:profile.into(),body,
+        font:HFONT::default(),title_font:HFONT::default(),brush:HBRUSH::default(),input_brush:HBRUSH::default(),dpi:96,text_percent:ui.interface_text_percent,palette,kind,profile:profile.into(),body,
         status:match kind{Kind::Search=>String::new(),Kind::Shortcuts=>zsdesk_core::i18n::text("滚动查看全部快捷键 · Esc 关闭").into(),Kind::About=>String::new()},paths:Vec::new(),incoming:Vec::new(),awaiting_page:false,engine:None,generation:0,
         reply:Arc::new(UpdateReply{alive:AtomicBool::new(true),value:Mutex::new(None)}),adopted:false,result_menu:None,rename_target:None,search_view:if kind==Kind::Search{SearchView::load(profile)}else{SearchView::default()},sort:SearchSort::NameAsc,offset:0,has_next:false,detail_reader:None,info,scroll:0,busy:false,search_error:false,update_release:None,update_package:None}));
     let pointer=Rc::into_raw(state.clone());
@@ -107,13 +112,13 @@ fn show(owner:HWND,profile:&Path,kind:Kind,body:String)->Result<HWND>{
         CW_USEDEFAULT,CW_USEDEFAULT,740,560,(!owner.0.is_null()).then_some(owner),None,Some(instance),Some(pointer.cast()))};
     let hwnd=match result{Ok(hwnd)=>hwnd,Err(error)=>{if !state.borrow().adopted{unsafe{drop(Rc::from_raw(pointer));}}return Err(error.into());}};
     struct Owner(HWND);impl Drop for Owner{fn drop(&mut self){if !self.0.0.is_null(){let _=unsafe{DestroyWindow(self.0)};}}}let mut owned=Owner(hwnd);
-    let initialized={let mut state=unsafe{&*pointer}.borrow_mut();state.adopted=true;state.hwnd=hwnd;state.dpi=unsafe{GetDpiForWindow(hwnd)}.max(96);state.init()};
+    let initialized={let mut state=unsafe{&*pointer}.borrow_mut();state.adopted=true;state.hwnd=hwnd;state.dpi=ui.interface_dpi(unsafe{GetDpiForWindow(hwnd)});zsdesk_windows::flyout::set_text_percent(hwnd,ui.interface_text_percent);state.search_view.table.dpi(state.dpi);state.init()};
     if let Err(error)=initialized{return Err(error);}
     zsdesk_windows::theme::set_dark_frame(hwnd,dark);zsdesk_windows::theme::round_corners(hwnd,false);
     if kind==Kind::Search{zsdesk_windows::theme::set_backdrop(hwnd,zsdesk_core::model::explorer::BackdropStyle::Mica);}
     let mut cursor=POINT::default();let _=unsafe{GetCursorPos(&mut cursor)};let monitor=unsafe{MonitorFromPoint(cursor,MONITOR_DEFAULTTONEAREST)};
     let mut info=MONITORINFO{cbSize:std::mem::size_of::<MONITORINFO>()as u32,..Default::default()};unsafe{GetMonitorInfoW(monitor,&mut info)}.ok()?;
-    let scale=|n:i32|n*unsafe{GetDpiForWindow(hwnd)}.max(96)as i32/96;
+    let scale=|n:i32|n*ui.interface_dpi(unsafe{GetDpiForWindow(hwnd)})as i32/96;
     let width=scale(match kind{Kind::About=>560,Kind::Shortcuts=>800,Kind::Search=>960}).min(info.rcWork.right-info.rcWork.left);
     let height=scale(match kind{Kind::About=>430,Kind::Shortcuts=>640,Kind::Search=>540}).min(info.rcWork.bottom-info.rcWork.top);
     unsafe{SetWindowPos(hwnd,None,info.rcWork.left+(info.rcWork.right-info.rcWork.left-width)/2,info.rcWork.top+(info.rcWork.bottom-info.rcWork.top-height)/3,width,height,SWP_NOZORDER|SWP_NOACTIVATE)?;}
@@ -241,6 +246,7 @@ impl Panel{
         self.awaiting_page=true;if !self.busy{self.clear_pending_page();}self.offset=0;self.has_next=false;self.page_buttons();if let Some(rd)=&self.detail_reader{rd.reset(0);}self.status=zsdesk_core::i18n::text("正在等待输入…").into();
     }
     fn dpi_changed(&mut self,dpi:u32,rect:RECT){
+        let dpi=(dpi.max(96)*u32::from(self.text_percent.clamp(100,150))+50)/100;self.search_view.table.dpi(dpi);
         self.scroll=self.scroll*dpi.max(96)as i32/self.dpi.max(96)as i32;self.dpi=dpi.max(96);self.search_view.buttons.appearance(self.palette,self.dpi);let old=self.font;let old_title=self.title_font;
         let mut font=LOGFONTW{lfHeight:-self.s(if self.kind==Kind::Search{14}else{16}),..Default::default()};let family=wide(&zsdesk_windows::gfx::system_ui_font(None).0);font.lfFaceName[..family.len().min(32)].copy_from_slice(&family[..family.len().min(32)]);
         self.font=unsafe{CreateFontIndirectW(&font)};font.lfHeight=-self.s(if self.kind==Kind::Search{18}else{23});font.lfWeight=if self.kind==Kind::Search{400}else{600};self.title_font=unsafe{CreateFontIndirectW(&font)};

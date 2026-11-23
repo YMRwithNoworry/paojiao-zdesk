@@ -96,6 +96,7 @@ pub struct ChromeInput<'a> {
     pub tree_width: i32,
     pub show_bookmarks: bool,
     pub bookmarks_on_right: bool,
+    pub bookmark_dropdown:bool,
     pub bookmarks_width: i32,
     /// Search is active; show the close action beside the fixed native edit.
     pub search_panel_open: bool,
@@ -279,6 +280,7 @@ pub enum Hit {
     BookmarkSplitter,
     Splitter,
     PaneSplitter,
+    ColumnDivider(usize),
     PaneHeader(usize),
     StatusDetails,
     StatusTiles,
@@ -339,8 +341,9 @@ impl ChromeLayout {
         let width=(width-panel_width).max(0);
         // Bookmarks bar, directly under the tabs.
         let mut nav_y = layout.strip.bottom();
-        let right_bookmarks=input.show_bookmarks&&input.bookmarks_on_right&&width>=s(540);
-        if input.show_bookmarks&&!right_bookmarks {
+        let dropdown=input.show_bookmarks&&input.bookmark_dropdown;
+        let right_bookmarks=input.show_bookmarks&&!dropdown&&input.bookmarks_on_right&&width>=s(540);
+        if input.show_bookmarks&&!right_bookmarks&&!dropdown {
             layout.bookmarks_row = Rect::clamped(0, nav_y, width, s(BOOKMARK_H));
             let chip_h = s(26);
             let chip_y = nav_y + (s(BOOKMARK_H) - chip_h) / 2;
@@ -366,6 +369,10 @@ impl ChromeLayout {
         for slot in [&mut layout.back, &mut layout.forward, &mut layout.up, &mut layout.refresh] {
             *slot = Rect::clamped(nx, nb_y, nav_button, s(32));
             nx += nav_button + s(2);
+        }
+        if dropdown {
+            let w=input.bookmark_widths.first().copied().unwrap_or(s(76));let h=s(26);
+            layout.bookmark_overflow=Rect::clamped(nx,nav_y+(s(NAV_H)-h)/2,w,h);nx+=w+s(2);
         }
         let search_w = (width / 4).clamp(s(140), s(280));
         let field_h = s(32);
@@ -560,6 +567,7 @@ impl ChromeLayout {
             if self.app_menu.contains(x, y) { return Hit::AppMenu; }
             return if self.strip.contains(x,y){Hit::Caption}else{Hit::None};
         }
+        if self.bookmark_overflow.contains(x,y){return Hit::BookmarkOverflow;}
         if self.nav_row.contains(x, y) {
             if self.search_panel.close.contains(x,y) { return Hit::SearchPanel(SearchPanelHit::Close); }
             for (rect, hit) in [(self.back, Hit::Back), (self.forward, Hit::Forward), (self.up, Hit::Up),
@@ -574,7 +582,6 @@ impl ChromeLayout {
         if self.search_panel.card.contains(x, y) { return self.search_panel.hit(x, y); }
         if self.bookmarks_row.contains(x, y) {
             if let Some(i) = self.bookmarks.iter().position(|r| r.contains(x, y)) { return Hit::Bookmark(i); }
-            if self.bookmark_overflow.contains(x, y) { return Hit::BookmarkOverflow; }
             return Hit::BookmarksBar;
         }
         if self.bookmark_splitter.contains(x,y){return Hit::BookmarkSplitter;}
@@ -673,10 +680,24 @@ mod tests {
 
     fn input(width: i32, tabs: usize, active: usize, dpi: u32) -> ChromeInput<'static> {
         ChromeInput { tab_placement:zsdesk_core::model::explorer::TabPlacement::Top, side_tabs_width:210,side_tabs_compact:true,width, height: 800, dpi, caption_width: scale(138, dpi), caption_button: None,
-            tab_count: tabs, active_tab: active, show_tab_list:true, show_tree: true, tree_width: scale(220, dpi), show_bookmarks: true,bookmarks_on_right:false,bookmarks_width:scale(210,dpi),
+            tab_count: tabs, active_tab: active, show_tab_list:true, show_tree: true, tree_width: scale(220, dpi), show_bookmarks: true,bookmarks_on_right:false,bookmark_dropdown:false,bookmarks_width:scale(210,dpi),
             command_bar: &DEFAULT_COMMAND_BAR, status_bar: true, bookmark_widths: &[], search_panel_open: false }
     }
 
+    #[test]
+    fn compact_bookmarks_use_the_same_measured_chip_size_and_free_the_bar(){
+        use zsdesk_core::model::explorer::TabPlacement;
+        for dpi in [96,120,144,192]{for side in [TabPlacement::Top,TabPlacement::Left,TabPlacement::Right]{
+            let widths=[scale(82,dpi)];let base=ChromeInput{tab_placement:side,bookmark_widths:&widths,..input(scale(1300,dpi),3,1,dpi)};
+            let bar=ChromeLayout::new(&base);
+            let compact=ChromeLayout::new(&ChromeInput{bookmark_dropdown:true,bookmarks_on_right:true,..base});
+            let b=compact.bookmark_overflow;
+            assert!(compact.bookmarks_row.is_empty()&&compact.bookmarks.is_empty());
+            assert_eq!((b.width,b.height),(bar.bookmarks[0].width,bar.bookmarks[0].height));
+            assert!(b.x>=compact.refresh.right()&&b.right()<=compact.address.x);
+            assert_eq!(compact.hit(b.x+b.width/2,b.y+b.height/2),Hit::BookmarkOverflow);
+        }}
+    }
     #[test]
     fn disabled_status_has_no_buttons_or_hit_targets() {
         for dpi in [96, 144, 192] {

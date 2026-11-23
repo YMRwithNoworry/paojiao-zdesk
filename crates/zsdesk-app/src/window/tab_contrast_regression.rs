@@ -25,7 +25,9 @@ fn save_bmp(path:&Path,width:i32,height:i32,pixels:&[u8])->Result<()>{
     data.extend([0;4]);data.extend((pixels.len()as u32).to_le_bytes());data.extend([0;16]);data.extend(pixels);fs::write(path,data)?;Ok(())
 }
 
-fn render_tabs(gfx:&Gfx,palette:Palette,focused:bool,emphasis:bool,vertical:bool,dpi:u32,legacy:bool)->Result<Surface>{
+use zsdesk_core::model::explorer::TabPlacement;
+fn render_tabs(gfx:&Gfx,palette:Palette,focused:bool,emphasis:bool,placement:TabPlacement,dpi:u32)->Result<Surface>{
+    let vertical=placement!=TabPlacement::Top;
     let s=|value:f32|value*dpi as f32/96.0;
     let surface=Surface::new(s(480.0)as i32,s(144.0)as i32).context("memory tab surface")?;
     let selected=RectF::new(s(16.0),s(32.0),s(196.0),s(34.0));
@@ -34,13 +36,8 @@ fn render_tabs(gfx:&Gfx,palette:Palette,focused:bool,emphasis:bool,vertical:bool
         cv.fill(RectF::new(0.0,0.0,s(480.0),s(144.0)),c(palette.strip));
         for (r,active,label) in [(selected,true,"Current tab"),(other,false,"Another tab")]{
             let style=palette.tab_appearance(active,focused,emphasis);
-            if active{
-                if legacy{
-                    if vertical{cv.round(r,s(6.0),c(palette.layer));}else{cv.tab_shape(r,s(8.0),s(6.0),c(palette.layer));}
-                }else{paint_selected_tab(cv,r,vertical,dpi,style);}
-            }
-            let text=if legacy{if focused{palette.text}else{palette.text_secondary}}else{style.text};
-            cv.text(label,RectF::new(r.x+s(38.0),r.y,r.w-s(46.0),r.h),&TextStyle::ui(s(UI_TEXT)).weight(if legacy{400}else{style.weight}),c(text));
+            if active{paint_selected_tab(cv,r,placement,dpi,style,palette.accent);}
+            cv.text(label,RectF::new(r.x+s(38.0),r.y,r.w-s(46.0),r.h),&TextStyle::ui(s(UI_TEXT)).weight(style.weight),c(style.text));
         }
     })?;Ok(surface)
 }
@@ -82,23 +79,20 @@ fn command_row_background_survives_separate_paint_bands() -> Result<()> {
 }
 
 #[test]
-fn opt_in_tab_contrast_keeps_legacy_pixels_and_never_adds_an_accent_marker()->Result<()>{
+fn active_tab_marker_and_text_are_distinct_on_every_tab_placement()->Result<()>{
     unsafe{OleInitialize(None)}?;
     struct Apartment;impl Drop for Apartment{fn drop(&mut self){unsafe{OleUninitialize();}}}let _apartment=Apartment;
     let gfx=Gfx::new("Segoe UI")?;let mut cases=0;let mut preview=vec![0u8;960*576*4];
-    for vertical in [false,true]{for dpi in [96,144,192]{
+    for placement in [TabPlacement::Top,TabPlacement::Left,TabPlacement::Right]{let vertical=placement!=TabPlacement::Top;for dpi in [96,144,192]{
         let s=|value:f32|value*dpi as f32/96.0;
         for (row,(dark,focused)) in [(false,true),(false,false),(true,true),(true,false)].into_iter().enumerate(){
             let palette=if dark{Palette::dark()}else{Palette::light()};
-            let baseline=render_tabs(&gfx,palette,focused,false,vertical,dpi,true)?;
-            let normal=render_tabs(&gfx,palette,focused,false,vertical,dpi,false)?;
-            ensure!(pixels(&baseline)==pixels(&normal),"disabled compatibility mode changed existing pixels: dark={dark} focused={focused} vertical={vertical} dpi={dpi}");
-            let enhanced=render_tabs(&gfx,palette,focused,true,vertical,dpi,false)?;
-            let changed_accent=render_tabs(&gfx,palette.with_accent([232,17,35]),focused,true,vertical,dpi,false)?;
-            ensure!(pixels(&enhanced)==pixels(&changed_accent),"enhanced tab unexpectedly depends on the system accent");
-            let restored=render_tabs(&gfx,palette,focused,false,vertical,dpi,false)?;
-            ensure!(pixels(&baseline)==pixels(&restored),"disabling enhancement failed to restore existing rendering");
-            let fill=palette.emphasized_tab_fill;let background=[fill.r,fill.g,fill.b,255];
+            let normal=render_tabs(&gfx,palette,focused,false,placement,dpi)?;
+            let enhanced=render_tabs(&gfx,palette,focused,true,placement,dpi)?;
+            ensure!(pixels(&normal)!=pixels(&enhanced),"extra outline toggle had no effect");
+            let (mx,my)=match placement{TabPlacement::Top=>(114.0,64.5),TabPlacement::Left=>(20.5,49.0),TabPlacement::Right=>(207.5,49.0)};
+            for image in [&normal,&enhanced]{ensure!(close(pixel(image,s(mx)as i32,s(my)as i32),palette.accent),"missing {placement:?} marker at {dpi}");}
+            let fill=palette.tab_appearance(true,focused,true).fill.unwrap();let background=[fill.r,fill.g,fill.b,255];
             ensure!(close(pixel(&enhanced,s(66.0)as i32,s(37.0)as i32),fill),"enhanced selected fill is not opaque");
             let mut strongest=1.0f64;
             for x in s(16.0)as i32..s(20.0).ceil()as i32{strongest=strongest.max(contrast(pixel(&enhanced,x,s(49.0)as i32),background));}
@@ -119,6 +113,6 @@ fn opt_in_tab_contrast_keeps_legacy_pixels_and_never_adds_an_accent_marker()->Re
         for parent in root.ancestors(){if parent.exists(){use std::os::windows::fs::MetadataExt;ensure!(fs::symlink_metadata(parent)?.file_attributes()&0x400==0,"raster output crosses a reparse point");}}
         fs::create_dir_all(&root)?;save_bmp(&root.join("tab-emphasis.current.bmp"),960,576,&preview)?;
     }
-    println!("{}",serde_json::json!({"cases":cases,"windowless":true,"default_pixels_unchanged":true,"toggle_restores_original":true,"accent_independent":true,"selected_border_contrast":3.0,"selected_text_contrast":4.5}));
+    println!("{}",serde_json::json!({"cases":cases,"windowless":true,"all_tab_placements":true,"system_accent_marker":true,"selected_border_contrast":3.0,"selected_text_contrast":4.5}));
     Ok(())
 }

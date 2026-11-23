@@ -39,17 +39,25 @@ fn pixel_aligned_icon(rect: RectF) -> RectF {
 }
 
 /// Window-independent tab painting also used by the memory-raster regression.
-fn paint_selected_tab(cv:&Canvas,r:RectF,vertical:bool,dpi:u32,appearance:zsdesk_ui::theme::TabAppearance){
+fn paint_selected_tab(cv:&Canvas,r:RectF,placement:zsdesk_core::model::explorer::TabPlacement,dpi:u32,appearance:zsdesk_ui::theme::TabAppearance,accent:zsdesk_ui::theme::Color){
+    use zsdesk_core::model::explorer::TabPlacement;
+    let vertical=placement!=TabPlacement::Top;
     let Some(fill)=appearance.fill else{return;};let s=|value:f32|value*dpi as f32/96.0;
     if let Some(border)=appearance.border{
         let card=RectF::new(r.x+s(1.0),r.y+s(1.0),(r.w-s(2.0)).max(0.0),(r.h-s(2.0)).max(0.0));
         cv.round(card,s(6.0),c(fill));cv.stroke_round(card,s(6.0),c(border),s(1.0));
     }else if vertical{cv.round(r,s(6.0),c(fill));}
     else{cv.tab_shape(r,s(8.0),s(6.0),c(fill));}
+    let thickness=s(3.0);
+    let indicator=if vertical{
+        let h=s(20.0).min((r.h-s(8.0)).max(1.0));let x=if placement==TabPlacement::Left{r.x+s(3.0)}else{r.right()-s(3.0)-thickness};
+        RectF::new(x,r.y+(r.h-h)/2.0,thickness,h)
+    }else{let w=s(32.0).min((r.w-s(8.0)).max(1.0));RectF::new(r.x+(r.w-w)/2.0,r.bottom()-thickness,w,thickness)};
+    cv.round(indicator,thickness/2.0,c(accent));
 }
 
 impl WindowState {
-    pub(super) fn sf(&self, v: f32) -> f32 { v * self.dpi as f32 / 96.0 }
+    pub(super) fn sf(&self, v: f32) -> f32 { v * self.interface_dpi() as f32 / 96.0 }
     pub(super) fn ui_style(&self) -> TextStyle { TextStyle::ui(self.sf(UI_TEXT)) }
 
     /// Resolves (and caches) the small Shell icon for a location.
@@ -87,12 +95,20 @@ impl WindowState {
         let band_height=if destination.is_some(){height.min(96)}else{height};
         if Surface::ensure(&mut self.surface, width, band_height).is_none() { return; }
         // Collect icons first: uploading needs `&mut self`, drawing only `&self`.
-        let tab_icons: Vec<Option<ID2D1Bitmap>> = self.layout.tabs.clone().iter()
-            .map(|slot| { let l = self.session.tabs[slot.index].current().clone(); self.icon_for(&l) }).collect();
-        let current = self.current_location().clone();
-        let address_icon = self.icon_for(&current);
-        let bookmark_icons: Vec<Option<ID2D1Bitmap>> = (0..self.layout.bookmarks.len())
-            .map(|i| {let index=self.bookmark_index(i)?;if self.session.bookmarks[index].is_folder{return None;}let t=self.session.bookmarks[index].target.clone();self.icon_for(&t)}).collect();
+        let damaged=|r:LayoutRect|!r.is_empty()&&r.x<dirty.right&&r.right()>dirty.left&&r.y<dirty.bottom&&r.bottom()>dirty.top;
+        let mut tab_icons=Vec::new();
+        if damaged(self.layout.strip)||damaged(self.layout.tab_panel){
+            for slot in 0..self.layout.tabs.len(){
+                let location=self.session.tabs[self.layout.tabs[slot].index].current().clone();tab_icons.push(self.icon_for(&location));
+            }
+        }
+        let address_icon=if damaged(self.layout.address){let location=self.current_location().clone();self.icon_for(&location)}else{None};
+        let bookmark_icons:Vec<_>=if damaged(self.layout.bookmarks_row){
+            (0..self.layout.bookmarks.len()).map(|i|{
+                let index=self.bookmark_index(i)?;let b=&self.session.bookmarks[index];
+                if b.is_folder{return None;}let location=b.target.clone();self.icon_for(&location)
+            }).collect()
+        }else{Vec::new()};
         let (Some(gfx), Some(surface)) = (self.gfx.as_ref(), self.surface.as_ref()) else { return };
         let mut top=dirty.top/band_height*band_height;
         while top<dirty.bottom{
@@ -147,10 +163,10 @@ impl WindowState {
         let active = self.session.active_tab;
         if self.layout.vertical_tabs{
             cv.fill(rf(self.layout.tab_panel),c(p.strip));
-            if self.hover==Hit::TabSplitter||self.side_tab_resize.is_some(){cv.fill(rf(self.layout.tab_splitter),c(p.hover));}
+            if self.session.ui.navigation_divider.visible(self.hover==Hit::TabSplitter,self.side_tab_resize.is_some())&&(self.hover==Hit::TabSplitter||self.side_tab_resize.is_some()){cv.fill(rf(self.layout.tab_splitter),c(p.hover));}
             if !self.layout.tab_scroll_thumb.is_empty(){cv.round(rf(self.layout.tab_scroll_thumb),self.sf(4.0),c(if self.hover==Hit::TabScrollbar||self.side_tab_scroll_drag.is_some(){p.text}else{p.text_secondary}));}
             let edge = if self.layout.nav_row.x > 0 { self.layout.tab_panel.right() as f32 - 0.5 } else { self.layout.tab_panel.x as f32 + 0.5 };
-            cv.line(edge, self.layout.tab_panel.y as f32, edge, self.layout.tab_panel.bottom() as f32, c(p.divider), 1.0);
+            if self.session.ui.navigation_divider.visible(self.hover==Hit::TabSplitter,self.side_tab_resize.is_some()){cv.line(edge,self.layout.tab_panel.y as f32,edge,self.layout.tab_panel.bottom() as f32,c(p.divider),1.0);}
             let title=self.session.current_location().title();
             let title_end=if self.layout.tab_list.is_empty(){self.layout.app_menu.x}else{self.layout.tab_list.x};
             cv.text(&title,RectF::new(self.sf(14.0),strip.y,(title_end as f32-self.sf(24.0)).max(0.0),strip.h),&self.ui_style(),text);
@@ -163,7 +179,7 @@ impl WindowState {
             let text=c(appearance.text);
             let hovered = matches!(self.hover, Hit::Tab(i) | Hit::TabClose(i) if i == slot.index);
             if is_active {
-                paint_selected_tab(cv,r,self.layout.vertical_tabs,self.dpi,appearance);
+                paint_selected_tab(cv,r,self.session.ui.tab_placement,self.interface_dpi(),appearance,p.accent);
             } else if hovered {
                 cv.round(RectF::new(r.x + self.sf(2.0), r.y + self.sf(2.0), r.w - self.sf(4.0), r.h - self.sf(6.0)), self.sf(6.0), c(p.hover));
             } else {
@@ -257,6 +273,14 @@ impl WindowState {
         if !l.command_toggle.is_empty(){
             self.button_fill(cv,l.command_toggle,Hit::ToggleCommandBar,self.sf(4.0));
             cv.glyph(if self.session.ui.command_bar.visible{glyph::CHEVRON_UP}else{glyph::CHEVRON_DOWN},rf(l.command_toggle),self.sf(12.0),c(p.text_secondary));
+        }
+        if l.bookmarks_row.is_empty()&&!l.bookmark_overflow.is_empty(){
+            let r=l.bookmark_overflow;self.button_fill(cv,r,Hit::BookmarkOverflow,self.sf(4.0));
+            let icon=self.sf(ICON_DIP as f32);let rect=rf(r);
+            let area=RectF::new(rect.x+self.sf(8.0),rect.y+(rect.h-icon)/2.0,icon,icon);
+            cv.glyph(glyph::FOLDER,area,self.sf(14.0),c(p.text));
+            let x=area.right()+self.sf(6.0);
+            cv.text(zsdesk_core::i18n::text("收藏夹"),RectF::new(x,rect.y,(rect.right()-x-self.sf(6.0)).max(0.0),rect.h),&self.ui_style(),c(p.text));
         }
         // Address box.
         let address = rf(l.address);
@@ -368,7 +392,7 @@ impl WindowState {
         if l.bookmarks_row.is_empty() { return; }
         paint_chrome_layer(cv, l.bookmarks_row, c(self.palette.layer), crate::edition::THEMED && self.mica);
         if l.bookmarks_vertical{
-            let r=l.bookmarks_row;cv.line(r.x as f32,r.y as f32,r.x as f32,r.bottom()as f32,c(p.divider),1.0);
+            let r=l.bookmarks_row;if self.session.ui.navigation_divider.visible(self.hover==Hit::BookmarkSplitter,self.bookmark_resize.is_some()){cv.line(r.x as f32,r.y as f32,r.x as f32,r.bottom()as f32,c(p.divider),1.0);}
             cv.text(zsdesk_core::i18n::text("收藏夹"),rf(l.bookmarks_title),&self.ui_style(),c(p.text_secondary));
         }
         if self.session.bookmarks.is_empty() {
@@ -414,7 +438,8 @@ impl WindowState {
         let content = LayoutRect::new(l.nav_row.x, l.top, l.nav_row.width, (l.status.y - l.top).max(0));
         cv.fill(rf(content), c(p.content));
         if self.columns.active{
-            for x in [self.columns.bounds.right(),l.browser.right()]{
+            for (i,x) in [self.columns.bounds.right(),l.browser.right()].into_iter().enumerate(){
+                if !self.session.ui.navigation_divider.visible(self.hover==Hit::ColumnDivider(i),false){continue;}
                 cv.line(x as f32+0.5,l.browser.y as f32,x as f32+0.5,l.browser.bottom()as f32,c(p.divider),1.0);
             }
         }
@@ -433,15 +458,16 @@ impl WindowState {
             let split=rf(l.pane_splitter);
             cv.fill(split,c(p.content));
             let middle=(split.x+split.w/2.0).floor()+0.5;
+            if self.session.ui.navigation_divider.visible(self.hover==Hit::PaneSplitter,self.pane_splitter_drag.is_some()){
             if self.hover==Hit::PaneSplitter || self.pane_splitter_drag.is_some() {
                 let grip=self.sf(3.0);
                 cv.round(RectF::new(middle-grip/2.0,split.y,grip,split.h),grip/2.0,c(p.text_secondary).with_alpha(0.55));
             } else {
                 cv.line(middle,split.y,middle,split.bottom(),c(p.divider),1.0);
-            }
+            }}
         }
-        if !l.bookmark_splitter.is_empty()&&(self.hover==Hit::BookmarkSplitter||self.bookmark_resize.is_some()){cv.fill(rf(l.bookmark_splitter),c(p.hover));}
-        if !l.splitter.is_empty() && (self.hover == Hit::Splitter || self.splitter_drag.is_some()) {
+        if !l.bookmark_splitter.is_empty()&&self.session.ui.navigation_divider.visible(self.hover==Hit::BookmarkSplitter,self.bookmark_resize.is_some())&&(self.hover==Hit::BookmarkSplitter||self.bookmark_resize.is_some()){cv.fill(rf(l.bookmark_splitter),c(p.hover));}
+        if !l.splitter.is_empty() && self.session.ui.navigation_divider.visible(self.hover==Hit::Splitter,self.splitter_drag.is_some()) {
             let x = l.splitter.x as f32 + l.splitter.width as f32 / 2.0;
             cv.line(x, l.splitter.y as f32, x, l.splitter.bottom() as f32, c(p.divider), 1.0);
         }
@@ -505,7 +531,7 @@ impl WindowState {
         let style = self.ui_style();
         let pad = self.s(6);
         let widths: Vec<i32> = self.crumbs.iter().map(|c| gfx.measure(&c.title, &style, 2000.0).0 as i32 + pad * 2).collect();
-        self.crumb_slots = breadcrumb_geometry(a, &widths, self.dpi);
+        self.crumb_slots = breadcrumb_geometry(a, &widths, self.interface_dpi());
     }
 
     pub(super) fn crumb_at(&self, x: i32, y: i32) -> Option<CrumbPart> {
@@ -514,10 +540,16 @@ impl WindowState {
     }
 
     pub(super) fn measure_bookmarks(&mut self) {
-        self.bookmark_order=self.session.visible_bookmarks();
+        use zsdesk_core::model::explorer::BookmarkDisplay;
+        self.bookmark_order=if !self.session.ui.show_bookmarks || self.session.ui.bookmark_display==BookmarkDisplay::Dropdown{Vec::new()}
+            else if self.session.ui.bookmark_display==BookmarkDisplay::Categories{self.session.bookmarks.iter().enumerate().filter_map(|(i,b)|b.parent_id.is_none().then_some(i)).collect()}
+            else{self.session.visible_bookmarks()};
         let Some(gfx) = self.gfx.as_ref() else { return };
         let style = self.ui_style();
         let extra = self.s(8) + self.s(ICON_DIP) + self.s(6) + self.s(10);
+        if self.session.ui.show_bookmarks && self.session.ui.bookmark_display==BookmarkDisplay::Dropdown{
+            self.bookmark_widths=vec![(gfx.measure(zsdesk_core::i18n::text("收藏夹"),&style,600.0).0 as i32+extra).min(self.s(220))];return;
+        }
         self.bookmark_widths = self.bookmark_order.iter().map(|&index|
             (gfx.measure(&self.bookmark_label(index), &style, 600.0).0 as i32 + extra).min(self.s(220))).collect();
     }

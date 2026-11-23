@@ -190,6 +190,11 @@ unsafe extern "system" fn flyout_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
 }
 
 /// Work area and effective DPI of the monitor containing `point`.
+pub fn set_text_percent(owner:HWND,percent:u16){
+    let key=w!("ZSDesk.FlyoutTextPercent");
+    if percent==100{unsafe{let _=RemovePropW(owner,key);}}
+    else{unsafe{let _=SetPropW(owner,key,Some(windows::Win32::Foundation::HANDLE(usize::from(percent.clamp(100,150)) as *mut _)));}}
+}
 fn monitor_at(point: POINT) -> (Bounds, u32) {
     let monitor = unsafe { MonitorFromPoint(point, MONITOR_DEFAULTTONEAREST) };
     let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
@@ -212,7 +217,9 @@ fn open_level<'a>(gfx: &Gfx, owner: HWND, items: &'a [FlyoutItem], place: Place)
         Place::Root(Anchor::Below(button)) => POINT { x: button.left, y: button.bottom },
         Place::Beside { parent, item_top } => POINT { x: parent.right, y: item_top },
     };
-    let (work, dpi) = monitor_at(reference);
+    let (work,dpi)=monitor_at(reference);
+    let pct=unsafe{GetPropW(owner,w!("ZSDesk.FlyoutTextPercent"))}.0 as usize;
+    let dpi=if (100..=150).contains(&pct){(dpi*pct as u32+50)/100}else{dpi};
     let metrics = Metrics::new(dpi);
     let text_style = TextStyle::ui(metrics.px(geometry::TEXT_DIP));
     let accelerator_style = TextStyle::ui(metrics.px(geometry::ACCELERATOR_DIP));

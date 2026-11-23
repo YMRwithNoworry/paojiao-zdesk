@@ -609,7 +609,8 @@ impl WindowState {
     }
 
     fn current_location(&self) -> &ShellLocation { self.session.current_location() }
-    fn s(&self, v: i32) -> i32 { scale(v, self.dpi) }
+    fn interface_dpi(&self)->u32{self.session.ui.interface_dpi(self.dpi)}
+    fn s(&self, v: i32) -> i32 { scale(v,self.interface_dpi()) }
     fn client_size(&self) -> (i32, i32) {
         let mut r = RECT::default();
         let _ = unsafe { GetClientRect(self.hwnd, &mut r) };
@@ -621,13 +622,19 @@ impl WindowState {
         caption_rects(self.hwnd)
     }
 
+    fn column_divider(&self,i:usize)->LayoutRect{
+        if !self.columns.active{return LayoutRect::default();}
+        let l=&self.layout;let (x,right)=if i==0{(self.columns.bounds.right(),l.browser.x)}else{(l.browser.right(),self.preview_rect.map_or(l.browser.right(),|r|r.x))};
+        LayoutRect::new(x,l.browser.y,(right-x).max(0),l.browser.height)
+    }
     pub(super) fn chrome_hit(&self,x:i32,y:i32)->Hit{
+        if self.columns.active{for i in 0..2{if self.column_divider(i).contains(x,y){return Hit::ColumnDivider(i);}}}
         self.layout.hit_with_top_edge(x,y,screen_edge_window(self.hwnd))
     }
 
     /// Width covered by the DWM caption buttons, in client pixels.
     fn caption_width(&self) -> i32 {
-        if window_actions::fullscreen(self.hwnd) { return self.s(46*3); }
+        if window_actions::fullscreen(self.hwnd) { return scale(46*3,self.dpi); }
         let (width, _) = self.client_size();
         if let Some(bounds) = theme::caption_button_bounds(self.hwnd) {
             let mut window = RECT::default();
@@ -637,7 +644,7 @@ impl WindowState {
             let left_in_client = bounds.left - (origin.x - window.left);
             if left_in_client > 0 && left_in_client < width { return width - left_in_client; }
         }
-        self.s(46 * 3)
+        scale(46*3,self.dpi)
     }
 
     fn relayout(&mut self) {
@@ -647,12 +654,12 @@ impl WindowState {
             search_panel_open:self.search_panel.open,
             tab_placement:self.session.ui.tab_placement,
             side_tabs_width:self.session.ui.side_tabs_width,side_tabs_compact:self.session.ui.side_tabs_compact,
-            width, height, dpi: self.dpi, caption_width: self.caption_width(),
+            width, height, dpi:self.interface_dpi(), caption_width: self.caption_width(),
             caption_button: self.caption_buttons().map(|r|r[0]), command_bar: &self.session.ui.command_bar,
             tab_count: self.session.tabs.len(), active_tab: self.session.active_tab,
             show_tab_list:self.session.ui.tab_count_button_visible(),
             show_tree: self.session.ui.show_tree && self.tree.is_some() && (!self.session.ui.show_preview || width>=self.s(if self.session.ui.tab_placement==zsdesk_core::model::explorer::TabPlacement::Top{900}else{1110})), tree_width: self.s(self.session.ui.tree_width),
-            show_bookmarks: self.session.ui.show_bookmarks,bookmarks_on_right:self.session.ui.bookmarks_on_right,bookmarks_width:self.s(self.session.ui.bookmarks_width),
+            show_bookmarks: self.session.ui.show_bookmarks,bookmarks_on_right:self.session.ui.bookmarks_on_right,bookmark_dropdown:self.session.ui.bookmark_display==zsdesk_core::model::explorer::BookmarkDisplay::Dropdown,bookmarks_width:self.s(self.session.ui.bookmarks_width),
             status_bar: true, bookmark_widths: &self.bookmark_widths,
         };
         let mut layout=ChromeLayout::new(&input);
@@ -671,7 +678,7 @@ impl WindowState {
         }
         self.layout_dual_pane();
         self.layout_crumbs();
-        self.drop_zones.set(DropZones { bookmarks: self.layout.bookmarks_row, strip: self.layout.strip,tabs:self.layout.tab_panel,
+        self.drop_zones.set(DropZones { bookmarks: if self.layout.bookmarks_row.is_empty(){self.layout.bookmark_overflow}else{self.layout.bookmarks_row}, strip: self.layout.strip,tabs:self.layout.tab_panel,
             identity:if self.background_pane{self.drop_zones.get().identity}else{self.identity_for_source(self.browser_source)} });
         let frame_height=if crate::edition::THEMED && self.mica {self.layout.browser.y}else{self.layout.strip.height};
         theme::extend_frame(self.hwnd, if self.fullscreen_restore.is_some() { 0 } else { frame_height });
@@ -679,7 +686,7 @@ impl WindowState {
 
     fn position_children(&mut self) {
         self.position_picker();
-        self.columns.position(self.font,self.dpi);
+        let dpi=self.interface_dpi();self.columns.position(self.font,dpi);
         if self.columns.active{self.columns.fit_middle(self.layout.browser.width-self.s(24));}
         if let Some(browser) = &self.browser { unsafe { browser.resize(win_rect(self.layout.browser)); } }
         self.position_other_pane();
@@ -735,15 +742,17 @@ impl WindowState {
     }
 
     unsafe fn update_font(&mut self) {
+        zsdesk_windows::flyout::set_text_percent(self.hwnd,self.session.ui.interface_text_percent);
         let mut metrics = NONCLIENTMETRICSW { cbSize: size_of::<NONCLIENTMETRICSW>() as u32, ..Default::default() };
         let _ = unsafe { SystemParametersInfoForDpi(SPI_GETNONCLIENTMETRICS.0, metrics.cbSize, Some((&mut metrics as *mut NONCLIENTMETRICSW).cast()), 0, self.dpi) };
         let old = self.font;
-        self.font = unsafe { CreateFontIndirectW(&metrics.lfMessageFont) };
+        metrics.lfMessageFont.lfHeight=(i64::from(metrics.lfMessageFont.lfHeight)*i64::from(self.session.ui.interface_text_percent)/100) as i32;
+        let font=unsafe{CreateFontIndirectW(&metrics.lfMessageFont)};if font.is_invalid(){return;}self.font=font;
         for hwnd in [self.address_edit, self.search_edit, self.rename_hwnd, self.tooltip] {
             if !hwnd.0.is_null() { unsafe { SendMessageW(hwnd, WM_SETFONT, Some(WPARAM(self.font.0 as usize)), Some(LPARAM(1))); } }
         }
+        self.picker_fonts();self.apply_content_font();let dpi=self.interface_dpi();self.columns.position(self.font,dpi);
         if !old.0.is_null() { let _ = unsafe { DeleteObject(old.into()) }; }
-        self.picker_fonts();
     }
 
     /// Follows the system app mode for the chrome, DWM frame and Shell controls.
@@ -789,9 +798,16 @@ impl WindowState {
         // asynchronous navigation suppresses selection backgrounds in new views.
         if let Some(tree) = &self.tree { tree.apply_theme(self.dark, colorref(self.palette.content), colorref(self.palette.text)); }
         if let Some(browser)=&self.browser {browser.set_content_background(self.dark,colorref(self.palette.content));}
-        self.theme_other_pane();
+        self.theme_other_pane();self.apply_content_font();
     }
 
+    fn apply_content_font(&self){
+        if self.font.is_invalid(){return;}
+        if let Some(tree)=&self.tree{tree.set_label_font(self.font,self.session.ui.interface_text_percent!=100);}
+        for browser in [&self.browser,&self.other_pane.browser].into_iter().flatten(){
+            if let Some(view)=browser.view_window(){apply_view_font(view,self.font,self.session.ui.interface_text_percent!=100);}
+        }
+    }
     fn invalidate(&self) { let _ = unsafe { InvalidateRect(Some(self.hwnd), None, false) }; }
     fn invalidate_rect(&self, r: LayoutRect) {
         let rect = win_rect(r);
@@ -936,6 +952,26 @@ fn work_area_offset(hwnd: HWND) -> (i32, i32) {
 }
 
 /// Frame thickness used for the resize border (matches the system caption metrics).
+// Apply the application font to standard child controls that support WM_SETFONT.
+fn apply_view_font(view:HWND,font:HFONT,custom:bool){
+    unsafe extern "system" fn each(child:HWND,param:LPARAM)->windows::core::BOOL{
+        let mut class=[0u16;32];let n=unsafe{GetClassNameW(child,&mut class)}.max(0)as usize;
+        if ["SysListView32","SysHeader32"].iter().any(|v|v.encode_utf16().eq(class[..n].iter().copied())){
+            let key=windows::core::w!("ZSDesk.CustomViewFont");
+            let custom=param.0!=0;
+            if custom || !unsafe{GetPropW(child,key)}.is_invalid(){
+                if unsafe{SendMessageW(child,WM_GETFONT,None,None)}.0!=param.0{
+                    unsafe{SendMessageW(child,WM_SETFONT,Some(WPARAM(param.0 as usize)),Some(LPARAM(1)));}
+                }
+                if custom{unsafe{let _=SetPropW(child,key,Some(windows::Win32::Foundation::HANDLE(1usize as _)));}}
+                else{unsafe{let _=RemovePropW(child,key);}}
+            }
+        }true.into()
+    }
+    let p=LPARAM(if custom{font.0 as isize}else{0});
+    unsafe{let _=each(view,p);let _=EnumChildWindows(Some(view),Some(each),p);}
+}
+
 fn frame_size(dpi: u32) -> (i32, i32) {
     let padded = unsafe { GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi) };
     (unsafe { GetSystemMetricsForDpi(SM_CXFRAME, dpi) } + padded, unsafe { GetSystemMetricsForDpi(SM_CYFRAME, dpi) } + padded)
@@ -1503,7 +1539,7 @@ impl WindowState {
                 unsafe{SetDCBrushColor(HDC(wp.0 as *mut _),COLORREF(colorref(self.palette.content)));}
                 return Some(LRESULT(unsafe{GetStockObject(DC_BRUSH)}.0 as isize));
             }
-            WM_DRAWITEM if self.columns.draw(lp,self.font,&self.palette,self.dpi) => return Some(LRESULT(1)),
+            WM_DRAWITEM if self.columns.draw(lp,self.font,&self.palette,self.interface_dpi()) => return Some(LRESULT(1)),
             column_browser::CHANGED => {
                 let _=zsdesk_windows::shell::notify::read_change(wp,lp);
                 if self.columns.active{unsafe{SetTimer(Some(self.hwnd),column_browser::RELOAD,180,None);}}
@@ -1564,6 +1600,11 @@ impl WindowState {
                 self.session.ui.single_click_blank_up=saved.ui.single_click_blank_up;
                 self.session.ui.double_click_blank_up=saved.ui.double_click_blank_up;
                 self.session.ui.right_click_close_tab = saved.ui.right_click_close_tab;
+                if self.session.ui.bookmark_display!=saved.ui.bookmark_display||self.session.ui.navigation_divider!=saved.ui.navigation_divider||self.session.ui.interface_text_percent!=saved.ui.interface_text_percent{
+                    unsafe{self.commit_bookmark_rename();}self.session.ui.bookmark_display=saved.ui.bookmark_display;self.session.ui.navigation_divider=saved.ui.navigation_divider;
+                    if self.session.ui.interface_text_percent!=saved.ui.interface_text_percent{self.session.ui.interface_text_percent=saved.ui.interface_text_percent;unsafe{self.update_font();}self.crumbs_for=None;}
+                    self.measure_bookmarks();unsafe{self.resize();}self.invalidate();
+                }
                 if self.session.ui.tab_selection_emphasis!=saved.ui.tab_selection_emphasis{
                     self.session.ui.tab_selection_emphasis=saved.ui.tab_selection_emphasis;self.invalidate();
                 }

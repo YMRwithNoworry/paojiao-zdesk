@@ -25,3 +25,11 @@ dirs = "6"
 [profile.release]
 opt-level = 3
 lto = "thin"
+
+# Size-oriented code generation for Win32 integration. Search matching retains
+# the workspace release optimization level.
+[profile.release.package.zsdesk-windows]
+opt-level = "s"
+
+[profile.release.package.zsdesk-ui]
+opt-level = "s"

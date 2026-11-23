@@ -270,6 +270,16 @@ impl Geometry {
         self.add = Rect::new(x.min(right - button).max(left), y, button, chip_h);
     }
 
+    fn title_at_bottom(&mut self){
+        let dy=self.height-self.title.height;
+        if dy<=0{return;}
+        for r in [&mut self.title,&mut self.more,&mut self.back,&mut self.add,&mut self.tab_list]{if !r.is_empty(){r.y+=dy;}}
+        for (_,r) in &mut self.tabs{r.y+=dy;}
+        let shift=self.height-self.title.height-self.content.height-self.content.y;
+        self.content.y+=shift;
+        let cell=&mut self.cells.first_cell;
+        for r in [&mut cell.cell,&mut cell.icon,&mut cell.label,&mut self.thumb]{if !r.is_empty(){r.y+=shift;}}
+    }
     pub fn hit(&self, x: i32, y: i32, dpi: u32, locked: bool, collapsed: bool) -> FenceHit {
         let edge = scale(EDGE, dpi);
         if !locked {
@@ -359,6 +369,7 @@ pub struct FenceWin {
     pub tracking: bool,
     /// A collapsed fence temporarily rolled down under the pointer.
     pub peek: bool,
+    pub title_bottom:bool,
     /// Explicitly collapsed under the pointer: no peek until it leaves.
     pub peek_blocked: bool,
     /// The fence's tab group (empty or one entry for a plain fence).
@@ -383,7 +394,7 @@ impl FenceWin {
     pub fn new(id: u64) -> Self {
         let mut value=Self { id, hwnd: HWND::default(), dpi: 96, entries: Vec::new(), selection: HashSet::new(), menu_highlight: None, anchor: None, focus: None,
             hover: FenceHit::None, scroll: 0, zoom_remainder: 0, standalone: false, interaction: None, surface: None, notify: None, notify_path: None, drop: None,
-            drop_hover: None, rename: None, message: None,notice:None,cut_keys:HashSet::new(),pending_selection:None,operation_epoch:0, tracking: false, peek: false, peek_blocked: false,
+            drop_hover: None, rename: None, message: None,notice:None,cut_keys:HashSet::new(),pending_selection:None,operation_epoch:0, tracking: false, peek: false, title_bottom:false, peek_blocked: false,
             tabs: Vec::new(), ghost: false, merge_hover: None, drop_tab: None };
         value.advance_operation_epoch();value
     }
@@ -403,6 +414,7 @@ impl FenceWin {
         if self.standalone { return Geometry::desktop_item(r.right-r.left, r.bottom-r.top, self.dpi, fence.icon_size.pixels(), self.entries.len()); }
         let mut g=Geometry::with_collapse(r.right-r.left,r.bottom-r.top,self.dpi,fence,self.entries.len(),self.scroll,fence.browse.is_some(),self.collapsed(fence));
         g.layout_tabs(&self.tabs, self.active_index(), self.dpi);
+        if self.title_bottom{g.title_at_bottom();}
         g.add_hidden = !self.title_hovered() || (self.peek && !self.tabbed());
         g
     }
@@ -524,7 +536,7 @@ impl FenceWin {
             if !self.standalone {
             cv.round(outer, radius, col(palette.background));
             // Title bar.
-            let title = RectF::new(0.0, 0.0, w as f32, g.title.height as f32);
+            let title=rf(g.title);
             cv.push_clip(title);
             cv.round(outer, radius, col(palette.title));
             cv.pop_clip();
@@ -577,13 +589,13 @@ impl FenceWin {
                 let side = if hovered { sf(66.0) } else { sf(36.0) };
                 let lock = if fence.locked { sf(16.0) } else { 0.0 };
                 let room = (w as f32 - side * 2.0 - lock).max(0.0);
-                let area = RectF::new(side + lock / 2.0, 0.0, room, title.h);
+                let area = RectF::new(side + lock / 2.0, title.y, room, title.h);
                 cv.text(&fence.title, area, &title_style, col(palette.text));
                 if fence.locked {
                     // Fluent lock glyph after the centred title (not a color emoji).
                     let (text_w, _) = cv.gfx().measure(&fence.title, &title_style, room);
                     let x = area.x + (room + text_w.min(room)) / 2.0 + sf(4.0);
-                    cv.glyph(glyph::LOCK, RectF::new(x, 0.0, sf(12.0), title.h), sf(10.0), col(palette.text_secondary));
+                    cv.glyph(glyph::LOCK, RectF::new(x, title.y, sf(12.0), title.h), sf(10.0), col(palette.text_secondary));
                 }
             }
             if !g.add_hidden && !g.add.is_empty() && self.merge_hover.is_none() {
@@ -595,7 +607,7 @@ impl FenceWin {
                 // Where the dragged fence will land as a tab.
                 let width = sf(96.0).min((w as f32 - sf(80.0)).max(sf(40.0)));
                 let x = if self.tabbed() { g.add.x as f32 } else { g.more.x as f32 - sf(4.0) - width };
-                let chip = RectF::new(x.min(w as f32 - sf(36.0) - width).max(sf(6.0)), (title.h - sf(28.0)) / 2.0, width, sf(28.0));
+                let chip = RectF::new(x.min(w as f32 - sf(36.0) - width).max(sf(6.0)), title.y+(title.h - sf(28.0)) / 2.0, width, sf(28.0));
                 cv.stroke_round(chip, sf(6.0), col(palette.accent), sf(1.5));
                 cv.text(incoming, chip.inset(sf(10.0), 0.0), &TextStyle::ui(sf(13.0)).weight(600), col(palette.accent));
             }
@@ -606,7 +618,7 @@ impl FenceWin {
                 cv.glyph(glyph::MORE, more, sf(13.0), col(palette.text));
             } else if show_counts {
                 let count = self.entries.len().to_string();
-                cv.text(&count, RectF::new(w as f32 - sf(40.0), 0.0, sf(30.0), title.h), &small, col(palette.text_secondary));
+                cv.text(&count, RectF::new(w as f32 - sf(40.0), title.y, sf(30.0), title.h), &small, col(palette.text_secondary));
             }
             if !g.back.is_empty() {
                 let back = rf(g.back);
@@ -706,6 +718,14 @@ mod tests {
 
     fn fence() -> Fence { Fence::new(1, "t", FenceSource::Desktop, Placement::default()) }
 
+    #[test]
+    fn upward_geometry_moves_content_and_header_hit_targets_together(){
+        let mut g=Geometry::new(360,280,96,&fence(),40,0,false);
+        let before=g.cells.at(0).cell;g.title_at_bottom();let r=g.cells.at(0).cell;
+        assert_eq!(g.title.bottom(),g.height);assert!(g.content.bottom()<=g.title.y);
+        assert!(r.y<before.y && r.y>=g.content.y);assert_eq!(g.hit(170,g.title.y+12,96,true,false),FenceHit::Title);
+        assert_eq!(g.hit(g.more.x+5,g.more.y+5,96,true,false),FenceHit::More);
+    }
     #[test]
     fn desktop_pointer_menu_highlight_pixels_and_selection_lifetime() -> anyhow::Result<()> {
         use windows::Win32::System::Ole::{OleInitialize,OleUninitialize};

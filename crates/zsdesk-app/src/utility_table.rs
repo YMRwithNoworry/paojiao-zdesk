@@ -91,6 +91,7 @@ pub(super) struct Table {
     model: RefCell<Model>,
     palette: Cell<Option<Palette>>,
     empty: Cell<Empty>,
+    render_dpi:Cell<u32>,
 }
 impl Table {
     pub fn attach(self: &Rc<Self>, list: HWND, p: Palette) -> Result<()> {
@@ -111,6 +112,7 @@ impl Table {
             }
         }
     }
+    pub fn dpi(&self,dpi:u32){self.render_dpi.set(dpi.max(96));}
     pub fn theme(&self, p: Palette) {
         self.palette.set(Some(p));
     }
@@ -189,7 +191,7 @@ impl Table {
         if body.height == 0 || body.width == 0 {
             return true;
         }
-        let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
+        let dpi=self.render_dpi.get().max(96);
         let widths: [i32; 4] = std::array::from_fn(
             |i| unsafe { SendMessageW(hwnd, LVM_GETCOLUMNWIDTH, Some(WPARAM(i)), None) }.0 as i32,
         );
