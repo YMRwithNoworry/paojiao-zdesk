@@ -49,7 +49,8 @@ impl WindowState {
     pub(super) unsafe fn capture_active(&mut self) {
         if self.pending.is_some() {return;}
         let Some(id)=self.shown_tab else {return;};
-        let snapshot=self.browser.as_ref().and_then(|b|unsafe {b.capture_view()});
+        let mut snapshot=self.browser.as_ref().and_then(|b|unsafe {b.capture_view()});
+        if !self.background_pane{if let Some(view)=snapshot.as_mut(){self.columns.preserve_tab_view(view);}}
         if let Some(tab)=self.session.tabs.iter_mut().find(|t|t.id==id) {tab.view=snapshot;}
     }
     pub(super) unsafe fn request_navigation(&mut self,request:NavigationRequest) {
@@ -70,6 +71,7 @@ impl WindowState {
         }
         if !self.session.tabs.iter().any(|t|t.id==request.tab.id) {return;}
         let target=request.tab.current().clone();
+        if !self.background_pane{self.columns.release_middle();self.columns.preview_file=None;}
         self.pending=Some(request);
         self.publish_listary_folder();
         // Invalidate the old query before clearing/replacing its native view.
@@ -173,6 +175,7 @@ impl WindowState {
         }
         self.publish_listary_folder();
         self.save();
+        if !self.background_pane && self.queued.is_none() { self.restore_folder_layout(); }
         unsafe {self.rebuild_tabs();}
         if self.queued.is_none() {
             let current=self.current_location().clone();
@@ -198,7 +201,9 @@ impl WindowState {
         let failed=self.pending.take().map(|p|p.tab.current().address()).unwrap_or_default();
         self.show_message(zsdesk_core::tr_format!("无法打开：{failed}", failed=failed));
         if self.queued.is_none() {
-            if let Some(index)=self.session.tabs.iter().position(|t|Some(t.id)==self.shown_tab) {self.session.active_tab=index;}
+            if let Some(index)=self.session.tabs.iter().position(|t|Some(t.id)==self.shown_tab) {self.session.active_tab=index;
+                if self.columns.active&&!self.background_pane{self.restore_folder_layout();}
+            }
         }
         unsafe {self.rebuild_tabs();}
         if self.queued.is_none(){if let Some(identity)=self.identity_for_source(self.browser_source){let _=zsdesk_windows::shell::file_transfer::bind_origin(self.view_hwnd,identity.source,identity.tab,identity.epoch);}}

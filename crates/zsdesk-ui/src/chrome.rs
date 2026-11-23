@@ -247,6 +247,7 @@ pub struct ChromeLayout {
     pub status_details: Rect,
     pub status_tiles: Rect,
     pub status_dual_pane: Rect,
+    pub status_columns: Rect,
     /// Bottom of the top chrome (start of the content area).
     pub top: i32,
 }
@@ -282,6 +283,7 @@ pub enum Hit {
     StatusDetails,
     StatusTiles,
     StatusDualPane,
+    StatusColumns,
     Status,
 }
 
@@ -442,6 +444,7 @@ impl ChromeLayout {
             layout.status_tiles = Rect { x: width - s(8) - toggle.width, ..toggle };
             layout.status_details = Rect { x: layout.status_tiles.x - s(2) - toggle.width, ..toggle };
             layout.status_dual_pane = Rect { x: layout.status_details.x - s(2) - toggle.width, ..toggle };
+            layout.status_columns = Rect { x: layout.status_dual_pane.x - s(2) - toggle.width, ..toggle };
         }
         let content_h = (status_y - layout.top).max(0);
         if input.show_tree && width > s(MIN_TREE_W) * 2 {
@@ -497,7 +500,7 @@ impl ChromeLayout {
             layout.set_tab_viewport(input.tab_count,first);
             for rect in [&mut layout.nav_row,&mut layout.back,&mut layout.forward,&mut layout.up,&mut layout.refresh,&mut layout.address,&mut layout.search,
                 &mut layout.command_row,&mut layout.command_toggle,&mut layout.bookmarks_row,&mut layout.bookmarks_title,&mut layout.bookmark_overflow,&mut layout.bookmark_splitter,&mut layout.tree,&mut layout.splitter,&mut layout.browser,
-                &mut layout.status,&mut layout.status_details,&mut layout.status_tiles,&mut layout.status_dual_pane]{rect.x+=content_offset;}
+                &mut layout.status,&mut layout.status_details,&mut layout.status_tiles,&mut layout.status_dual_pane,&mut layout.status_columns]{rect.x+=content_offset;}
             for (_,rect) in &mut layout.commands{rect.x+=content_offset;}
             for rect in layout.bookmarks.iter_mut().chain(layout.separators.iter_mut()){rect.x+=content_offset;}
             layout.search_panel.translate_x(content_offset);
@@ -583,6 +586,7 @@ impl ChromeLayout {
         if !self.status.is_empty() && self.status.contains(x, y) {
             if self.status_details.contains(x, y) { return Hit::StatusDetails; }
             if self.status_tiles.contains(x, y) { return Hit::StatusTiles; }
+            if self.status_columns.contains(x, y) { return Hit::StatusColumns; }
             if self.status_dual_pane.contains(x, y) { return Hit::StatusDualPane; }
             return Hit::Status;
         }
@@ -958,6 +962,15 @@ mod tests {
         assert!(after.separators.iter().all(|r| r.x > after.commands[0].1.right()));
     }
 
+    #[test]
+    fn column_layout_switch_is_left_of_dual_pane_and_has_its_own_hit_target(){
+        for dpi in [96,120,144,192]{
+            let layout=ChromeLayout::new(&input(1440,3,0,dpi));
+            assert!(layout.status_columns.right()<layout.status_dual_pane.x);
+            assert_eq!(layout.hit(layout.status_columns.x+2,layout.status_columns.y+2),Hit::StatusColumns);
+            assert_eq!(layout.hit(layout.status_dual_pane.x+2,layout.status_dual_pane.y+2),Hit::StatusDualPane);
+        }
+    }
     #[test]
     fn hidden_command_bar_gives_its_entire_height_to_content() {
         for dpi in [96, 120, 144, 192] {

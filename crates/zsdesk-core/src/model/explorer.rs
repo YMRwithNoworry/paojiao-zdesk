@@ -324,6 +324,9 @@ impl Default for QuickSearchPreferences {
 }
 
 /// Chrome preferences shared by every tab.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FolderLayout { #[default] Single, Dual, Columns }
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct ExplorerUi {
@@ -335,6 +338,8 @@ pub struct ExplorerUi {
     pub side_tabs_width: i32,
     pub side_tabs_compact: bool,
     pub dual_pane: bool,
+    #[serde(default)]
+    pub folder_layouts: std::collections::BTreeMap<PathBuf, FolderLayout>,
     /// Split position in thousandths, independent of monitor scaling.
     pub pane_ratio: u16,
     pub double_click_close_tab: bool,
@@ -404,7 +409,7 @@ impl ExplorerUi{
 
 impl Default for ExplorerUi {
     fn default() -> Self {
-        Self { language:crate::i18n::LanguagePreference::System,startup_location:StartupLocation::default(),new_tab_location:NewTabLocation::default(), tab_placement:TabPlacement::Top, side_tabs_width:210,side_tabs_compact:true,dual_pane:false, pane_ratio:500,
+        Self { language:crate::i18n::LanguagePreference::System,startup_location:StartupLocation::default(),new_tab_location:NewTabLocation::default(), tab_placement:TabPlacement::Top, side_tabs_width:210,side_tabs_compact:true,dual_pane:false, folder_layouts:Default::default(), pane_ratio:500,
             double_click_close_tab:true, right_click_close_tab:false, mouse_gestures:true, everything_folder_sizes:false,
             close_window_on_last_tab:true,double_click_blank_up:true,single_click_blank_up:false,show_tab_count:true,show_tab_list:true,tab_selection_emphasis:false,
             show_tree: true, tree_width: 220, show_bookmarks: true, bookmarks_on_right:false, bookmarks_width:210, explorer_tray:false, show_preview: false, show_details: false,

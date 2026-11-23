@@ -340,7 +340,7 @@ fn execute_inner(core:&Core,options:&SearchOptions,roots:Option<&[PathBuf]>,shar
     for failure in &store.failures{if let Some(status)=statuses.iter_mut().find(|status|same_root(&status.root,&failure.root)){status.phase=IndexPhase::Paused;status.warning=failure.warning.clone();}else{statuses.push(failure.clone());}}
     if let Some(warning)=&store.snapshot_warning{if let Some(status)=statuses.first_mut(){status.warning=Some(warning.clone());}}
     let error=(!store.failures.is_empty()).then(||zsdesk_core::i18n::text("部分位置暂时不可更新，请查看搜索状态").to_owned());store.last_use=Instant::now();
-    if options.index_metadata&&matches!(request.sort,everything::SearchSort::SizeDesc|everything::SearchSort::ModifiedDesc){store.dirty=true;}
+    if options.index_metadata&&!matches!(request.sort,everything::SearchSort::NameAsc|everything::SearchSort::NameDesc){store.dirty=true;}
     drop(store);
     let changed={let mut previous=shared.native_page.lock().unwrap_or_else(|e|e.into_inner());
         ensure!(shared.current(request.generation),"搜索已取消");
@@ -354,7 +354,7 @@ fn execute_inner(core:&Core,options:&SearchOptions,roots:Option<&[PathBuf]>,shar
 struct RankedRow{hit:u64,value:u64}
 
 fn sort_attribute(volume:&mut VolumeIndex,row:u32,sort:everything::SearchSort)->u64{
-    let size_sort=sort==everything::SearchSort::SizeDesc;
+    let size_sort=matches!(sort,everything::SearchSort::SizeDesc|everything::SearchSort::SizeAsc);
     let known=volume.index.attributes.as_ref().map(|a|if size_sort{a.size[row as usize]}else{a.modified[row as usize]});
     if let Some(value)=known.filter(|v|*v!=UNKNOWN){return value;}
     let data=volume.index.path(&volume.root,row).and_then(|path|fs::symlink_metadata(path).ok());
@@ -372,6 +372,7 @@ fn compare_rows(volumes:&[VolumeIndex],sort:everything::SearchSort,a:&RankedRow,
             let order=name(a.hit).cmp(name(b.hit)).then_with(||a.hit.cmp(&b.hit));
             if sort==NameDesc{order.reverse()}else{order}
         }
+        SizeAsc|ModifiedAsc=>(a.value==UNKNOWN).cmp(&(b.value==UNKNOWN)).then_with(||a.value.cmp(&b.value)).then_with(||a.hit.cmp(&b.hit)),
         SizeDesc|ModifiedDesc=>(a.value==UNKNOWN).cmp(&(b.value==UNKNOWN))
             .then_with(||b.value.cmp(&a.value)).then_with(||a.hit.cmp(&b.hit)),
     }

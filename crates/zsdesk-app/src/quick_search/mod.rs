@@ -2,6 +2,7 @@
 pub mod control;
 mod resident;
 pub(super) mod popup;
+pub(crate) mod details;
 use std::path::{Path,PathBuf};
 use anyhow::{Context,Result};
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]

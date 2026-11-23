@@ -42,7 +42,7 @@ impl QuickPreview {
     }
     pub(super) fn window(&self)->HWND{self.state.hwnd.get()}
     pub(super) fn status(&self)->(String,String){
-        let kind=match &*self.state.content.borrow(){Content::Empty=>"information",Content::Handler(preview)=>if preview.rendered.is_some(){"wps"}else{"system"},Content::Text(_)=>"text",Content::Image(_)=>"image",Content::Media(_)=>"media"};
+        let kind=match &*self.state.content.borrow(){Content::Empty=>"information",Content::Handler(preview)=>if preview.rendered.is_some(){"wps"}else{"system"},Content::Text(_)=>"text",Content::Folder(_)=>"folder",Content::Image(_)=>"image",Content::Media(_)=>"media"};
         (kind.into(),self.state.notice.borrow().clone())
     }
     pub(super) fn open(owner: HWND, path: &Path) -> Result<Self> {
@@ -128,7 +128,20 @@ impl QuickPreview {
         *self.state.summary.borrow_mut() = if metadata.is_dir() { zsdesk_core::i18n::text("文件夹").into() }
             else { format!("{} · {}", file_type(path), zsdesk_ui::chrome::format_size(metadata.len())) };
         if metadata.is_dir() {
-            *self.state.notice.borrow_mut() = zsdesk_core::i18n::text("请选择文件以显示内容预览。").into();
+            if self.state.embedded {
+                let colors=self.state.colors.get();
+                match super::folder_preview::create(self.state.hwnd.get(),path,self.state.font.get(),colors.background,colors.text,||image_request_cancelled(path)){
+                    Ok((list,total,shown))=>{
+                        let child=TextPreview(list);
+                        if !self.is_open() || self.state.path.borrow().as_path()!=path || image_request_cancelled(path){return Ok(());}
+                        let name=path.file_name().unwrap_or(path.as_os_str()).to_string_lossy();
+                        *self.state.summary.borrow_mut()=if shown==total{zsdesk_core::tr_format!("{name} · {total} 个项目",name=name,total=total)}
+                            else{zsdesk_core::tr_format!("{name} · {total} 个项目，预览 {shown} 项",name=name,total=total,shown=shown)};
+                        *self.state.content.borrow_mut()=Content::Folder(child);self.state.layout_content();
+                    }
+                    Err(error)=>*self.state.notice.borrow_mut()=error.to_string()
+                }
+            } else {*self.state.notice.borrow_mut() = zsdesk_core::i18n::text("请选择文件以显示内容预览。").into();}
             self.state.invalidate();
             return Ok(());
         }
@@ -225,6 +238,7 @@ impl QuickPreview {
             Content::Empty => ("information", 0, None),
             Content::Handler(_) => ("system", 0, None),
             Content::Text(text) => ("text", 0, Some(text.0)),
+            Content::Folder(list) => ("folder", 0, Some(list.0)),
             Content::Image(image) => ("image", image.pixels.len(), None),
             Content::Media(_) => ("media", 0, None),
         };
@@ -285,7 +299,7 @@ impl Drop for PreviewDpiScope {
     fn drop(&mut self) { if !self.0.0.is_null() { unsafe { SetThreadDpiAwarenessContext(self.0); } } }
 }
 
-enum Content { Empty, Handler(SystemPreview), Text(TextPreview), Image(ImagePreview),Media(Rc<MediaPreview>) }
+enum Content { Empty, Handler(SystemPreview), Text(TextPreview), Folder(TextPreview), Image(ImagePreview),Media(Rc<MediaPreview>) }
 struct TextPreview(HWND);
 impl Drop for TextPreview {
     fn drop(&mut self) { if unsafe { IsWindow(Some(self.0)) }.as_bool() { let _ = unsafe { DestroyWindow(self.0) }; } }
@@ -331,7 +345,7 @@ impl PreviewState {
         zsdesk_windows::theme::set_dark_frame(self.hwnd.get(),colors.dark);
         let media=match &*self.content.borrow(){Content::Media(media)=>Some(media.clone()),_=>None};
         if let Some(media)=media{media.set_dark(colors.dark);}
-        let text=match &*self.content.borrow(){Content::Text(text)=>Some(text.0),_=>None};
+        let text=match &*self.content.borrow(){Content::Text(text)|Content::Folder(text)=>Some(text.0),_=>None};
         if let Some(text)=text{zsdesk_windows::theme::theme_control(text,colors.dark);let _=unsafe{InvalidateRect(Some(text),None,true)};}
         if let Some(visuals)=self.handler().and_then(|handler|handler.cast::<IPreviewHandlerVisuals>().ok()){
             let _=unsafe{visuals.SetBackgroundColor(COLORREF(colors.background))};let _=unsafe{visuals.SetTextColor(COLORREF(colors.text))};
@@ -360,11 +374,15 @@ impl PreviewState {
         let rect = self.content_rect();
         let _dpi = PreviewDpiScope::for_window(self.hwnd.get());
         let handler = self.handler();
-        let text = match &*self.content.borrow() { Content::Text(text) => Some(text.0), _ => None };
+        let text = match &*self.content.borrow() { Content::Text(text)|Content::Folder(text) => Some(text.0), _ => None };
         let media=match &*self.content.borrow(){Content::Media(media)=>Some(media.clone()),_=>None};
         if let Some(media)=media{media.layout(rect);}
         if let Some(handler) = handler { let _ = unsafe { handler.SetRect(&rect) }; }
         if let Some(hwnd) = text {
+            if matches!(&*self.content.borrow(),Content::Folder(_)){
+                crate::report_list::width(hwnd,0,(rect.right-rect.left-self.s(18)).max(1));
+                crate::report_list::style(hwnd,COLORREF(self.colors.get().background),COLORREF(self.colors.get().text));
+            }
             let _ = unsafe { MoveWindow(hwnd, rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top, true) };
             let _ = unsafe { ShowWindow(hwnd, SW_SHOWNOACTIVATE) };
         }
@@ -376,7 +394,7 @@ impl PreviewState {
             let next = unsafe { CreateFontIndirectW(&metrics.lfMessageFont) };
             if !next.0.is_null() {
                 let previous = self.font.replace(next);
-                let text=match &*self.content.borrow(){Content::Text(text)=>Some(text.0),_=>None};
+                let text=match &*self.content.borrow(){Content::Text(text)|Content::Folder(text)=>Some(text.0),_=>None};
                 // WM_SETFONT can synchronously dispatch color/destruction
                 // callbacks; retain only the HWND across that call.
                 if let Some(text)=text{unsafe { SendMessageW(text, WM_SETFONT, Some(WPARAM(next.0 as usize)), Some(LPARAM(1))); }}

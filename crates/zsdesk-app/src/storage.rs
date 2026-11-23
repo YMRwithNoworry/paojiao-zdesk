@@ -168,7 +168,7 @@ fn save_window_preferences(path:&Path,session:&ExplorerSession,secondary:bool,
     baseline:&SearchPreferences,baseline_bookmarks:Option<&[Bookmark]>)->Result<(SearchPreferences,Vec<Bookmark>)>{
     let _write=SAVE_LOCK.lock().map_err(|_|anyhow::anyhow!("会话保存锁异常"))?;
     let saved=load(path).ok();let mut next=session.clone();
-    if let Some(saved)=&saved {next.ui.explorer_tray=saved.ui.explorer_tray;next.ui.language=saved.ui.language;
+    if let Some(saved)=&saved {next.ui.folder_layouts.clone_from(&saved.ui.folder_layouts);next.ui.explorer_tray=saved.ui.explorer_tray;next.ui.language=saved.ui.language;
         next.ui.startup_location=saved.ui.startup_location.clone();next.ui.new_tab_location=saved.ui.new_tab_location.clone();next.ui.context_menu=saved.ui.context_menu.clone();next.ui.forward_unhandled_windows=saved.ui.forward_unhandled_windows;next.ui.forward_while_running=saved.ui.forward_while_running;next.ui.tab_selection_emphasis=saved.ui.tab_selection_emphasis;
         next.ui.right_click_close_tab=saved.ui.right_click_close_tab;
         next.ui.single_click_blank_up=saved.ui.single_click_blank_up;
@@ -259,6 +259,18 @@ mod tests {
         assert_eq!(load(&path).unwrap().ui.startup_location,chosen);
         assert_eq!(load(&path).unwrap().ui.new_tab_location,new_tab);
         fs::remove_file(path).unwrap();fs::remove_dir(root).unwrap();
+    }
+    #[test]fn remembered_folder_layouts_survive_stale_saves_and_restart()->Result<()> {
+        use zsdesk_core::model::explorer::FolderLayout;
+        let root=std::env::temp_dir().join(format!("zsdesk-layout-memory-{}-{}",std::process::id(),SAVE_SERIAL.fetch_add(1,Ordering::Relaxed)));
+        fs::create_dir(&root)?;let path=root.join("profile.json");let stale=default_session();save(&path,&stale)?;
+        update_shared_ui(&path,|ui|ui.folder_layouts.insert(root.join("A"),FolderLayout::Dual))?;
+        update_shared_ui(&path,|ui|ui.folder_layouts.insert(root.join("B"),FolderLayout::Columns))?;
+        update_shared_ui(&path,|ui|ui.folder_layouts.insert(root.join("C"),FolderLayout::Single))?;
+        for secondary in [true,false] { save_window_with_shared_preferences(&path,&stale,secondary,&stale.ui.search_preferences(),&stale.bookmarks)?; }
+        let loaded=load(&path)?;assert_eq!(loaded.ui.folder_layouts.len(),3);
+        for (name,layout) in [("A",FolderLayout::Dual),("B",FolderLayout::Columns),("C",FolderLayout::Single)] {assert_eq!(loaded.ui.folder_layouts[&root.join(name)],layout);}
+        fs::remove_file(path)?;fs::remove_dir(root)?;Ok(())
     }
     #[test]fn first_launch_can_save_tab_defaults_before_a_session_exists(){
         let root=std::env::temp_dir().join(format!("zsdesk-first-tab-{}-{}",std::process::id(),SAVE_SERIAL.fetch_add(1,Ordering::Relaxed)));

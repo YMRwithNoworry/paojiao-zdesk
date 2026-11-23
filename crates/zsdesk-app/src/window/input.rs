@@ -79,6 +79,7 @@ impl WindowState {
             Command::Up => unsafe { self.go_up() },
             Command::FocusAddress => unsafe { self.focus_address() },
             Command::Refresh => unsafe {
+                if self.columns.active{self.columns.invalidate();self.restore_folder_layout();}
                 if matches!(self.current_location(), ShellLocation::Search { .. }) {
                     self.cancel_fast_search();
                     self.request_integrated_search(false);
@@ -92,7 +93,11 @@ impl WindowState {
             Command::FocusSearch => unsafe { self.open_integrated_search() },
             Command::NewFolder => self.shell_result(self.browser.as_ref().map(|b| b.invoke_background(self.hwnd, "NewFolder"))),
             Command::CopyPath => self.copy_paths(),
-            Command::TogglePreview => { let d = self.session.ui.show_details; self.set_panes(!self.session.ui.show_preview, d && self.session.ui.show_preview); }
+            Command::TogglePreview => {
+                let d=self.session.ui.show_details;
+                if self.columns.active {self.choose_folder_layout(zsdesk_core::model::explorer::FolderLayout::Single);self.set_panes(false,d);}
+                else{self.set_panes(!self.session.ui.show_preview,d && self.session.ui.show_preview);}
+            }
             Command::ToggleDetails => { let p = self.session.ui.show_preview; self.set_panes(p && self.session.ui.show_details, !self.session.ui.show_details); }
             Command::ToggleDualPane => self.toggle_dual_pane(),
             Command::SwitchPane => {self.activate_pane(!self.active_pane_right);self.focus_view();},
@@ -148,7 +153,7 @@ impl WindowState {
             Hit::Back | Hit::Forward | Hit::Up | Hit::Refresh | Hit::ToggleCommandBar | Hit::Address | Hit::Search => self.layout.nav_row,
             Hit::Command(_) => self.layout.command_row,
             Hit::Bookmark(_) | Hit::BookmarkOverflow | Hit::BookmarksBar => self.layout.bookmarks_row,
-            Hit::StatusDetails | Hit::StatusTiles | Hit::StatusDualPane | Hit::Status => self.layout.status,
+            Hit::StatusDetails | Hit::StatusTiles | Hit::StatusDualPane | Hit::StatusColumns | Hit::Status => self.layout.status,
         })
     }
 
@@ -194,6 +199,7 @@ impl WindowState {
             Hit::Bookmark(i) => (self.bookmark_index(i).and_then(|index|self.session.bookmarks.get(index)).map(|b|if b.is_folder{zsdesk_core::tr_format!("{}：点击展开或折叠，拖入项目可分类", b.display_name)}else{b.target.address()}).unwrap_or_default(), self.layout.bookmarks.get(i).copied().unwrap_or_default()),
             Hit::StatusDetails => (zsdesk_core::i18n::text("在窗口中显示每一项的相关信息 (Ctrl+Shift+6)").into(), self.layout.status_details),
             Hit::StatusTiles => (zsdesk_core::i18n::text("使用大缩略图显示项 (Ctrl+Shift+2)").into(), self.layout.status_tiles),
+            Hit::StatusColumns => (zsdesk_core::i18n::text("多栏显示（父文件夹、当前文件夹、预览）").into(),self.layout.status_columns),
             Hit::StatusDualPane => (zsdesk_core::i18n::text("开启或关闭双栏布局").into(),self.layout.status_dual_pane),
             Hit::PaneHeader(index) => (self.pane_title(index==1),self.layout.pane_headers[index]),
             _ => (String::new(), LayoutRect::default()),
@@ -341,6 +347,7 @@ impl WindowState {
             Hit::BookmarkOverflow => unsafe { self.bookmarks_overflow() },
             Hit::StatusDetails => self.set_view(menus::view_choice("details")),
             Hit::StatusTiles => self.set_view(menus::view_choice("large")),
+            Hit::StatusColumns => self.toggle_columns(),
             Hit::StatusDualPane => self.toggle_dual_pane(),
             _ => {}
         }
@@ -509,6 +516,7 @@ impl WindowState {
     }
 
     pub(super) fn set_panes(&mut self, preview: bool, details: bool) {
+        if self.columns.active && (!preview || details){self.choose_folder_layout(zsdesk_core::model::explorer::FolderLayout::Single);}
         self.set_panes_with_rebuild(preview,details,false);
     }
     pub(super) fn set_panes_with_rebuild(&mut self,preview:bool,details:bool,force:bool){
@@ -549,7 +557,7 @@ impl WindowState {
         let (mode, icon) = self.browser.as_ref().and_then(|b| b.view_mode()).unwrap_or((0, 0));
         let (hidden, extensions) = folder_settings();
         let show = ShowState {
-            navigation: self.session.ui.show_tree, preview: self.session.ui.show_preview, details: self.session.ui.show_details,
+            navigation: self.session.ui.show_tree, preview: self.session.ui.show_preview || self.columns.active, details: self.session.ui.show_details,
             bookmarks: self.session.ui.show_bookmarks, checkboxes: self.browser.as_ref().is_some_and(|b| b.checkboxes()),
             extensions, hidden,
         };

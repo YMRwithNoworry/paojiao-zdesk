@@ -328,7 +328,7 @@ impl WindowState {
                 _ => true,
             };
             let hit = Hit::Command(*id);
-            let toggled = (*id == CommandId::DetailsPane && self.session.ui.show_details) || (*id == CommandId::PreviewPane && self.session.ui.show_preview);
+            let toggled = (*id == CommandId::DetailsPane && self.session.ui.show_details) || (*id == CommandId::PreviewPane && (self.session.ui.show_preview || self.columns.active));
             if toggled { cv.round(rf(*rect), self.sf(4.0), c(p.pressed)); }
             if enabled { self.button_fill(cv, *rect, hit, self.sf(4.0)); }
             let color = if enabled { c(p.text) } else { c(p.text_disabled) };
@@ -413,6 +413,11 @@ impl WindowState {
         // Visible only around the native children (splitter, empty tree area while loading).
         let content = LayoutRect::new(l.nav_row.x, l.top, l.nav_row.width, (l.status.y - l.top).max(0));
         cv.fill(rf(content), c(p.content));
+        if self.columns.active{
+            for x in [self.columns.bounds.right(),l.browser.right()]{
+                cv.line(x as f32+0.5,l.browser.y as f32,x as f32+0.5,l.browser.bottom()as f32,c(p.divider),1.0);
+            }
+        }
         if self.session.ui.dual_pane {
             for (index,header) in l.pane_headers.iter().enumerate() {
                 let active=(index==1)==self.active_pane_right;
@@ -474,15 +479,20 @@ impl WindowState {
         if !self.status.is_empty() || self.search_progress.is_some() || folder_progress.is_some() {
             let x = left + w + self.sf(24.0);
             let text=if self.status.is_empty(){self.search_progress.as_deref().or(folder_progress.as_deref()).unwrap_or("")}else{&self.status};
-            cv.text(text, RectF::new(x, r.y, (l.status_dual_pane.x as f32 - x - self.sf(8.0)).max(0.0), r.h), &style,
+            cv.text(text, RectF::new(x, r.y, (l.status_columns.x as f32 - x - self.sf(8.0)).max(0.0), r.h), &style,
                 c(if status_is_error(&self.status) {p.danger} else {p.text_secondary}));
         }
         let (mode, _) = self.view_mode;
-        for (rect, hit, g, on) in [(l.status_dual_pane,Hit::StatusDualPane,glyph::DUAL_PANE,self.session.ui.dual_pane),
+        for (rect, hit, g, on) in [(l.status_columns,Hit::StatusColumns,"",self.columns.active),(l.status_dual_pane,Hit::StatusDualPane,glyph::DUAL_PANE,self.session.ui.dual_pane),
             (l.status_details, Hit::StatusDetails, glyph::DETAILS_VIEW, mode == 4), (l.status_tiles, Hit::StatusTiles, glyph::TILES_VIEW, mode == 1)] {
             if on { cv.round(rf(rect), self.sf(4.0), c(p.pressed)); cv.round(RectF::new(rect.x as f32 + self.sf(9.0), rect.bottom() as f32 - self.sf(3.0), rect.width as f32 - self.sf(18.0), self.sf(2.0)), self.sf(1.0), c(p.accent)); }
             self.button_fill(cv, rect, hit, self.sf(4.0));
-            cv.glyph(g, rf(rect), self.sf(12.0), c(p.text));
+            if hit==Hit::StatusColumns {
+                let w=self.sf(15.0);let h=self.sf(12.0);
+                let left=rect.x as f32+(rect.width as f32-w)*0.5;let top=rect.y as f32+(rect.height as f32-h)*0.5;
+                cv.stroke_round(RectF::new(left,top,w,h),self.sf(2.0),c(p.text),self.sf(1.0));
+                for x in [left+w/3.0,left+2.0*w/3.0]{cv.line(x,top+1.0,x,top+h-1.0,c(p.text),self.sf(1.0));}
+            } else {cv.glyph(g, rf(rect), self.sf(12.0), c(p.text));}
         }
     }
 

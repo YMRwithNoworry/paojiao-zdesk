@@ -17,6 +17,8 @@ mod address_input;
 pub(crate) mod archive_actions;
 mod terminal;
 mod quick_preview;
+mod folder_preview;
+mod folder_contents;
 mod quicklook;
 pub(crate) mod preview_process;
 mod wps_preview;
@@ -35,6 +37,7 @@ mod context_manager;
 mod listary;
 mod mouse_navigation;
 mod dual_pane;
+mod column_browser;
 mod pane_input;
 mod mouse_gestures;
 mod wheel_input;
@@ -244,6 +247,8 @@ unsafe fn run_window(session: ExplorerSession, config_path: PathBuf, selection: 
         if diagnostics::dispatch(&msg){continue;}
         if picker::pre_translate(&slot,&msg){continue;}
         if address_input::pre_translate(&msg){continue;}
+        if msg.message==WM_KEYDOWN && slot.try_borrow().ok().is_some_and(|s|s.as_ref().is_some_and(|w|w.columns.owns(msg.hwnd)))
+            && (matches!(msg.wParam.0 as u16,0x2e|0x71) || (unsafe{GetKeyState(VK_CONTROL.0 as i32)}<0 && matches!(msg.wParam.0 as u16,0x41|0x43|0x56|0x58))) {continue;}
         dual_pane::activate_for_message(&slot,&msg);
         if pane_input::blank_double_click(&slot,&msg,&mut blank_clicks){continue;}
         if gestures.process(hwnd,&msg,&slot) { hover_preview.dismiss(&mut quick_preview);continue; }
@@ -413,6 +418,7 @@ struct WindowState {
     view_hwnd: HWND,
     navigation_epoch: u64,
     other_pane: dual_pane::InactivePane,
+    columns: column_browser::ParentColumn,
     active_pane_right: bool,
     background_pane: bool,
     routing_pane_message: bool,
@@ -501,7 +507,7 @@ impl WindowState {
             search_panel:search_panel::SearchPanel::default(),
             hwnd: HWND::default(), dpi: 96, search_saved_preferences:session.ui.search_preferences(),bookmarks_saved:session.bookmarks.clone(),session_ending:false,session, config_path, modern, browser: None, tree: None,
             browser_source:0,destroyed:false,folder_sizes:Default::default(),view_hwnd:HWND::default(),navigation_epoch:0,
-            other_pane:Default::default(),active_pane_right:false,background_pane:false,routing_pane_message:false,pane_splitter_drag:None,
+            other_pane:Default::default(),columns:Default::default(),active_pane_right:false,background_pane:false,routing_pane_message:false,pane_splitter_drag:None,
             address_edit: HWND::default(), search_edit: HWND::default(), rename_hwnd: HWND::default(), rename_id: None,
             tooltip: HWND::default(), tooltip_text: vec![0], font: HFONT::default(), gfx: None, surface: None,
             palette: Palette::light(), dark: false, mica: false, solid_caption: false, active: true, layout: ChromeLayout::default(),
@@ -654,7 +660,10 @@ impl WindowState {
         if layout.vertical_tabs{if let Some(first)=self.side_tab_first{layout.set_tab_viewport(self.session.tabs.len(),first);}}else{self.side_tab_first=None;}
         self.layout=layout;
         self.preview_rect=None;
-        if self.session.ui.show_preview && self.layout.browser.width>self.s(240){
+        if self.columns.active {
+            let (left,middle,right)=column_browser::column_rects(self.layout.browser,self.s(1));
+            self.columns.bounds=left;self.layout.browser=middle;self.preview_rect=Some(right);
+        } else if self.session.ui.show_preview && self.layout.browser.width>self.s(240){
             let area=self.layout.browser;
             let width=(area.width/3).clamp(self.s(280),self.s(520)).min(area.width-self.s(160));
             self.layout.browser.width-=width+self.s(1);
@@ -670,6 +679,8 @@ impl WindowState {
 
     fn position_children(&mut self) {
         self.position_picker();
+        self.columns.position(self.font,self.dpi);
+        if self.columns.active{self.columns.fit_middle(self.layout.browser.width-self.s(24));}
         if let Some(browser) = &self.browser { unsafe { browser.resize(win_rect(self.layout.browser)); } }
         self.position_other_pane();
         if let Some(tree) = &self.tree {
@@ -836,7 +847,7 @@ impl WindowState {
                 Err(error)=>{diagnostics::record("session","ownership-check-failed",None);crate::runtime::trace(&format!("session ownership: {error:#}"));},
             }
         }
-        if let Ok(saved)=storage::load(&self.config_path){self.session.ui.file_dialog_takeover=saved.ui.file_dialog_takeover;}
+        if let Ok(saved)=storage::load(&self.config_path){self.session.ui.file_dialog_takeover=saved.ui.file_dialog_takeover;self.session.ui.folder_layouts=saved.ui.folder_layouts;}
         if let Some(options)=crate::context_preferences::current(&self.config_path){self.session.ui.context_menu=options;}
         match storage::save_window_with_shared_preferences(&self.config_path,&self.canonical_session(),self.secondary_window,&self.search_saved_preferences,&self.bookmarks_saved){
             Ok((preferences,bookmarks))=>{
@@ -889,7 +900,7 @@ impl WindowState {
         #[cfg(test)]println!("window teardown: capture");
         unsafe { self.capture_active(); self.commit_bookmark_rename(); }
         #[cfg(test)]println!("window teardown: other pane");
-        self.destroy_other_pane();
+        self.columns.release_middle();self.destroy_other_pane();
         self.remember_placement();
         self.drop_registration = None;
         #[cfg(test)]println!("window teardown: tree");
@@ -1281,7 +1292,8 @@ unsafe fn reentrant(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
             let _=unsafe{SetPropW(hwnd,DEFERRED_PAINT_PROPERTY,Some(windows::Win32::Foundation::HANDLE(1usize as*mut _)))};
             LRESULT(0)
         }
-        WM_CLOSE | picker::WM_NATIVE_REPLY | WM_LAYOUT | WM_ACTION | WM_SHELL_NAVIGATED | WM_SHELL_FOLDER_INVOKED | WM_SHELL_NAVIGATION_FAILED | WM_BOOKMARK_PATH_DROPPED
+        column_browser::CHANGED=>{let _=zsdesk_windows::shell::notify::read_change(wp,lp);unsafe{SetTimer(Some(hwnd),column_browser::RELOAD,180,None);}LRESULT(0)}
+        column_browser::READY | WM_CLOSE | picker::WM_NATIVE_REPLY | WM_LAYOUT | WM_ACTION | WM_SHELL_NAVIGATED | WM_SHELL_FOLDER_INVOKED | WM_SHELL_NAVIGATION_FAILED | WM_BOOKMARK_PATH_DROPPED
         | WM_OPEN_REQUEST | WM_TREE_NAVIGATE | WM_SHELL_SELECTION_CHANGED | crate::routing_control::WM_RESULT | WM_FAST_SEARCH | WM_DIAGNOSTIC
         | WM_CANCELMODE | WM_CAPTURECHANGED | WM_THEMECHANGED | WM_DWMCOMPOSITIONCHANGED | WM_SYSCOLORCHANGE | pane_input::MESSAGE | crate::shell_window_registry::WM_SELECT => {
             defer_message(hwnd,msg,wp,lp);
@@ -1473,6 +1485,24 @@ impl WindowState {
                 if let Some(b) = &self.browser { unsafe { b.focus(); } }
                 return Some(LRESULT(0));
             }
+            WM_CTLCOLORLISTBOX if self.columns.owns(HWND(lp.0 as *mut _)) => {
+                use windows::Win32::Graphics::Gdi::{GetStockObject,SetDCBrushColor,DC_BRUSH};
+                unsafe{SetDCBrushColor(HDC(wp.0 as *mut _),COLORREF(colorref(self.palette.content)));}
+                return Some(LRESULT(unsafe{GetStockObject(DC_BRUSH)}.0 as isize));
+            }
+            WM_DRAWITEM if self.columns.draw(lp,self.font,&self.palette,self.dpi) => return Some(LRESULT(1)),
+            column_browser::CHANGED => {
+                let _=zsdesk_windows::shell::notify::read_change(wp,lp);
+                if self.columns.active{unsafe{SetTimer(Some(self.hwnd),column_browser::RELOAD,180,None);}}
+                return Some(LRESULT(0));
+            }
+            WM_TIMER if wp.0==column_browser::RELOAD=>{
+                let _=unsafe{KillTimer(Some(self.hwnd),column_browser::RELOAD)};
+                if self.columns.active && self.pending.is_none(){self.columns.invalidate();self.refresh_parent_column();}
+                return Some(LRESULT(0));
+            }
+            column_browser::READY => { self.column_results(); return Some(LRESULT(0)); }
+            WM_COMMAND if self.columns.is_selection(wp,lp) => {self.column_selection();return Some(LRESULT(0));}
             WM_COMMAND => {
                 let id = wp.0 & 0xFFFF;
                 let code = (wp.0 >> 16) as u32;
@@ -1501,7 +1531,7 @@ impl WindowState {
             WM_SHELL_NAVIGATED => if lp.0 != 0 { unsafe { self.navigation_completed(*Box::from_raw(lp.0 as *mut ShellLocation)); } context_menu::schedule_prewarm(self.hwnd); },
             WM_SHELL_FOLDER_INVOKED => if lp.0 != 0 { unsafe { self.navigate_to(*Box::from_raw(lp.0 as *mut ShellLocation)); } },
             WM_SHELL_NAVIGATION_FAILED => unsafe { self.navigation_failed() },
-            WM_SHELL_SELECTION_CHANGED => { unsafe { acknowledge_selection_changed(lp.0); } self.refresh_status();self.picker_selection_changed(); }
+            WM_SHELL_SELECTION_CHANGED => { unsafe { acknowledge_selection_changed(lp.0); } self.columns.preview_file=None;self.refresh_status();self.picker_selection_changed(); }
             zsdesk_windows::shell::WM_SHELL_PICKER_ACCEPT=>self.picker_accept_view(),
             WM_TREE_NAVIGATE => if lp.0 != 0 {
                 let location = unsafe { *Box::from_raw(lp.0 as *mut ShellLocation) };

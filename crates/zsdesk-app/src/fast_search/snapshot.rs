@@ -53,7 +53,19 @@ pub fn save(path:&Path,policy:&Policy,volumes:&[VolumeIndex],cancel:&impl Fn()->
         scalar(&mut writer,u32::from(volume.has_journal)|(u32::from(volume.mft)<<1)|if volume.pending_dirs.is_empty(){0}else{4})?;scalar(&mut writer,volume.denied)?;
         let index=&volume.index;
         column(&mut writer,&index.ids,cancel)?;column(&mut writer,&index.parent,cancel)?;column(&mut writer,&index.name,cancel)?;bytes(&mut writer,&index.flags)?;
-        column(&mut writer,&index.names.units,cancel)?;column(&mut writer,&index.names.starts,cancel)?;bytes(&mut writer,&index.names.folded)?;column(&mut writer,&index.names.folded_starts,cancel)?;
+        let names=&index.names;
+        scalar(&mut writer,u64::from(names.wide_count))?;
+        let mut offsets=Vec::with_capacity(names.len()+1);
+        let mut offset=0u32;offsets.push(offset);
+        let mut encoded=[0u8;510];
+        for id in 0..names.len() as u32 {
+            if id%4096==0 {ensure!(!cancel(),"快照保存已取消");}
+            let mut length=0;
+            for unit in names.get(id).encode_wide(){encoded[length..length+2].copy_from_slice(&unit.to_le_bytes());length+=2;}
+            writer.write_all(&encoded[..length])?;offset+=(length/2)as u32;
+            offsets.push(offset);
+        }
+        column(&mut writer,&offsets,cancel)?;bytes(&mut writer,names.folded.as_bytes())?;column(&mut writer,&index.names.folded_starts,cancel)?;
         ensure!(index.attributes.is_some()==policy.metadata,"快照属性选项不一致");
         if let Some(attrs)=&index.attributes{column(&mut writer,&attrs.size,cancel)?;column(&mut writer,&attrs.modified,cancel)?;}
         if !volume.pending_dirs.is_empty(){column(&mut writer,&volume.pending_dirs,cancel)?;}
@@ -79,9 +91,11 @@ pub fn load(path:&Path,policy:&Policy,cancel:&impl Fn()->bool)->Result<Vec<Volum
         index.ids=read_column(&mut reader,&mut remaining,MAX_ROWS,cancel)?;total+=index.ids.len();ensure!(total<=MAX_ROWS,"快照总项目数超出容量");
         index.parent=read_column(&mut reader,&mut remaining,index.ids.len(),cancel)?;index.name=read_column(&mut reader,&mut remaining,index.ids.len(),cancel)?;
         index.flags=read_bytes(&mut reader,&mut remaining,index.ids.len())?;
-        let mut names=Names::new();names.units=read_column(&mut reader,&mut remaining,MAX_BYTES as usize/2,cancel)?;
-        names.starts=read_column(&mut reader,&mut remaining,MAX_ROWS+1,cancel)?;names.folded=read_bytes(&mut reader,&mut remaining,MAX_BYTES as usize)?;
-        names.folded_starts=read_column(&mut reader,&mut remaining,MAX_ROWS+1,cancel)?;index.names=names;
+        let units=read_column(&mut reader,&mut remaining,MAX_BYTES as usize/2,cancel)?;
+        let starts=read_column(&mut reader,&mut remaining,MAX_ROWS+1,cancel)?;
+        let folded=read_bytes(&mut reader,&mut remaining,MAX_BYTES as usize)?;
+        let folded_starts=read_column(&mut reader,&mut remaining,MAX_ROWS+1,cancel)?;
+        index.names=Names::restore(units,starts,folded,folded_starts,cancel)?;
         if policy.metadata{index.attributes=Some(Attributes{size:read_column(&mut reader,&mut remaining,index.ids.len(),cancel)?,modified:read_column(&mut reader,&mut remaining,index.ids.len(),cancel)?});}
         let pending_dirs=if flags&4!=0{read_column::<u64>(&mut reader,&mut remaining,MAX_ROWS,cancel)?}else{Vec::new()};
         index.validate()?;volumes.push(VolumeIndex{root,serial,journal_id,checkpoint,has_journal:flags&1!=0,mft:flags&2!=0,denied,index,pending_dirs});
@@ -92,6 +106,27 @@ pub fn load(path:&Path,policy:&Policy,cancel:&impl Fn()->bool)->Result<Vec<Volum
 
 #[cfg(test)]mod tests{
     use super::*;
+    #[test]
+    fn original_spellings_survive_snapshot_and_incremental_updates()->Result<()>{
+        let root=std::env::temp_dir().join(format!("zsdesk-original-spellings-{}",std::process::id()));
+        fs::create_dir_all(&root)?;let path=root.join("names.zsi");
+        let words=vec![OsString::from("readme"),OsString::from("README"),OsString::from("İß中📁"),
+            OsString::from_wide(&[0xd801,0x78]),OsString::from_wide(&[0xd802,0x78]),OsString::from("�x")];
+        let mut index=Index::new(5,false);
+        for (n,word) in words.iter().enumerate(){index.append(n as u64+10,0,word,0)?;}
+        let policy=Policy{development:false,metadata:false};
+        let vol=VolumeIndex{root:Path::new(r"C:\").into(),serial:1,journal_id:0,checkpoint:0,has_journal:false,mft:false,denied:0,index,pending_dirs:Vec::new()};
+        save(&path,&policy,&[vol],&||false)?;
+        let mut restored=load(&path,&policy,&||false)?;
+        let index=&mut restored[0].index;
+        for (n,word) in words.iter().enumerate(){
+            let id=index.name[n+1];assert_eq!(index.names.get(id),word.as_os_str());
+            assert_eq!(index.names.folded(id),word.to_string_lossy().to_lowercase());
+            assert_eq!(index.names.intern(word)?,id);
+        }
+        index.upsert_child(11,0,&words[1],0)?;assert_eq!(index.len(),words.len()+1);
+        fs::remove_file(path)?;fs::remove_dir(root)?;Ok(())
+    }
     #[test]fn snapshot_roundtrip_checksum_and_policy()->Result<()>{
         let root=std::env::temp_dir().join(format!("zsdesk-column-snapshot-{}",std::process::id()));fs::create_dir_all(&root)?;
         let path=root.join("index.zsi");let mut index=Index::new(5,true);index.append(7,0,std::ffi::OsStr::new("中文.txt"),0)?;index.reindex();index.set_attributes(1,Some(0),Some(42));
