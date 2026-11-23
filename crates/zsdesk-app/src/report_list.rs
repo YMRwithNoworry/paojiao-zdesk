@@ -85,13 +85,6 @@ pub fn cell(list: HWND, row: usize, col: i32, text: &str) {
         );
     }
 }
-/// Replace the label and discard the old item's icon without removing the row.
-pub fn replace_name(list: HWND,row:usize,name:&str) {
-    let mut name=wide(name);
-    let item=LVITEMW{mask:LVIF_TEXT|LVIF_IMAGE,iItem:row as i32,iImage:I_IMAGENONE,
-        pszText:PWSTR(name.as_mut_ptr()),..Default::default()};
-    unsafe{SendMessageW(list,LVM_SETITEMW,None,Some(LPARAM(&item as *const _ as isize)));}
-}
 pub fn clear(list: HWND) {
     unsafe {
         SendMessageW(list, LVM_DELETEALLITEMS, None, None);

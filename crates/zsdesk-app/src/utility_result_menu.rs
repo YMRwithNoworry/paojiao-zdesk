@@ -338,6 +338,8 @@ impl Panel {
             Ok(()) => {
                 if let Some(p) = self.paths.get_mut(target.row) {
                     p.set_file_name(&name);
+                    self.search_view.table.rename(target.row,p);
+                    unsafe{SendMessageW(self.list,LVM_REDRAWITEMS,Some(WPARAM(target.row)),Some(LPARAM(target.row as isize)));}
                 }
                 true
             }

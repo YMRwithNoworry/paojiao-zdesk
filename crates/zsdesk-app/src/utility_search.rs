@@ -53,6 +53,8 @@ pub(super) fn palette(dark: bool) -> Palette {
 #[derive(Default)]
 pub(super) struct SearchView {
     pub filter: usize,
+    pub table:Rc<result_table::Table>,
+    pub staged:Option<(Vec<PathBuf>,std::time::Instant)>,
     widths: [Option<i32>; 4],
     icons: HashMap<(bool, OsString), i32>,
     pub last_query: String,
@@ -122,7 +124,7 @@ impl SearchView {
         }
         widths
     }
-    pub(super) fn icon(&mut self, list: HWND, path: &Path, folder: bool, row: usize) {
+    pub(super) fn icon(&mut self, list: HWND, path: &Path, folder: bool) -> i32 {
         let ext = if folder {
             OsString::new()
         } else {
@@ -153,7 +155,7 @@ impl SearchView {
                 )
             };
             if handle == 0 {
-                return;
+                return I_IMAGENONE;
             }
             unsafe {
                 if SendMessageW(list,LVM_GETIMAGELIST,Some(WPARAM(LVSIL_SMALL as usize)),None).0 != handle as isize {
@@ -171,30 +173,17 @@ impl SearchView {
             self.icons.insert((folder, ext), info.iIcon);
             info.iIcon
         };
-        let item = LVITEMW {
-            mask: LVIF_IMAGE,
-            iItem: row as i32,
-            iImage: index,
-            ..Default::default()
-        };
-        unsafe {
-            SendMessageW(
-                list,
-                LVM_SETITEMW,
-                None,
-                Some(LPARAM(&item as *const _ as isize)),
-            );
-        }
+        index
     }
 }
-fn label(value: &str, bounds: Rect, role: TextRole, color: ColorRole, align: HorizontalAlign) -> NativeDrawCommand {
+pub(super) fn label(value: &str, bounds: Rect, role: TextRole, color: ColorRole, align: HorizontalAlign) -> NativeDrawCommand {
     let mut style = SemanticTextStyle::for_role(role);
     style.color = color;
     style.horizontal_align = align;
     NativeDrawCommand::Text(NativeDrawTextCommand::new(value, bounds, style))
 }
 
-fn surface(p: Palette) -> WindowsGdiPalette {
+pub(super) fn surface(p: Palette) -> WindowsGdiPalette {
     let opaque = |fg, bg| {
         let v = composite(fg, bg).0;
         Color::rgb(v as u8, (v >> 8) as u8, (v >> 16) as u8)
@@ -282,27 +271,6 @@ impl Panel {
             fill: NativeDrawFill::Role(ColorRole::SurfaceRaised),
             stroke: Some(NativeDrawFill::Role(ColorRole::Border)), radius:s(6),
         });
-        if self.paths.is_empty() {
-            let top = s(104);
-            let bottom = r.bottom - s(52);
-            let center = top + (bottom - top) / 2;
-            let idle = text(self.edit).trim().is_empty() && self.search_view.filter == 0;
-            let (title, hint) = if self.search_error {
-                ("搜索不可用", "")
-            } else if self.busy {
-                ("正在搜索…", "")
-            } else if idle {
-                (
-                    "输入名称或路径",
-                    "用 ↑ ↓ 选择结果，Enter 打开，Ctrl+Enter 定位",
-                )
-            } else {
-                ("未找到匹配项", "可更换关键词或选择“全部”")
-            };
-            let line = |y, h| Rect {x:s(28), y, width:(r.right-s(56)).max(1), height:s(h)};
-            plan.push(label(zsdesk_core::i18n::text(title), line(center-s(30), 32), TextRole::Subtitle, ColorRole::PrimaryText, HorizontalAlign::Center));
-            plan.push(label(zsdesk_core::i18n::text(hint), line(center+s(4), 25), TextRole::Body, ColorRole::SecondaryText, HorizontalAlign::Center));
-        }
         plan.push(label(&self.status, Rect {x:s(18), y:r.bottom-s(42), width:(r.right-s(326)).max(1), height:s(33)},
             TextRole::Body, if self.search_error {ColorRole::Danger} else {ColorRole::SecondaryText}, HorizontalAlign::Start));
         self.draw_plan(dc, surface(self.palette), &plan);
@@ -311,6 +279,10 @@ impl Panel {
     pub(super) fn draw_search_button(&self, d: &DRAWITEMSTRUCT) -> bool {
         let id = d.CtlID as i32;
         if ![12,16,17].contains(&id) && !(FIRST_FILTER..FIRST_FILTER+FILTERS.len() as i32).contains(&id) { return false; }
+        let r=d.rcItem;
+        let rect=windows_sys::Win32::Foundation::RECT{left:r.left,top:r.top,right:r.right,bottom:r.bottom};
+        let buffer=unsafe{zsui::WindowsBufferedPaint::begin(d.hDC.0,&rect)};
+        let dc=buffer.as_ref().map_or(d.hDC,|b|HDC(b.hdc()));
         let mut colors = surface(self.palette);
         let mut cursor = POINT::default();
         let hovered = unsafe { GetCursorPos(&mut cursor) }.is_ok() && unsafe { WindowFromPoint(cursor) } == d.hwndItem;
@@ -322,7 +294,6 @@ impl Panel {
             let value = composite(fg,self.palette.layer).0;
             colors.control = Color::rgb(value as u8,(value>>8) as u8,(value>>16) as u8);
         }
-        let r = d.rcItem;
         let bounds = Rect {x:r.left+1,y:r.top+1,width:(r.right-r.left-2).max(1),height:(r.bottom-r.top-2).max(1)};
         let geometry = zsui::zs_toggle_button_render_plan(bounds, id == FIRST_FILTER + self.search_view.filter as i32,
             ZsPlatformStyle::current(), Dpi::new(self.dpi as f32));
@@ -334,11 +305,11 @@ impl Panel {
                 text.bounds.width = bounds.width - self.s(4);
             }
         }
-        unsafe { FillRect(d.hDC,&r,self.brush); }
-        self.draw_plan(d.hDC, colors, &plan);
+        unsafe { FillRect(dc,&r,self.brush); }
+        self.draw_plan(dc, colors, &plan);
         if d.itemState.0 & ODS_FOCUS.0 != 0 && d.itemState.0 & ODS_NOFOCUSRECT.0 == 0 {
             let mut focus=r;
-            unsafe {let _=InflateRect(&mut focus,-self.s(3),-self.s(3));let _=DrawFocusRect(d.hDC,&focus);}
+            unsafe {let _=InflateRect(&mut focus,-self.s(3),-self.s(3));let _=DrawFocusRect(dc,&focus);}
         }
         true
     }

@@ -78,14 +78,14 @@ impl Reader {
                     let (row, path) = state.pending.pop_front().unwrap();
                     (state.generation, row, path)
                 };
-                let Ok(meta) = fs::metadata(&path) else {
-                    continue;
+                let meta=fs::metadata(&path).ok();
+                let folder=meta.as_ref().is_some_and(|m|m.is_dir());
+                let size=match &meta{
+                    Some(_) if folder=>String::new(),
+                    Some(m)=>zsdesk_ui::chrome::format_size(m.len()),
+                    None=>"—".into(),
                 };
-                let size = if meta.is_dir() {
-                    String::new()
-                } else {
-                    zsdesk_ui::chrome::format_size(meta.len())
-                };
+                let modified=meta.as_ref().map_or_else(||"—".into(),|m|date(m.last_write_time()));
                 let state = shared.0.lock().unwrap_or_else(|e| e.into_inner());
                 if state.closed {
                     return;
@@ -97,7 +97,7 @@ impl Reader {
                             row,
                             path,
                             size,
-                            modified: date(meta.last_write_time()),folder:meta.is_dir(),
+                            modified,folder,
                         })
                         .is_err()
                     {
