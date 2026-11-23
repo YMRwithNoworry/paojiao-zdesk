@@ -36,16 +36,36 @@ pub fn capture_view_layout(shell:&IShellView)->Option<ShellViewState> {
     let view:IFolderView2=shell.cast().ok()?;
     let mut mode=FOLDERVIEWMODE(0);let mut icon_size=0;
     unsafe{view.GetViewModeAndIconSize(&mut mode,&mut icon_size).ok()?;}
-    Some(ShellViewState{mode:mode.0,icon_size,
+    let layout=ShellViewState{mode:mode.0,icon_size,
         sort_columns:super::folder_totals::base_sort_columns(shell,read_sort_columns(&view).unwrap_or_default()).into_iter().map(|column|ViewSortColumn{key:encode_key(super::folder_totals::logical_sort_key(shell,column.propkey)),ascending:column.direction==SORT_ASCENDING}).collect(),
         grouping:read_grouping(&view).map(|(key,ascending)|ViewGrouping{key:(key!=NULL_KEY).then(||encode_key(super::folder_totals::logical_sort_key(shell,key))),ascending}),
-        ..Default::default()})
+        ..Default::default()};
+    valid_menu_layout(&layout).then_some(layout)
 }
 pub fn capture_background_layout(shell: &IShellView) -> Option<ShellViewState> {
     let mut layout = capture_view_layout(shell)?;
     layout.columns = layout_columns(shell);
-    if !layout.columns.is_empty() { layout.column_dpi = view_dpi(shell); }
+    if !layout.columns.is_empty() {
+        layout.column_dpi = view_dpi(shell);
+        if !valid_menu_layout(&layout) {
+            layout.columns.clear();
+            layout.column_dpi = 0;
+        }
+    }
     Some(layout)
+}
+
+/// The isolated menu carries layout metadata only. Its selection travels separately.
+pub fn valid_menu_layout(layout: &ShellViewState) -> bool {
+    (1..=8).contains(&layout.mode)
+        && (8..=512).contains(&layout.icon_size)
+        && layout.selected.is_empty() && layout.focused.is_none() && layout.first_visible.is_none()
+        && layout.sort_columns.len() <= MAX_COLUMNS
+        && layout.sort_columns.iter().all(|column| decode_key(&column.key).is_some())
+        && layout.grouping.as_ref().and_then(|group| group.key.as_ref()).is_none_or(|key| decode_key(key).is_some())
+        && layout.columns.len() <= MAX_COLUMNS
+        && (layout.column_dpi == 0 || (48..=960).contains(&layout.column_dpi))
+        && layout.columns.iter().all(|column| (1..=MAX_COLUMN_WIDTH).contains(&column.width) && decode_key(&column.key).is_some())
 }
 /// Restores menu-controlled layout without clearing selection or moving focus.
 pub fn restore_view_layout(shell:&IShellView,state:&ShellViewState) {

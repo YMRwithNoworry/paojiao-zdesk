@@ -374,8 +374,9 @@ fn validate(request:&Request)->Result<()>{
     if let Some(context)=&request.view_context{ensure!(context.folder.as_ref().is_none_or(|pidl|valid_pidl(pidl)),"菜单源文件夹标识无效");}
     for keys in [&request.options.hidden_verbs,&request.options.shown_verbs]{ensure!(keys.len()<=1024&&keys.iter().all(|verb|verb.len()<=512&&!verb.contains('\0')),"菜单设置无效");}
     if let Some(layout)=&request.layout {
-        ensure!(matches!(request.mode,Mode::Background|Mode::New|Mode::CatalogBackground|Mode::More|Mode::CatalogSelection)&&(1..=8).contains(&layout.mode)&&(8..=512).contains(&layout.icon_size)
-            &&layout.sort_columns.len()<=64&&layout.columns.is_empty()&&layout.selected.is_empty()&&layout.focused.is_none()&&layout.first_visible.is_none(),"背景视图设置无效");
+        let allows_columns = matches!(request.mode, Mode::Background | Mode::New | Mode::CatalogBackground);
+        ensure!(matches!(request.mode, Mode::More | Mode::CatalogSelection) || allows_columns, "背景视图设置无效");
+        ensure!((allows_columns || layout.columns.is_empty()) && zsdesk_windows::shell::valid_menu_layout(layout), "背景视图设置无效");
     }
     Ok(())
 }
@@ -1337,6 +1338,51 @@ pub fn run_worker_if_requested()->Option<Result<()>>{
         assert!(validate(&request).is_ok());
         for value in ["",r"..\escape","bad/session","bad\0session"]{request.session=value.into();assert!(validate(&request).is_err());}
         request.session="session-1".into();for ordinal in [0,MAX_SESSION_REQUESTS+1]{request.ordinal=ordinal;assert!(validate(&request).is_err());}
+    }
+    #[test]
+    fn background_menu_accepts_serialized_details_columns_and_grouping() -> Result<()> {
+        use zsdesk_core::model::explorer::{ViewColumn, ViewGrouping, ViewPropertyKey, ViewSortColumn};
+        let key = |property_id| ViewPropertyKey { format_id: "B725F130-47EF-101A-A5F1-02608C9EEBAC".into(), property_id };
+        let layout = ShellViewState {
+            mode: 4, icon_size: 16, column_dpi: 96,
+            columns: [10, 14, 4, 12].into_iter().map(|id| ViewColumn { key: key(id), width: 144 }).collect(),
+            sort_columns: vec![ViewSortColumn { key: key(10), ascending: true }],
+            grouping: Some(ViewGrouping { key: Some(key(14)), ascending: false }),
+            ..Default::default()
+        };
+        let mut request = Request { english: None, token: "request-1".into(), session: "session-1".into(), ordinal: 1,
+            parent: 1, parent_created: 1, owner: 1, point: [0,0], pidls: vec![vec![0,0]], folder: None,
+            options: Default::default(), rename: false, open: false, file_actions: false, mode: Mode::Background,
+            extended: false, layout: Some(layout.clone()), view_context: None, probe: None };
+        for mode in [Mode::Background, Mode::New, Mode::CatalogBackground] {
+            request.mode = mode;
+            let decoded: Request = serde_json::from_slice(&serde_json::to_vec(&request)?)?;
+            validate(&decoded)?;
+            assert_eq!(decoded.layout.as_ref(), Some(&layout));
+        }
+        for mode in [Mode::More, Mode::CatalogSelection] {
+            request.mode = mode;
+            assert!(validate(&request).is_err());
+            request.layout.as_mut().unwrap().columns.clear();
+            validate(&request)?;
+            request.layout = Some(layout.clone());
+        }
+        request.mode = Mode::Background;
+        // Profiles and older request senders can omit DPI.
+        let mut legacy = serde_json::to_value(&request)?;
+        legacy["layout"].as_object_mut().unwrap().remove("column_dpi");
+        validate(&serde_json::from_value(legacy)?)?;
+        for change in [
+            (|s: &mut ShellViewState| s.columns.resize(65, s.columns[0].clone())) as fn(&mut ShellViewState),
+            |s| s.columns[0].width = 0, |s| s.columns[0].width = 16_385,
+            |s| s.columns[0].key.format_id = "invalid".into(), |s| s.column_dpi = u32::MAX,
+            |s| s.selected.push(vec![0,0]), |s| s.focused = Some(vec![0,0]), |s| s.first_visible = Some(vec![0,0]),
+        ] {
+            let mut invalid = request.clone();
+            change(invalid.layout.as_mut().unwrap());
+            assert!(validate(&invalid).is_err());
+        }
+        Ok(())
     }
     #[test]fn filesystem_action_interception_is_opt_in_on_the_wire()->Result<()>{
         let request=Request{english:None,token:"request-1".into(),session:"session-1".into(),ordinal:1,parent:1,parent_created:1,owner:1,
