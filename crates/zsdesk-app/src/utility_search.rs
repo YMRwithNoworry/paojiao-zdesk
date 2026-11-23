@@ -156,12 +156,14 @@ impl SearchView {
                 return;
             }
             unsafe {
+                if SendMessageW(list,LVM_GETIMAGELIST,Some(WPARAM(LVSIL_SMALL as usize)),None).0 != handle as isize {
                 SendMessageW(
                     list,
                     LVM_SETIMAGELIST,
                     Some(WPARAM(LVSIL_SMALL as usize)),
                     Some(LPARAM(handle as isize)),
                 );
+                }
             }
             if self.icons.len() >= 256 {
                 self.icons.clear();
@@ -341,7 +343,7 @@ impl Panel {
         true
     }
     pub(super) fn move_selection(&self, step: isize) {
-        if self.paths.is_empty() {
+        if self.awaiting_page || self.paths.is_empty() {
             return;
         }
         let selected =
@@ -393,6 +395,15 @@ mod tests {
         assert_eq!(filtered_query("a | b", 2), "<a | b> folder:");
         assert_eq!(filtered_query("", 1), "file:");
         assert!(filtered_query("", 0).is_empty());
+    }
+    #[test]
+    fn all_file_folder_document_and_image_filters(){
+        use crate::fast_search::query::Query;
+        let corpus=[("标准文件夹",true),("标准.pdf",false),("标准.png",false),("标准.exe",false),("其他.pdf",false)];
+        for (filter,expected) in [4,3,1,1,1].into_iter().enumerate() {
+            let q=Query::parse(&filtered_query("标准",filter),false).unwrap();
+            assert_eq!(corpus.iter().filter(|(name,dir)|q.matches(name,*dir,"")).count(),expected);
+        }
     }
     #[test]
     fn resized_columns_keep_manual_width_and_scale_across_monitors() {

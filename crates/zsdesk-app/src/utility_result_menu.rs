@@ -31,6 +31,7 @@ pub(super) struct Session {
 }
 impl Panel {
     fn selected_target(&self, t: &Target) -> bool {
+        if self.awaiting_page{return false;}
         report_list::selected_rows(self.list).len() == 1
             && t.at(
                 self.generation,
@@ -40,6 +41,7 @@ impl Panel {
             && unsafe { IsWindowVisible(self.hwnd) }.as_bool()
     }
     fn same_results(&self, targets: &[Target]) -> bool {
+        if self.awaiting_page{return false;}
         let selected = report_list::selected_rows(self.list);
         selected.len() == targets.len()
             && !selected.is_empty()
@@ -50,6 +52,7 @@ impl Panel {
             && unsafe { IsWindowVisible(self.hwnd) }.as_bool()
     }
     pub(super) fn copy_result_selection(&self, paths_only: bool) -> Result<()> {
+        if self.awaiting_page{return Ok(());}
         let paths: Vec<_> = report_list::selected_rows(self.list)
             .into_iter()
             .filter_map(|i| self.paths.get(i).cloned())
@@ -302,6 +305,7 @@ impl Panel {
         Ok(())
     }
     pub(super) fn edit_row(&self) -> Option<usize> {
+        if self.awaiting_page{return None;}
         self.rename_target
             .as_ref()
             .filter(|t| self.selected_target(t))

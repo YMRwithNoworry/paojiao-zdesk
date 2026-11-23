@@ -4,6 +4,7 @@ mod resident;
 pub(super) mod popup;
 pub(crate) mod shortcut;
 pub(crate) mod details;
+pub(crate) mod timing;
 use std::path::{Path,PathBuf};
 use anyhow::{Context,Result};
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]

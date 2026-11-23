@@ -83,6 +83,12 @@ pub struct Volume {
     handle: Handle, event: Handle, buffer: Vec<u8>,
     unprivileged:bool,
 }
+pub(super) fn is_ntfs(root:&Path)->bool{
+    let path:Vec<_>=root.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut name=[0u16;32];
+    unsafe{GetVolumeInformationW(PCWSTR(path.as_ptr()),None,None,None,None,Some(&mut name))}.is_ok()
+        && name.starts_with(&[78,84,70,83,0])
+}
 impl Volume {
     pub fn open(root: &Path) -> Result<Self> {
         Self::open_mode(root,false)

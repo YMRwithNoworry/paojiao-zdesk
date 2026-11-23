@@ -68,7 +68,7 @@ unsafe extern "system" fn proc(hwnd:HWND,message:u32,wp:WPARAM,lp:LPARAM)->LRESU
     if pointer.is_null(){return unsafe{DefWindowProcW(hwnd,message,wp,lp)};}
     if message==WM_HOTKEY&&unsafe{(*pointer).registered&&wp.0==(*pointer).registration_id as usize}{
         if super::shortcut::dialog_active() || crate::utility_panel::hide_search_if_foreground(){return LRESULT(0);}
-        let profile=unsafe{&*pointer}.profile.clone();let result=focus_main(&profile,false);
+        super::timing::wake();let profile=unsafe{&*pointer}.profile.clone();let result=focus_main(&profile,false);
         let state=unsafe{&mut*pointer};state.error=result.err().map(|error|zsdesk_core::tr_format!("无法打开快速搜索：{error:#}", error=error));state.visible=super::popup::is_open();
         control::write_status(&profile,state.error.as_deref(),state.visible,&state.hotkey,state.registered);return LRESULT(0);
     }

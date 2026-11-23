@@ -222,12 +222,22 @@ fn resume_walk(volume:&mut VolumeIndex,options:&SearchOptions,shared:&Shared,sen
 #[cfg(test)]pub(super) fn cancel_after_directory_for_test(){CANCEL_AFTER_DIRECTORY.with(|count|count.set(1));}
 #[cfg(test)]pub(super) fn change_query_after_directory_for_test(){QUERY_AFTER_DIRECTORY.with(|value|value.set(true));cancel_after_directory_for_test();}
 fn synthetic_id(parent:u64,name:&OsStr)->u64{use std::hash::{Hash,Hasher};let mut hash=std::collections::hash_map::DefaultHasher::new();parent.hash(&mut hash);name.hash(&mut hash);hash.finish()}
+// Windows reserves this directory only directly under an NTFS volume root.
+fn extend_path(root:&Path,path:&Path)->bool {
+    path.strip_prefix(root).ok().and_then(|relative|relative.components().next())
+        .is_some_and(|part|matches!(part,std::path::Component::Normal(name) if name.eq_ignore_ascii_case("$Extend")))
+}
+fn reserved_walk_path(path:&Path)->bool{
+    scan::volume_root(path).is_some_and(|root|extend_path(&root,path)&&ntfs::is_ntfs(&root))
+}
 /// The outer error ends the whole pass: cancellation or an index that cannot take the entry.
 /// The inner error means only this directory could not be listed; its known rows are kept.
 fn scan_one(volume:&mut VolumeIndex,parent:u32,bulk:bool,options:&SearchOptions,shared:&Shared,generation:u64)->Result<Result<Vec<u32>>>{
     let Some(path)=volume.index.path(&volume.root,parent)else{return Ok(Err(anyhow::anyhow!("目录路径已失效")));};
+    if reserved_walk_path(&path){if parent!=0{volume.index.delete(parent);}return Ok(Ok(Vec::new()));}
     let old=if bulk{Vec::new()}else{volume.index.children(parent)};for row in &old{volume.index.flags[*row as usize]|=MARK;}
     let mut directories=Vec::new();let mut fatal=None;let result=scan::directory(&path,&||shared.cancelled()||!shared.current(generation),|entry|{
+        if entry.name.eq_ignore_ascii_case("$Extend") && reserved_walk_path(&path.join(&entry.name)){return Ok(());}
         let bits=flags(entry.attributes,&entry.name,options);let id=if entry.id==0{synthetic_id(volume.index.ids[parent as usize],&entry.name)}else{entry.id};
         // A second path to an ancestor would recurse forever or be mistaken for a move into itself.
         if bits&DIRECTORY!=0&&volume.index.aliases_ancestor(parent,id){return Ok(());}
@@ -265,15 +275,19 @@ fn catch_up(volume:&mut VolumeIndex,options:&SearchOptions,shared:&Shared,sender
         }
         for id in parents{
             ensure!(!shared.cancelled()&&shared.current(generation),"索引已让出给新查询");
+            if id & 0x0000_ffff_ffff_ffff == 11 {continue;} // NTFS $Extend's reserved MFT record
             // A change that cannot be resolved or listed costs that one directory, never a volume rebuild.
             let path=match reader.path_for_id(id){Ok(path)=>path,Err(error)=>{
                 if shared.cancelled()||device_lost(&error){return Err(error);}
+                let known=volume.index.rows_for_id(id);
+                if !known.is_empty() && known.iter().all(|row|volume.index.path(&volume.root,*row).is_some_and(|p|extend_path(&root,&p))){continue;}
                 if error.downcast_ref::<windows::core::Error>().is_some_and(|e|matches!(e.code().0 as u32,0x80070005|0x80070020)){
                     for row in volume.index.rows_for_id(id){if row!=0&&volume.index.is_dir(row){volume.index.flags[row as usize]|=BLOCKED;}}
                 }
                 volume.note_read_error(id,&error);continue;
             }};
             let Some(path)=path else{volume.index.delete_id(id);continue;};
+            if extend_path(&root,&path){continue;}
             let Some(parent)=ensure_directory(volume,&path,options,shared)?else{continue;};
             let prior:HashSet<_>=volume.index.children(parent).into_iter().filter(|row|volume.index.is_dir(*row)).collect();
             let children=match scan_one(volume,parent,false,options,shared,generation)?{Ok(children)=>children,Err(error)=>{
@@ -410,3 +424,14 @@ pub(super) fn select_page<T>(values:&mut[T],begin:usize,end:usize,mut compare:im
 #[cfg(test)]pub(super) fn disable_journal_for_test(core:&Core){let mut store=core.lock().unwrap();if let Some(volumes)=store.volumes.as_mut(){for volume in volumes{volume.has_journal=false;}}}
 #[cfg(test)]pub(super) fn dirty_for_test(core:&Core){core.lock().unwrap().dirty=true;}
 #[cfg(test)]pub(super) fn checkpoints(core:&Core)->Vec<(u64,i64,bool)>{core.lock().unwrap().volumes.as_deref().unwrap_or_default().iter().map(|v|(v.journal_id,v.checkpoint,v.has_journal)).collect()}
+
+#[cfg(test)]
+mod metadata_scope_tests{
+    use super::*;
+    #[test]
+    fn reserved_metadata_is_limited_to_the_volume_root_component(){
+        let root=Path::new(r"E:\");
+        for p in [r"E:\$Extend",r"E:\$extend\$Deleted"]{assert!(extend_path(root,Path::new(p)));}
+        for p in [r"E:\docs\$Extend\$Deleted",r"E:\$Extended\private",r"D:\$Extend",r"E:\资料\拒绝访问"]{assert!(!extend_path(root,Path::new(p)));}
+    }
+}
