@@ -351,8 +351,9 @@ fn file_sha256(path: &std::path::Path) -> Option<String> {
     Some(hasher.finalize().iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
-fn presentation(modern:bool,_drawn:bool,build:u32,_verified_native:bool)->(bool,bool){
-    if (10240..22000).contains(&build) { return (false,false); }
+fn presentation(modern:bool,drawn:bool,build:u32,_verified_native:bool)->(bool,bool){
+    // The private Windows 11 presenter is unavailable on Windows 10. The public HMENU renderer is independent.
+    if (10240..22000).contains(&build) { return (false,drawn); }
     (modern,modern)
 }
 pub fn presentation_name()->&'static str{
@@ -1456,7 +1457,11 @@ mod runtime_tests;
             assert_eq!(presentation(true,false,build,true),(true,true));
             assert_eq!(presentation(false,false,build,true),(false,false));
         }
-        assert_eq!(presentation(true,true,19045,false),(false,false));
+        for build in [18362,19041,19045]{
+            assert_eq!(presentation(true,true,build,false),(false,true));
+            assert_eq!(presentation(false,true,build,false),(false,true)); // resolved again in the worker
+            assert_eq!(presentation(false,false,build,false),(false,false));
+        }
         assert_eq!(presentation(true,false,0,false),(true,true));
     }
 }

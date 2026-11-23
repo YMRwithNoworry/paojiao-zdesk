@@ -946,7 +946,11 @@ fn run_request(path:&Path,request:Request,events:&EventSet,com_us:u64,fault_repo
     state.status.window=window.0 as isize;unsafe{SetTimer(Some(window),1,15,None);}
     state.status.timing.worker_setup_microseconds=micros(setup.elapsed());
     let result=(||->Result<MenuOutcome>{
-        let request=state.request.clone();zsdesk_windows::shell::menu::set_context_menu_options(request.options.clone());
+        let request=state.request.clone();
+        let classic_gesture=request.extended&&!request.view_context.as_ref().is_some_and(|context|context.keyboard&&context.f10);
+        let mut requested=request.options.clone();
+        if classic_gesture {requested.modern=false;requested.drawn=false;}
+        zsdesk_windows::shell::menu::set_context_menu_options(requested);
         if request.mode.prewarm(){
             let effective=zsdesk_windows::shell::menu::context_menu_options();
             if effective.drawn {
@@ -1000,9 +1004,10 @@ fn run_request(path:&Path,request:Request,events:&EventSet,com_us:u64,fault_repo
                 else{unsafe{zsdesk_windows::shell::shell_item(&zsdesk_core::model::explorer::ShellLocation::Path(request.folder.clone().context("粘贴目标缺失")?))}?})
         }else{None};
         let effective_options=zsdesk_windows::shell::menu::context_menu_options();
-        let classic_selection=zsdesk_windows::theme::os_build()<22000&&!effective_options.modern&&!effective_options.drawn
+        let legacy_shell=zsdesk_windows::theme::windows10_shell(zsdesk_windows::theme::os_build());
+        let classic_selection=legacy_shell
             &&!request.pidls.is_empty()&&!is_background;
-        let compact_selection=background_view::compact_selection(window,&request,&effective_options)?;
+        let compact_selection=if legacy_shell {None}else{background_view::compact_selection(window,&request,&effective_options)?};
         let background_view=if compact_selection.is_some(){None}
             else if let Some(item)=&background{Some(background_view::BackgroundView::create(item,&request,events)?)}
             else if !request.pidls.is_empty()&&!classic_selection{
@@ -1013,14 +1018,13 @@ fn run_request(path:&Path,request:Request,events:&EventSet,com_us:u64,fault_repo
         if is_background{if let (Some(host),Some(layout))=(&background_view,&request.layout){zsdesk_windows::shell::restore_view_layout(&host.view,layout);}}
         let initial_layout=background_view.as_ref().filter(|_|is_background).and_then(|host|zsdesk_windows::shell::capture_background_layout(&host.view));
         let full_context=matches!(request.mode,Mode::More|Mode::Background|Mode::CatalogSelection|Mode::CatalogBackground);
-        let classic_gesture=request.extended&&!request.view_context.as_ref().is_some_and(|context|context.keyboard&&context.f10);
         let packaged=full_context&&(effective_options.drawn||!effective_options.modern||classic_gesture||matches!(request.mode,Mode::CatalogSelection|Mode::CatalogBackground));
         let menu=if let Some(menu)=compact_selection{menu}else if let Some(host)=&background_view{
             if request.mode==Mode::New{zsdesk_windows::shell::new_menu::for_view(&host.view)?}
-            else if effective_options.drawn&&!classic_gesture&&matches!(request.mode,Mode::More|Mode::Background){
+            else if !legacy_shell&&effective_options.drawn&&!classic_gesture&&matches!(request.mode,Mode::More|Mode::Background){
                 ShellMenu::for_compact_view(&host.view,&host.browser,window,!is_background,&effective_options)?
             }
-            else if packaged{ShellMenu::for_view_with_packages(&host.view,&host.browser,window,!is_background)?}
+            else if packaged&&!legacy_shell{ShellMenu::for_view_with_packages(&host.view,&host.browser,window,!is_background)?}
             else{ShellMenu::for_view(&host.view,!is_background)?}
         }else if request.pidls.is_empty(){let folder=zsdesk_windows::desktop::folder_for_path(request.folder.as_deref().context("目录缺失")?)?;ShellMenu::for_folder_background(window,&folder)?}else{ShellMenu::for_items(window,&request.pidls)?};
         menu.set_directory(request.folder.as_deref());

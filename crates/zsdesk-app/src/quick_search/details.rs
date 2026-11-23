@@ -42,6 +42,7 @@ pub(crate) struct Detail {
     pub path: PathBuf,
     pub size: String,
     pub modified: String,
+    pub folder: bool,
 }
 #[derive(Default)]
 struct Work {
@@ -96,7 +97,7 @@ impl Reader {
                             row,
                             path,
                             size,
-                            modified: date(meta.last_write_time()),
+                            modified: date(meta.last_write_time()),folder:meta.is_dir(),
                         })
                         .is_err()
                     {

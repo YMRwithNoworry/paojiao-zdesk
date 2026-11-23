@@ -7,7 +7,7 @@ use windows::{core::w,Win32::{Foundation::{HWND,LPARAM,LRESULT,WPARAM,HINSTANCE}
 const EVENT:u32=WM_APP+75;
 const HOTKEY:i32=0x5a53;
 const LIFETIME_TIMER:usize=1;
-struct State{profile:PathBuf,registered:bool,hotkey:String,error:Option<String>,persistent:bool,start_with_windows:bool,visible:bool,lifetime_check:std::time::Instant}
+struct State{profile:PathBuf,registered:bool,registration_id:i32,hotkey:String,error:Option<String>,persistent:bool,start_with_windows:bool,visible:bool,lifetime_check:std::time::Instant}
 
 fn chord(text:&str)->Result<(HOT_KEY_MODIFIERS,u32)>{control::native_hotkey(text)}
 fn focus_main(profile:&Path,settings:bool)->Result<()>{
@@ -28,11 +28,17 @@ fn configure(hwnd:HWND,state:&mut State)->Result<bool>{
     if state.registered&&prefs.enabled&&state.hotkey.eq_ignore_ascii_case(&prefs.hotkey){
         control::write_status(&state.profile,None,false,&state.hotkey,true);return Ok(true);
     }
-    let previous=state.registered.then(||chord(&state.hotkey).ok()).flatten();
-    if state.registered{unsafe{UnregisterHotKey(Some(hwnd),HOTKEY)}?;state.registered=false;}
     if let Some((mods,key))=requested{
-        match unsafe{RegisterHotKey(Some(hwnd),HOTKEY,mods,key)}{
-            Ok(())=>{state.registered=true;state.hotkey=prefs.hotkey.clone();},
+        let next_id=if state.registered && state.registration_id==HOTKEY{HOTKEY+1}else{HOTKEY};
+        match unsafe{RegisterHotKey(Some(hwnd),next_id,mods,key)}{
+            Ok(())=>{
+                if state.registered {
+                    if let Err(error)=unsafe{UnregisterHotKey(Some(hwnd),state.registration_id)}{
+                        let _=unsafe{UnregisterHotKey(Some(hwnd),next_id)};return Err(error.into());
+                    }
+                }
+                state.registration_id=next_id;state.registered=true;state.hotkey=prefs.hotkey.clone();
+            },
             Err(error)=>{
                 let reason=match error.code().0 as u32{
                     0x80070581=>zsdesk_core::i18n::text("已被其他程序占用"),
@@ -40,11 +46,16 @@ fn configure(hwnd:HWND,state:&mut State)->Result<bool>{
                     _=>zsdesk_core::i18n::text("系统未接受注册"),
                 };
                 state.error=Some(zsdesk_core::tr_format!("快捷键 {} 未注册（{reason}）：{error}" , prefs.hotkey, reason=reason, error=error));
-                if let Some((mods,key))=previous{if unsafe{RegisterHotKey(Some(hwnd),HOTKEY,mods,key)}.is_ok(){state.registered=true;state.error.as_mut().unwrap().push_str(zsdesk_core::i18n::text("；原快捷键仍可使用"));}}
+                if state.registered{
+                    state.error.as_mut().unwrap().push_str(zsdesk_core::i18n::text("；原快捷键仍可使用"));
+                    if let Err(e)=control::restore_rejected_chord(&state.profile,&prefs.hotkey,&state.hotkey){
+                        state.error=Some(format!("{} ({e:#})",state.error.take().unwrap_or_default()));
+                    }
+                }
                 if !state.registered{state.hotkey=prefs.hotkey.clone();}
             },
         }
-    }else{state.hotkey=prefs.hotkey.clone();}
+    }else{if state.registered{unsafe{UnregisterHotKey(Some(hwnd),state.registration_id)}?;state.registered=false;}state.hotkey=prefs.hotkey.clone();}
     control::write_status(&state.profile,state.error.as_deref(),false,&state.hotkey,state.registered);
     Ok(prefs.enabled||super::needs_background(&state.profile))
 }
@@ -54,7 +65,8 @@ unsafe extern "system" fn proc(hwnd:HWND,message:u32,wp:WPARAM,lp:LPARAM)->LRESU
     }
     let pointer=unsafe{GetWindowLongPtrW(hwnd,GWLP_USERDATA)}as*mut State;
     if pointer.is_null(){return unsafe{DefWindowProcW(hwnd,message,wp,lp)};}
-    if message==WM_HOTKEY&&wp.0==HOTKEY as usize{
+    if message==WM_HOTKEY&&unsafe{(*pointer).registered&&wp.0==(*pointer).registration_id as usize}{
+        if super::shortcut::dialog_active() || crate::utility_panel::hide_search_if_foreground(){return LRESULT(0);}
         let profile=unsafe{&*pointer}.profile.clone();let result=focus_main(&profile,false);
         let state=unsafe{&mut*pointer};state.error=result.err().map(|error|zsdesk_core::tr_format!("无法打开快速搜索：{error:#}", error=error));state.visible=super::popup::is_open();
         control::write_status(&profile,state.error.as_deref(),state.visible,&state.hotkey,state.registered);return LRESULT(0);
@@ -92,7 +104,7 @@ unsafe extern "system" fn proc(hwnd:HWND,message:u32,wp:WPARAM,lp:LPARAM)->LRESU
     }
     if message==WM_DESTROY{
         super::popup::close();let _=unsafe{KillTimer(Some(hwnd),LIFETIME_TIMER)};
-        let state=unsafe{&mut*pointer};if state.registered{let _=unsafe{UnregisterHotKey(Some(hwnd),HOTKEY)};state.registered=false;}
+        let state=unsafe{&mut*pointer};if state.registered{let _=unsafe{UnregisterHotKey(Some(hwnd),state.registration_id)};state.registered=false;}
         control::write_status(&state.profile,state.error.as_deref(),false,&state.hotkey,false);unsafe{PostQuitMessage(0)};return LRESULT(0);
     }
     unsafe{DefWindowProcW(hwnd,message,wp,lp)}
@@ -107,13 +119,13 @@ pub(super) fn run(profile:PathBuf,action:Action,instance:&control::Instance)->Re
     if action!=Action::Open&&!configuration.preferences.enabled&&!super::needs_background(&profile){return Ok(());}
     let module=HINSTANCE(unsafe{GetModuleHandleW(None)}?.0);let class=w!("ZSDesk.SearchHotkey");
     unsafe{RegisterClassW(&WNDCLASSW{hInstance:module,lpfnWndProc:Some(proc),lpszClassName:class,..Default::default()});}
-    let mut state=Box::new(State{profile,registered:false,hotkey:String::new(),error:None,persistent:false,start_with_windows:false,visible:false,lifetime_check:std::time::Instant::now()});
+    let mut state=Box::new(State{profile,registered:false,registration_id:HOTKEY,hotkey:String::new(),error:None,persistent:false,start_with_windows:false,visible:false,lifetime_check:std::time::Instant::now()});
     let hwnd=unsafe{CreateWindowExW(WS_EX_TOOLWINDOW,class,w!("ZSdesk"),WS_POPUP,0,0,0,0,None,None,Some(module),Some((&mut*state as*mut State).cast()))}?;
     struct Window(HWND);impl Drop for Window{fn drop(&mut self){if unsafe{IsWindow(Some(self.0))}.as_bool(){let _=unsafe{DestroyWindow(self.0)};}}}let _window=Window(hwnd);
     state.persistent=configure(hwnd,&mut state)?;let listener=instance.listen_native(hwnd,EVENT)?;
     unsafe{SetTimer(Some(hwnd),LIFETIME_TIMER,250,None);}
     let mut msg=MSG::default();while unsafe{GetMessageW(&mut msg,None,0,0)}.0>0{unsafe{let _=TranslateMessage(&msg);DispatchMessageW(&msg);}}
-    drop(listener);Ok(())
+    drop(listener);zsdesk_windows::shell::file_transfer::persist_thread_clipboard()?;Ok(())
 }
 
 #[cfg(test)]mod tests{
@@ -150,7 +162,7 @@ pub(super) fn run(profile:PathBuf,action:Action,instance:&control::Instance)->Re
             let owner=make()?;let blocker=make()?;let probe=make()?;
             let profile=output.join("explorer-session.json");let config=profile.with_file_name("quick-search.json");
             let write=|enabled:bool,hotkey:&str|->Result<()>{fs::write(&config,serde_json::to_vec(&control::Configuration{preferences:zsdesk_core::model::explorer::QuickSearchPreferences{enabled,hotkey:hotkey.into(),start_with_windows:false},startup_command:None})?)?;Ok(())};
-            let mut state=State{profile,registered:false,hotkey:String::new(),error:None,persistent:false,start_with_windows:false,visible:false,lifetime_check:std::time::Instant::now()};
+            let mut state=State{profile,registered:false,registration_id:HOTKEY,hotkey:String::new(),error:None,persistent:false,start_with_windows:false,visible:false,lifetime_check:std::time::Instant::now()};
             write(true,"Ctrl+Alt+Shift+F23")?;let initial=configure(owner.0,&mut state)?;
             let (old_mods,old_key)=chord("Ctrl+Alt+Shift+F23")?;
             let initial_status=serde_json::json!({"stage":"initial-registration","hwnd":owner.0.0 as usize,"modifiers":old_mods.0,"vk":old_key,

@@ -1,7 +1,8 @@
-//! Shared hotkey/background lifecycle. Search lives in the file-manager window.
+//! Per-profile global hotkey, search window and background integrations.
 pub mod control;
 mod resident;
 pub(super) mod popup;
+pub(crate) mod shortcut;
 pub(crate) mod details;
 use std::path::{Path,PathBuf};
 use anyhow::{Context,Result};

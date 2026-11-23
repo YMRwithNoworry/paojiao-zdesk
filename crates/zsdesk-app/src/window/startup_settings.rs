@@ -14,10 +14,10 @@ const HOTKEYS: &[(&str, &str)] = &[
 fn settings_menu(preferences: &QuickSearchPreferences, main_startup: Option<bool>, desktop_startup: Option<Option<bool>>) -> MenuSpec {
     let mut items = vec![
         menus::entry(zsdesk_core::i18n::text("搜索与开机启动（当前配置）"), "startup-heading", false, false),
-        menus::entry(zsdesk_core::i18n::text("启用全局搜索快捷键（唤出主窗口）"), "search-hotkey-enabled", true, preferences.enabled),
+        menus::entry(zsdesk_core::i18n::text("启用全局搜索快捷键"), "search-hotkey-enabled", true, preferences.enabled),
         menus::submenu(&zsdesk_core::tr_format!("全局搜索快捷键：{}", preferences.hotkey), HOTKEYS.iter().map(|(id, hotkey)| {
             menus::entry(hotkey, id, true, preferences.hotkey.eq_ignore_ascii_case(hotkey))
-        }).collect()),
+        }).chain(std::iter::once(menus::item(zsdesk_core::i18n::text("自定义快捷键…"),"search-hotkey-custom"))).collect()),
         menus::entry(zsdesk_core::i18n::text("登录 Windows 时启用后台快捷键（不打开窗口）"), "search-background-login", preferences.enabled, preferences.enabled && preferences.start_with_windows),
         MenuItemSpec::Separator,
         menus::entry(if main_startup.is_some() { zsdesk_core::i18n::text("登录 Windows 时打开文件管理主窗口") } else { zsdesk_core::i18n::text("主窗口登录启动（无法读取状态）") },
@@ -68,6 +68,12 @@ pub(crate) fn show(profile: &std::path::Path, owner: super::HWND, anchor: Option
     if let Some(Err(error)) = &desktop_startup { report(zsdesk_core::tr_format!("无法读取桌面格子登录启动设置：{error:#}", error=error)); }
     let Some(choice) = super::input::popup(owner, &spec, anchor) else { return; };
 
+    if choice == "search-hotkey-custom" {
+        match quick_search::shortcut::edit(owner,profile) {
+            Ok(Some(message))=>report(message),Ok(None)=>{},Err(error)=>report(error.to_string())
+        }
+        return;
+    }
     if preference_action(&mut preferences, &choice) {
         let enabled = preferences.enabled;
         if let Err(error) = control::apply(profile, preferences) {

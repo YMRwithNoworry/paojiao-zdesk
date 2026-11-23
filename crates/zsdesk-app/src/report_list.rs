@@ -104,7 +104,50 @@ pub fn selected(list: HWND) -> Option<usize> {
     )
     .ok()
 }
+pub fn selected_rows(list: HWND) -> Vec<usize> {
+    let mut indices = Vec::new();
+    let mut current = usize::MAX;
+    loop {
+        let next = unsafe {
+            SendMessageW(
+                list,
+                LVM_GETNEXTITEM,
+                Some(WPARAM(current)),
+                Some(LPARAM(LVNI_SELECTED as isize)),
+            )
+        }
+        .0;
+        if next < 0 || current != usize::MAX && next as usize <= current {
+            break;
+        }
+        current = next as usize;
+        indices.push(current);
+    }
+    indices
+}
+pub fn set_selection(list: HWND, all: bool) {
+    let item = LVITEMW {
+        stateMask: LVIS_SELECTED,
+        state: if all {
+            LVIS_SELECTED
+        } else {
+            LIST_VIEW_ITEM_STATE_FLAGS(0)
+        },
+        ..Default::default()
+    };
+    unsafe {
+        SendMessageW(
+            list,
+            LVM_SETITEMSTATE,
+            Some(WPARAM(usize::MAX)),
+            Some(LPARAM(&item as *const _ as isize)),
+        );
+    }
+}
 pub fn select_first(list: HWND) {
+    select(list, 0);
+}
+pub fn select(list: HWND, row: usize) {
     let state = LIST_VIEW_ITEM_STATE_FLAGS(LVIS_SELECTED.0 | LVIS_FOCUSED.0);
     let mut item = LVITEMW {
         stateMask: state,
@@ -115,7 +158,7 @@ pub fn select_first(list: HWND) {
         SendMessageW(
             list,
             LVM_SETITEMSTATE,
-            Some(WPARAM(0)),
+            Some(WPARAM(row)),
             Some(LPARAM(&mut item as *mut _ as isize)),
         );
     }
