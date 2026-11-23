@@ -773,6 +773,9 @@ impl WindowState {
                 Err(error)=>self.show_message(error.to_string()),
             },
             Some("diagnostics")=>if let Err(error)=diagnostics::show(self.hwnd){self.show_message(zsdesk_core::tr_format!("无法打开诊断日志：{error}", error=error));},
+            Some("quick-search-shortcut") => match crate::quick_search::shortcut::edit(self.hwnd,&self.config_path) {
+                Ok(Some(message))=>self.show_message(message), Err(error)=>self.show_message(error.to_string()), _=>{}
+            },
             Some("quick-search-settings") => unsafe { self.search_settings_menu(); },
             Some("quick-search-open")=>if let Err(error)=crate::quick_search::launch(&self.config_path,false){self.show_message(zsdesk_core::tr_format!("无法打开快速搜索：{error:#}", error=error));},
             Some("manage-context-commands")=>self.load_context_catalog(),

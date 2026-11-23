@@ -34,6 +34,35 @@ fn collect(service:&FastSearch,generation:u64)->Result<(Vec<PathBuf>,SearchEvent
         ensure!(Instant::now()<deadline,"native search timeout");thread::sleep(Duration::from_millis(5));}
 }
 
+#[test]
+fn opening_search_only_warms_existing_rows_and_historical_skips_stay_in_diagnostics()->Result<()>{
+    let fixture=Fixture::new(&std::env::temp_dir())?;
+    let core=native::shared(&fixture.index);
+    let state=shared();
+    let options=SearchOptions::default();
+    native::warm_existing(&core,&options,&state);
+    assert!(!fixture.index.exists());
+    assert_eq!(native::inspect(&core).0,0);
+    let expected=fixture.write("warm-marker.txt",b"ok")?;
+    direct(&core,&fixture,options,"warm-marker",0,20,everything::SearchSort::NameAsc)?;
+    native::evict_if_idle(&core,0);
+    let policy=snapshot::Policy{development:false,metadata:false};
+    let mut data=snapshot::load(&fixture.index,&policy,&||false)?;
+    let root=data[0].index.ids[0];
+    data[0].note_read_error(root,&anyhow::anyhow!("fixture read error"));
+    assert!(data[0].read_issue.as_ref().unwrap().1.contains("fixture read error"));
+    snapshot::save(&fixture.index,&policy,&data,&||false)?;
+    native::warm_existing(&core,&options,&state);
+    assert!(native::inspect(&core).0>0);
+    let(sender,receiver)=mpsc::sync_channel(128);
+    let request=Request{generation:1,query:"warm-marker".into(),preferred:None,invalid:None,offset:0,limit:20,sort:everything::SearchSort::NameAsc};
+    native::execute_cached(&core,&options,Some(std::slice::from_ref(&fixture.files)),&state,&sender,&request)?;
+    let event=receiver.try_iter().find(|e|e.finished).unwrap();
+    assert_eq!(event.paths,[expected]);assert_eq!(event.denied,0);
+    assert!(event.volumes.iter().all(|v|v.warning.as_ref().is_none_or(|s|!s.contains("fixture read error"))));
+    Ok(())
+}
+
 #[test]fn cancelled_partial_catalog_is_saved_and_resumed_without_bootstrap()->Result<()>{
     let fixture=Fixture::new(&std::env::temp_dir())?;
     for index in 0..96{fixture.write(&format!("dir-{index}/resume-marker.txt"),b"resumable")?;}
@@ -259,7 +288,7 @@ fn native_compact_million_rows_snapshot_and_eviction()->Result<()>{
     let dirs:Vec<_>=(0..1000).map(|n|index.append(100+n,0,OsStr::new(&format!("目录{n}")),DIRECTORY)).collect::<Result<_>>()?;
     for row in 0..1_000_000u64{index.append(10_000+row,dirs[(row/1000)as usize],OsStr::new(&format!("文件-{:06}.txt",row%300_000)),0)?;}
     index.reindex();index.compact()?;index.validate()?;let heap=index.heap_bytes();ensure!(heap<160*1024*1024,"compact synthetic catalog exceeded reviewed memory budget");
-    let count=index.len();let volumes=vec![VolumeIndex{root:fixture.files.clone(),serial:1,journal_id:7,checkpoint:99,has_journal:true,mft:true,denied:0,index,pending_dirs:Vec::new()}];
+    let count=index.len();let volumes=vec![VolumeIndex{root:fixture.files.clone(),serial:1,journal_id:7,checkpoint:99,has_journal:true,mft:true,denied:0,read_issue:None,index,pending_dirs:Vec::new()}];
     let policy=snapshot::Policy{development:false,metadata:false};snapshot::save(&fixture.index,&policy,&volumes,&||false)?;let bytes=fs::metadata(&fixture.index)?.len();drop(volumes);
     let loaded=snapshot::load(&fixture.index,&policy,&||false)?;ensure!(loaded[0].index.len()==count&&loaded[0].index.attributes.is_none(),"scale roundtrip mismatch");drop(loaded);
     let report=json!({"state":"passed","synthetic_files":1000000,"directories":1000,"resident_column_estimate_bytes":heap,"snapshot_bytes":bytes,
@@ -358,7 +387,7 @@ fn broad_queries_keep_the_correct_page_after_pruning() -> Result<()> {
     }
     index.reindex();
     let volumes=[VolumeIndex{root:fixture.files.clone(),serial:1,journal_id:0,checkpoint:0,
-        has_journal:false,mft:false,denied:0,index,pending_dirs:Vec::new()}];
+        has_journal:false,mft:false,denied:0,read_issue:None,index,pending_dirs:Vec::new()}];
     snapshot::save(&fixture.index,&snapshot::Policy{development:false,metadata:true},&volumes,&||false)?;
     let core=native::shared(&fixture.index);
     let options=SearchOptions{index_metadata:true,..Default::default()};

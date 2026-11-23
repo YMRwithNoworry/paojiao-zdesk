@@ -466,6 +466,7 @@ pub fn app_menu_with_capabilities(state: AppMenuState, ui: &ExplorerUi, themed: 
         MenuItemSpec::Separator,
         item(zsdesk_core::i18n::text("开机启动与全局快捷键…"), "quick-search-settings"),
         item(zsdesk_core::i18n::text("快速搜索…"), "quick-search-open"),
+        item(zsdesk_core::i18n::text("搜索快捷键设置"), "quick-search-shortcut"),
         item(zsdesk_core::i18n::text("文件位置转发…"), "routing-settings"),
     ]));
     items.extend([

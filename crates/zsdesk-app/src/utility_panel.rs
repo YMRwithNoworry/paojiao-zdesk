@@ -9,7 +9,7 @@ use zsdesk_ui::theme::{Palette,Mode};
 use content::InfoRow;
 #[path="utility_result_menu.rs"]mod result_menu;
 #[path="utility_search.rs"] mod search_ui;
-use search_ui::{SearchView,FIRST_FILTER,FILTERS,SHORTCUT};
+use search_ui::{SearchView,FIRST_FILTER,FILTERS};
 use crate::{report_list,fast_search::everything::SearchSort,quick_search::details};
 const PAGE_SIZE:u32=200;
 const HEADINGS:[&str;4]=["名称","路径","大小","修改时间"];
@@ -56,7 +56,7 @@ pub(crate) fn show_search(profile:&Path)->Result<()>{
         let dark=match ui.appearance.color_scheme{zsdesk_core::model::explorer::ColorScheme::Dark=>true,zsdesk_core::model::explorer::ColorScheme::Light=>false,_=>zsdesk_windows::theme::system_dark_mode()};
         let dark=dark&&!zsdesk_windows::theme::high_contrast();
         let pointer=unsafe{GetWindowLongPtrW(hwnd,GWLP_USERDATA)}as*const RefCell<Panel>;let slot=unsafe{&*pointer};
-        {let mut panel=slot.borrow_mut();let palette=search_ui::palette(dark);
+        {let mut panel=slot.borrow_mut();panel.warm_search(&ui);let palette=search_ui::palette(dark);
             if palette!=panel.palette{panel.palette=palette;unsafe{DeleteObject(panel.brush.into());DeleteObject(panel.input_brush.into());}
                 panel.brush=unsafe{CreateSolidBrush(rgb(palette.layer))};panel.input_brush=unsafe{CreateSolidBrush(rgb(palette.input_focused))};panel.style_list();}
             if (!panel.search_view.last_query.is_empty()||panel.search_view.filter!=0) && text(panel.edit).is_empty(){let last=panel.search_view.last_query.clone();set_text(panel.edit,&last);panel.search();}
@@ -113,13 +113,19 @@ fn show(owner:HWND,profile:&Path,kind:Kind,body:String)->Result<HWND>{
     let width=scale(match kind{Kind::About=>560,Kind::Shortcuts=>800,Kind::Search=>960}).min(info.rcWork.right-info.rcWork.left);
     let height=scale(match kind{Kind::About=>430,Kind::Shortcuts=>640,Kind::Search=>540}).min(info.rcWork.bottom-info.rcWork.top);
     unsafe{SetWindowPos(hwnd,None,info.rcWork.left+(info.rcWork.right-info.rcWork.left-width)/2,info.rcWork.top+(info.rcWork.bottom-info.rcWork.top-height)/3,width,height,SWP_NOZORDER)?;}
-    if kind==Kind::Search{SEARCH.with(|slot|slot.set(hwnd.0 as isize));}
+    if kind==Kind::Search{state.borrow_mut().warm_search(&ui);SEARCH.with(|slot|slot.set(hwnd.0 as isize));}
     let activate=true;
     #[cfg(test)]let activate=activate&&!TEST_NO_ACTIVATE.with(Cell::get);
     unsafe{let _=ShowWindow(hwnd,if activate{SW_SHOWNORMAL}else{SW_SHOWNOACTIVATE});if activate{let _=SetForegroundWindow(hwnd);PostMessageW(Some(hwnd),WM_APP+103,WPARAM(0),LPARAM(0))?;}}
     owned.0=HWND::default();Ok(hwnd)
 }
 impl Panel{
+    fn warm_search(&mut self, ui: &zsdesk_core::model::explorer::ExplorerUi) {
+        let options=SearchOptions::from_ui(ui);
+        if !options.backend.is_builtin(){return;}
+        if self.engine.is_none(){self.engine=FastSearch::for_profile(&self.profile,self.hwnd,RESULTS,options).ok();}
+        if let Some(engine)=&self.engine{engine.warm_snapshot();}
+    }
     fn hide_search(&mut self){
         self.cancel_result_menu();let _=unsafe{KillTimer(Some(self.hwnd),DEBOUNCE)};
         if let Some(engine)=&self.engine{engine.cancel();}
@@ -128,7 +134,7 @@ impl Panel{
     }
     fn s(&self,n:i32)->i32{n*self.dpi as i32/96}
     fn child(&self,class:PCWSTR,label:&str,id:usize,style:WINDOW_STYLE)->Result<HWND>{
-        let style=if matches!(id,12|13|14)||(self.kind==Kind::Search && (matches!(id,16..=18)||(FIRST_FILTER as usize..FIRST_FILTER as usize+FILTERS.len()).contains(&id))){style|WINDOW_STYLE(BS_OWNERDRAW as u32)}else{style};
+        let style=if matches!(id,12|13|14)||(self.kind==Kind::Search && (matches!(id,16|17)||(FIRST_FILTER as usize..FIRST_FILTER as usize+FILTERS.len()).contains(&id))){style|WINDOW_STYLE(BS_OWNERDRAW as u32)}else{style};
         let hwnd=unsafe{CreateWindowExW(WINDOW_EX_STYLE::default(),class,PCWSTR(wide(label).as_ptr()),WS_CHILD|WS_VISIBLE|style,0,0,0,0,Some(self.hwnd),Some(HMENU(id as*mut _)),None,None)}?;
         unsafe{SendMessageW(hwnd,WM_SETFONT,Some(WPARAM(self.font.0 as usize)),Some(LPARAM(0)));SetWindowSubclass(hwnd,Some(control_proc),1,self.hwnd.0 as usize).ok()?;}
         Ok(hwnd)
@@ -153,7 +159,6 @@ impl Panel{
             for (col,title) in HEADINGS.iter().enumerate(){report_list::heading(self.list,col,zsdesk_core::i18n::text(title),120,true);}
             self.child(w!("BUTTON"),zsdesk_core::i18n::text("上一页"),16,WS_TABSTOP)?;
             self.child(w!("BUTTON"),zsdesk_core::i18n::text("下一页"),17,WS_TABSTOP)?;
-            self.child(w!("BUTTON"),zsdesk_core::i18n::text("快捷键设置"),SHORTCUT as usize,WS_TABSTOP)?;
             for (i,(label,_)) in FILTERS.iter().enumerate(){self.child(w!("BUTTON"),zsdesk_core::i18n::text(label),FIRST_FILTER as usize+i,WS_TABSTOP)?;}
             self.refresh_headings();self.detail_reader=Some(details::Reader::new(self.hwnd)?);
             self.action=self.child(w!("BUTTON"),zsdesk_core::i18n::text("打开文件位置"),12,WS_TABSTOP)?;
@@ -180,7 +185,6 @@ impl Panel{
             Kind::Search=>{
                 set_text(self.action,tr("打开文件位置"));self.style_list();
                 for (i,(label,_)) in FILTERS.iter().enumerate(){if let Ok(b)=unsafe{GetDlgItem(Some(self.hwnd),FIRST_FILTER+i as i32)}{set_text(b,tr(label));}}
-                if let Ok(b)=unsafe{GetDlgItem(Some(self.hwnd),SHORTCUT)}{set_text(b,tr("快捷键设置"));}
                 self.refresh_headings();
                 for (id,label) in [(16,"上一页"),(17,"下一页")]{if let Ok(button)=unsafe{GetDlgItem(Some(self.hwnd),id)}{set_text(button,tr(label));}}
                 let cue=wide(tr("搜索文件、文件夹和路径"));
@@ -236,7 +240,7 @@ impl Panel{
         for hwnd in [self.edit,self.list,self.action,self.close]{if !hwnd.0.is_null(){unsafe{SendMessageW(hwnd,WM_SETFONT,Some(WPARAM(self.font.0 as usize)),Some(LPARAM(1)));}}}
         if let Ok(link)=unsafe{GetDlgItem(Some(self.hwnd),14)}{unsafe{SendMessageW(link,WM_SETFONT,Some(WPARAM(self.font.0 as usize)),Some(LPARAM(1)));}}
         if self.kind==Kind::Search{unsafe{SendMessageW(self.edit,WM_SETFONT,Some(WPARAM(self.title_font.0 as usize)),Some(LPARAM(1)));}}
-        unsafe{DeleteObject(old.into());DeleteObject(old_title.into());for id in [16,17,SHORTCUT,FIRST_FILTER,FIRST_FILTER+1,FIRST_FILTER+2,FIRST_FILTER+3,FIRST_FILTER+4]{if let Ok(b)=GetDlgItem(Some(self.hwnd),id){SendMessageW(b,WM_SETFONT,Some(WPARAM(self.font.0 as usize)),Some(LPARAM(1)));}}
+        unsafe{DeleteObject(old.into());DeleteObject(old_title.into());for id in [16,17,FIRST_FILTER,FIRST_FILTER+1,FIRST_FILTER+2,FIRST_FILTER+3,FIRST_FILTER+4]{if let Ok(b)=GetDlgItem(Some(self.hwnd),id){SendMessageW(b,WM_SETFONT,Some(WPARAM(self.font.0 as usize)),Some(LPARAM(1)));}}
             SetWindowPos(self.hwnd,None,rect.left,rect.top,rect.right-rect.left,rect.bottom-rect.top,SWP_NOZORDER|SWP_NOACTIVATE).ok();}
         self.layout();
     }
@@ -362,14 +366,13 @@ unsafe extern "system" fn procedure(hwnd:HWND,msg:u32,wp:WPARAM,lp:LPARAM)->LRES
             drop(state);
             use zsdesk_ui::menus;
             let menu=menus::menu(vec![menus::item(zsdesk_core::i18n::text("刷新搜索结果"),"refresh"),
-                menus::item(zsdesk_core::i18n::text("恢复默认列宽"),"widths"),menus::item(zsdesk_core::i18n::text("快捷键设置"),"shortcut")]);
+                menus::item(zsdesk_core::i18n::text("恢复默认列宽"),"widths")]);
             let prefs=crate::context_preferences::current(&profile).or_else(||crate::storage::load(&profile).ok().map(|s|s.ui.context_menu));
             let action=if prefs.as_ref().is_some_and(|p|!crate::context_preferences::modern(p)){crate::flyout_menu::native(hwnd,&menu,anchor)}
                 else{crate::flyout_menu::show(hwnd,&menu,anchor,dark)};
             if let Ok(mut panel)=slot.try_borrow_mut(){match action.as_deref(){
                 Some("refresh")=>panel.search(),
                 Some("widths")=>{if let Err(e)=panel.search_view.reset_widths(&profile){panel.status=e.to_string();}panel.layout();}
-                Some("shortcut")=>{let _=unsafe{PostMessageW(Some(hwnd),WM_COMMAND,WPARAM(SHORTCUT as usize),LPARAM(0))};}
                 _=>{}
             }}
             return LRESULT(0);
@@ -434,13 +437,6 @@ unsafe extern "system" fn procedure(hwnd:HWND,msg:u32,wp:WPARAM,lp:LPARAM)->LRES
             }
         },
         WM_COMMAND=>{let id=wp.0&0xffff;let event=(wp.0>>16)as u32;
-            if state.kind==Kind::Search && event==BN_CLICKED && id==SHORTCUT as usize{
-                let profile=state.profile.clone();drop(state);
-                let result=crate::quick_search::shortcut::edit(hwnd,&profile);
-                if let Ok(mut panel)=slot.try_borrow_mut(){match result{Ok(Some(msg))=>panel.status=msg,Err(e)=>panel.status=e.to_string(),_=>{}}
-                    let edit=panel.edit;drop(panel);let _=unsafe{SetFocus(Some(edit))};let _=unsafe{InvalidateRect(Some(hwnd),None,false)};}
-                return LRESULT(0);
-            }
             if state.kind==Kind::Search&&event==BN_CLICKED&&(FIRST_FILTER as usize..FIRST_FILTER as usize+FILTERS.len()).contains(&id){
                 state.search_view.filter=id-FIRST_FILTER as usize;state.offset=0;state.search();
                 for i in 0..FILTERS.len(){if let Ok(b)=unsafe{GetDlgItem(Some(hwnd),FIRST_FILTER+i as i32)}{let _=unsafe{InvalidateRect(Some(b),None,false)};}}
@@ -474,7 +470,7 @@ unsafe extern "system" fn procedure(hwnd:HWND,msg:u32,wp:WPARAM,lp:LPARAM)->LRES
                     if let Err(error)=crate::update_check::set_automatic(&state.profile,enabled){state.status=zsdesk_core::tr_format!("无法保存更新设置：{error:#}" , error=error);unsafe{SendMessageW(check,BM_SETCHECK,Some(WPARAM(usize::from(!enabled))),None);}}
                 }
             }
-            else if id==10&&event==EN_CHANGE&&state.kind==Kind::Search{state.invalidate_query();unsafe{SetTimer(Some(hwnd),DEBOUNCE,200,None);}}
+            else if id==10&&event==EN_CHANGE&&state.kind==Kind::Search{state.invalidate_query();unsafe{SetTimer(Some(hwnd),DEBOUNCE,40,None);}}
             else if state.kind==Kind::Search && event==BN_CLICKED && (id==16 || id==17){
                 if id==16 && state.offset>0{state.offset=state.offset.saturating_sub(PAGE_SIZE);state.search();}
                 else if id==17 && state.has_next{state.offset=state.offset.saturating_add(PAGE_SIZE);state.search();}
@@ -517,7 +513,7 @@ unsafe extern "system" fn control_proc(hwnd:HWND,msg:u32,wp:WPARAM,lp:LPARAM,id:
                 let _=unsafe{PostMessageW(Some(parent),search_ui::WIDTH_CHANGED,WPARAM(h.iItem as usize),LPARAM(width as isize))};}
         }
     }
-    if matches!(msg,WM_MOUSEMOVE|WM_MOUSELEAVE)&&matches!(child_id,12|16..=18|30..=34){
+    if matches!(msg,WM_MOUSEMOVE|WM_MOUSELEAVE)&&matches!(child_id,12|16|17|30..=34){
         if msg==WM_MOUSEMOVE{let mut t=TRACKMOUSEEVENT{cbSize:std::mem::size_of::<TRACKMOUSEEVENT>()as u32,dwFlags:TME_LEAVE,hwndTrack:hwnd,..Default::default()};let _=unsafe{TrackMouseEvent(&mut t)};}
         let _=unsafe{InvalidateRect(Some(hwnd),None,false)};
     }
@@ -529,7 +525,7 @@ unsafe extern "system" fn control_proc(hwnd:HWND,msg:u32,wp:WPARAM,lp:LPARAM,id:
     if !unsafe{GetPropW(hwnd,w!("ZSDesk.ImeActive"))}.0.is_null(){return unsafe{DefSubclassProc(hwnd,msg,wp,lp)};}
     if msg==WM_KEYDOWN{
         if wp.0==VK_ESCAPE.0 as usize{unsafe{PostMessageW(Some(parent),WM_CLOSE,WPARAM(0),LPARAM(0)).ok();}return LRESULT(0);}
-        if wp.0==VK_RETURN.0 as usize&&matches!(unsafe{GetDlgCtrlID(hwnd)},12|13|14|16..=18|30..=34){let _=unsafe{PostMessageW(Some(parent),WM_COMMAND,WPARAM(GetDlgCtrlID(hwnd)as usize),LPARAM(hwnd.0 as isize))};return LRESULT(0);}
+        if wp.0==VK_RETURN.0 as usize&&matches!(unsafe{GetDlgCtrlID(hwnd)},12|13|14|16|17|30..=34){let _=unsafe{PostMessageW(Some(parent),WM_COMMAND,WPARAM(GetDlgCtrlID(hwnd)as usize),LPARAM(hwnd.0 as isize))};return LRESULT(0);}
         if wp.0==VK_RETURN.0 as usize&&matches!(unsafe{GetDlgCtrlID(hwnd)},10|11)&&unsafe{GetDlgItem(Some(parent),11)}.is_ok(){unsafe{PostMessageW(Some(parent),WM_APPPLUS_OPEN,WPARAM((GetKeyState(VK_CONTROL.0 as i32)<0)as usize),LPARAM(0)).ok();}return LRESULT(0);}
         if shortcut_page&&[VK_DOWN.0 as usize,VK_UP.0 as usize,VK_NEXT.0 as usize,VK_PRIOR.0 as usize,VK_HOME.0 as usize,VK_END.0 as usize].contains(&wp.0){
             let code=match wp.0 as u16{key if key==VK_UP.0=>0,key if key==VK_DOWN.0=>1,key if key==VK_PRIOR.0=>2,key if key==VK_NEXT.0=>3,key if key==VK_HOME.0=>6,_=>7};

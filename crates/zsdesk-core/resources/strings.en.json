@@ -91,7 +91,7 @@
   "不能把文件夹复制或移动到它自己的子目录": "A folder cannot be copied or moved into its own subfolder.",
   "文件超过目标文件系统允许的大小": "The file exceeds the destination file system's size limit.",
   "索引快照未能保存：{error:#}；当前结果仍可使用": "Could not save the index snapshot: {error:#}. Current results are still available.",
-  "部分目录暂不可读取（{} 次）": "Some folders could not be read ({} attempts).",
+  "{} · 最近一次索引维护跳过 {} 次读取：{}": "{} · {} reads skipped during the last index update. Latest failure: {}",
   "此位置无可用 USN 日志，搜索时刷新目录": "No USN journal is available here. Folders are refreshed during searches.",
   "部分位置暂时不可更新，请查看搜索状态": "Some locations could not be updated. See search status.",
 
@@ -431,7 +431,7 @@
   "（已处理 {} 条）": " ({} processed)",
   " · 共享索引，只读查询": " · Shared index, read-only query",
   " 等 {} 卷": " and other volumes ({} total)",
-  " · 跳过 {} 处受限位置": " · {} restricted locations skipped",
+  " · 跳过 {} 次读取": " · {} reads skipped",
   " · {} 处目录链接未跟随": " · {} directory links skipped",
   "准备中": "Preparing",
   "读取已有索引": "Loading saved index",

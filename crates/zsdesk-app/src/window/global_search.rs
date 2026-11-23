@@ -410,7 +410,7 @@ fn progress_text(event:&crate::fast_search::SearchEvent,found:usize)->String{
             if warning.chars().count()>72{text.push('…');}
         }
     }
-    if event.denied>0{text.push_str(&zsdesk_core::tr_format!(" · 跳过 {} 处受限位置", event.denied));}
+    if event.denied>0{text.push_str(&zsdesk_core::tr_format!(" · 跳过 {} 次读取", event.denied));}
     if event.skipped_reparse>0{text.push_str(&zsdesk_core::tr_format!(" · {} 处目录链接未跟随", event.skipped_reparse));}
     text
 }

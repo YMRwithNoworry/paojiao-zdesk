@@ -44,9 +44,23 @@ pub(super) fn diagnostics()->serde_json::Value{
     serde_json::Value::Array(cores.into_iter().map(|core|match core.try_lock(){
         Ok(store)=>serde_json::json!({"busy":false,"resident":store.volumes.is_some(),"idle_milliseconds":store.last_use.elapsed().as_millis()as u64,"scan_pending":store.pending,
             "heap_bytes":store.volumes.as_ref().map_or(0,|volumes|volumes.iter().map(|v|v.index.heap_bytes()+v.pending_dirs.capacity()*8).sum::<usize>()),
+            "volumes":store.volumes.as_ref().map(|volumes|volumes.iter().map(|v|serde_json::json!({"root":v.root,"historical_read_skips":v.denied,"last_pass_read_issue":v.read_issue})).collect::<Vec<_>>()),
             "rows":store.volumes.as_ref().map_or(0,|volumes|volumes.iter().map(|v|v.index.len()).sum::<usize>()),"snapshot_warning":store.snapshot_warning}),
         Err(_)=>serde_json::json!({"busy":true}),
     }).collect())
+}
+pub(super) fn warm_existing(core:&Core,options:&SearchOptions,shared:&Shared) {
+    let Ok(mut store)=lock(core,shared) else {return;};
+    if store.volumes.is_some(){store.last_use=Instant::now();return;}
+    if store.force || !store.path.is_file(){return;}
+    if let Ok(volumes)=snapshot::load(&store.path,&policy(options),&||shared.cancelled()){
+        if shared.cancelled() || volumes.is_empty(){return;}
+        store.pending=volumes.iter().any(|volume|!volume.pending_dirs.is_empty());
+        store.volumes=Some(volumes);
+        store.policy=Some((options.include_development,options.index_metadata));
+        store.last_use=Instant::now();
+        store.last_check=Instant::now()-DIRECTORY_REFRESH;
+    }
 }
 fn policy(options:&SearchOptions)->snapshot::Policy{snapshot::Policy{development:options.include_development,metadata:options.index_metadata}}
 impl Store{
@@ -87,7 +101,7 @@ impl Store{
                 if let Some((_,_,warning))=self.backoff.iter().find(|(path,at,_)|same_root(path,&root)&&at.elapsed()<FAILED_BUILD_RETRY){
                     self.failures.push(VolumeStatus{root:root.clone(),backend:BackendKind::DirectoryScan,phase:IndexPhase::Paused,indexed:volumes[at].index.len()as u64,checkpoint:None,warning:Some(warning.clone())});continue;
                 }
-                let volume=&mut volumes[at];
+                let volume=&mut volumes[at];volume.read_issue=None;
                 if volume.pending_dirs.is_empty(){
                     if volume.has_journal{
                         match catch_up(volume,options,shared,sender,generation){Ok(updated)=>changed|=updated,Err(error)=>{
@@ -153,7 +167,7 @@ fn build_volume(root:&Path,options:&SearchOptions,shared:&Shared,sender:&SyncSen
     let mut journal=scan::volume_root(root).and_then(|path|ntfs::Volume::open_changes(&path).ok());
     let before=journal.as_mut().and_then(|volume|{let journal=volume.journal(&shared.engine_stop).ok()?;
         volume.changes(journal.next,journal.id,&shared.engine_stop).ok()?;Some(journal)});
-    let mut volume=VolumeIndex{root:root.into(),serial,journal_id:before.map_or(0,|j|j.id),checkpoint:before.map_or(0,|j|j.next),has_journal:before.is_some(),mft:false,denied:0,index:Index::new(root_id,options.index_metadata),pending_dirs:vec![root_id]};
+    let mut volume=VolumeIndex{root:root.into(),serial,journal_id:before.map_or(0,|j|j.id),checkpoint:before.map_or(0,|j|j.next),has_journal:before.is_some(),mft:false,denied:0,read_issue:None,index:Index::new(root_id,options.index_metadata),pending_dirs:vec![root_id]};
     let whole=scan::volume_root(root).is_some_and(|path|same_root(root,&path));
     if whole&&options.backend!=BackendPreference::DirectoryScan&&unsafe{IsUserAnAdmin()}.as_bool(){
         if let Ok(mut reader)=ntfs::Volume::open(root){
@@ -188,7 +202,7 @@ fn resume_walk(volume:&mut VolumeIndex,options:&SearchOptions,shared:&Shared,sen
             &&volume.index.flags[*row as usize]&(REPARSE|EXCLUDED|metadata::DEAD)==0)else{continue;};
         match scan_one(volume,parent,false,options,shared,generation){
             Ok(Ok(children))=>for row in children{let child=volume.index.ids[row as usize];if queued.insert(child){volume.pending_dirs.push(child);}},
-            Ok(Err(error))=>{if parent==0||device_lost(&error){volume.pending_dirs.push(id);return Err(error);}volume.denied+=1;},
+            Ok(Err(error))=>{if parent==0||device_lost(&error){volume.pending_dirs.push(id);return Err(error);}volume.note_read_error(id,&error);},
             Err(error)=>{volume.pending_dirs.push(id);return Err(error);},
         }
         #[cfg(test)]CANCEL_AFTER_DIRECTORY.with(|count|{let left=count.get();if left!=usize::MAX{if left<=1{count.set(usize::MAX);if QUERY_AFTER_DIRECTORY.with(|value|value.replace(false)){shared.generation.fetch_add(1,Ordering::AcqRel);}else{shared.engine_stop.store(true,Ordering::Release);}}else{count.set(left-1);}}});
@@ -252,13 +266,13 @@ fn catch_up(volume:&mut VolumeIndex,options:&SearchOptions,shared:&Shared,sender
                 if error.downcast_ref::<windows::core::Error>().is_some_and(|e|matches!(e.code().0 as u32,0x80070005|0x80070020)){
                     for row in volume.index.rows_for_id(id){if row!=0&&volume.index.is_dir(row){volume.index.flags[row as usize]|=BLOCKED;}}
                 }
-                volume.denied+=1;continue;
+                volume.note_read_error(id,&error);continue;
             }};
             let Some(path)=path else{volume.index.delete_id(id);continue;};
             let Some(parent)=ensure_directory(volume,&path,options,shared)?else{continue;};
             let prior:HashSet<_>=volume.index.children(parent).into_iter().filter(|row|volume.index.is_dir(*row)).collect();
             let children=match scan_one(volume,parent,false,options,shared,generation)?{Ok(children)=>children,Err(error)=>{
-                if parent==0||device_lost(&error){return Err(error);}volume.denied+=1;continue;
+                if parent==0||device_lost(&error){return Err(error);}volume.note_read_error(id,&error);continue;
             }};
             for child in children{if !prior.contains(&child){let id=volume.index.ids[child as usize];if !volume.pending_dirs.contains(&id){volume.pending_dirs.push(id);}}}
         }
@@ -288,11 +302,12 @@ fn execute_inner(core:&Core,options:&SearchOptions,roots:Option<&[PathBuf]>,shar
         let index=&volumes[which].index;
         // Two bits encode a probe for each (name, file-or-directory) pair.
         let mut memo=vec![0u8;index.names.len().div_ceil(2)];
+        let mut last_parent=None;
         for row in 1..index.len() as u32{
             if row%1024==0{ensure!(shared.current(request.generation)&&!shared.cancelled(),"搜索已取消");}
             let volume=&mut volumes[which];
             let index=&volume.index;
-            if !index.searchable(row){continue;}
+            if !index.searchable_with_parent(row,&mut last_parent){continue;}
             scanned+=1;
             let id=index.name[row as usize];
             let dir=index.is_dir(row);
@@ -335,8 +350,8 @@ fn execute_inner(core:&Core,options:&SearchOptions,roots:Option<&[PathBuf]>,shar
     }).collect();
     drop(candidates);
     let mut statuses:Vec<_>=volumes.iter().map(|v|VolumeStatus{root:v.root.clone(),backend:if v.mft{BackendKind::NativeNtfs}else{BackendKind::DirectoryScan},phase:if v.pending_dirs.is_empty(){IndexPhase::Ready}else{IndexPhase::Scanning},indexed:v.index.len().saturating_sub(1)as u64,
-        checkpoint:v.has_journal.then_some(v.checkpoint),warning:if v.denied>0{Some(zsdesk_core::tr_format!("部分目录暂不可读取（{} 次）",v.denied))}else if !v.has_journal{Some(zsdesk_core::i18n::text("此位置无可用 USN 日志，搜索时刷新目录").into())}else{None}}).collect();
-    let denied=volumes.iter().map(|v|v.denied).sum();let backend=if volumes.iter().all(|v|v.mft){BackendKind::NativeNtfs}else if volumes.iter().any(|v|v.mft){BackendKind::Mixed}else{BackendKind::DirectoryScan};
+        checkpoint:v.has_journal.then_some(v.checkpoint),warning:if let Some((count,last))=&v.read_issue{Some(zsdesk_core::tr_format!("{} · 最近一次索引维护跳过 {} 次读取：{}",v.root.display(),count,last))}else if !v.has_journal{Some(zsdesk_core::i18n::text("此位置无可用 USN 日志，搜索时刷新目录").into())}else{None}}).collect();
+    let denied=volumes.iter().filter_map(|v|v.read_issue.as_ref().map(|(count,_)|*count)).sum();let backend=if volumes.iter().all(|v|v.mft){BackendKind::NativeNtfs}else if volumes.iter().any(|v|v.mft){BackendKind::Mixed}else{BackendKind::DirectoryScan};
     for failure in &store.failures{if let Some(status)=statuses.iter_mut().find(|status|same_root(&status.root,&failure.root)){status.phase=IndexPhase::Paused;status.warning=failure.warning.clone();}else{statuses.push(failure.clone());}}
     if let Some(warning)=&store.snapshot_warning{if let Some(status)=statuses.first_mut(){status.warning=Some(warning.clone());}}
     let error=(!store.failures.is_empty()).then(||zsdesk_core::i18n::text("部分位置暂时不可更新，请查看搜索状态").to_owned());store.last_use=Instant::now();

@@ -26,8 +26,20 @@ fn reserve_column<T>(column:&mut Vec<T>,additional:usize)->Result<()>{
 pub struct VolumeIndex {
     pub root:PathBuf,pub serial:u32,pub journal_id:u64,pub checkpoint:i64,pub has_journal:bool,
     pub mft:bool,pub denied:u64,pub index:Index,
+    /// Most recent maintenance pass only. Historical totals in snapshots have no path or error code.
+    pub read_issue:Option<(u64,String)>,
     /// Directory identities still needing enumeration; identities survive compaction.
     pub pending_dirs:Vec<u64>,
+}
+
+impl VolumeIndex {
+    pub fn note_read_error(&mut self, id:u64, error:&anyhow::Error) {
+        self.denied = self.denied.saturating_add(1);
+        let count = self.read_issue.as_ref().map_or(1, |(n,_)|n.saturating_add(1));
+        let location=self.index.rows_for_id(id).into_iter().find_map(|row|self.index.path(&self.root,row))
+            .map_or_else(||format!("ID {id}"),|path|path.display().to_string());
+        self.read_issue=Some((count,format!("{location} ({error:#})")));
+    }
 }
 
 #[derive(Default)]
@@ -37,8 +49,8 @@ pub struct Names {
     original_ends: Vec<u32>,
     pub folded: String,
     pub folded_starts: Vec<u32>,
-    pub wide_count: u32,
-    slots: HashMap<u64,u32>,
+    // Snapshot queries use only the packed columns. Allocate the mutation table on the first journal edit.
+    slots: Vec<u32>,
 }
 impl Names {
     pub fn new() -> Self { Self { folded_starts:vec![0], ..Default::default() } }
@@ -59,6 +71,21 @@ impl Names {
     fn hash(name:&OsStr)->u64 {
         let mut hash=std::collections::hash_map::DefaultHasher::new();name.hash(&mut hash);hash.finish()
     }
+    fn reserve_slots(&mut self) -> Result<()> {
+        let needed=self.len().checked_add(1).context("文件名索引超出容量")?;
+        if needed <= self.slots.len()/4*3 {return Ok(());}
+        let size=(needed+needed.div_ceil(3)).next_power_of_two().max(16);
+        let mut slots=Vec::new();
+        slots.try_reserve_exact(size)?;
+        slots.resize(size,NONE);
+        for id in 0..self.len() as u32 {
+            let mut at=Self::hash(self.get(id)) as usize & (size-1);
+            while slots[at]!=NONE {at=(at+1)&(size-1);}
+            slots[at]=id;
+        }
+        self.slots=slots;
+        Ok(())
+    }
     fn push_original(&mut self,name:&OsStr,folded:&str)->Result<()> {
         let bytes=name.as_encoded_bytes();
         if bytes!=folded.as_bytes() {
@@ -70,11 +97,16 @@ impl Names {
         Ok(())
     }
     pub fn intern(&mut self,name:&OsStr)->Result<u32>{
-        let mut key=Self::hash(name);
-        loop {match self.slots.get(&key).copied(){Some(id) if self.get(id)==name=>return Ok(id),Some(_)=>key=key.wrapping_add(1),None=>break}}
+        self.reserve_slots()?;
+        let mask=self.slots.len()-1;
+        let mut at=Self::hash(name) as usize & mask;
+        while self.slots[at]!=NONE {
+            let id=self.slots[at];
+            if self.get(id)==name {return Ok(id);}
+            at=(at+1)&mask;
+        }
         let count=name.encode_wide().count();
         ensure!(count<=255&&!name.as_encoded_bytes().iter().any(|b|matches!(*b,0|47|92))&&name!="."&&name!="..","索引名称无效");
-        let next=self.wide_count.checked_add(count as u32).context("文件名索引超出容量")?;
         let folded=name.to_string_lossy().to_lowercase();
         ensure!(self.len()<MAX_ROWS && self.folded.len()+folded.len()<u32::MAX as usize,"文件名索引超出容量");
         reserve_column(&mut self.original_ends,1)?;reserve_column(&mut self.folded_starts,1)?;
@@ -82,32 +114,55 @@ impl Names {
             let growth=(self.folded.capacity()/8).clamp(4096,1024*1024);
             self.folded.try_reserve_exact(folded.len().max(growth))?;
         }
-        self.slots.try_reserve(1)?;
         let id=self.len() as u32;self.push_original(name,&folded)?;
         self.folded.push_str(&folded);self.folded_starts.push(self.folded.len() as u32);
-        self.slots.insert(key,id);self.wide_count=next;Ok(id)
+        self.slots[at]=id;Ok(id)
     }
     pub fn restore(units:Vec<u16>,starts:Vec<u32>,folded:Vec<u8>,folded_starts:Vec<u32>,cancel:&impl Fn()->bool)->Result<Self>{
         ensure!(starts.first()==Some(&0)&&folded_starts.first()==Some(&0)&&starts.len()==folded_starts.len()
             &&starts.last().copied()==Some(units.len() as u32)&&folded_starts.last().copied()==Some(folded.len() as u32),"快照名称列长度不一致");
         let folded=String::from_utf8(folded)?;
-        let mut names=Self{wide_count:units.len() as u32,..Self::default()};
+        let mut names=Self::default();
         names.original_ends.try_reserve_exact(starts.len()-1)?;
-        names.slots.try_reserve(starts.len()-1)?;
         for (i,pair) in starts.windows(2).enumerate(){
             if i%4096==0 {ensure!(!cancel(),"快照读取已取消");}
             let wide=units.get(pair[0] as usize..pair[1] as usize).context("快照名称偏移无效")?;
             ensure!(wide.len()<=255&&!wide.iter().any(|u|matches!(*u,0|47|92))&&wide!=[46]&&wide!=[46,46],"快照名称无效");
             let lower=folded.get(folded_starts[i] as usize..folded_starts[i+1] as usize).context("快照名称偏移无效")?;
-            let name=OsString::from_wide(wide);
-            ensure!(name.to_string_lossy().to_lowercase()==lower,"快照名称规范化不一致");
-            let mut key=Self::hash(&name);
-            while names.slots.contains_key(&key){key=key.wrapping_add(1);}
-            names.push_original(&name,lower)?;names.slots.insert(key,i as u32);
+            if lower.len()==wide.len() && lower.is_ascii() && lower.bytes().zip(wide).all(|(b,&u)|u==u16::from(b) && !b.is_ascii_uppercase()) {
+                names.original_ends.push(names.originals.len() as u32);
+            } else {
+                let name=OsString::from_wide(wide);
+                ensure!(name.to_string_lossy().to_lowercase()==lower,"快照名称规范化不一致");
+                names.push_original(&name,lower)?;
+            }
         }
         names.folded=folded;names.folded_starts=folded_starts;Ok(names)
     }
-    pub fn bytes(&self)->usize{self.originals.capacity()+self.original_ends.capacity()*4+self.folded.capacity()+self.folded_starts.capacity()*4+self.slots.capacity()*24}
+    pub fn restore_compact(folded:Vec<u8>,starts:Vec<u32>,mut spelling:impl FnMut()->Result<Option<OsString>>,cancel:&impl Fn()->bool)->Result<Self>{
+        ensure!(starts.first()==Some(&0)&&starts.last().copied()==Some(folded.len() as u32),"快照名称列长度不一致");
+        let folded=String::from_utf8(folded)?;
+        let mut names=Self::default();
+        names.original_ends.try_reserve_exact(starts.len()-1)?;
+        for (id,pair) in starts.windows(2).enumerate() {
+            if id%4096==0 {ensure!(!cancel(),"快照读取已取消");}
+            let lower=folded.get(pair[0] as usize..pair[1] as usize).context("快照名称偏移无效")?;
+            ensure!(!lower.bytes().any(|b|matches!(b,0|47|92))&&lower!="."&&lower!="..","快照名称无效");
+            if let Some(name)=spelling()? {
+                ensure!(name.to_string_lossy().to_lowercase()==lower,"快照名称规范化不一致");
+                names.push_original(&name,lower)?;
+            } else {
+                let valid=if lower.is_ascii(){lower.len()<=255&&!lower.bytes().any(|b|b.is_ascii_uppercase())}
+                    else{lower.encode_utf16().count()<=255 && lower.to_lowercase()==lower};
+                ensure!(valid,"快照名称规范化不一致");
+                names.original_ends.push(names.originals.len() as u32);
+            }
+        }
+        names.folded=folded;
+        names.folded_starts=starts;
+        Ok(names)
+    }
+    pub fn bytes(&self)->usize{self.originals.capacity()+self.original_ends.capacity()*4+self.folded.capacity()+self.folded_starts.capacity()*4+self.slots.capacity()*4}
     pub fn shrink(&mut self){self.originals.shrink_to_fit();self.original_ends.shrink_to_fit();self.folded.shrink_to_fit();self.folded_starts.shrink_to_fit();self.slots.shrink_to_fit();}
 }
 pub struct Attributes {pub size:Vec<u64>,pub modified:Vec<u64>}
@@ -123,9 +178,25 @@ impl Index {
     }
     pub fn len(&self)->usize{self.ids.len()}
     pub fn live(&self,row:u32)->bool{self.flags.get(row as usize).is_some_and(|f|f&DEAD==0)}
-    pub fn searchable(&self,row:u32)->bool{
-        let mut at=row;for _ in 0..1024{let Some(&flags)=self.flags.get(at as usize)else{return false;};
-            if flags&(DEAD|BLOCKED)!=0||(flags&EXCLUDED!=0&&at!=row){return false;}if at==0{return row!=0;}at=self.parent[at as usize];}false
+    pub fn searchable(&self,row:u32)->bool {
+        self.searchable_with_parent(row,&mut None)
+    }
+    /// Sibling rows often follow one another. Their ancestor visibility is identical
+    /// for this scan, including the 1024-level limit and excluded directory rule.
+    pub fn searchable_with_parent(&self,row:u32,last:&mut Option<(u32,bool)>)->bool {
+        let Some(&flags)=self.flags.get(row as usize) else {return false;};
+        if row==0 || flags&(DEAD|BLOCKED)!=0 {return false;}
+        let parent=self.parent[row as usize];
+        if let Some((id,visible))=*last {if id==parent{return visible;}}
+        let mut at=parent;
+        let mut visible=false;
+        for _ in 1..1024 {
+            let Some(&flags)=self.flags.get(at as usize) else {break;};
+            if flags&(DEAD|BLOCKED|EXCLUDED)!=0 {break;}
+            if at==0 {visible=true;break;}
+            at=self.parent[at as usize];
+        }
+        *last=Some((parent,visible));visible
     }
     pub fn is_dir(&self,row:u32)->bool{self.flags[row as usize]&DIRECTORY!=0}
     pub fn rows_for_id(&self,id:u64)->Vec<u32>{

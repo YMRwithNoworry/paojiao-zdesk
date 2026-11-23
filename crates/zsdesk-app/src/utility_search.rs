@@ -7,7 +7,9 @@ use windows::Win32::UI::Shell::{
     SHGetFileInfoW, SHFILEINFOW, SHGFI_SMALLICON, SHGFI_SYSICONINDEX, SHGFI_USEFILEATTRIBUTES,
 };
 
-pub(super) const SHORTCUT: i32 = 18;
+use zsui::{Color, ColorRole, Dpi, HorizontalAlign, NativeDrawCommand, NativeDrawFill,
+    NativeDrawPlan, NativeDrawTextCommand, Rect, SemanticTextStyle, TextRole, WindowsGdiDrawSink,
+    WindowsGdiPalette, ZsPlatformStyle};
 pub(super) const FIRST_FILTER: i32 = 30;
 pub(super) const FILTERS: [(&str, &str); 5] = [
     ("全部", ""),
@@ -183,25 +185,27 @@ impl SearchView {
         }
     }
 }
-fn centered(dc: HDC, value: &str, mut rect: RECT, font: HFONT, color: COLORREF) {
-    if value.is_empty() {
-        return;
-    }
-    let mut units = wide(value);
-    units.pop();
-    unsafe {
-        let old = SelectObject(dc, font.into());
-        SetTextColor(dc, color);
-        SetBkMode(dc, TRANSPARENT);
-        DrawTextW(
-            dc,
-            &mut units,
-            &mut rect,
-            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX,
-        );
-        SelectObject(dc, old);
+fn label(value: &str, bounds: Rect, role: TextRole, color: ColorRole, align: HorizontalAlign) -> NativeDrawCommand {
+    let mut style = SemanticTextStyle::for_role(role);
+    style.color = color;
+    style.horizontal_align = align;
+    NativeDrawCommand::Text(NativeDrawTextCommand::new(value, bounds, style))
+}
+
+fn surface(p: Palette) -> WindowsGdiPalette {
+    let opaque = |fg, bg| {
+        let v = composite(fg, bg).0;
+        Color::rgb(v as u8, (v >> 8) as u8, (v >> 16) as u8)
+    };
+    WindowsGdiPalette {
+        primary_text: opaque(p.text, p.layer), secondary_text: opaque(p.text_secondary, p.layer),
+        disabled_text: opaque(p.text_disabled, p.layer), accent: p.accent, accent_text: p.accent_text,
+        surface: p.input_focused, surface_raised: p.content, control: p.layer,
+        border: opaque(p.input_border, p.layer), strong_stroke: opaque(p.text, p.layer),
+        danger: p.danger, success: p.accent, warning: p.danger,
     }
 }
+
 pub(super) fn filtered_query(query: &str, filter: usize) -> String {
     let q = query.trim();
     let restrict = FILTERS.get(filter).map(|f| f.1).unwrap_or("");
@@ -212,6 +216,14 @@ pub(super) fn filtered_query(query: &str, filter: usize) -> String {
     }
 }
 impl Panel {
+    fn input_plan(&self, width: i32) -> zsui::ZsAutoSuggestRenderPlan {
+        let bounds = Rect { x: self.s(16), y: self.s(12), width: (width - self.s(32)).max(1), height: self.s(44) };
+        zsui::zs_auto_suggest_render_plan(bounds, 0, None, false, true, true, ZsPlatformStyle::current(), Dpi::new(self.dpi as f32))
+    }
+    fn draw_plan(&self, dc: HDC, palette: WindowsGdiPalette, plan: &NativeDrawPlan) {
+        WindowsGdiDrawSink::with_palette_contrast_and_dpi(dc.0, palette,
+            zsdesk_windows::theme::high_contrast(), Dpi::new(self.dpi as f32)).draw_native_plan(plan);
+    }
     pub(super) fn search_layout(&self, width: i32, height: i32) {
         let s = |v| self.s(v);
         let move_to = |hwnd: HWND, x: i32, y: i32, w: i32, h: i32| {
@@ -230,8 +242,8 @@ impl Panel {
             }
         };
         let child = |id| unsafe { GetDlgItem(Some(self.hwnd), id) }.unwrap_or_default();
-        move_to(self.edit, s(55), s(22), width - s(208), s(26));
-        move_to(child(SHORTCUT), width - s(132), s(13), s(116), s(42));
+        let input = self.input_plan(width).text_bounds;
+        move_to(self.edit, input.x, input.y + (input.height - s(26)) / 2, input.width, s(26));
         let mut left = s(16);
         for (i, w) in [60, 60, 75, 60, 60].into_iter().enumerate() {
             move_to(child(FIRST_FILTER + i as i32), left, s(65), s(w), s(29));
@@ -254,63 +266,20 @@ impl Panel {
     }
     pub(super) fn draw_search(&self, dc: HDC, r: RECT) {
         let s = |n| self.s(n);
-        let area = RECT {
-            left: s(16),
-            top: s(12),
-            right: r.right - s(146),
-            bottom: s(56),
-        };
-        let p = self.palette;
-        content::rounded(
-            dc,
-            area,
-            rgb(p.input_focused),
-            composite(p.input_border, p.layer),
-            s(8),
-        );
-        let pen = unsafe {
-            CreatePen(
-                PS_SOLID,
-                s(2).max(1),
-                composite(p.text_secondary, p.input_focused),
-            )
-        };
-        unsafe {
-            let old = SelectObject(dc, pen.into());
-            let brush = SelectObject(dc, GetStockObject(NULL_BRUSH));
-            let _ = Ellipse(dc, s(31), s(25), s(43), s(37));
-            let _ = MoveToEx(dc, s(40), s(35), None);
-            let _ = LineTo(dc, s(47), s(42));
-            SelectObject(dc, brush);
-            SelectObject(dc, old);
-            let _ = DeleteObject(pen.into());
-        }
+        let input = self.input_plan(r.right);
+        let mut plan = zsui::zs_auto_suggest_header_native_draw_plan(&input, "", None);
         if unsafe { GetFocus() } == self.edit {
-            let line = RECT {
-                left: area.left + s(4),
-                right: area.right - s(4),
-                top: area.bottom - s(2),
-                bottom: area.bottom,
-            };
-            let b = unsafe { CreateSolidBrush(rgb(p.accent)) };
-            unsafe {
-                FillRect(dc, &line, b);
-                let _ = DeleteObject(b.into());
-            }
+            plan.push(NativeDrawCommand::RoundFill {
+                rect: Rect { x: input.bounds.x + s(4), y: input.bounds.y + input.bounds.height - s(2),
+                    width: (input.bounds.width - s(8)).max(1), height: s(2) },
+                fill: NativeDrawFill::Role(ColorRole::Accent), radius: s(1),
+            });
         }
-        // A card separates the results from the command and status surfaces.
-        content::rounded(
-            dc,
-            RECT {
-                left: s(15),
-                top: s(103),
-                right: r.right - s(15),
-                bottom: r.bottom - s(51),
-            },
-            rgb(p.content),
-            composite(p.divider, p.layer),
-            s(6),
-        );
+        plan.push(NativeDrawCommand::RoundRect {
+            rect: Rect { x:s(15), y:s(103), width:(r.right-s(30)).max(1), height:(r.bottom-s(154)).max(1) },
+            fill: NativeDrawFill::Role(ColorRole::SurfaceRaised),
+            stroke: Some(NativeDrawFill::Role(ColorRole::Border)), radius:s(6),
+        });
         if self.paths.is_empty() {
             let top = s(104);
             let bottom = r.bottom - s(52);
@@ -328,113 +297,46 @@ impl Panel {
             } else {
                 ("未找到匹配项", "可更换关键词或选择“全部”")
             };
-            centered(
-                dc,
-                zsdesk_core::i18n::text(title),
-                RECT {
-                    left: s(28),
-                    right: r.right - s(28),
-                    top: center - s(30),
-                    bottom: center + s(2),
-                },
-                self.title_font,
-                composite(p.text, p.content),
-            );
-            centered(
-                dc,
-                zsdesk_core::i18n::text(hint),
-                RECT {
-                    left: s(28),
-                    right: r.right - s(28),
-                    top: center + s(4),
-                    bottom: center + s(29),
-                },
-                self.font,
-                composite(p.text_secondary, p.content),
-            );
+            let line = |y, h| Rect {x:s(28), y, width:(r.right-s(56)).max(1), height:s(h)};
+            plan.push(label(zsdesk_core::i18n::text(title), line(center-s(30), 32), TextRole::Subtitle, ColorRole::PrimaryText, HorizontalAlign::Center));
+            plan.push(label(zsdesk_core::i18n::text(hint), line(center+s(4), 25), TextRole::Body, ColorRole::SecondaryText, HorizontalAlign::Center));
         }
-        draw_text(
-            dc,
-            &self.status,
-            RECT {
-                left: s(18),
-                top: r.bottom - s(42),
-                right: r.right - s(308),
-                bottom: r.bottom - s(9),
-            },
-            self.font,
-            if self.search_error {
-                rgb(p.danger)
-            } else {
-                composite(p.text_secondary, p.layer)
-            },
-        );
+        plan.push(label(&self.status, Rect {x:s(18), y:r.bottom-s(42), width:(r.right-s(326)).max(1), height:s(33)},
+            TextRole::Body, if self.search_error {ColorRole::Danger} else {ColorRole::SecondaryText}, HorizontalAlign::Start));
+        self.draw_plan(dc, surface(self.palette), &plan);
     }
+
     pub(super) fn draw_search_button(&self, d: &DRAWITEMSTRUCT) -> bool {
         let id = d.CtlID as i32;
-        if id != SHORTCUT
-            && ![12, 16, 17].contains(&id)
-            && !(FIRST_FILTER..FIRST_FILTER + FILTERS.len() as i32).contains(&id)
-        {
-            return false;
-        }
-        let selected = id == FIRST_FILTER + self.search_view.filter as i32;
-        let disabled = d.itemState.0 & ODS_DISABLED.0 != 0;
-        let pressed = d.itemState.0 & ODS_SELECTED.0 != 0;
+        if ![12,16,17].contains(&id) && !(FIRST_FILTER..FIRST_FILTER+FILTERS.len() as i32).contains(&id) { return false; }
+        let mut colors = surface(self.palette);
         let mut cursor = POINT::default();
-        let hover = unsafe { GetCursorPos(&mut cursor) }.is_ok()
-            && unsafe { WindowFromPoint(cursor) } == d.hwndItem;
-        let p = self.palette;
-        let bg = if selected {
-            p.accent
-        } else if pressed {
-            p.pressed
-        } else if hover && !disabled {
-            p.hover
-        } else {
-            p.layer
-        };
-        let fill = if selected {
-            rgb(bg)
-        } else {
-            composite(bg, p.layer)
-        };
-        let border = if selected {
-            rgb(p.accent)
-        } else if id == SHORTCUT || id == 12 || hover {
-            composite(p.divider, p.layer)
-        } else {
-            fill
-        };
-        unsafe {
-            FillRect(d.hDC, &d.rcItem, self.brush);
+        let hovered = unsafe { GetCursorPos(&mut cursor) }.is_ok() && unsafe { WindowFromPoint(cursor) } == d.hwndItem;
+        let disabled = d.itemState.0 & ODS_DISABLED.0 != 0;
+        if disabled {
+            colors.primary_text = colors.disabled_text;
+        } else if hovered || d.itemState.0 & ODS_SELECTED.0 != 0 {
+            let fg = if d.itemState.0 & ODS_SELECTED.0 != 0 {self.palette.pressed} else {self.palette.hover};
+            let value = composite(fg,self.palette.layer).0;
+            colors.control = Color::rgb(value as u8,(value>>8) as u8,(value>>16) as u8);
         }
-        content::rounded(d.hDC, d.rcItem, fill, border, self.s(8));
-        let fg = if disabled {
-            composite(p.text_disabled, p.layer)
-        } else if selected {
-            rgb(p.accent_text)
-        } else {
-            composite(p.text, p.layer)
-        };
-        let mut title = wide(&text(d.hwndItem));
-        title.pop();
-        let mut rect = d.rcItem;
-        unsafe {
-            let old = SelectObject(d.hDC, self.font.into());
-            SetBkMode(d.hDC, TRANSPARENT);
-            SetTextColor(d.hDC, fg);
-            DrawTextW(
-                d.hDC,
-                &mut title,
-                &mut rect,
-                DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
-            );
-            SelectObject(d.hDC, old);
-            if d.itemState.0 & ODS_FOCUS.0 != 0 {
-                let _ = InflateRect(&mut rect, -self.s(3), -self.s(3));
-                let _ = DrawFocusRect(d.hDC, &rect);
+        let r = d.rcItem;
+        let bounds = Rect {x:r.left+1,y:r.top+1,width:(r.right-r.left-2).max(1),height:(r.bottom-r.top-2).max(1)};
+        let geometry = zsui::zs_toggle_button_render_plan(bounds, id == FIRST_FILTER + self.search_view.filter as i32,
+            ZsPlatformStyle::current(), Dpi::new(self.dpi as f32));
+        let mut plan = zsui::zs_toggle_button_native_draw_plan(&geometry, &text(d.hwndItem));
+        for command in &mut plan.commands {
+            if let NativeDrawCommand::Text(text) = command {
+                text.style.horizontal_align = HorizontalAlign::Center;
+                text.bounds.x = bounds.x + self.s(2);
+                text.bounds.width = bounds.width - self.s(4);
             }
+        }
+        unsafe { FillRect(d.hDC,&r,self.brush); }
+        self.draw_plan(d.hDC, colors, &plan);
+        if d.itemState.0 & ODS_FOCUS.0 != 0 && d.itemState.0 & ODS_NOFOCUSRECT.0 == 0 {
+            let mut focus=r;
+            unsafe {let _=InflateRect(&mut focus,-self.s(3),-self.s(3));let _=DrawFocusRect(d.hDC,&focus);}
         }
         true
     }
@@ -467,6 +369,24 @@ impl Panel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn zsui_search_chrome_has_antialiased_corners_at_multiple_scales() {
+        for dpi in [96.0,120.0,144.0,192.0] {
+            let surface_dc=zsdesk_windows::gfx::Surface::new(180,96).unwrap();
+            let dpi=Dpi::new(dpi);
+            let bounds=Rect{x:4,y:4,width:160,height:80};
+            let geometry=zsui::zs_auto_suggest_render_plan(bounds,0,None,false,true,true,ZsPlatformStyle::current(),dpi);
+            assert!(geometry.search_icon.is_some());
+            let mut colors=surface(Palette::light());
+            colors.surface=Color::rgb(255,255,255);
+            colors.border=colors.surface;
+            unsafe{let _=PatBlt(surface_dc.dc,0,0,180,96,BLACKNESS);}
+            let plan=zsui::zs_auto_suggest_header_native_draw_plan(&geometry,"",None);
+            WindowsGdiDrawSink::with_palette_and_dpi(surface_dc.dc.0,colors,dpi).draw_native_plan(&plan);
+            let corner=(4..4+geometry.control_radius+1).flat_map(|x|(4..4+geometry.control_radius+1).map(move |y|(x,y)));
+            assert!(corner.map(|(x,y)|unsafe{GetPixel(surface_dc.dc,x,y)}.0 & 255).any(|v|v>0 && v<255),"corner at {dpi:?}");
+        }
+    }
     #[test]
     fn filters_preserve_disjunctions_and_plain_queries() {
         assert_eq!(filtered_query("  a | b ", 0), "a | b");
