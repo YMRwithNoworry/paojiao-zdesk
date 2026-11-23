@@ -39,21 +39,13 @@ fn pixel_aligned_icon(rect: RectF) -> RectF {
 }
 
 /// Window-independent tab painting also used by the memory-raster regression.
-fn paint_selected_tab(cv:&Canvas,r:RectF,placement:zsdesk_core::model::explorer::TabPlacement,dpi:u32,appearance:zsdesk_ui::theme::TabAppearance,accent:zsdesk_ui::theme::Color){
-    use zsdesk_core::model::explorer::TabPlacement;
-    let vertical=placement!=TabPlacement::Top;
+fn paint_selected_tab(cv:&Canvas,r:RectF,vertical:bool,dpi:u32,appearance:zsdesk_ui::theme::TabAppearance){
     let Some(fill)=appearance.fill else{return;};let s=|value:f32|value*dpi as f32/96.0;
     if let Some(border)=appearance.border{
         let card=RectF::new(r.x+s(1.0),r.y+s(1.0),(r.w-s(2.0)).max(0.0),(r.h-s(2.0)).max(0.0));
         cv.round(card,s(6.0),c(fill));cv.stroke_round(card,s(6.0),c(border),s(1.0));
     }else if vertical{cv.round(r,s(6.0),c(fill));}
     else{cv.tab_shape(r,s(8.0),s(6.0),c(fill));}
-    let thickness=s(3.0);
-    let indicator=if vertical{
-        let h=s(20.0).min((r.h-s(8.0)).max(1.0));let x=if placement==TabPlacement::Left{r.x+s(3.0)}else{r.right()-s(3.0)-thickness};
-        RectF::new(x,r.y+(r.h-h)/2.0,thickness,h)
-    }else{let w=s(32.0).min((r.w-s(8.0)).max(1.0));RectF::new(r.x+(r.w-w)/2.0,r.bottom()-thickness,w,thickness)};
-    cv.round(indicator,thickness/2.0,c(accent));
 }
 
 impl WindowState {
@@ -179,7 +171,7 @@ impl WindowState {
             let text=c(appearance.text);
             let hovered = matches!(self.hover, Hit::Tab(i) | Hit::TabClose(i) if i == slot.index);
             if is_active {
-                paint_selected_tab(cv,r,self.session.ui.tab_placement,self.interface_dpi(),appearance,p.accent);
+                paint_selected_tab(cv,r,self.layout.vertical_tabs,self.interface_dpi(),appearance);
             } else if hovered {
                 cv.round(RectF::new(r.x + self.sf(2.0), r.y + self.sf(2.0), r.w - self.sf(4.0), r.h - self.sf(6.0)), self.sf(6.0), c(p.hover));
             } else {
