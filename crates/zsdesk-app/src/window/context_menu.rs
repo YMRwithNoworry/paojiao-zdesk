@@ -1,7 +1,7 @@
 //! Immediate common commands with explicit, isolated extension menus.
 use super::*;
 use std::collections::HashMap;
-use windows::{core::{Interface,Error,HRESULT},Win32::{System::{Com::CoTaskMemFree,SystemServices::SFGAO_FOLDER},UI::Shell::{Common::ITEMIDLIST,IFolderView2,IEnumIDList,IPersistFolder2,IShellFolder,IShellItem,IShellItemArray,IShellView,ILGetSize,SHCreateItemWithParent,SVGIO_SELECTION,SVSI_SELECT,SVSI_NOTAKEFOCUS,SVSI_FOCUSED,SVSI_SELECTIONMARK}}};
+use windows::{core::{Interface,Error,HRESULT},Win32::{System::{Com::CoTaskMemFree,SystemServices::{SFGAO_FILESYSTEM,SFGAO_FOLDER}},UI::Shell::{Common::ITEMIDLIST,IFolderView2,IEnumIDList,IPersistFolder2,IShellFolder,IShellItem,IShellItemArray,IShellView,ILGetSize,SHCreateItemWithParent,SVGIO_SELECTION,SVSI_SELECT,SVSI_NOTAKEFOCUS,SVSI_FOCUSED,SVSI_SELECTIONMARK}}};
 use zsdesk_windows::shell::{file_transfer,menu::{self,MenuInterceptions,MenuOutcome,QuickAction}};
 use crate::context_menu_process::{AsyncClient as Client,Mode as WorkerMode};
 
@@ -83,13 +83,16 @@ impl ChildPidl{
     }
 }
 struct VisualSelection{folder:Vec<u8>,children:Vec<Vec<u8>>,focused:Option<Vec<u8>>}
+fn filesystem_item(item:&IShellItem)->bool{
+    unsafe{item.GetAttributes(SFGAO_FILESYSTEM)}.is_ok_and(|attributes|attributes.0&SFGAO_FILESYSTEM.0!=0)
+}
 impl VisualSelection{
-    fn capture(view:&IShellView)->windows::core::Result<(Self, Vec<Vec<u8>>)>{
+    fn capture(view:&IShellView)->windows::core::Result<(Self, Vec<Vec<u8>>,bool)>{
         let folder_view:IFolderView2=view.cast()?;let folder:IShellFolder=unsafe{folder_view.GetFolder()?};
         let root=background_pidl(view)?;let selected:IEnumIDList=unsafe{folder_view.Items(SVGIO_SELECTION)?};
         let count=unsafe{folder_view.ItemCount(SVGIO_SELECTION)}?;
         if !(1..=8192).contains(&count){return Err(failure(zsdesk_core::i18n::text("菜单选区数量过多")));}
-        let mut children=Vec::with_capacity(count as usize);let mut absolute=Vec::with_capacity(count as usize);let mut bytes=0usize;
+        let mut children=Vec::with_capacity(count as usize);let mut absolute=Vec::with_capacity(count as usize);let mut bytes=0usize;let mut filesystem=true;
         loop{
             let mut raw=[std::ptr::null_mut()];let mut fetched=0;
             let status=unsafe{selected.Next(&mut raw,Some(&mut fetched))};let child=ChildPidl(raw[0]);status.ok()?;
@@ -97,6 +100,7 @@ impl VisualSelection{
             if children.len()>=8192{return Err(failure(zsdesk_core::i18n::text("菜单选区数量过多")));}
             let id=child.bytes()?;bytes=bytes.saturating_add(id.len());if bytes>3*1024*1024{return Err(failure(zsdesk_core::i18n::text("菜单选区标识过大")));}
             let item:IShellItem=unsafe{SHCreateItemWithParent(None,&folder,child.0)}?;
+            filesystem &= filesystem_item(&item);
             absolute.push(zsdesk_windows::shell::pidl::item_pidl(&item).ok_or_else(||failure(zsdesk_core::i18n::text("无法确认菜单选区标识")))?);
             children.push(id);
         }
@@ -104,7 +108,7 @@ impl VisualSelection{
         let focused=unsafe{folder_view.GetFocusedItem()}.ok().filter(|index|*index>=0)
             .and_then(|index|unsafe{folder_view.Item(index)}.ok()).and_then(|item|ChildPidl(item).bytes().ok())
             .filter(|item|children.contains(item));
-        Ok((Self{folder:root,children,focused},absolute))
+        Ok((Self{folder:root,children,focused},absolute,filesystem))
     }
     fn restore_if_cleared(&self,view:&IShellView,expected:&[Vec<u8>],permit:&dyn Fn()->bool)->bool{
         let restore=(||->windows::core::Result<bool>{
@@ -202,9 +206,9 @@ fn start(owner:HWND,window:HWND,view:&IShellView,identity:super::pane_input::Ide
     // that the visible selection still agrees with the command.
     let mut input=super::global_search::InputWatch::new();
     if input.is_none(){return Ok(());}
-    let (visual,pidls)=if new||background_click{(None,Vec::new())}
-        else if let Ok((saved,items))=VisualSelection::capture(view){(Some(saved),items)}
-        else{(None,snapshot(view)?)};
+    let (visual,pidls,filesystem_selection)=if new||background_click{(None,Vec::new(),true)}
+        else if let Ok((saved,items,filesystem))=VisualSelection::capture(view){(Some(saved),items,filesystem)}
+        else{let items=snapshot(view)?;let filesystem=file_transfer::paths_from_pidls(&items).is_ok();(None,items,filesystem)};
     let background=if pidls.is_empty(){Some(background_pidl(view)?)}else{None};
     let folder=file_transfer::folder_path(view).ok();
     let filesystem_folder=if pidls.is_empty(){file_transfer::filesystem_folder_path(view).ok().flatten()}else{None};
@@ -215,7 +219,6 @@ fn start(owner:HWND,window:HWND,view:&IShellView,identity:super::pane_input::Ide
     };
     let can_paste=file_transfer::has_paste_content()&&if pidls.is_empty(){filesystem_folder.is_some()}else{pidls.len()==1&&is_folder_pidl(&pidls[0])};
     let can_create_folder=pidls.is_empty()&&filesystem_folder.is_some();
-    let filesystem_selection=pidls.is_empty()||file_transfer::paths_from_pidls(&pidls).is_ok();
     let quick_eligible=filesystem_selection&&(!pidls.is_empty()||filesystem_folder.is_some());
     let mut mode=if catalog{if pidls.is_empty(){WorkerMode::CatalogBackground}else{WorkerMode::CatalogSelection}}
         else if new{WorkerMode::New}else if pidls.is_empty(){WorkerMode::Background}else{WorkerMode::More};
@@ -552,6 +555,17 @@ pub(super) fn poll(owner:HWND){
         assert!(!same_identities(&[first.clone()],&[different]),"a real replacement selection cannot use the frozen snapshot");
         assert!(!same_identities(&[first],&[]),"a cleared selection must be restored before granting a command");
         Ok(())
+    }
+    #[test]fn filesystem_item_uses_shell_attributes_not_path_conversion()->Result<()>{
+        unsafe{OleInitialize(None)}?;
+        struct Apartment;impl Drop for Apartment{fn drop(&mut self){unsafe{OleUninitialize();}}}let _apartment=Apartment;
+        let root=std::env::temp_dir().join(format!("zsdesk-menu-filesystem-{}-{}",std::process::id(),unsafe{windows::Win32::System::Threading::GetCurrentThreadId()}));
+        std::fs::create_dir(&root)?;
+        struct Fixture(PathBuf);impl Drop for Fixture{fn drop(&mut self){let _=std::fs::remove_file(self.0.join("item.txt"));let _=std::fs::remove_dir(&self.0);}}let _fixture=Fixture(root.clone());
+        let path=root.join("item.txt");std::fs::write(&path,b"fixture")?;
+        let file=unsafe{zsdesk_windows::shell::shell_item(&ShellLocation::Path(path))}?;
+        let computer=unsafe{zsdesk_windows::shell::shell_item(&ShellLocation::ThisPc)}?;
+        assert!(filesystem_item(&file));assert!(!filesystem_item(&computer));Ok(())
     }
     #[test]fn menu_input_watch_observes_source_thread_input()->Result<()>{
         let window=unsafe{CreateWindowExW(WINDOW_EX_STYLE::default(),windows::core::w!("STATIC"),None,WS_POPUP,0,0,1,1,None,None,None,None)}?;
