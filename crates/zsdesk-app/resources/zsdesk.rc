@@ -22,4 +22,19 @@ BEGIN
     VALUE "Translation", 0x0804, 1200
   END
 END
-1 RT_MANIFEST "resources\\zsdesk.exe.manifest"
+1 RT_MANIFEST "resources\\\\zsdesk.exe.manifest"
+
+220 DIALOGEX 0, 0, 280, 124
+STYLE 0x80C808C8
+EXSTYLE 0x00000001
+CAPTION "Search shortcut"
+FONT 9, "Segoe UI"
+BEGIN
+    LTEXT "Activation shortcut", 221, 14, 11, 251, 12
+    EDITTEXT 222, 14, 28, 165, 18, 0x50810080
+    PUSHBUTTON "Type shortcut", 223, 185, 28, 80, 18
+    LTEXT "", 224, 14, 52, 251, 24
+    AUTOCHECKBOX "Enable shortcut", 225, 14, 78, 165, 13
+    DEFPUSHBUTTON "Save", 1, 151, 99, 54, 17
+    PUSHBUTTON "Cancel", 2, 211, 99, 54, 17
+END

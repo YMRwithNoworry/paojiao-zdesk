@@ -458,6 +458,20 @@ fn locked_tabs_and_bookmark_drag(output:&std::path::Path)->Result<serde_json::Va
     {
         let mut slot=runner.slot.borrow_mut();let state=slot.as_mut().unwrap();state.save();
         let saved=storage::load(&state.config_path)?;ensure!(saved.bookmarks==state.session.bookmarks,"category order did not persist");ensure!(saved.secondary_pane.tabs[0].locked,"hidden lock did not persist");
+        let native=state.browser.as_ref().unwrap().view_window();let saved_items=state.session.bookmarks.clone();
+        for style in ["bookmarks-display-categories","bookmarks-display-dropdown","bookmarks-display-expanded"]{
+            state.apply_interface_choice(style);
+            ensure!(state.browser.as_ref().unwrap().view_window()==native,"bookmark presentation recreated the file view");
+            if style.ends_with("dropdown"){let r=state.layout.bookmark_overflow;ensure!(state.layout.bookmarks_row.is_empty()&&state.chrome_hit(r.x+1,r.y+1)==Hit::BookmarkOverflow,"dropdown unreachable");}
+        }
+        for mode in ["always","hidden","hover"]{state.apply_interface_choice(&format!("navigation-divider-{mode}"));
+            let r=state.layout.splitter;if !r.is_empty(){ensure!(state.chrome_hit(r.x+1,r.y+1)==Hit::Splitter,"divider drag area lost");}}
+        let get_height=|font:HFONT|{use windows::Win32::Graphics::Gdi::{LOGFONTW,GetObjectW};let mut lf=LOGFONTW::default();unsafe{GetObjectW(font.into(),size_of::<LOGFONTW>() as i32,Some((&mut lf as *mut LOGFONTW).cast()))};lf.lfHeight.abs()};
+        let before=get_height(state.font);
+        for percent in [150,115,130,100]{state.apply_interface_choice(&format!("interface-text-{percent}"));
+            ensure!((get_height(state.font)-before*percent/100).abs()<=1,"native edit font did not scale");
+            ensure!(storage::load(&state.config_path)?.ui.interface_text_percent==percent as u16,"font size did not persist");}
+        ensure!(saved_items==state.session.bookmarks,"appearance settings changed bookmark data");
         state.session.secondary_pane.tabs[0].locked=false;state.session.tabs[0].locked=true;
     }
     unsafe{SendMessageW(runner.hwnd,WM_ENDSESSION,Some(WPARAM(1)),None);SendMessageW(runner.hwnd,WM_CLOSE,None,None);}

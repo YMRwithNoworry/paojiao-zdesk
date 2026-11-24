@@ -17,9 +17,9 @@ const PAGE_LIMIT:u32=2000;
 fn wide(value:&str)->Vec<u16>{value.encode_utf16().chain(Some(0)).collect()}
 
 #[derive(Clone,Copy,Debug,Default,PartialEq,Eq)]
-pub enum SearchSort{#[default]NameAsc,NameDesc,ModifiedDesc,SizeDesc}
+pub enum SearchSort{#[default]NameAsc,NameDesc,ModifiedDesc,SizeDesc,ModifiedAsc,SizeAsc}
 impl SearchSort{
-    fn code(self)->u32{match self{Self::NameAsc=>1,Self::NameDesc=>2,Self::ModifiedDesc=>14,Self::SizeDesc=>6}}
+    fn code(self)->u32{match self{Self::NameAsc=>1,Self::NameDesc=>2,Self::ModifiedDesc=>14,Self::SizeDesc=>6,Self::ModifiedAsc=>13,Self::SizeAsc=>5}}
 }
 #[derive(Clone,Debug)]
 pub struct QueryOptions{pub text:String,pub offset:u32,pub limit:u32,pub sort:SearchSort}

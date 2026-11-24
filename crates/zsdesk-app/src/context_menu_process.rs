@@ -108,6 +108,7 @@ struct IdleWorker {
     /// never terminated on retirement.
     committed:bool,
     native_owner:Option<MenuOwner>,
+    prepared_drawn:bool,
 }
 impl IdleWorker {
     fn within_lifetime(&self,margin:Duration)->bool{
@@ -365,7 +366,7 @@ fn validate(request:&Request)->Result<()>{
     ensure!(request.pidls.iter().map(Vec::len).sum::<usize>()<=3*1024*1024,"菜单选择标识总量过大");
     ensure!(!request.pidls.is_empty()||request.folder.is_some(),"没有可用的系统菜单目标");
     if request.mode.prewarm(){
-        ensure!(request.pidls.len()==1 && request.folder.is_some() && request.options.modern &&
+        ensure!(request.pidls.len()==1 &&
             !request.options.quick_first && !request.extended,"无效的原生预热请求");
     }
     ensure!(!matches!(request.mode,Mode::Background|Mode::New|Mode::CatalogBackground|Mode::PasteBackground)||request.pidls.len()==1,"背景菜单需要一个文件夹标识");
@@ -373,8 +374,9 @@ fn validate(request:&Request)->Result<()>{
     if let Some(context)=&request.view_context{ensure!(context.folder.as_ref().is_none_or(|pidl|valid_pidl(pidl)),"菜单源文件夹标识无效");}
     for keys in [&request.options.hidden_verbs,&request.options.shown_verbs]{ensure!(keys.len()<=1024&&keys.iter().all(|verb|verb.len()<=512&&!verb.contains('\0')),"菜单设置无效");}
     if let Some(layout)=&request.layout {
-        ensure!(matches!(request.mode,Mode::Background|Mode::New|Mode::CatalogBackground|Mode::More|Mode::CatalogSelection)&&(1..=8).contains(&layout.mode)&&(8..=512).contains(&layout.icon_size)
-            &&layout.sort_columns.len()<=64&&layout.columns.is_empty()&&layout.selected.is_empty()&&layout.focused.is_none()&&layout.first_visible.is_none(),"背景视图设置无效");
+        let allows_columns = matches!(request.mode, Mode::Background | Mode::New | Mode::CatalogBackground);
+        ensure!(matches!(request.mode, Mode::More | Mode::CatalogSelection) || allows_columns, "背景视图设置无效");
+        ensure!((allows_columns || layout.columns.is_empty()) && zsdesk_windows::shell::valid_menu_layout(layout), "背景视图设置无效");
     }
     Ok(())
 }
@@ -418,6 +420,8 @@ impl Client{
         Self::spawn_at(owner,point,pidls,folder,options,intercept,mode,extended,origin)
     }
     fn spawn_at(owner:HWND,point:POINT,pidls:Vec<Vec<u8>>,folder:Option<PathBuf>,options:ContextMenuOptions,intercept:MenuInterceptions,mode:Mode,extended:bool,origin:Origin)->Result<Self>{
+        // Keep worker selection and its lifetime policy on the effective OS presentation.
+        let options=zsdesk_windows::shell::menu::resolve_presentation(options);
         if !mode.prewarm(){prewarm::interrupt();}
         let started=origin.started;let started_counter=origin.counter;
         let root=diagnostics_directory();ensure!(root.is_absolute(),"菜单缓存目录必须是绝对路径");fs::create_dir_all(&root)?;
@@ -432,13 +436,15 @@ impl Client{
                     &&idle.within_lifetime(Duration::from_secs(2));
                 // The child retains its own STA; changing the parent window
                 // sends a fresh serialized request, never a COM interface.
-                let index=pool.iter().position(|idle|idle.thread==thread&&compatible(idle))
+                let style_matches=|idle:&IdleWorker| compatible(idle) && idle.prepared_drawn == options.drawn;
+                let index=pool.iter().position(|idle|idle.thread==thread && style_matches(idle))
+                    .or_else(||pool.iter().position(style_matches))
                     .or_else(||pool.iter().position(compatible));
                 index.map(|index|pool.swap_remove(index))};
             let Some(idle)=cached else{break;};
             // Switching styles must not lend a parked native STA (and any
             // resources it already owns) to an on-demand drawn session.
-            if options.drawn{drop(idle);break;}
+            if idle.prepared_drawn != options.drawn {drop(idle);break;}
             let valid=idle.child.as_ref().is_some_and(|child|created(child.id())==Some(idle.created))
                 &&read_small::<Status>(&idle.workspace.join("status.json"),MAX_STATUS).is_ok_and(|status|
                     status.phase=="idle"&&status.reusable&&status.token==idle.token&&idle.child.as_ref().is_some_and(|child|status.pid==child.id()));
@@ -626,6 +632,7 @@ impl Drop for Client{fn drop(&mut self){
     if reusable{
         let idle=IdleWorker{child:self.child.take(),job:self.job.take(),workspace:self.workspace.clone(),session:self.session.clone(),token:self.token.clone(),
             events:self.events.take(),count:self.ordinal,created:self.child_created,last_used:Instant::now(),desktop:self.desktop,thread:self.thread,committed,
+            prepared_drawn:self.mode.prewarm() && self.last_status.as_ref().is_some_and(|s|s.native_menu["drawn_renderer_ready"]==true),
             native_owner:self.last_status.as_ref().filter(|s|s.native_menu["runtime_initializations"].as_u64().unwrap_or(0)>0).map(|_|self.owner)};
         let retired={let mut pool=IDLE.lock().unwrap_or_else(|error|error.into_inner());let old=pool.iter().position(|worker|worker.thread==self.thread).map(|index|pool.swap_remove(index));
             let evicted=if pool.len()>=MAX_IDLE_WORKERS{Some(pool.remove(0))}else{None};pool.push(idle);(old,evicted)};drop(retired);start_reaper();return;
@@ -745,10 +752,10 @@ impl Drop for AsyncClient {fn drop(&mut self){
     }
 }}
 
-struct Worker<'a>{request:Request,path:PathBuf,status:Status,events:&'a EventSet}
+struct Worker<'a>{request:std::rc::Rc<Request>,path:PathBuf,status:Status,events:&'a EventSet}
 struct Watch{
     #[cfg(test)]visual_step:std::cell::Cell<usize>,
-    request:Request,path:PathBuf,status_event:usize,cancel_event:usize,dismiss_event:usize,worker_started:u64,
+    request:std::rc::Rc<Request>,path:PathBuf,status_event:usize,cancel_event:usize,dismiss_event:usize,worker_started:u64,
     menu_open:std::cell::Cell<bool>,
     tracking_started:std::cell::Cell<u64>,
     #[cfg(test)]command:std::cell::Cell<Option<u32>>,
@@ -917,7 +924,7 @@ fn run_request(path:&Path,request:Request,events:&EventSet,com_us:u64,fault_repo
     let setup=Instant::now();let worker_started=monotonic_us();
     let mut state=Box::new(Worker{status:Status{token:request.token.clone(),pid:std::process::id(),window:0,phase:"starting".into(),validation:0,before_invoke:false,outcome:None,error:None,error_hresult:None,error_phase:None,bind_microseconds:0,populate_microseconds:0,
         reusable:false,layout:None,layout_sort_changed:false,created:Vec::new(),catalog:Vec::new(),timing:MenuTimings{worker_thread:unsafe{windows::Win32::System::Threading::GetCurrentThreadId()},fault_report_available,com_microseconds:com_us,..Default::default()},native_menu:serde_json::Value::Null,
-        #[cfg(test)]probe_menu_open:false,#[cfg(test)]probe_classic_loop:false,#[cfg(test)]probe_expanded_requested:false,#[cfg(test)]probe_command_messages:0,#[cfg(test)]probe_clipboard_after_invoke:serde_json::Value::Null},request,path:path.into(),events});
+        #[cfg(test)]probe_menu_open:false,#[cfg(test)]probe_classic_loop:false,#[cfg(test)]probe_expanded_requested:false,#[cfg(test)]probe_command_messages:0,#[cfg(test)]probe_clipboard_after_invoke:serde_json::Value::Null},request:request.into(),path:path.into(),events});
     state.state("starting")?;
     #[cfg(test)]if state.request.probe.as_deref()==Some("crash"){unsafe{RaiseException(0xc0000005,1,0,std::ptr::null());}std::process::exit(0x51);}
     #[cfg(test)]if state.request.probe.as_deref()==Some("memory-limit"){
@@ -939,9 +946,21 @@ fn run_request(path:&Path,request:Request,events:&EventSet,com_us:u64,fault_repo
     state.status.window=window.0 as isize;unsafe{SetTimer(Some(window),1,15,None);}
     state.status.timing.worker_setup_microseconds=micros(setup.elapsed());
     let result=(||->Result<MenuOutcome>{
-        let request=state.request.clone();zsdesk_windows::shell::menu::set_context_menu_options(request.options.clone());
+        let request=state.request.clone();
+        let classic_gesture=request.extended&&!request.view_context.as_ref().is_some_and(|context|context.keyboard&&context.f10);
+        let mut requested=request.options.clone();
+        if classic_gesture {requested.modern=false;requested.drawn=false;}
+        zsdesk_windows::shell::menu::set_context_menu_options(requested);
         if request.mode.prewarm(){
-            if request.options.modern&&!request.options.quick_first{zsdesk_windows::shell::menu::prepare_drawn_runtime()?;}
+            let effective=zsdesk_windows::shell::menu::context_menu_options();
+            if effective.drawn {
+                zsdesk_windows::shell::menu::prepare_drawn_runtime()?;
+                if request.folder.is_some() && effective.native_first_page_apps.as_ref().is_some_and(|apps| !apps.is_empty()) {
+                    if let Some(folder)=request.view_context.as_ref().and_then(|context| context.folder.as_deref()) {
+                        background_view::prepare_folder(folder,&request,events)?;
+                    }
+                }
+            }
             return Ok(MenuOutcome::Dismissed);
         }
         #[cfg(test)]if request.probe.as_deref()==Some("dismiss"){state.allow(false)?;return Ok(MenuOutcome::Dismissed);}
@@ -990,9 +1009,10 @@ fn run_request(path:&Path,request:Request,events:&EventSet,com_us:u64,fault_repo
             ensure!(attributes.0&windows::Win32::System::SystemServices::SFGAO_FOLDER.0!=0,"后台菜单目标不是文件夹");
         }
         let effective_options=zsdesk_windows::shell::menu::context_menu_options();
-        let classic_selection=zsdesk_windows::theme::os_build()<22000&&!effective_options.modern&&!effective_options.drawn
+        let legacy_shell=zsdesk_windows::theme::windows10_shell(zsdesk_windows::theme::os_build());
+        let classic_selection=legacy_shell
             &&!request.pidls.is_empty()&&!is_background;
-        let compact_selection=background_view::compact_selection(window,&request,&effective_options)?;
+        let compact_selection=if legacy_shell {None}else{background_view::compact_selection(window,&request,&effective_options)?};
         let background_view=if compact_selection.is_some(){None}
             else if let Some(item)=&background{Some(background_view::BackgroundView::create(item,&request,events)?)}
             else if !request.pidls.is_empty()&&!classic_selection{
@@ -1001,16 +1021,15 @@ fn run_request(path:&Path,request:Request,events:&EventSet,com_us:u64,fault_repo
             }else{None};
         state.status.timing.background_view_reused=is_background&&background_view.is_some()&&background_view::reused();
         if is_background{if let (Some(host),Some(layout))=(&background_view,&request.layout){zsdesk_windows::shell::restore_view_layout(&host.view,layout);}}
-        let initial_layout=background_view.as_ref().filter(|_|is_background).and_then(|host|zsdesk_windows::shell::capture_view_layout(&host.view));
+        let initial_layout=background_view.as_ref().filter(|_|is_background).and_then(|host|zsdesk_windows::shell::capture_background_layout(&host.view));
         let full_context=matches!(request.mode,Mode::More|Mode::Background|Mode::CatalogSelection|Mode::CatalogBackground);
-        let classic_gesture=request.extended&&!request.view_context.as_ref().is_some_and(|context|context.keyboard&&context.f10);
         let packaged=full_context&&(effective_options.drawn||!effective_options.modern||classic_gesture||matches!(request.mode,Mode::CatalogSelection|Mode::CatalogBackground));
         let menu=if let Some(menu)=compact_selection{menu}else if let Some(host)=&background_view{
             if request.mode==Mode::New{zsdesk_windows::shell::new_menu::for_view(&host.view)?}
-            else if effective_options.drawn&&!classic_gesture&&matches!(request.mode,Mode::More|Mode::Background){
+            else if !legacy_shell&&effective_options.drawn&&!classic_gesture&&matches!(request.mode,Mode::More|Mode::Background){
                 ShellMenu::for_compact_view(&host.view,&host.browser,window,!is_background,&effective_options)?
             }
-            else if packaged{ShellMenu::for_view_with_packages(&host.view,&host.browser,window,!is_background)?}
+            else if packaged&&!legacy_shell{ShellMenu::for_view_with_packages(&host.view,&host.browser,window,!is_background)?}
             else{ShellMenu::for_view(&host.view,!is_background)?}
         }else if request.pidls.is_empty(){let folder=zsdesk_windows::desktop::folder_for_path(request.folder.as_deref().context("目录缺失")?)?;ShellMenu::for_folder_background(window,&folder)?}else{ShellMenu::for_items(window,&request.pidls)?};
         menu.set_directory(request.folder.as_deref());
@@ -1033,6 +1052,9 @@ fn run_request(path:&Path,request:Request,events:&EventSet,com_us:u64,fault_repo
         menu.populate(request.rename,request.extended)?;
         #[cfg(test)]watch.menu.set(menu.hmenu());
         state.status.populate_microseconds=started.elapsed().as_micros()as u64;
+        #[cfg(test)]if request.probe.as_deref()==Some("query-compact-catalog"){
+            state.allow(false)?;state.status.catalog=menu.catalog();return Ok(MenuOutcome::Dismissed);
+        }
         if matches!(request.mode,Mode::CatalogSelection|Mode::CatalogBackground){
             state.allow(false)?;state.status.catalog=menu.catalog();return Ok(MenuOutcome::Dismissed);
         }
@@ -1092,13 +1114,20 @@ fn run_request(path:&Path,request:Request,events:&EventSet,com_us:u64,fault_repo
             else if let Some(host)=&background_view{menu.track_selected_in_view_before(window,point,&request.pidls,&host.browser,
                 MenuInterceptions{rename:request.rename,open:request.open,file_actions},&mut||state.allow(true))?}
             else{menu.track_selected_before(window,point,&request.pidls,0,MenuInterceptions{rename:request.rename,open:request.open,file_actions},&mut||state.allow(true))?};
+        if outcome == MenuOutcome::CompressZip {
+            state.allow(true)?;
+            let paths = zsdesk_windows::shell::file_transfer::paths_from_pidls(&request.pidls)?;
+            let path = zsdesk_windows::archive::compress_zip(&paths)?;
+            state.status.created.push(zsdesk_windows::shell::new_menu::CreatedItem { path, rename:false });
+            return Ok(MenuOutcome::ShellInvoked);
+        }
         if matches!(outcome,MenuOutcome::ShellInvoked|MenuOutcome::NativeHandled){
             pump(150);
             // ShellNew can open a modeless shortcut/template wizard. Its site
             // must remain alive until the wizard finishes its create callback.
-            if creation.is_some(){while process_visible_windows(std::process::id(),window){pump(50);}}
+            if creation.is_some() || is_background {while process_visible_windows(std::process::id(),window){pump(50);}}
             if let Some(creation)=&creation{state.status.created=creation.take();}
-            let layout=background_view.as_ref().filter(|_|is_background).and_then(|host|zsdesk_windows::shell::capture_view_layout(&host.view));
+            let layout=background_view.as_ref().filter(|_|is_background).and_then(|host|zsdesk_windows::shell::capture_background_layout(&host.view));
             if layout!=initial_layout{
                 state.status.layout_sort_changed=layout.as_ref().zip(initial_layout.as_ref()).is_some_and(|(after,before)|after.sort_columns!=before.sort_columns);
                 state.status.layout=layout;
@@ -1148,7 +1177,7 @@ fn run_request(path:&Path,request:Request,events:&EventSet,com_us:u64,fault_repo
     }
     // A drawn request owns one short-lived isolation process. The existing
     // done path still pumps modeless dialogs and protects clipboard ownership.
-    let reusable=!state.request.options.drawn&&state.status.error.is_none()&&state.request.ordinal<MAX_SESSION_REQUESTS
+    let reusable=(state.request.mode.prewarm() || !state.request.options.drawn)&&state.status.error.is_none()&&state.request.ordinal<MAX_SESSION_REQUESTS
         &&persisted&&!owns_clipboard()&&!process_visible_windows(std::process::id(),window)&&!EventSet::signaled(events.cancel);
     if reusable{
         // Release all selection/menu objects and their real owner before
@@ -1191,7 +1220,8 @@ fn run_worker(path:&Path)->Result<()>{
     ensure!(path.is_absolute()&&path.file_name().is_some_and(|name|name=="request.json"),"菜单请求路径无效");
     ensure!(std::env::var_os("ZSDESK_MENU_WORKSPACE").map(PathBuf::from).as_deref()==path.parent(),"菜单工作目录不匹配");
     let session=std::env::var("ZSDESK_MENU_SESSION").context("菜单会话缺失")?;
-    let mut request:Request=read_small(path,MAX_REQUEST)?;validate(&request)?;
+    let mut request:Request=read_small(path,MAX_REQUEST)?;
+    validate(&request)?;
     ensure!(session==request.session&&request.ordinal==1&&parent_alive(&request),"菜单请求归属无效");
     let parent=(request.parent,request.parent_created);let events=EventSet::open(&session)?;
     let deadline=Instant::now()+Duration::from_secs(5);
@@ -1317,6 +1347,51 @@ pub fn run_worker_if_requested()->Option<Result<()>>{
         assert!(validate(&request).is_ok());
         for value in ["",r"..\escape","bad/session","bad\0session"]{request.session=value.into();assert!(validate(&request).is_err());}
         request.session="session-1".into();for ordinal in [0,MAX_SESSION_REQUESTS+1]{request.ordinal=ordinal;assert!(validate(&request).is_err());}
+    }
+    #[test]
+    fn background_menu_accepts_serialized_details_columns_and_grouping() -> Result<()> {
+        use zsdesk_core::model::explorer::{ViewColumn, ViewGrouping, ViewPropertyKey, ViewSortColumn};
+        let key = |property_id| ViewPropertyKey { format_id: "B725F130-47EF-101A-A5F1-02608C9EEBAC".into(), property_id };
+        let layout = ShellViewState {
+            mode: 4, icon_size: 16, column_dpi: 96,
+            columns: [10, 14, 4, 12].into_iter().map(|id| ViewColumn { key: key(id), width: 144 }).collect(),
+            sort_columns: vec![ViewSortColumn { key: key(10), ascending: true }],
+            grouping: Some(ViewGrouping { key: Some(key(14)), ascending: false }),
+            ..Default::default()
+        };
+        let mut request = Request { english: None, token: "request-1".into(), session: "session-1".into(), ordinal: 1,
+            parent: 1, parent_created: 1, owner: 1, point: [0,0], pidls: vec![vec![0,0]], folder: None,
+            options: Default::default(), rename: false, open: false, file_actions: false, mode: Mode::Background,
+            extended: false, layout: Some(layout.clone()), view_context: None, probe: None };
+        for mode in [Mode::Background, Mode::New, Mode::CatalogBackground] {
+            request.mode = mode;
+            let decoded: Request = serde_json::from_slice(&serde_json::to_vec(&request)?)?;
+            validate(&decoded)?;
+            assert_eq!(decoded.layout.as_ref(), Some(&layout));
+        }
+        for mode in [Mode::More, Mode::CatalogSelection] {
+            request.mode = mode;
+            assert!(validate(&request).is_err());
+            request.layout.as_mut().unwrap().columns.clear();
+            validate(&request)?;
+            request.layout = Some(layout.clone());
+        }
+        request.mode = Mode::Background;
+        // Profiles and older request senders can omit DPI.
+        let mut legacy = serde_json::to_value(&request)?;
+        legacy["layout"].as_object_mut().unwrap().remove("column_dpi");
+        validate(&serde_json::from_value(legacy)?)?;
+        for change in [
+            (|s: &mut ShellViewState| s.columns.resize(65, s.columns[0].clone())) as fn(&mut ShellViewState),
+            |s| s.columns[0].width = 0, |s| s.columns[0].width = 16_385,
+            |s| s.columns[0].key.format_id = "invalid".into(), |s| s.column_dpi = u32::MAX,
+            |s| s.selected.push(vec![0,0]), |s| s.focused = Some(vec![0,0]), |s| s.first_visible = Some(vec![0,0]),
+        ] {
+            let mut invalid = request.clone();
+            change(invalid.layout.as_mut().unwrap());
+            assert!(validate(&invalid).is_err());
+        }
+        Ok(())
     }
     #[test]fn filesystem_action_interception_is_opt_in_on_the_wire()->Result<()>{
         let mut request=Request{english:None,token:"request-1".into(),session:"session-1".into(),ordinal:1,parent:1,parent_created:1,owner:1,

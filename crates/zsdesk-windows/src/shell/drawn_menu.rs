@@ -21,6 +21,7 @@ const TIMER:usize=0x5a53464c;
 const MAX_ITEMS:usize=16384;
 const MAX_LEVELS:usize=32;
 const HOVER_DELAY:Duration=Duration::from_millis(300);
+const OPEN_WITH_HOVER_DELAY:Duration=Duration::from_millis(120);
 const AIM_DELAY:Duration=Duration::from_millis(450);
 // Independently measured Shell popup metrics. Generic application flyouts keep
 // their own layout; these values describe the Shell's command strip and body.
@@ -86,7 +87,13 @@ impl Action{
     hidden:bool,variants:bool,
 }
 impl Item{fn cascade(&self)->bool{self.variants||!self.submenu.is_invalid()}fn selectable(&self)->bool{self.kind==RowKind::Item&&!self.hidden&&self.enabled}
-    fn opens_on_hover(&self)->bool{self.cascade()&&self.verb.as_deref()!=Some("zsdesk.more")}}
+    fn opens_on_hover(&self)->bool{self.cascade()&&self.verb.as_deref()!=Some("zsdesk.more")}
+    fn hover_delay(&self)->Duration{
+        if self.cascade()&&self.verb.as_deref().is_some_and(|v|v.eq_ignore_ascii_case("openas")){
+            OPEN_WITH_HOVER_DELAY
+        }else{HOVER_DELAY}
+    }
+}
 struct Level{menu:HMENU,hwnd:HWND,frame_id:usize,body:Bounds,metrics:Metrics,layout:LevelLayout,items:Vec<Item>,scroll:f32,
     toolbar:Vec<usize>,accelerator_width:f32,text_left_dip:f32,keyboard_focus:bool,variant_label:Option<String>,suspended:bool,
     highlight:Option<usize>,pressed:Option<usize>,open_child:Option<usize>,surface:Option<Surface>,initialized:bool}
@@ -175,8 +182,17 @@ fn bitmap_alpha(bitmap:HBITMAP)->BitmapAlpha{
     }BitmapAlpha::Ignore
 }
 fn read_raw(menu:HMENU,position:u32)->Result<(MENUITEMINFOW,String)>{
+    let mut short = [0u16; 256];
     let mut info=MENUITEMINFOW{cbSize:std::mem::size_of::<MENUITEMINFOW>()as u32,
-        fMask:MIIM_ID|MIIM_FTYPE|MIIM_STATE|MIIM_SUBMENU|MIIM_DATA|MIIM_BITMAP|MIIM_CHECKMARKS|MIIM_STRING,..Default::default()};
+        fMask:MIIM_ID|MIIM_FTYPE|MIIM_STATE|MIIM_SUBMENU|MIIM_DATA|MIIM_BITMAP|MIIM_CHECKMARKS|MIIM_STRING,
+        dwTypeData:PWSTR(short.as_mut_ptr()),cch:short.len()as u32,..Default::default()};
+    unsafe{GetMenuItemInfoW(menu,position,true,&mut info)}?;
+    info.dwTypeData=PWSTR::null();
+    if (info.cch as usize) < short.len()-1 {
+        let end = short.iter().position(|&unit| unit == 0).unwrap_or(short.len());
+        return Ok((info, String::from_utf16_lossy(&short[..end])));
+    }
+    info.cch=0;
     unsafe{GetMenuItemInfoW(menu,position,true,&mut info)}?;
     if info.cch>32767{return Err(error(0x8007000e,"菜单文字超过可绘制范围"));}
     let mut buffer=vec![0u16;info.cch as usize+1];info.dwTypeData=PWSTR(buffer.as_mut_ptr());info.cch=buffer.len()as u32;
@@ -410,6 +426,7 @@ fn paint(cv:&Canvas,level:&Level,colors:&Palette){
 }
 fn paint_provider_rows(provider:&Provider,level:&Level,surface:&Surface){
     let shadow=level.metrics.px(geometry::SHADOW_DIP)as i32;
+    let mut painted = Vec::new();
     for(index,(row,item))in level.layout.rows.iter().zip(&level.items).enumerate(){if item.hidden||row.h<=0.||(!item.owner_draw&&item.bitmap!=HBMMENU_CALLBACK){continue;}
         // Providers may replace an owner-draw payload while a menu is open.
         // Never pass a stale itemData pointer back to the provider's drawer.
@@ -425,15 +442,24 @@ fn paint_provider_rows(provider:&Provider,level:&Level,surface:&Surface){
         let mut draw=DRAWITEMSTRUCT{CtlType:ODT_MENU,itemID:item.id,itemAction:ODA_DRAWENTIRE,itemState:flags,hwndItem:HWND(level.menu.0),hDC:surface.dc,rcItem:rect,itemData:item.item_data,..Default::default()};
         let saved=unsafe{SaveDC(surface.dc)};unsafe{IntersectClipRect(surface.dc,clip.left,clip.top,clip.right,clip.bottom);SetBkMode(surface.dc,TRANSPARENT);}
         provider.message(WM_DRAWITEM,WPARAM(0),LPARAM((&mut draw as*mut DRAWITEMSTRUCT)as isize));
-        if saved!=0{let _=unsafe{RestoreDC(surface.dc,saved)};}let _=unsafe{GdiFlush()};
-        // Ordinary GDI drawers write RGB and leave alpha undefined. Only their
-        // clipped row becomes opaque; the flyout's rounded shadow stays intact.
-        let pixels=unsafe{std::slice::from_raw_parts_mut(surface.bits,surface.pixel_bytes()as usize)};
+        if saved!=0{let _=unsafe{RestoreDC(surface.dc,saved)};}
+        painted.push(clip);
+    }
+    if painted.is_empty() { return; }
+    let _ = unsafe { GdiFlush() };
+    // Flush the provider's GDI draws once before touching any DIB pixels.
+    let pixels=unsafe{std::slice::from_raw_parts_mut(surface.bits,surface.pixel_bytes()as usize)};
+    for clip in painted {
         for y in clip.top.max(0)..clip.bottom.min(surface.height){for x in clip.left.max(0)..clip.right.min(surface.width){pixels[((y*surface.width+x)*4+3)as usize]=255;}}
     }
 }
 fn present(provider:&Provider,level:&mut Level,gfx:&Gfx,colors:&Palette)->Result<()>{
-    for item in &mut level.items{if item.image.as_ref().is_none_or(|(generation,_)|*generation!=gfx.generation()){item.image=item.wic.as_ref().and_then(|wic|gfx.upload(wic)).map(|image|(gfx.generation(),image));}}
+    for (i, (item, row)) in level.items.iter_mut().zip(&level.layout.rows).enumerate() {
+        if !level.toolbar.contains(&i) && (row.h <= 0. || row.y+row.h < level.scroll || row.y > level.scroll+level.body.height() as f32) { continue; }
+        if item.image.as_ref().is_none_or(|(generation,_)| *generation != gfx.generation()) {
+            item.image=item.wic.as_ref().and_then(|wic| gfx.upload(wic)).map(|image| (gfx.generation(),image));
+        }
+    }
     let shadow=level.metrics.px(geometry::SHADOW_DIP)as i32;let(width,height)=(level.body.width()+2*shadow,level.body.height()+2*shadow);
     let mut surface=level.surface.take();let target=Surface::ensure(&mut surface,width,height).ok_or_else(||error(0x8007000e,"菜单绘图内存不足"))?;
     let drawn=gfx.draw(target,|canvas|paint(canvas,level,colors));if drawn.is_ok(){paint_provider_rows(provider,level,target);}
@@ -479,7 +505,7 @@ impl Tooltip{
             SendMessageW(self.hwnd,TTM_TRACKACTIVATE,Some(WPARAM(1)),Some(LPARAM((&info as*const TTTOOLINFOW)as isize)));}}
 }
 impl Drop for Tooltip{fn drop(&mut self){self.hide();let _=unsafe{DestroyWindow(self.hwnd)};}}
-struct Session{provider:Provider,owner:HWND,anchor:POINT,levels:Vec<Level>,entered:bool,revision:u64,tooltip:Option<Tooltip>,tip_target:Option<(usize,usize,Instant)>,tip_shown:bool}
+struct Session{provider:Provider,owner:HWND,anchor:POINT,levels:Vec<Level>,entered:bool,revision:u64,tooltip:Option<Tooltip>,tip_target:Option<(usize,usize,Instant)>,tip_shown:bool,capture_snapshot:bool}
 impl Session{
     fn hide_tooltip(&mut self){if let Some(tip)=&mut self.tooltip{tip.hide();}self.tip_target=None;self.tip_shown=false;}
     fn schedule_tooltip(&mut self,target:Option<(usize,usize)>){
@@ -506,7 +532,7 @@ impl Session{
             "toolbar":level.toolbar.iter().enumerate().map(|(slot,index)|{let rect=level.toolbar_rect(slot);let item=&level.items[*index];serde_json::json!({"row":index,"id":item.id,"position":item.position,"label":item.label,"enabled":item.enabled,"rect":[rect.x,rect.y,rect.w,rect.h],"action":format!("{:?}",item.action)})}).collect::<Vec<_>>(),
             "rows":level.items.iter().zip(&level.layout.rows).map(|(item,row)|serde_json::json!({"id":item.id,"label":item.label,"position":item.position,"submenu":item.cascade(),"enabled":item.enabled,"checked":item.checked,"radio":item.radio,"default":item.default,"owner_draw":item.owner_draw,"y":row.y,"height":row.h})).collect::<Vec<_>>()})
         ).collect::<Vec<_>>()}));}
-    fn present(&mut self,depth:usize,gfx:&Gfx,colors:&Palette)->Result<()>{if !self.levels[depth].suspended{present(&self.provider,&mut self.levels[depth],gfx,colors)?;}self.snapshot();Ok(())}
+    fn present(&mut self,depth:usize,gfx:&Gfx,colors:&Palette)->Result<()>{if !self.levels[depth].suspended{present(&self.provider,&mut self.levels[depth],gfx,colors)?;}if self.capture_snapshot {self.snapshot();}Ok(())}
     fn rebuild_level(&mut self,depth:usize,gfx:&Gfx,colors:&Palette)->Result<Step>{
         self.hide_tooltip();
         let level=&self.levels[depth];let menu=level.menu;let metrics=level.metrics;let body=level.body;let text_left_dip=level.text_left_dip;
@@ -688,7 +714,9 @@ pub(super) fn track_initialized(owner:HWND,menu:HMENU,point:POINT,context:&ICont
     let colors=palette(crate::theme::menus_dark());
     provider.message(WM_INITMENU,WPARAM(menu.0 as usize),LPARAM(0));
     let Some(root)=open_level(&provider,&gfx,owner,menu,0,Place::Root(point),root_initialized,None)?else{return Ok(None);};
-    let mut session=Session{provider,owner,anchor:point,levels:vec![root],entered:false,revision:0,tooltip:None,tip_target:None,tip_shown:false};let root=session.levels[0].hwnd;ROOT.with(|value|value.set(root));
+    let capture_snapshot=cfg!(any(test,feature="menu-visual-qa")) || std::env::var_os("ZSDESK_NATIVE_TEST_OUTPUT").is_some();
+    SNAPSHOT.with(|snapshot| *snapshot.borrow_mut()=serde_json::Value::Null);
+    let mut session=Session{provider,owner,anchor:point,levels:vec![root],entered:false,revision:0,tooltip:None,tip_target:None,tip_shown:false,capture_snapshot};let root=session.levels[0].hwnd;ROOT.with(|value|value.set(root));
     if CANCEL.with(Cell::get)||!unsafe{IsWindow(Some(owner))}.as_bool(){return Ok(None);}
     session.present(0,&gfx,&colors)?;session.entered=true;
     unsafe{SendMessageW(owner,WM_ENTERMENULOOP,Some(WPARAM(1)),Some(LPARAM(0)));SetCapture(root);}
@@ -711,7 +739,7 @@ pub(super) fn track_initialized(owner:HWND,menu:HMENU,point:POINT,context:&ICont
                         if let Some(row)=row{if !pending.is_some_and(|(at,old,_,delay)|at==depth&&old==row&&delay==AIM_DELAY){pending=Some((depth,row,Instant::now(),AIM_DELAY));}}
                     }else{
                         let before=session.levels[depth].highlight;session.highlight(depth,row,true,&gfx,&colors)?;
-                        if session.levels[depth].highlight!=before{pending=session.levels[depth].highlight.map(|row|(depth,row,Instant::now(),HOVER_DELAY));}
+                        if session.levels[depth].highlight!=before{pending=session.levels[depth].highlight.map(|row|(depth,row,Instant::now(),session.levels[depth].items[row].hover_delay()));}
                     }
                 }else{pending=None;}
                 let tip=hit(&session.levels,pointer).and_then(|(depth,row)|row.filter(|row|session.levels[depth].toolbar.contains(row)).map(|row|(depth,row)));
@@ -739,7 +767,7 @@ pub(super) fn track_initialized(owner:HWND,menu:HMENU,point:POINT,context:&ICont
                     session.update_tooltip();
                     let revision=session.revision;
                     let update=if refreshed.elapsed()>=Duration::from_millis(120){refreshed=Instant::now();session.refresh_states(&gfx,&colors)?}else{Step::Continue};
-                    if revision!=session.revision{pending=hit(&session.levels,previous).and_then(|(depth,row)|row.filter(|row|session.levels[depth].items[*row].selectable()).map(|row|(depth,row,Instant::now(),HOVER_DELAY)));}
+                    if revision!=session.revision{pending=hit(&session.levels,previous).and_then(|(depth,row)|row.filter(|row|session.levels[depth].items[*row].selectable()).map(|row|(depth,row,Instant::now(),session.levels[depth].items[row].hover_delay())));}
                     if !matches!(update,Step::Continue){update}
                     else if let Some((depth,row,since,delay))=pending{
                     if since.elapsed()>=delay{pending=None;if depth<session.levels.len(){
@@ -914,6 +942,21 @@ pub(super) fn track_initialized(owner:HWND,menu:HMENU,point:POINT,context:&ICont
         let isolated=foreground!=std::process::id();let report=serde_json::json!({"state":if result.is_ok()&&closed&&isolated{"passed"}else{"failed"},"checks":result.as_ref().map_err(|error|format!("{error:#}")),"desktop_closed":closed,"test_did_not_activate":isolated,"physical_input_generated":false});
         std::fs::write(output.join("drawn-shell-menu.current.json"),serde_json::to_vec_pretty(&report)?)?;println!("{report}");result?;ensure!(closed&&isolated,"private popup cleanup/foreground failed");Ok(())
     }
+    #[test]
+    fn menu_labels_round_trip_below_at_and_above_stack_capacity() -> Result<()> {
+        struct OwnedMenu(HMENU);
+        impl Drop for OwnedMenu { fn drop(&mut self) { let _=unsafe{DestroyMenu(self.0)}; } }
+        let menu=OwnedMenu(unsafe { CreatePopupMenu()? });
+        for (i,len) in [0, 10, 254, 255, 256, 900].into_iter().enumerate() {
+            let label = "名".repeat(len);
+            let wide:Vec<_> = label.encode_utf16().chain(Some(0)).collect();
+            unsafe { AppendMenuW(menu.0, MF_STRING, 10+i, PCWSTR(wide.as_ptr()))?; }
+            let (info,actual) = read_raw(menu.0,i as u32)?;
+            assert_eq!(info.wID, (10+i) as u32);
+            assert_eq!(actual, label);
+        }
+        Ok(())
+    }
     #[test]fn submenu_aim_corridor_keeps_diagonal_pointer_travel(){
         let a=POINT{x:100,y:140};let b=POINT{x:200,y:100};let c=POINT{x:200,y:350};
         assert!(in_triangle(POINT{x:150,y:180},a,b,c));assert!(!in_triangle(POINT{x:90,y:180},a,b,c));
@@ -944,6 +987,12 @@ pub(super) fn track_initialized(owner:HWND,menu:HMENU,point:POINT,context:&ICont
         assert_eq!(toolbar_items(&items),vec![2],"duplicate verbs and owner-draw rows must remain complete body entries");
         assert_eq!(action_label(&items[0]),"复制");assert_eq!(items[0].raw_label,"复制(&C)\tCtrl+C");
         assert_eq!(Action::from_verb("Windows.ModernShare"),Some(Action::Share));assert_eq!(Action::from_verb("sharewith"),None);
+        let mut cascade=items[0].clone();
+        cascade.variants=true;
+        cascade.verb=Some("openas".into());
+        assert_eq!(cascade.hover_delay(),Duration::from_millis(120));
+        cascade.verb=Some("newfolder".into());
+        assert_eq!(cascade.hover_delay(),Duration::from_millis(300));
         assert_eq!(next_in_order(&[80,41,90],Some(80),1),Some(41));
         let work=Bounds::new(0,0,1920,1080);let parent=Bounds::new(100,100,400,600);
         assert_eq!(place_shell_submenu(parent,160,250,400,work,Metrics::new(96)),(392,156));

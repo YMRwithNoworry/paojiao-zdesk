@@ -74,7 +74,7 @@ fn tidy_separators(items: Vec<FlyoutItem>) -> Vec<FlyoutItem> {
 
 fn wide(text: &str) -> Vec<u16> { text.encode_utf16().chain(Some(0)).collect() }
 
-fn native(owner: HWND, spec: &MenuSpec, anchor: Anchor) -> Option<String> {
+pub(crate) fn native(owner: HWND, spec: &MenuSpec, anchor: Anchor) -> Option<String> {
     let mut ids = Vec::new();
     let menu = build_native(spec, &mut ids)?;
     let (point, flags) = match anchor {

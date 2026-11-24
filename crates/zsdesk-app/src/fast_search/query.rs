@@ -1,6 +1,6 @@
 //! Filename query grammar shared by scope/type filters and native search.
 use anyhow::{Result,ensure,bail};
-#[derive(Debug)]enum Expr{Name(String),Path(String),Ext(Vec<String>),Kind(bool),And(Vec<Expr>),Or(Vec<Expr>),Not(Box<Expr>)}
+#[derive(Debug)]enum Expr{Name(Pattern),Path(Pattern),Ext(Vec<String>),Kind(bool),And(Vec<Expr>),Or(Vec<Expr>),Not(Box<Expr>)}
 #[derive(Clone,Debug,PartialEq)]enum Token{Word(String),Open,Close,Or,Not}
 #[derive(Clone,Copy,Debug,PartialEq)]pub enum Probe{No,Yes,Path}
 pub struct Query{expr:Expr,pinyin:bool}
@@ -29,10 +29,10 @@ impl Parser{
             Some(Token::Word(text))=>{let text=text.to_lowercase().replace('/',"\\");
                 if text=="folder:"{return Ok(Expr::Kind(true));}if text=="file:"{return Ok(Expr::Kind(false));}
                 if let Some(value)=text.strip_prefix("ext:"){let values:Vec<_>=value.split(';').filter(|v|!v.is_empty()).map(|v|v.trim_start_matches('.').to_owned()).collect();ensure!(!values.is_empty(),"文件类型筛选为空");return Ok(Expr::Ext(values));}
-                if let Some(value)=text.strip_prefix("path:"){ensure!(!value.is_empty(),"路径筛选为空");return Ok(Expr::Path(value.into()));}
-                if text.contains('\\'){return Ok(Expr::Path(text));}
+                if let Some(value)=text.strip_prefix("path:"){ensure!(!value.is_empty(),"路径筛选为空");return Ok(Expr::Path(Pattern::new(value)));}
+                if text.contains('\\'){return Ok(Expr::Path(Pattern::new(&text)));}
                 if text.contains(':'){bail!("自带搜索支持文件名、通配符、分组、排除、ext:、file:、folder: 和 path:；此语法可切换 Everything 使用");}
-                Ok(Expr::Name(text))},_=>bail!("搜索表达式无效")}
+                Ok(Expr::Name(Pattern::new(&text)))},_=>bail!("搜索表达式无效")}
     }
 }
 impl Expr{
@@ -47,21 +47,52 @@ impl Expr{
     }
     fn matches(&self,name:&str,dir:bool,path:&str,pinyin:bool)->bool{
         match self{
-            Self::Name(value)=>pattern(value,name)||(pinyin&&initials_match(value,name)),Self::Path(value)=>pattern(value,path),
+            Self::Name(value)=>value.matches(name)||(pinyin&&matches!(value,Pattern::Plain(query) if !name.is_ascii() && initials_match(query,name))),Self::Path(value)=>value.matches(path),
             Self::Ext(extensions)=>!dir&&name.rsplit_once('.').is_some_and(|(_,ext)|extensions.iter().any(|value|value==ext)),
             Self::Kind(expected)=>dir==*expected,Self::And(values)=>values.iter().all(|v|v.matches(name,dir,path,pinyin)),
             Self::Or(values)=>values.iter().any(|v|v.matches(name,dir,path,pinyin)),Self::Not(value)=>!value.matches(name,dir,path,pinyin),
         }
     }
 }
-fn pattern(pattern:&str,text:&str)->bool{
-    if pattern=="*"{return true;}
-    if !pattern.contains(['*','?']){return text.contains(pattern);}
-    let pattern:Vec<_>=pattern.chars().collect();let text:Vec<_>=text.chars().collect();let(mut p,mut t,mut star,mut retry)=(0,0,None,0);
-    while t<text.len(){if p<pattern.len()&&(pattern[p]=='?'||pattern[p]==text[t]){p+=1;t+=1;}
-        else if p<pattern.len()&&pattern[p]=='*'{star=Some(p);p+=1;retry=t;}
-        else if let Some(s)=star{retry+=1;t=retry;p=s+1;}else{return false;}}
-    while p<pattern.len()&&pattern[p]=='*'{p+=1;}p==pattern.len()
+#[derive(Debug)]
+enum Pattern {
+    Any, Plain(String), Contains(String), Prefix(String), Suffix(String), Glob(Vec<char>),
+}
+impl Pattern {
+    fn new(value:&str)->Self {
+        if !value.contains(['*','?']) {return Self::Plain(value.into());}
+        let inner=value.trim_matches('*');
+        if inner.is_empty(){return Self::Any;}
+        if !inner.contains(['*','?']) {
+            return match (value.starts_with('*'),value.ends_with('*')) {
+                (true,true)=>Self::Contains(inner.into()),
+                (true,false)=>Self::Suffix(inner.into()),
+                _=>Self::Prefix(inner.into()),
+            };
+        }
+        Self::Glob(value.chars().collect())
+    }
+    fn matches(&self,text:&str)->bool {
+        match self {
+            Self::Any=>true, Self::Plain(s)|Self::Contains(s)=>text.contains(s),
+            Self::Prefix(s)=>text.starts_with(s), Self::Suffix(s)=>text.ends_with(s),
+            Self::Glob(pattern)=>glob(pattern,text),
+        }
+    }
+}
+fn glob(pattern:&[char],text:&str)->bool {
+    let (mut p,mut t,mut star,mut retry)=(0,0,None,0);
+    while let Some(ch)=text[t..].chars().next() {
+        match pattern.get(p) {
+            Some('*')=>{p+=1;star=Some(p);retry=t;},
+            Some(&c) if c=='?' || c==ch=>{p+=1;t+=ch.len_utf8();},
+            _=>if let Some(resume)=star {
+                let Some(next)=text[retry..].chars().next() else{return false;};
+                retry+=next.len_utf8();t=retry;p=resume;
+            }else{return false;},
+        }
+    }
+    pattern[p..].iter().all(|c|*c=='*')
 }
 fn initials_match(query:&str,name:&str)->bool{
     use pinyin::ToPinyin;
@@ -77,6 +108,13 @@ fn initials_match(query:&str,name:&str)->bool{
         assert!(!query.matches("工程合同.pdf",false,r"e:\其他\工程合同.pdf"));
         assert!(!query.matches("图纸草稿.docx",false,r"e:\资料\图纸草稿.docx"));
         assert!(!query.matches("合同.pdf",true,r"e:\资料\合同.pdf"));
+    }
+    #[test]fn compiled_globs_preserve_unicode_boundaries_and_pinyin_scope(){
+        for (pattern,name,want) in [("*.rs","工程.rs",true),("a*","ba",false),("*a*","ba",true),
+            ("a?*甲","a📁中甲",true),("a?甲","a📁中甲",false),("a**?*b","a📁b",true),("?","",false)] {
+            assert_eq!(Query::parse(pattern,false).unwrap().matches(name,false,""),want);
+        }
+        assert!(!Query::parse("*zg*",true).unwrap().matches("中国",false,""));
     }
     #[test]fn unicode_wildcards_pinyin_and_invalid_syntax(){
         assert!(Query::parse("中文?.txt",false).unwrap().matches("中文甲.txt",false,""));

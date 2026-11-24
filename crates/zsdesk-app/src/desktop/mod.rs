@@ -174,6 +174,7 @@ thread_local! {
     static ALLOW_Z: Cell<bool> = const { Cell::new(false) };
     static LAYER_EVENTS: RefCell<std::collections::VecDeque<(u64, HWND, u32, u32)>> = const { RefCell::new(std::collections::VecDeque::new()) };
     static NEXT_LAYER_EVENT: Cell<u64> = const { Cell::new(1) };
+    static RAISE_CANDIDATE: Cell<Option<(isize,std::time::Instant)>> = const { Cell::new(None) };
     static LAYER_SETTLE_UNTIL: Cell<Option<std::time::Instant>> = const { Cell::new(None) };
     static MENU_WORKER: RefCell<Option<menu_worker::Worker>> = const { RefCell::new(None) };
     static DEFERRED_QUIT: Cell<bool> = const { Cell::new(false) };
@@ -233,7 +234,13 @@ fn settle_layer(host:HWND){
     LAYER_SETTLE_UNTIL.with(|until|until.set(Some(std::time::Instant::now()+std::time::Duration::from_millis(800))));
     unsafe{SetTimer(Some(host),TIMER_REPAIR_LAYER,100,None);}
 }
-pub(super) fn schedule_desktop_raise(host:HWND){unsafe{SetTimer(Some(host),TIMER_RAISE,180,None);}}
+fn observe_desktop_foreground(host: HWND, window: HWND) {
+    let _ = unsafe { KillTimer(Some(host), TIMER_RAISE) };
+    let desktop = unsafe { GetForegroundWindow() } == window
+        && matches!(class_name(window).as_str(), "WorkerW" | "Progman");
+    RAISE_CANDIDATE.with(|candidate| candidate.set(desktop.then(|| (window.0 as isize, std::time::Instant::now()))));
+    if desktop { unsafe { SetTimer(Some(host), TIMER_RAISE, 180, None); } }
+}
 
 struct MenuLayerRepair;
 impl Drop for MenuLayerRepair { fn drop(&mut self) { request_layer_repair(); } }
@@ -297,7 +304,8 @@ fn forward(key: &[u16], command: &DesktopCommand) -> Result<()> {
             if unsafe { GetPropW(hwnd, PCWSTR(key.as_ptr())) }.0 as usize != 1 { continue; }
             let data = COPYDATASTRUCT { dwData: DESKTOP_MAGIC, cbData: bytes.len() as u32, lpData: bytes.as_ptr() as *mut _ };
             let mut result = 0;
-            unsafe { SendMessageTimeoutW(hwnd, WM_COPYDATA, WPARAM(0), LPARAM(&data as *const COPYDATASTRUCT as isize), SMTO_ABORTIFHUNG, 3000, Some(&mut result)) };
+            let sent = unsafe { SendMessageTimeoutW(hwnd, WM_COPYDATA, WPARAM(0), LPARAM(&data as *const COPYDATASTRUCT as isize), SMTO_ABORTIFHUNG, 3000, Some(&mut result)) };
+            anyhow::ensure!(sent.0 != 0 && result == 1, "{}", zsdesk_core::i18n::text("桌面格子未确认接收命令"));
             return Ok(());
         }
         std::thread::sleep(std::time::Duration::from_millis(60));
@@ -306,6 +314,7 @@ fn forward(key: &[u16], command: &DesktopCommand) -> Result<()> {
 }
 
 fn run_host(config_path: PathBuf, explorer_config: PathBuf, command: DesktopCommand, key: &[u16]) -> Result<()> {
+    let config = host::load_config(&config_path).with_context(|| format!("无法读取桌面格子布局 {}", config_path.display()))?;
     if let Ok(session)=crate::storage::load(&explorer_config){crate::context_preferences::register(&explorer_config,&session.ui.context_menu);}
     let instance = HINSTANCE(unsafe { GetModuleHandleW(None)? }.0);
     let host_class = wide(HOST_CLASS);
@@ -320,7 +329,6 @@ fn run_host(config_path: PathBuf, explorer_config: PathBuf, command: DesktopComm
     HOST_HWND.with(|h| h.set(hwnd.0 as isize));
     let (family, _) = zsdesk_windows::gfx::system_ui_font(None);
     let gfx = Gfx::new(&family).context(zsdesk_core::i18n::text("Direct2D 初始化失败"))?;
-    let config = host::load_config(&config_path);
     HOST.with(|h| *h.borrow_mut() = Some(DesktopHost::new(hwnd, config_path, explorer_config, config, gfx)));
     with_host(|h| h.start());
     let _clipboard=clipboard::Listener::new(hwnd).ok();
@@ -330,6 +338,7 @@ fn run_host(config_path: PathBuf, explorer_config: PathBuf, command: DesktopComm
     let layer_hooks=[(EVENT_OBJECT_SHOW,EVENT_OBJECT_HIDE),(EVENT_OBJECT_REORDER,EVENT_OBJECT_REORDER),
         (EVENT_SYSTEM_MINIMIZESTART,EVENT_SYSTEM_MINIMIZEEND),(EVENT_OBJECT_CLOAKED,EVENT_OBJECT_UNCLOAKED)]
         .map(|(first,last)|unsafe{windows::Win32::UI::Accessibility::SetWinEventHook(first,last,None,Some(layer_window_hook),0,0,WINEVENT_OUTOFCONTEXT)});
+    observe_desktop_foreground(hwnd, unsafe { GetForegroundWindow() });
     execute(command);
     let mut msg = MSG::default();
     while unsafe { GetMessageW(&mut msg, None, 0, 0) }.0 > 0 {
@@ -340,6 +349,7 @@ fn run_host(config_path: PathBuf, explorer_config: PathBuf, command: DesktopComm
     external_drop::shutdown();
     if !foreground.is_invalid() { let _ = unsafe { windows::Win32::UI::Accessibility::UnhookWinEvent(foreground) }; }
     for hook in layer_hooks{if !hook.is_invalid(){let _=unsafe{windows::Win32::UI::Accessibility::UnhookWinEvent(hook)};}}
+    RAISE_CANDIDATE.with(|candidate|candidate.set(None));
     LAYER_SETTLE_UNTIL.with(|until|until.set(None));
     if let Some(mut host) = HOST.with(|h| h.borrow_mut().take()) { host.shutdown(); }
     let menu = MENU_WORKER.with(|worker| worker.borrow_mut().take());
@@ -398,7 +408,7 @@ pub fn guard(config_path: PathBuf, pid: u32, desktop_thread: Option<u32>) -> Res
     let waited=unsafe { WaitForMultipleObjects(&handles, false, INFINITE) }.0;
     anyhow::ensure!((waited as usize)<handles.len(), "{}", zsdesk_core::tr_format!("桌面监护等待失败：{waited:#x}" , waited=waited));
     drop(thread);drop(process);
-    let mut config = host::load_config(&config_path);
+    let mut config = host::load_config(&config_path)?;
     if config.settings.icons_hidden_by_zsdesk {
         unsafe { OleInitialize(None)?; }
         let restored=desktop::set_icons_visible(true);
@@ -431,14 +441,20 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
         WM_TIMER if wp.0==external_drop::TIMER=>{external_drop::tick();return LRESULT(0);}
         WM_CANCELMODE=>{outside_selection::cancel();return unsafe{DefWindowProcW(hwnd,msg,wp,lp)};}
         WM_CLOSE => { execute(DesktopCommand::Quit); return LRESULT(0); }
-        menu_worker::READY => { finish_menu_work(); return LRESULT(0); }
+        menu_worker::READY => { finish_menu_work(hwnd); return LRESULT(0); }
+        WM_TIMER if wp.0 == protocol::HostTimer::MenuReady as usize => {
+            let _ = unsafe { KillTimer(Some(hwnd), wp.0) };
+            finish_menu_work(hwnd); return LRESULT(0);
+        }
         WM_COPYDATA if lp.0 != 0 => {
             let data = unsafe { &*(lp.0 as *const COPYDATASTRUCT) };
             if data.dwData != DESKTOP_MAGIC || data.cbData > 65536 || data.lpData.is_null() { return LRESULT(0); }
             let bytes = unsafe { std::slice::from_raw_parts(data.lpData.cast::<u8>(), data.cbData as usize) };
-            if let Ok(command) = serde_json::from_slice::<DesktopCommand>(bytes) {
-                let payload = Box::into_raw(Box::new(command));
-                if unsafe { PostMessageW(Some(hwnd), WM_COMMAND_REQUEST, WPARAM(0), LPARAM(payload as isize)) }.is_err() { unsafe { drop(Box::from_raw(payload)); } }
+            let Ok(command) = serde_json::from_slice::<DesktopCommand>(bytes) else { return LRESULT(0) };
+            let payload = Box::into_raw(Box::new(command));
+            if unsafe { PostMessageW(Some(hwnd), WM_COMMAND_REQUEST, WPARAM(0), LPARAM(payload as isize)) }.is_err() {
+                unsafe { drop(Box::from_raw(payload)); }
+                return LRESULT(0);
             }
             return LRESULT(1);
         }
@@ -465,9 +481,13 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             return LRESULT(0);
         }
         WM_TIMER if wp.0 == TIMER_RAISE => {
-            let _ = unsafe { KillTimer(Some(hwnd), TIMER_RAISE) };
             let window = unsafe { GetForegroundWindow() };
-            if matches!(class_name(window).as_str(), "WorkerW" | "Progman") { with_host(|h| h.raise_above(window)); }
+            if let Some((expected, since)) = RAISE_CANDIDATE.with(Cell::get) {
+                if window.0 as isize == expected && (since.elapsed() < std::time::Duration::from_millis(180)
+                    || with_host(|host| host.raise_above(window)).is_none()) { return LRESULT(0); }
+            }
+            RAISE_CANDIDATE.with(|candidate| candidate.set(None));
+            let _ = unsafe { KillTimer(Some(hwnd), TIMER_RAISE) };
             return LRESULT(0);
         }
         WM_TIMER if wp.0 == TIMER_FOREGROUND => { flush_foreground(hwnd); return LRESULT(0); }
@@ -509,13 +529,9 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
         }
         WM_FOREGROUND => {
             let window = HWND(lp.0 as *mut _);
-            let class = class_name(window);
+            observe_desktop_foreground(hwnd, window);
             queue_foreground(hwnd,window);
             settle_layer(hwnd);
-            if class == "WorkerW" || class == "Progman" {
-                // "显示桌面" may finish raising its WorkerW after the event: raise again shortly.
-                unsafe { SetTimer(Some(hwnd), TIMER_RAISE, 180, None); }
-            }
             return LRESULT(0);
         }
         crate::language::CHANGED=>{with_host(|host|host.render_all());return LRESULT(0);}
@@ -549,6 +565,7 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
 fn point_of(lp: LPARAM) -> POINT { POINT { x: (lp.0 as i16) as i32, y: ((lp.0 >> 16) as i16) as i32 } }
 
 unsafe extern "system" fn fence_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    if msg==WM_NCDESTROY{zsdesk_windows::shell::file_dialogs::release(hwnd);}
     if msg != 0 && msg == zsdesk_windows::shell::menu::failure_message() {
         let text = wide(&zsdesk_core::tr_format!("右键菜单加载失败（0x{:08X}），隐藏设置仍保留。" , wp.0 as u32));
         unsafe { MessageBoxW(Some(hwnd), PCWSTR(text.as_ptr()), windows::core::PCWSTR(zsdesk_core::i18n::wide("ZSDesk 桌面格子").as_ptr()), MB_OK | MB_ICONWARNING); }
@@ -645,7 +662,7 @@ unsafe extern "system" fn fence_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
                 }).flatten();
                 if let Some((pidl,folder,profile))=selected{
                     if let Some(prefs)=crate::context_preferences::current(&profile){
-                        crate::context_menu_process::prewarm::start(hwnd,pidl,folder,false,crate::context_preferences::native(&prefs),None);
+                        crate::context_menu_process::prewarm::start(hwnd,pidl,Some(folder),false,crate::context_preferences::native(&prefs),None);
                     }
                 }
             }
@@ -725,7 +742,7 @@ fn run_after(after: After) {
     let _hold=hold.map(FenceModal::begin);
     match after {
         After::Nothing => {}
-        After::ItemMenu { fence, point } => item_menu(fence, point),
+        After::ItemMenu { fence, point, highlight } => item_menu(fence, point, highlight),
         After::FenceMenu { fence, point } => fence_menu(fence, point),
         After::FolderSystemMenu { fence, point } => folder_system_menu(fence, point),
         After::TrayMenu(point) => tray_menu(point),
@@ -824,14 +841,14 @@ fn queue_menu(mut request:menu_worker::Request){
     let fence=request.fence;
     if matches!(request.target,menu_worker::Target::Background{..})&&request.mode==crate::context_menu_process::Mode::More{request.layout=with_host(|host|host.menu_layout(fence)).flatten();}else{request.layout=None;}
     let owner=HWND(request.owner as*mut _);
-    let Some(host)=with_host(|host|host.hwnd)else{return;};
+    let Some(host)=with_host(|host|{host.clear_other_menu_highlights(request.highlight);host.hwnd})else{return;};
     let _=unsafe{SetForegroundWindow(owner)};
     request.foreground=unsafe{GetForegroundWindow()}.0 as isize;
     let result=MENU_WORKER.with(|worker|->anyhow::Result<()>{
         let mut worker=worker.borrow_mut();if worker.is_none(){*worker=Some(menu_worker::Worker::new(host)?);}
         let generation=worker.as_ref().unwrap().submit(request);with_host(|host|host.menu_started(fence,generation));Ok(())
     });
-    if let Err(error)=result{file_action_error(owner,&windows::core::Error::new(windows::core::HRESULT(0x80004005u32 as i32),error.to_string()));}
+    if let Err(error)=result{with_host(|host|host.menu_cancelled());file_action_error(owner,&windows::core::Error::new(windows::core::HRESULT(0x80004005u32 as i32),error.to_string()));}
     request_layer_repair();
 }
 
@@ -840,6 +857,10 @@ fn menu_target_current(request:&menu_worker::Request)->bool{
         let index=host.win_index(request.fence)?;
         if host.fences[index].hwnd.0 as isize!=request.owner||!unsafe{IsWindowVisible(host.fences[index].hwnd)}.as_bool(){return None;}
         Some(match &request.target{
+            menu_worker::Target::Items{..} if request.highlight.is_some()=>{
+                let entry=host.fences[index].menu_entry(request.highlight?)?;
+                menu_worker::Target::Items{pidls:vec![entry.pidl.clone()],key:None}
+            },
             menu_worker::Target::Items{..}=>menu_worker::Target::Items{pidls:host.selected_pidls(request.fence),key:None},
             menu_worker::Target::Background{..}=>background_target(host,request.fence),
         })
@@ -863,7 +884,17 @@ fn menu_target_current(request:&menu_worker::Request)->bool{
 fn menu_diagnostics()->serde_json::Value{MENU_WORKER.with(|worker|worker.borrow().as_ref().map_or(serde_json::Value::Null,menu_worker::Worker::diagnostics))}
 fn menu_request_current(generation:u64)->bool{MENU_WORKER.with(|worker|worker.borrow().as_ref().is_some_and(|worker|worker.is_current(generation)))}
 
-fn finish_menu_work(){
+fn finish_menu_work(hwnd: HWND){
+    // A Shell callback can re-enter while the desktop model is borrowed.
+    // Leave the events in the queue until their cleanup and redraw can run.
+    if HOST.with(|slot|slot.try_borrow_mut().is_err()) {
+        unsafe { SetTimer(Some(hwnd),protocol::HostTimer::MenuReady as usize,20,None); }
+        return;
+    }
+    struct Completion(u64,u64);
+    impl Drop for Completion {
+        fn drop(&mut self) { with_host(|host|host.menu_finished(self.0,self.1)); }
+    }
     let events=MENU_WORKER.with(|worker|worker.borrow_mut().as_mut().map(menu_worker::Worker::drain).unwrap_or_default());
     for event in events{match event{
         menu_worker::Event::Validate{request,before_invoke,answer}=>{
@@ -872,16 +903,33 @@ fn finish_menu_work(){
             let _=answer.try_send(valid);
         }
         menu_worker::Event::Finished{request,ids,outcome,effects,..}=>{
-            with_host(|host|host.menu_finished(request.fence,request.generation));
+            let _completion=Completion(request.fence,request.generation);
+            // Remove the pointer plate before validating/dispatching a command
+            // that may open a modal dialog. The captured target remains usable.
+            if let Some(token)=request.highlight {
+                with_host(|host| {
+                    if let Some(i)=host.win_index(request.fence) {
+                        if host.fences[i].hide_menu_highlight(token) { host.render(request.fence); }
+                    }
+                });
+            }
             let _layer=MenuLayerRepair;
             let owner=HWND(request.owner as*mut _);
             // Shell commands already ran against their captured PIDLs. Only
             // application actions require the current selection to still match.
-            let actionable=matches!(&outcome,Ok(MenuOutcome::Application(_)|MenuOutcome::Rename|MenuOutcome::Open|MenuOutcome::Explore|MenuOutcome::Copy|MenuOutcome::Cut|MenuOutcome::Paste|MenuOutcome::PinInExplorer|MenuOutcome::Delete{..}));
+            let actionable=matches!(&outcome,Ok(MenuOutcome::Application(_)|MenuOutcome::Rename|MenuOutcome::Open|MenuOutcome::Explore|MenuOutcome::Copy|MenuOutcome::Cut|MenuOutcome::Paste|MenuOutcome::PinInExplorer|MenuOutcome::Share|MenuOutcome::ChooseApplication|MenuOutcome::Delete{..}));
             // A superseded construction can fail after another menu was
             // requested. Its error must not interrupt the newer interaction.
             if outcome.is_err()&&!menu_request_current(request.generation){continue;}
             if actionable&&(!menu_request_current(request.generation)||!menu_target_current(&request)){continue;}
+            if let Ok(action @ (MenuOutcome::Share|MenuOutcome::ChooseApplication))=&outcome{
+                if let menu_worker::Target::Items{pidls,..}=&request.target{
+                    if let Err(error)=zsdesk_windows::shell::file_dialogs::show(owner,*action,pidls){
+                        if !zsdesk_windows::shell::file_transfer::is_cancelled(error.code()){file_action_error(owner,&error);}
+                    }
+                }
+                continue;
+            }
             if matches!(outcome,Ok(MenuOutcome::PinInExplorer)){
                 if let menu_worker::Target::Items{pidls,..}=&request.target{
                     let owner_id=owner.0 as isize;

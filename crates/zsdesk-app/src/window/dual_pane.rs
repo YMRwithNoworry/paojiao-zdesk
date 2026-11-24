@@ -117,7 +117,7 @@ impl WindowState {
         self.folder_sizes.cancel();
         self.browser_source=NEXT_BROWSER_SOURCE.fetch_add(1,Ordering::Relaxed).max(1);
         self.view_hwnd=HWND::default();
-        let panes=Panes{preview:false,details:self.session.ui.show_details};
+        let panes=Panes{preview:false,details:self.session.ui.show_details && !self.columns.active};
         let browser=unsafe {
             if cfg!(test) { ExplorerBrowserHost::create_transient_with_source(self.hwnd,win_rect(self.layout.browser),self.modern,panes,self.browser_source) }
             else { ExplorerBrowserHost::create_with_source(self.hwnd,win_rect(self.layout.browser),self.modern,panes,self.browser_source) }
@@ -302,8 +302,9 @@ impl WindowState {
     }
 
     pub(super) fn toggle_dual_pane(&mut self) {
-        self.session.ui.dual_pane=!self.session.ui.dual_pane;
-        self.ensure_dual_pane();self.invalidate();
+        use zsdesk_core::model::explorer::FolderLayout;
+        let next=if self.session.ui.dual_pane {FolderLayout::Single} else {FolderLayout::Dual};
+        self.choose_folder_layout(next);
     }
 
     pub(super) fn activate_pane(&mut self,right:bool) {

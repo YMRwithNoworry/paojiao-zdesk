@@ -76,7 +76,7 @@ pub struct Edges { pub left: bool, pub top: bool, pub right: bool, pub bottom: b
 pub enum Interaction {
     Move { cursor: POINT, rect: RECT },
     Resize { edges: Edges, cursor: POINT, rect: RECT },
-    Press { key: String, cursor: POINT },
+    Press { key: String, cursor: POINT, deselect_on_release: bool },
     /// Rubber-band selection; `start` is in content coordinates (client y +
     /// scroll at the press), `current` in client coordinates.
     Rubber { start: POINT, current: POINT, base: HashSet<String> },
@@ -270,6 +270,16 @@ impl Geometry {
         self.add = Rect::new(x.min(right - button).max(left), y, button, chip_h);
     }
 
+    fn title_at_bottom(&mut self){
+        let dy=self.height-self.title.height;
+        if dy<=0{return;}
+        for r in [&mut self.title,&mut self.more,&mut self.back,&mut self.add,&mut self.tab_list]{if !r.is_empty(){r.y+=dy;}}
+        for (_,r) in &mut self.tabs{r.y+=dy;}
+        let shift=self.height-self.title.height-self.content.height-self.content.y;
+        self.content.y+=shift;
+        let cell=&mut self.cells.first_cell;
+        for r in [&mut cell.cell,&mut cell.icon,&mut cell.label,&mut self.thumb]{if !r.is_empty(){r.y+=shift;}}
+    }
     pub fn hit(&self, x: i32, y: i32, dpi: u32, locked: bool, collapsed: bool) -> FenceHit {
         let edge = scale(EDGE, dpi);
         if !locked {
@@ -321,6 +331,12 @@ impl Geometry {
     }
 }
 
+struct PointerMenuTarget {
+    token: u64,
+    key: String,
+    visible: bool,
+}
+
 /// Runtime state of one fence window.
 pub struct FenceWin {
     pub id: u64,
@@ -328,6 +344,8 @@ pub struct FenceWin {
     pub dpi: u32,
     pub entries: Vec<ShellEntry>,
     pub selection: HashSet<String>,
+    /// Paint-only target of a mouse menu on a loose desktop icon.
+    menu_highlight: Option<PointerMenuTarget>,
     pub anchor: Option<usize>,
     pub focus: Option<usize>,
     pub hover: FenceHit,
@@ -351,6 +369,7 @@ pub struct FenceWin {
     pub tracking: bool,
     /// A collapsed fence temporarily rolled down under the pointer.
     pub peek: bool,
+    pub title_bottom:bool,
     /// Explicitly collapsed under the pointer: no peek until it leaves.
     pub peek_blocked: bool,
     /// The fence's tab group (empty or one entry for a plain fence).
@@ -370,11 +389,12 @@ impl FenceWin {
     pub fn advance_operation_epoch(&mut self){
         static NEXT:std::sync::atomic::AtomicU64=std::sync::atomic::AtomicU64::new(1);
         self.operation_epoch=NEXT.fetch_add(1,std::sync::atomic::Ordering::Relaxed);self.pending_selection=None;
+        self.menu_highlight=None;
     }
     pub fn new(id: u64) -> Self {
-        let mut value=Self { id, hwnd: HWND::default(), dpi: 96, entries: Vec::new(), selection: HashSet::new(), anchor: None, focus: None,
+        let mut value=Self { id, hwnd: HWND::default(), dpi: 96, entries: Vec::new(), selection: HashSet::new(), menu_highlight: None, anchor: None, focus: None,
             hover: FenceHit::None, scroll: 0, zoom_remainder: 0, standalone: false, interaction: None, surface: None, notify: None, notify_path: None, drop: None,
-            drop_hover: None, rename: None, message: None,notice:None,cut_keys:HashSet::new(),pending_selection:None,operation_epoch:0, tracking: false, peek: false, peek_blocked: false,
+            drop_hover: None, rename: None, message: None,notice:None,cut_keys:HashSet::new(),pending_selection:None,operation_epoch:0, tracking: false, peek: false, title_bottom:false, peek_blocked: false,
             tabs: Vec::new(), ghost: false, merge_hover: None, drop_tab: None };
         value.advance_operation_epoch();value
     }
@@ -394,6 +414,7 @@ impl FenceWin {
         if self.standalone { return Geometry::desktop_item(r.right-r.left, r.bottom-r.top, self.dpi, fence.icon_size.pixels(), self.entries.len()); }
         let mut g=Geometry::with_collapse(r.right-r.left,r.bottom-r.top,self.dpi,fence,self.entries.len(),self.scroll,fence.browse.is_some(),self.collapsed(fence));
         g.layout_tabs(&self.tabs, self.active_index(), self.dpi);
+        if self.title_bottom{g.title_at_bottom();}
         g.add_hidden = !self.title_hovered() || (self.peek && !self.tabbed());
         g
     }
@@ -418,11 +439,78 @@ impl FenceWin {
     }
 
     pub fn change_selection(&mut self, change: SelectionChange) {
+        if matches!(change, SelectionChange::Clear) {
+            self.selection.clear();
+            self.focus=None;
+            self.anchor=None;
+            return;
+        }
         self.selection = changed_selection(self.entries.iter().map(|entry| entry.key.as_str()), &self.selection, change);
         if !self.focus.and_then(|index| self.entries.get(index)).is_some_and(|entry| self.selection.contains(&entry.key)) {
             self.focus = self.entries.iter().position(|entry| self.selection.contains(&entry.key));
         }
         self.anchor = self.focus;
+    }
+
+    pub(super) fn toggles_on_plain_click(&self,key:&str)->bool {
+        !self.standalone && self.selection.len()==1 && self.selection.contains(key)
+    }
+
+    pub(super) fn select_for_pointer_menu(&mut self, index:usize, desktop_multiselect:bool) -> (Option<u64>,bool) {
+        let key=self.entries[index].key.clone();
+        if !self.standalone || desktop_multiselect {
+            let changed=!self.selection.contains(&key) || self.focus!=Some(index);
+            if !self.selection.contains(&key) { self.selection=HashSet::from([key]); }
+            self.focus=Some(index);
+            return (None,changed);
+        }
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let token = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.change_selection(SelectionChange::Clear);
+        self.menu_highlight = Some(PointerMenuTarget {token,key,visible:true});
+        (Some(token),true)
+    }
+
+    pub(super) fn menu_entry(&self, token: u64) -> Option<&ShellEntry> {
+        let target = self.menu_highlight.as_ref()?;
+        if token != target.token || !self.selection.is_empty() { return None; }
+        self.entries.iter().find(|entry| entry.key == target.key)
+    }
+
+    pub(super) fn hide_menu_highlight(&mut self, token:u64) -> bool {
+        let Some(target)=self.menu_highlight.as_mut() else { return false; };
+        if target.token!=token || !target.visible { return false; }
+        target.visible=false;
+        self.hover=FenceHit::None;
+        true
+    }
+
+    pub(super) fn clear_other_menu_highlight(&mut self, keep: Option<u64>) -> bool {
+        let Some(target) = &self.menu_highlight else { return false; };
+        if Some(target.token) == keep { return false; }
+        let repaint=target.visible;
+        self.menu_highlight=None;
+        if repaint { self.hover=FenceHit::None; }
+        repaint
+    }
+
+    fn paint_item_background(&self, cv:&Canvas, i:usize, rect:RectF, palette:&FencePalette) -> bool {
+        let key=&self.entries[i].key;
+        let selected=self.selection.contains(key) || self.menu_highlight.as_ref().is_some_and(|target| target.visible && &target.key==key);
+        let scale=self.dpi as f32/96.0;
+        let col=|c:zsdesk_ui::theme::Color| Color::rgba8(c.r,c.g,c.b,c.a);
+        // Alpha 1 keeps an unselected loose icon hit-testable without a visible plate.
+        if self.standalone { cv.fill(rect,Color::rgba8(0,0,0,1)); }
+        if self.drop_hover==Some(i) {
+            cv.round(rect,4.*scale,col(palette.selected));
+            cv.stroke_round(rect,4.*scale,col(palette.accent),1.5*scale);
+        } else if selected {
+            cv.round(rect,4.*scale,col(palette.selected));
+            cv.stroke_round(rect,4.*scale,col(palette.selected_border),1.);
+        } else if self.hover==FenceHit::Item(i) {
+            cv.round(rect,4.*scale,col(palette.hover));
+        }
+        selected
     }
 
     /// Paints and presents the fence. `icon` resolves item bitmaps.
@@ -448,7 +536,7 @@ impl FenceWin {
             if !self.standalone {
             cv.round(outer, radius, col(palette.background));
             // Title bar.
-            let title = RectF::new(0.0, 0.0, w as f32, g.title.height as f32);
+            let title=rf(g.title);
             cv.push_clip(title);
             cv.round(outer, radius, col(palette.title));
             cv.pop_clip();
@@ -501,13 +589,13 @@ impl FenceWin {
                 let side = if hovered { sf(66.0) } else { sf(36.0) };
                 let lock = if fence.locked { sf(16.0) } else { 0.0 };
                 let room = (w as f32 - side * 2.0 - lock).max(0.0);
-                let area = RectF::new(side + lock / 2.0, 0.0, room, title.h);
+                let area = RectF::new(side + lock / 2.0, title.y, room, title.h);
                 cv.text(&fence.title, area, &title_style, col(palette.text));
                 if fence.locked {
                     // Fluent lock glyph after the centred title (not a color emoji).
                     let (text_w, _) = cv.gfx().measure(&fence.title, &title_style, room);
                     let x = area.x + (room + text_w.min(room)) / 2.0 + sf(4.0);
-                    cv.glyph(glyph::LOCK, RectF::new(x, 0.0, sf(12.0), title.h), sf(10.0), col(palette.text_secondary));
+                    cv.glyph(glyph::LOCK, RectF::new(x, title.y, sf(12.0), title.h), sf(10.0), col(palette.text_secondary));
                 }
             }
             if !g.add_hidden && !g.add.is_empty() && self.merge_hover.is_none() {
@@ -519,7 +607,7 @@ impl FenceWin {
                 // Where the dragged fence will land as a tab.
                 let width = sf(96.0).min((w as f32 - sf(80.0)).max(sf(40.0)));
                 let x = if self.tabbed() { g.add.x as f32 } else { g.more.x as f32 - sf(4.0) - width };
-                let chip = RectF::new(x.min(w as f32 - sf(36.0) - width).max(sf(6.0)), (title.h - sf(28.0)) / 2.0, width, sf(28.0));
+                let chip = RectF::new(x.min(w as f32 - sf(36.0) - width).max(sf(6.0)), title.y+(title.h - sf(28.0)) / 2.0, width, sf(28.0));
                 cv.stroke_round(chip, sf(6.0), col(palette.accent), sf(1.5));
                 cv.text(incoming, chip.inset(sf(10.0), 0.0), &TextStyle::ui(sf(13.0)).weight(600), col(palette.accent));
             }
@@ -530,7 +618,7 @@ impl FenceWin {
                 cv.glyph(glyph::MORE, more, sf(13.0), col(palette.text));
             } else if show_counts {
                 let count = self.entries.len().to_string();
-                cv.text(&count, RectF::new(w as f32 - sf(40.0), 0.0, sf(30.0), title.h), &small, col(palette.text_secondary));
+                cv.text(&count, RectF::new(w as f32 - sf(40.0), title.y, sf(30.0), title.h), &small, col(palette.text_secondary));
             }
             if !g.back.is_empty() {
                 let back = rf(g.back);
@@ -549,21 +637,7 @@ impl FenceWin {
                 for (i,cell,bitmap) in &visible {
                     let i=*i;
                     let entry = &self.entries[i];
-                    let selected = self.selection.contains(&entry.key);
-                    let r = rf(cell.cell);
-                    // Nonzero alpha only over the icon's own cell. The rest of
-                    // the desktop remains native and receives clicks normally.
-                    if self.standalone { cv.fill(r, Color::rgba8(0, 0, 0, 1)); }
-                    if self.drop_hover == Some(i) {
-                        cv.round(r, sf(4.0), col(palette.selected));
-                        cv.stroke_round(r, sf(4.0), col(palette.accent), sf(1.5));
-                    } else if selected {
-                        cv.round(r, sf(4.0), col(palette.selected));
-                        cv.stroke_round(r, sf(4.0), col(palette.selected_border), 1.0);
-                    } else if self.hover == FenceHit::Item(i) {
-                        cv.round(r, sf(4.0), col(palette.hover));
-                    }
-                    if self.focus == Some(i) && selected { cv.stroke_round(r, sf(4.0), col(palette.selected_border), 1.0); }
+                    let selected=self.paint_item_background(cv,i,rf(cell.cell),palette);
                     let icon_rect = rf(cell.icon);
                     let opacity = if entry.ghosted || self.cut_keys.contains(&entry.key) { 0.5 } else { 1.0 };
                     match bitmap {
@@ -585,13 +659,13 @@ impl FenceWin {
                     if shadow.a > 0.0 && !selected {
                         cv.text(&entry.name, RectF::new(label.x + 1.0, label.y + 1.0, label.w, label.h), &label_style, shadow);
                     }
-                    cv.text(&entry.name, label, &label_style, col(palette.text));
+                    cv.text(&entry.name, label, &label_style, col(if selected{palette.selected_text}else{palette.text}));
                 }
                 if let Some(Interaction::Rubber { start, current, .. }) = &self.interaction {
                     let start = POINT { x: start.x, y: start.y - self.scroll };
                     let band = RectF::new(start.x.min(current.x) as f32, start.y.min(current.y) as f32,
                         (start.x - current.x).abs() as f32, (start.y - current.y).abs() as f32);
-                    cv.fill(band, col(palette.selected));
+                    cv.fill(band, col(palette.accent).with_alpha(0.18));
                     cv.stroke_round(band, 0.0, col(palette.selected_border), 1.0);
                 }
                 if !self.standalone{if let Some((text,until))=&self.notice{if std::time::Instant::now()<*until{
@@ -643,6 +717,65 @@ mod tests {
     use zsdesk_core::model::desktop::{FenceSource, Placement};
 
     fn fence() -> Fence { Fence::new(1, "t", FenceSource::Desktop, Placement::default()) }
+
+    #[test]
+    fn upward_geometry_moves_content_and_header_hit_targets_together(){
+        let mut g=Geometry::new(360,280,96,&fence(),40,0,false);
+        let before=g.cells.at(0).cell;g.title_at_bottom();let r=g.cells.at(0).cell;
+        assert_eq!(g.title.bottom(),g.height);assert!(g.content.bottom()<=g.title.y);
+        assert!(r.y<before.y && r.y>=g.content.y);assert_eq!(g.hit(170,g.title.y+12,96,true,false),FenceHit::Title);
+        assert_eq!(g.hit(g.more.x+5,g.more.y+5,96,true,false),FenceHit::More);
+    }
+    #[test]
+    fn desktop_pointer_menu_highlight_pixels_and_selection_lifetime() -> anyhow::Result<()> {
+        use windows::Win32::System::Ole::{OleInitialize,OleUninitialize};
+        unsafe { OleInitialize(None)?; }
+        struct Apartment;
+        impl Drop for Apartment { fn drop(&mut self) { unsafe { OleUninitialize(); } } }
+        let _apartment=Apartment;
+        let gfx=Gfx::new("Segoe UI")?;
+        let surface=Surface::new(40,40).expect("offscreen icon cell");
+        let mut win=FenceWin::new(1);
+        win.standalone=true;
+        win.entries.push(ShellEntry{key:"file".into(),name:"file".into(),pidl:vec![2,0,0,0],path:None,
+            is_folder:false,is_file_system:true,is_link:false,is_stream:false,can_drop:false,ghosted:false,size:None,modified:None});
+        for mode in [zsdesk_ui::theme::Mode::Light,zsdesk_ui::theme::Mode::Dark] {
+            let palette=FencePalette::new(mode,80);
+            let pixels=|w:&FenceWin| -> anyhow::Result<Vec<u8>> {
+                gfx.draw(&surface,|cv|{w.paint_item_background(cv,0,RectF::new(0.,0.,40.,40.),&palette);})?;
+                Ok(unsafe{std::slice::from_raw_parts(surface.bits,surface.pixel_bytes() as usize)}.to_vec())
+            };
+            let plain=pixels(&win)?;
+            win.hover=FenceHit::Item(0);
+            let (first,changed)=win.select_for_pointer_menu(0,false);
+            let first=first.unwrap();
+            assert!(changed && win.selection.is_empty());
+            assert_eq!(win.menu_entry(first).unwrap().pidl,[2,0,0,0]);
+            let highlighted=pixels(&win)?;
+            assert!(highlighted[(20*40+20)*4+3]>plain[(20*40+20)*4+3]);
+            let (next,_)=win.select_for_pointer_menu(0,false);
+            assert!(win.menu_entry(first).is_none());
+            assert!(!win.clear_other_menu_highlight(next));
+            assert_eq!(pixels(&win)?,highlighted);
+            assert!(!win.hide_menu_highlight(first));
+            assert!(win.hide_menu_highlight(next.unwrap()));
+            assert_eq!(pixels(&win)?,plain);
+            assert!(win.menu_entry(next.unwrap()).is_some()); // Menu action can still use its captured target.
+            assert!(!win.clear_other_menu_highlight(None));
+            assert!(win.menu_entry(next.unwrap()).is_none());
+            assert_eq!(pixels(&win)?,plain);
+            win.selection.insert("file".into());
+            assert_eq!(win.select_for_pointer_menu(0,true).0,None);
+            assert!(!win.clear_other_menu_highlight(None) && win.selection.contains("file"));
+            assert_eq!(pixels(&win)?,highlighted);
+            let token=win.select_for_pointer_menu(0,false).0.unwrap();
+            win.selection.insert("file".into()); // A fresh intentional selection made before completion.
+            assert!(win.menu_entry(token).is_none());
+            assert!(win.clear_other_menu_highlight(None) && win.selection.contains("file"));
+            win.change_selection(SelectionChange::Clear);
+        }
+        Ok(())
+    }
 
     #[test]
     fn inverse_selection_uses_the_complete_original_set() {

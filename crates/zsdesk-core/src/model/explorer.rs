@@ -209,17 +209,17 @@ pub struct WindowPlacement {
 /// Individually configurable actions in the Explorer command bar.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "kebab-case")]
-pub enum CommandBarItem { New, Cut, Copy, Paste, Rename, Share, Delete, Sort, View, More, PreviewPane, DetailsPane }
+pub enum CommandBarItem { New, NewFolder, Cut, Copy, Paste, Rename, Share, Delete, ExtractHere, Sort, View, More, PreviewPane, DetailsPane }
 
 impl CommandBarItem {
-    pub const ALL: [Self; 11] = [Self::New, Self::Cut, Self::Copy, Self::Paste, Self::Rename, Self::Share,
-        Self::Delete, Self::Sort, Self::View, Self::More, Self::PreviewPane];
+    pub const ALL: [Self; 13] = [Self::New, Self::NewFolder, Self::Cut, Self::Copy, Self::Paste, Self::Rename, Self::Share,
+        Self::Delete, Self::ExtractHere, Self::Sort, Self::View, Self::More, Self::PreviewPane];
 
     pub const fn key(self) -> &'static str {
         match self {
-            Self::New => "new", Self::Cut => "cut", Self::Copy => "copy", Self::Paste => "paste",
+            Self::New => "new", Self::NewFolder => "new-folder", Self::Cut => "cut", Self::Copy => "copy", Self::Paste => "paste",
             Self::Rename => "rename", Self::Share => "share", Self::Delete => "delete", Self::Sort => "sort",
-            Self::View => "view", Self::More => "more", Self::PreviewPane => "preview-pane", Self::DetailsPane => "details-pane",
+            Self::ExtractHere => "extract-here", Self::View => "view", Self::More => "more", Self::PreviewPane => "preview-pane", Self::DetailsPane => "details-pane",
         }
     }
 
@@ -324,6 +324,22 @@ impl Default for QuickSearchPreferences {
 }
 
 /// Chrome preferences shared by every tab.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FolderLayout { #[default] Single, Dual, Columns }
+
+#[derive(Clone,Copy,Debug,Default,Serialize,Deserialize,PartialEq,Eq)]
+#[serde(rename_all="snake_case")]
+pub enum BookmarkDisplay { #[default] Expanded, Categories, Dropdown }
+
+#[derive(Clone,Copy,Debug,Default,Serialize,Deserialize,PartialEq,Eq)]
+#[serde(rename_all="snake_case")]
+pub enum NavigationDivider { #[default] Hover, Always, Hidden }
+impl NavigationDivider {
+    pub fn visible(self,hovered:bool,dragging:bool)->bool{
+        match self{Self::Hover=>hovered||dragging,Self::Always=>true,Self::Hidden=>false}
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct ExplorerUi {
@@ -335,10 +351,14 @@ pub struct ExplorerUi {
     pub side_tabs_width: i32,
     pub side_tabs_compact: bool,
     pub dual_pane: bool,
+    #[serde(default)]
+    pub folder_layouts: std::collections::BTreeMap<PathBuf, FolderLayout>,
     /// Split position in thousandths, independent of monitor scaling.
     pub pane_ratio: u16,
     pub double_click_close_tab: bool,
+    pub right_click_close_tab: bool,
     pub double_click_blank_up: bool,
+    pub single_click_blank_up: bool,
     pub close_window_on_last_tab: bool,
     pub show_tab_count: bool,
     pub show_tab_list: bool,
@@ -352,6 +372,9 @@ pub struct ExplorerUi {
     pub tree_width: i32,
     pub show_bookmarks: bool,
     pub bookmarks_on_right: bool,
+    pub bookmark_display:BookmarkDisplay,
+    pub navigation_divider:NavigationDivider,
+    pub interface_text_percent:u16,
     /// Right bookmark panel width in DIP.
     pub bookmarks_width: i32,
     pub explorer_tray: bool,
@@ -393,6 +416,9 @@ pub struct SearchPreferences {
     pub idle_seconds:u32,pub everything_executable:Option<PathBuf>,pub folder_sizes:bool,
 }
 impl ExplorerUi{
+    pub fn interface_dpi(&self,monitor_dpi:u32)->u32{
+        ((monitor_dpi.max(96) as u64*u64::from(self.interface_text_percent.clamp(100,150))+50)/100).min(u32::MAX as u64) as u32
+    }
     pub fn tab_count_button_visible(&self)->bool{self.show_tab_count&&self.show_tab_list}
     pub fn search_preferences(&self)->SearchPreferences{SearchPreferences{backend:self.search_backend,backend_configured:self.search_backend_configured,include_development:self.search_include_development,
         index_metadata:self.search_index_metadata,pinyin_initials:self.search_pinyin_initials,idle_seconds:self.search_idle_seconds,
@@ -404,10 +430,10 @@ impl ExplorerUi{
 
 impl Default for ExplorerUi {
     fn default() -> Self {
-        Self { language:crate::i18n::LanguagePreference::System,startup_location:StartupLocation::default(),new_tab_location:NewTabLocation::default(), tab_placement:TabPlacement::Top, side_tabs_width:210,side_tabs_compact:true,dual_pane:false, pane_ratio:500,
-            double_click_close_tab:true, mouse_gestures:true, everything_folder_sizes:false,
-            close_window_on_last_tab:true,double_click_blank_up:true,show_tab_count:true,show_tab_list:true,tab_selection_emphasis:false,
-            show_tree: true, tree_width: 220, show_bookmarks: true, bookmarks_on_right:false, bookmarks_width:210, explorer_tray:false, show_preview: false, show_details: false,
+        Self { language:crate::i18n::LanguagePreference::System,startup_location:StartupLocation::default(),new_tab_location:NewTabLocation::default(), tab_placement:TabPlacement::Top, side_tabs_width:210,side_tabs_compact:true,dual_pane:false, folder_layouts:Default::default(), pane_ratio:500,
+            double_click_close_tab:true, right_click_close_tab:false, mouse_gestures:true, everything_folder_sizes:false,
+            close_window_on_last_tab:true,double_click_blank_up:true,single_click_blank_up:false,show_tab_count:true,show_tab_list:true,tab_selection_emphasis:false,
+            show_tree: true, tree_width: 220, show_bookmarks: true, bookmarks_on_right:false,bookmark_display:BookmarkDisplay::default(),navigation_divider:NavigationDivider::default(),interface_text_percent:100, bookmarks_width:210, explorer_tray:false, show_preview: false, show_details: false,
             command_bar: CommandBarPreferences::default(), context_menu: ContextMenuPreferences::default(),
             search_all_files: true, search_backend: SearchBackendPreference::Everything, search_backend_configured:false, space_preview: true,
             search_include_development:false,search_index_metadata:false,search_pinyin_initials:false,search_idle_seconds:300,
@@ -501,6 +527,7 @@ impl ExplorerSession {
         self.active_tab = self.active_tab.min(self.tabs.len() - 1);
         self.ui.tree_width = self.ui.tree_width.clamp(120, 800);
         self.ui.bookmarks_width = self.ui.bookmarks_width.clamp(120, 600);
+        if ![100,115,130,150].contains(&self.ui.interface_text_percent){self.ui.interface_text_percent=100;}
         self.ui.side_tabs_width=self.ui.side_tabs_width.clamp(120,420);
         let largest = self.tabs.iter().chain(self.secondary_pane.tabs.iter()).map(|t|t.id)
             .chain(self.bookmarks.iter().map(|b|b.id)).max().unwrap_or(0);
@@ -525,13 +552,15 @@ impl ExplorerSession {
                 let id=self.take_id();self.bookmarks[index].id=id;seen.insert(id);
             }
         }
+        let folders:std::collections::HashMap<u64,usize>=self.bookmarks.iter().enumerate().filter(|(_,b)|b.is_folder).map(|(i,b)|(b.id,i)).collect();
         for index in 0..self.bookmarks.len() {
             let id=self.bookmarks[index].id;let mut parent=self.bookmarks[index].parent_id;
+            if parent.is_none(){continue;}
             let mut ancestors=std::collections::HashSet::from([id]);let mut valid=true;
             while let Some(next)=parent {
                 if !ancestors.insert(next){valid=false;break;}
-                let Some(folder)=self.bookmarks.iter().find(|item|item.id==next&&item.is_folder)else{valid=false;break;};
-                parent=folder.parent_id;
+                let Some(&folder)=folders.get(&next)else{valid=false;break;};
+                parent=self.bookmarks[folder].parent_id;
             }
             if !valid {self.bookmarks[index].parent_id=None;}
         }

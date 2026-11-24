@@ -36,12 +36,12 @@ pub fn scale(value: i32, dpi: u32) -> i32 {
 
 /// Command bar entries, left to right.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum CommandId { New, Cut, Copy, Paste, Rename, Share, Delete, Sort, View, More, PreviewPane, DetailsPane }
+pub enum CommandId { New, NewFolder, Cut, Copy, Paste, Rename, Share, Delete, ExtractHere, Sort, View, More, PreviewPane, DetailsPane }
 
 impl CommandId {
     pub const fn preference(self) -> CommandBarItem {
         match self {
-            Self::New => CommandBarItem::New, Self::Cut => CommandBarItem::Cut, Self::Copy => CommandBarItem::Copy,
+            Self::ExtractHere => CommandBarItem::ExtractHere, Self::New => CommandBarItem::New, Self::NewFolder => CommandBarItem::NewFolder, Self::Cut => CommandBarItem::Cut, Self::Copy => CommandBarItem::Copy,
             Self::Paste => CommandBarItem::Paste, Self::Rename => CommandBarItem::Rename, Self::Share => CommandBarItem::Share,
             Self::Delete => CommandBarItem::Delete, Self::Sort => CommandBarItem::Sort, Self::View => CommandBarItem::View,
             Self::More => CommandBarItem::More, Self::PreviewPane => CommandBarItem::PreviewPane, Self::DetailsPane => CommandBarItem::DetailsPane,
@@ -50,13 +50,13 @@ impl CommandId {
     /// Label shown next to the icon; icon-only buttons return `None`.
     pub fn label(self) -> Option<&'static str> {
         match self {
-            Self::New => Some("新建"), Self::Sort => Some("排序"), Self::View => Some("查看"),
+            Self::ExtractHere => Some("解压"), Self::New => Some("新建"), Self::Sort => Some("排序"), Self::View => Some("查看"),
             Self::PreviewPane => Some("预览"), Self::DetailsPane => Some("详细信息"), _ => None,
         }.map(zsdesk_core::i18n::text)
     }
     pub fn tooltip(self) -> &'static str {
         zsdesk_core::i18n::text(match self {
-            Self::New => "新建项目", Self::Cut => "剪切 (Ctrl+X)", Self::Copy => "复制 (Ctrl+C)",
+            Self::ExtractHere => "解压到当前文件夹", Self::New => "新建项目", Self::NewFolder => "新建文件夹 (Ctrl+Shift+N)", Self::Cut => "剪切 (Ctrl+X)", Self::Copy => "复制 (Ctrl+C)",
             Self::Paste => "粘贴 (Ctrl+V)", Self::Rename => "重命名 (F2)", Self::Share => "共享",
             Self::Delete => "删除 (Del)", Self::Sort => "排序方式", Self::View => "布局和视图选项",
             Self::More => "查看更多", Self::PreviewPane => "预览窗格 (Alt+P)", Self::DetailsPane => "详细信息窗格 (Alt+Shift+P)",
@@ -64,14 +64,14 @@ impl CommandId {
     }
     pub const fn has_dropdown(self) -> bool { matches!(self, Self::New | Self::Sort | Self::View) }
     const fn width(self) -> i32 {
-        match self { Self::New | Self::Sort | Self::View => 82, Self::PreviewPane => 72, Self::DetailsPane => 100, _ => 40 }
+        match self { Self::New | Self::Sort | Self::View => 82, Self::PreviewPane | Self::ExtractHere => 72, Self::DetailsPane => 100, _ => 40 }
     }
 }
 
 const COMMAND_GROUPS: &[&[CommandId]] = &[
-    &[CommandId::New],
+    &[CommandId::New, CommandId::NewFolder],
     &[CommandId::Cut, CommandId::Copy, CommandId::Paste, CommandId::Rename, CommandId::Share, CommandId::Delete],
-    &[CommandId::Sort, CommandId::View],
+    &[CommandId::ExtractHere, CommandId::Sort, CommandId::View],
     &[CommandId::More],
     &[CommandId::PreviewPane],
 ];
@@ -96,6 +96,7 @@ pub struct ChromeInput<'a> {
     pub tree_width: i32,
     pub show_bookmarks: bool,
     pub bookmarks_on_right: bool,
+    pub bookmark_dropdown:bool,
     pub bookmarks_width: i32,
     /// Search is active; show the close action beside the fixed native edit.
     pub search_panel_open: bool,
@@ -247,6 +248,7 @@ pub struct ChromeLayout {
     pub status_details: Rect,
     pub status_tiles: Rect,
     pub status_dual_pane: Rect,
+    pub status_columns: Rect,
     /// Bottom of the top chrome (start of the content area).
     pub top: i32,
 }
@@ -278,10 +280,12 @@ pub enum Hit {
     BookmarkSplitter,
     Splitter,
     PaneSplitter,
+    ColumnDivider(usize),
     PaneHeader(usize),
     StatusDetails,
     StatusTiles,
     StatusDualPane,
+    StatusColumns,
     Status,
 }
 
@@ -303,11 +307,11 @@ impl ChromeLayout {
         let button_h = caption.map_or(s(STRIP_H), |r| r.height);
         let button_y = caption.map_or(0, |r| r.y);
         let caption_left = caption.map_or(width - input.caption_width.max(0), |r| r.x).clamp(0, width);
-        let right_edge = (caption_left - s(4)).max(0);
+        let right_edge = caption_left;
         if right_edge >= button {
             layout.app_menu = Rect::clamped(right_edge - button, button_y, button, button_h);
-            if input.show_tab_list && layout.app_menu.x >= button + s(2) {
-                layout.tab_list = Rect::clamped(layout.app_menu.x - s(2) - button, button_y, button, button_h);
+            if input.show_tab_list && layout.app_menu.x >= button {
+                layout.tab_list = Rect::clamped(layout.app_menu.x - button, button_y, button, button_h);
             }
         }
         let drag_space = s(40);
@@ -337,8 +341,9 @@ impl ChromeLayout {
         let width=(width-panel_width).max(0);
         // Bookmarks bar, directly under the tabs.
         let mut nav_y = layout.strip.bottom();
-        let right_bookmarks=input.show_bookmarks&&input.bookmarks_on_right&&width>=s(540);
-        if input.show_bookmarks&&!right_bookmarks {
+        let dropdown=input.show_bookmarks&&input.bookmark_dropdown;
+        let right_bookmarks=input.show_bookmarks&&!dropdown&&input.bookmarks_on_right&&width>=s(540);
+        if input.show_bookmarks&&!right_bookmarks&&!dropdown {
             layout.bookmarks_row = Rect::clamped(0, nav_y, width, s(BOOKMARK_H));
             let chip_h = s(26);
             let chip_y = nav_y + (s(BOOKMARK_H) - chip_h) / 2;
@@ -364,6 +369,10 @@ impl ChromeLayout {
         for slot in [&mut layout.back, &mut layout.forward, &mut layout.up, &mut layout.refresh] {
             *slot = Rect::clamped(nx, nb_y, nav_button, s(32));
             nx += nav_button + s(2);
+        }
+        if dropdown {
+            let w=input.bookmark_widths.first().copied().unwrap_or(s(76));let h=s(26);
+            layout.bookmark_overflow=Rect::clamped(nx,nav_y+(s(NAV_H)-h)/2,w,h);nx+=w+s(2);
         }
         let search_w = (width / 4).clamp(s(140), s(280));
         let field_h = s(32);
@@ -442,6 +451,7 @@ impl ChromeLayout {
             layout.status_tiles = Rect { x: width - s(8) - toggle.width, ..toggle };
             layout.status_details = Rect { x: layout.status_tiles.x - s(2) - toggle.width, ..toggle };
             layout.status_dual_pane = Rect { x: layout.status_details.x - s(2) - toggle.width, ..toggle };
+            layout.status_columns = Rect { x: layout.status_dual_pane.x - s(2) - toggle.width, ..toggle };
         }
         let content_h = (status_y - layout.top).max(0);
         if input.show_tree && width > s(MIN_TREE_W) * 2 {
@@ -497,7 +507,7 @@ impl ChromeLayout {
             layout.set_tab_viewport(input.tab_count,first);
             for rect in [&mut layout.nav_row,&mut layout.back,&mut layout.forward,&mut layout.up,&mut layout.refresh,&mut layout.address,&mut layout.search,
                 &mut layout.command_row,&mut layout.command_toggle,&mut layout.bookmarks_row,&mut layout.bookmarks_title,&mut layout.bookmark_overflow,&mut layout.bookmark_splitter,&mut layout.tree,&mut layout.splitter,&mut layout.browser,
-                &mut layout.status,&mut layout.status_details,&mut layout.status_tiles,&mut layout.status_dual_pane]{rect.x+=content_offset;}
+                &mut layout.status,&mut layout.status_details,&mut layout.status_tiles,&mut layout.status_dual_pane,&mut layout.status_columns]{rect.x+=content_offset;}
             for (_,rect) in &mut layout.commands{rect.x+=content_offset;}
             for rect in layout.bookmarks.iter_mut().chain(layout.separators.iter_mut()){rect.x+=content_offset;}
             layout.search_panel.translate_x(content_offset);
@@ -557,6 +567,7 @@ impl ChromeLayout {
             if self.app_menu.contains(x, y) { return Hit::AppMenu; }
             return if self.strip.contains(x,y){Hit::Caption}else{Hit::None};
         }
+        if self.bookmark_overflow.contains(x,y){return Hit::BookmarkOverflow;}
         if self.nav_row.contains(x, y) {
             if self.search_panel.close.contains(x,y) { return Hit::SearchPanel(SearchPanelHit::Close); }
             for (rect, hit) in [(self.back, Hit::Back), (self.forward, Hit::Forward), (self.up, Hit::Up),
@@ -571,7 +582,6 @@ impl ChromeLayout {
         if self.search_panel.card.contains(x, y) { return self.search_panel.hit(x, y); }
         if self.bookmarks_row.contains(x, y) {
             if let Some(i) = self.bookmarks.iter().position(|r| r.contains(x, y)) { return Hit::Bookmark(i); }
-            if self.bookmark_overflow.contains(x, y) { return Hit::BookmarkOverflow; }
             return Hit::BookmarksBar;
         }
         if self.bookmark_splitter.contains(x,y){return Hit::BookmarkSplitter;}
@@ -583,6 +593,7 @@ impl ChromeLayout {
         if !self.status.is_empty() && self.status.contains(x, y) {
             if self.status_details.contains(x, y) { return Hit::StatusDetails; }
             if self.status_tiles.contains(x, y) { return Hit::StatusTiles; }
+            if self.status_columns.contains(x, y) { return Hit::StatusColumns; }
             if self.status_dual_pane.contains(x, y) { return Hit::StatusDualPane; }
             return Hit::Status;
         }
@@ -669,10 +680,24 @@ mod tests {
 
     fn input(width: i32, tabs: usize, active: usize, dpi: u32) -> ChromeInput<'static> {
         ChromeInput { tab_placement:zsdesk_core::model::explorer::TabPlacement::Top, side_tabs_width:210,side_tabs_compact:true,width, height: 800, dpi, caption_width: scale(138, dpi), caption_button: None,
-            tab_count: tabs, active_tab: active, show_tab_list:true, show_tree: true, tree_width: scale(220, dpi), show_bookmarks: true,bookmarks_on_right:false,bookmarks_width:scale(210,dpi),
+            tab_count: tabs, active_tab: active, show_tab_list:true, show_tree: true, tree_width: scale(220, dpi), show_bookmarks: true,bookmarks_on_right:false,bookmark_dropdown:false,bookmarks_width:scale(210,dpi),
             command_bar: &DEFAULT_COMMAND_BAR, status_bar: true, bookmark_widths: &[], search_panel_open: false }
     }
 
+    #[test]
+    fn compact_bookmarks_use_the_same_measured_chip_size_and_free_the_bar(){
+        use zsdesk_core::model::explorer::TabPlacement;
+        for dpi in [96,120,144,192]{for side in [TabPlacement::Top,TabPlacement::Left,TabPlacement::Right]{
+            let widths=[scale(82,dpi)];let base=ChromeInput{tab_placement:side,bookmark_widths:&widths,..input(scale(1300,dpi),3,1,dpi)};
+            let bar=ChromeLayout::new(&base);
+            let compact=ChromeLayout::new(&ChromeInput{bookmark_dropdown:true,bookmarks_on_right:true,..base});
+            let b=compact.bookmark_overflow;
+            assert!(compact.bookmarks_row.is_empty()&&compact.bookmarks.is_empty());
+            assert_eq!((b.width,b.height),(bar.bookmarks[0].width,bar.bookmarks[0].height));
+            assert!(b.x>=compact.refresh.right()&&b.right()<=compact.address.x);
+            assert_eq!(compact.hit(b.x+b.width/2,b.y+b.height/2),Hit::BookmarkOverflow);
+        }}
+    }
     #[test]
     fn disabled_status_has_no_buttons_or_hit_targets() {
         for dpi in [96, 144, 192] {
@@ -929,14 +954,18 @@ mod tests {
         for dpi in [96, 120, 144, 192] {
             let caption = Rect::new(1600 - scale(138, dpi), scale(3, dpi), scale(46, dpi), scale(30, dpi));
             let l = ChromeLayout::new(&ChromeInput { caption_button: Some(caption), ..input(1600, 2, 0, dpi) });
-            assert_eq!(l.new_tab.y, l.tabs[0].rect.y);
-            assert_eq!(l.new_tab.height, l.tabs[0].rect.height);
+            let tab = l.tabs[0].rect;
+            assert_eq!((l.new_tab.y, l.new_tab.height), (tab.y, tab.height));
+            assert_eq!(l.hit(l.new_tab.x + l.new_tab.width / 2, tab.y + tab.height / 2), Hit::NewTab);
             for rect in [l.tab_list, l.app_menu] {
                 assert_eq!(rect.y, caption.y);
                 assert_eq!(rect.height, caption.height);
                 assert_eq!(rect.y * 2 + rect.height, caption.y * 2 + caption.height);
-                assert!(rect.right() < caption.x);
+                assert!(rect.right() <= caption.x);
+                assert_eq!(rect.width,caption.width);
             }
+            assert_eq!(l.tab_list.right(),l.app_menu.x);
+            assert_eq!(l.app_menu.right(),caption.x);
         }
     }
 
@@ -948,13 +977,24 @@ mod tests {
         let after = ChromeLayout::new(&ChromeInput { command_bar: &preferences, ..input(1400, 2, 0, 96) });
         assert!(after.command_rect(CommandId::Cut).is_none());
         assert_eq!(after.command_rect(CommandId::Copy).unwrap().x, before.command_rect(CommandId::Cut).unwrap().x);
+        assert!(after.command_rect(CommandId::NewFolder).is_some());
         preferences.set_item_visible(CommandBarItem::New, false);
+        preferences.set_item_visible(CommandBarItem::NewFolder, false);
         let after = ChromeLayout::new(&ChromeInput { command_bar: &preferences, ..input(1400, 2, 0, 96) });
         assert_eq!(after.commands[0].0, CommandId::Copy);
         assert_eq!(after.commands[0].1.x, 12);
         assert!(after.separators.iter().all(|r| r.x > after.commands[0].1.right()));
     }
 
+    #[test]
+    fn column_layout_switch_is_left_of_dual_pane_and_has_its_own_hit_target(){
+        for dpi in [96,120,144,192]{
+            let layout=ChromeLayout::new(&input(1440,3,0,dpi));
+            assert!(layout.status_columns.right()<layout.status_dual_pane.x);
+            assert_eq!(layout.hit(layout.status_columns.x+2,layout.status_columns.y+2),Hit::StatusColumns);
+            assert_eq!(layout.hit(layout.status_dual_pane.x+2,layout.status_dual_pane.y+2),Hit::StatusDualPane);
+        }
+    }
     #[test]
     fn hidden_command_bar_gives_its_entire_height_to_content() {
         for dpi in [96, 120, 144, 192] {

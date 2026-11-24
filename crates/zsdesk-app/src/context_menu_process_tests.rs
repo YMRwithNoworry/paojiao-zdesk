@@ -135,6 +135,57 @@ fn read_clipboard_retry(stage:&str)->Result<(windows::Win32::System::Com::IDataO
         pump(20);
     }
 }
+
+// Open no popup and authorize no command. Exercise the actual compact provider
+// and its original Shell sharing cascade after handing off the prepared worker.
+#[test]
+#[ignore="Read-only shell menu query on a Windows installation"]
+fn prepared_worker_queries_file_commands_without_display() -> Result<()> {
+    let root=PathBuf::from(std::env::var_os("ZSDESK_NATIVE_TEST_OUTPUT").context("test output")?);
+    let folder=root.join("files");
+    fs::create_dir_all(&folder)?;
+    let file=folder.join("menu.txt");
+    fs::write(&file,b"menu test")?;
+    let _fixture=Fixtures(vec![file.clone()]);
+    let _root=Environment::set("ZSDESK_MENU_ROOT",root.join("workers"));
+    let _pool=PoolCleanup;
+    unsafe { OleInitialize(None)?; }
+    struct Apartment;
+    impl Drop for Apartment { fn drop(&mut self){unsafe{OleUninitialize()}} }
+    let _apartment=Apartment;
+    let owner=Owner(unsafe{CreateWindowExW(WINDOW_EX_STYLE::default(),w!("STATIC"),w!(""),WINDOW_STYLE::default(),0,0,0,0,Some(HWND_MESSAGE),None,None,None)}?);
+    let pidl=|path:PathBuf| zsdesk_windows::shell::pidl::location_pidl(&zsdesk_core::model::explorer::ShellLocation::Path(path)).context("item identity");
+    let parent=pidl(folder.clone())?;
+    let view=MenuViewContext{folder:Some(parent.clone()),..Default::default()};
+    let mut options=ContextMenuOptions::default();
+    if let Ok(app)=std::env::var("ZSDESK_MENU_TEST_FIRST_PAGE_APP"){ options.native_first_page_apps=Some(vec![app]); }
+    let query=||->Result<(u32,bool,u64)> {
+        let _probe=Environment::set("ZSDESK_MENU_TEST_PROBE","query-compact-catalog");
+        let mut client=Client::spawn_with_context(owner.0,POINT::default(),vec![pidl(file.clone())?],Some(folder.clone()),options.clone(),MenuInterceptions::default(),Mode::More,false,None,view.clone())?;
+        let (outcome,(bind,_))=complete_with_guard(&mut client,owner.0,&mut |invoke| !invoke)?;
+        ensure!(matches!(outcome,Ok(MenuOutcome::Dismissed)),"catalog query failed: {outcome:?}");
+        let status=client.last_status.as_ref().context("worker status")?;
+        ensure!(!status.catalog.is_empty()&&!client.committed&&client.timing.menu_open_observation.is_none(),"expected a read-only query");
+        if let Some(sharing)=status.catalog.iter().find(|row|row.label==zsdesk_core::i18n::text("共享对象")){
+            ensure!(!sharing.children.is_empty(),"sharing submenu lost its Shell commands");
+        }
+        fs::write(root.join("compact-catalog.json"),serde_json::to_vec_pretty(&status.catalog)?)?;
+        Ok((client.pid().context("worker PID")?,client.timing.reused_process,bind))
+    };
+    let (_,cold_reused,cold_bind)=query()?;
+    ensure!(!cold_reused,"unexpected worker before prewarm");
+    prewarm::start(owner.0,parent,Some(folder.clone()),true,options.clone(),Some(view.clone()));
+    let deadline=Instant::now()+Duration::from_secs(6);
+    let prepared=loop {
+        if let Some(pid)=idle_worker_diagnostics()[0]["pid"].as_u64(){break pid as u32;}
+        ensure!(Instant::now()<deadline,"worker failed to prepare");pump(10);
+    };
+    let (pid,reused,warm_bind)=query()?;
+    ensure!(reused&&pid==prepared,"prepared PID was discarded or replaced");
+    ensure!(idle_worker_diagnostics().as_array().is_some_and(Vec::is_empty),"drawn menu remained parked after use");
+    eprintln!("prepared_pid={pid} cold_bind_us={cold_bind} prepared_bind_us={warm_bind}");
+    Ok(())
+}
 fn exercise(root:&Path,desktop_name:&str)->Result<serde_json::Value>{
     unsafe{OleInitialize(None)?;}
     struct Apartment;impl Drop for Apartment{fn drop(&mut self){unsafe{OleUninitialize();}}}let _apartment=Apartment;

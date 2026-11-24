@@ -4,7 +4,7 @@ Windows 多标签文件管理器与桌面格子。可以在一个窗口里浏览
 
 [下载安装](https://github.com/YMRwithNoworry/paojiao-zdesk/releases/latest) · [使用说明](docs/user-guide.md) · [更新日志](CHANGELOG.md) · [问题反馈](https://github.com/YMRwithNoworry/paojiao-zdesk/issues)
 
-适用于 Windows 10 / 11，64 位。当前版本为 **0.4.0**，支持简体中文和英文界面。
+适用于 Windows 10 / 11，64 位。当前版本为 **0.4.3**，支持简体中文和英文界面。
 
 English UI is available. Non-Chinese Windows systems use English by default. Choose **≡ → Language → English** to change the application language immediately. Each package includes `README.en.txt`.
 
@@ -34,13 +34,18 @@ English UI is available. Non-Chinese Windows systems use English by default. Cho
 | 操作 | 快捷键或入口 |
 |---|---|
 | 新建、关闭、恢复标签 | Ctrl+T / Ctrl+W / Ctrl+Shift+T |
-| 标签栏 | 右键标签打开该标签的菜单，右键标签栏空白处关闭当前标签 |
+| 标签栏 | 默认右键标签打开菜单；可在“≡ → 标签页”开启右键直接关闭，Shift+右键仍可打开菜单 |
 | 在新标签打开文件夹 | 鼠标中键点击文件夹 |
 | 后退、前进、上一级 | Alt+← / Alt+→ / Alt+↑，支持鼠标侧键 |
 | 调整图标大小 | Ctrl+滚轮 |
 | 快速预览 | 空格；右侧预览窗格用 Alt+P |
 | 新窗口 | Ctrl+N |
-| 双击空白处返回上一级 | 在“预览与操作”中开关 |
+| 单击或双击文件夹空白处返回上一级 | 在“预览与操作”中选择，单击返回默认关闭 |
+| 新建文件夹 | 命令栏的文件夹按钮或 Ctrl+Shift+N |
+| 多栏浏览 | 点击右下角双栏按钮左侧的三栏图标。左侧列出父目录，单击其中的文件夹后，中栏显示该文件夹。中栏单击项目时右栏预览，双击文件夹进入下一层。顶部面包屑可直接返回上级。 |
+| 文件夹布局记忆 | 文件夹分别记住手动选定的单栏、双栏或多栏。再次点击已启用的布局按钮可以保存为单栏。尚未指定布局的文件夹沿用当前布局。 |
+| 全局快捷键搜索 | 在资源管理器的“≡ → 系统集成 → 搜索快捷键设置”中录制或输入自定义组合键。搜索窗口在前台时，再按唤起键可收起。按分类筛选结果，↑ / ↓ 选择，Enter 打开，Ctrl+Enter 定位。结果支持多选和文件右键菜单，Ctrl+C 复制文件，Ctrl+Shift+C 复制路径。 |
+| 解压到当前文件夹 | 选中压缩包，点击命令栏的“解压”。包内只有一个顶层文件夹时保留该文件夹，其余布局放入与压缩包同名的新文件夹。目标重名时自动编号。 |
 | 显示文件夹总大小并排序 | 排序 → 计算并按总大小排序 |
 | 检查版本更新 | 关于 ZSDesk → 检查更新 |
 

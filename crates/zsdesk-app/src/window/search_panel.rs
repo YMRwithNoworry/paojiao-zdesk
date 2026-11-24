@@ -81,6 +81,7 @@ fn color(c: zsdesk_ui::theme::Color) -> Color { Color::rgba8(c.r, c.g, c.b, c.a)
 fn sort_label(sort: SearchSort) -> &'static str {
     match sort {
         SearchSort::NameAsc => zsdesk_core::i18n::text("名称升序"), SearchSort::NameDesc => zsdesk_core::i18n::text("名称降序"),
+        SearchSort::ModifiedAsc=>zsdesk_core::i18n::text("修改时间升序"), SearchSort::SizeAsc=>zsdesk_core::i18n::text("大小升序"),
         SearchSort::ModifiedDesc => zsdesk_core::i18n::text("最近修改"), SearchSort::SizeDesc => zsdesk_core::i18n::text("大小降序"),
     }
 }

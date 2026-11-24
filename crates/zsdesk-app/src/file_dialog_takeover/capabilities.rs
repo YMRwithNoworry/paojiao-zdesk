@@ -74,6 +74,11 @@ fn preserve(primary_kind:Option<SelectionKind>,actions:&[Action])->Option<Preser
         .then_some(Preservation::AdditionalSelectionAction)
 }
 
+fn supported(kind:Option<SelectionKind>,actions:&[Action])->std::result::Result<bool,Preservation>{
+    if let Some(reason)=preserve(kind,actions){return Err(reason);}
+    Ok(kind==Some(SelectionKind::Files) && actions.iter().any(|a|!a.primary && a.kind==ActionKind::MobileUpload))
+}
+
 /// The original dialog remains the authority for every extra button and
 /// dropdown callback. Never synthesize an IDOK result for those contracts.
 pub(super) fn inspect(dialog:HWND,part:&Parts,kind:Option<SelectionKind>,automation:Option<&IUIAutomation>)->Result<bool,Preservation>{
@@ -129,6 +134,17 @@ pub(super) fn inspect(dialog:HWND,part:&Parts,kind:Option<SelectionKind>,automat
 #[cfg(test)]mod tests{
     use super::*;
     fn action(label:&str,primary:bool)->Action{Action{kind:action_kind(label),primary,dropdown:false,secondary_confirmation:false}}
+    #[test]fn browser_upload_offers_native_alternative_without_disabling_local_file_selection(){
+        for caption in ["从移动设备上传","Upload from mobile","從行動裝置上傳"]{
+            let mut mobile=action(caption,false);mobile.secondary_confirmation=true;
+            let open=action("打开(&O)",true);
+            assert_eq!(supported(Some(SelectionKind::Files),&[open.clone(),mobile.clone()]),Ok(true));
+            let mut other=action("Custom action",false);other.secondary_confirmation=true;
+            assert_eq!(supported(Some(SelectionKind::Files),&[open.clone(),mobile.clone(),other]),Err(Preservation::AdditionalSelectionAction));
+            assert_eq!(supported(Some(SelectionKind::Files),&[open]),Ok(false));
+            assert_eq!(supported(Some(SelectionKind::Folders),&[action("Choose folder",true),mobile]),Err(Preservation::AdditionalSelectionAction));
+        }
+    }
     #[test]fn a_file_dialog_with_a_folder_action_keeps_both_native_entry_points(){
         let actions=[action("打开(&O)",true),action("选择文件夹(&D)",false),action("取消",false)];
         assert_eq!(preserve(Some(SelectionKind::Files),&actions),Some(Preservation::MixedSelection));

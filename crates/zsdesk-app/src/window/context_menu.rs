@@ -25,26 +25,17 @@ pub(super) fn prewarm_active_view(owner:HWND){
         let Ok(state)=unsafe{&*slot}.try_borrow()else{return;};
         let Some(state)=state.as_ref()else{return;};
         if state.destroyed || state.pending.is_some() || state.picker.is_some(){return;}
-        let ShellLocation::Path(folder)=state.current_location()else{return;};
+        let folder=match state.current_location(){ShellLocation::Path(path)=>Some(path.clone()),ShellLocation::ThisPc=>None,_=>return};
         let Some(identity)=state.identity_for_source(state.browser_source)else{return;};
         let prefs=crate::context_preferences::current(&state.config_path).unwrap_or_else(||state.session.ui.context_menu.clone());
-        (state.view_hwnd,identity,folder.clone(),crate::context_preferences::native(&prefs))
+        (state.view_hwnd,identity,folder,crate::context_preferences::native(&prefs))
     };
-    if options.drawn || !options.modern || options.quick_first{return;}
+    if options.quick_first{return;}
     let Ok(view)=menu::attached_menu_view(window)else{return;};
-    let Ok(items)=view.cast::<IFolderView2>()else{return;};
-    let Ok(count)=(unsafe{items.ItemCount(SVGIO_SELECTION)})else{return;};
-    if !(0..=1).contains(&count){return;}
     let Ok(parent)=background_pidl(&view)else{return;};
-    let target=if count==0{parent.clone()}else{
-        let Ok(selected)=(unsafe{items.Items::<IShellItemArray>(SVGIO_SELECTION)})else{return;};
-        if unsafe{selected.GetCount()}.ok()!=Some(1){return;}
-        let Ok(item)=(unsafe{selected.GetItemAt(0)})else{return;};
-        let Some(pidl)=zsdesk_windows::shell::pidl::item_pidl(&item)else{return;};pidl
-    };
     if !live_source(owner,window,identity){return;}
-    let context=crate::context_menu_process::MenuViewContext{folder:Some(parent),..Default::default()};
-    crate::context_menu_process::prewarm::start(owner,target,folder,count==0,options,Some(context));
+    let context=crate::context_menu_process::MenuViewContext{folder:Some(parent.clone()),..Default::default()};
+    crate::context_menu_process::prewarm::start(owner,parent,folder,true,options,Some(context));
 }
 pub(super) type SourcePreferences=(bool,menu::ContextMenuOptions);
 impl WindowState{
@@ -93,10 +84,12 @@ impl ChildPidl{
 }
 struct VisualSelection{folder:Vec<u8>,children:Vec<Vec<u8>>,focused:Option<Vec<u8>>}
 impl VisualSelection{
-    fn capture(view:&IShellView,expected:&[Vec<u8>])->windows::core::Result<Self>{
+    fn capture(view:&IShellView)->windows::core::Result<(Self, Vec<Vec<u8>>)>{
         let folder_view:IFolderView2=view.cast()?;let folder:IShellFolder=unsafe{folder_view.GetFolder()?};
         let root=background_pidl(view)?;let selected:IEnumIDList=unsafe{folder_view.Items(SVGIO_SELECTION)?};
-        let mut children=Vec::with_capacity(expected.len());let mut absolute=Vec::with_capacity(expected.len());let mut bytes=0usize;
+        let count=unsafe{folder_view.ItemCount(SVGIO_SELECTION)}?;
+        if !(1..=8192).contains(&count){return Err(failure(zsdesk_core::i18n::text("菜单选区数量过多")));}
+        let mut children=Vec::with_capacity(count as usize);let mut absolute=Vec::with_capacity(count as usize);let mut bytes=0usize;
         loop{
             let mut raw=[std::ptr::null_mut()];let mut fetched=0;
             let status=unsafe{selected.Next(&mut raw,Some(&mut fetched))};let child=ChildPidl(raw[0]);status.ok()?;
@@ -107,11 +100,11 @@ impl VisualSelection{
             absolute.push(zsdesk_windows::shell::pidl::item_pidl(&item).ok_or_else(||failure(zsdesk_core::i18n::text("无法确认菜单选区标识")))?);
             children.push(id);
         }
-        if !same_identities(expected,&absolute){return Err(failure(zsdesk_core::i18n::text("菜单选区在读取期间已改变")));}
+        if absolute.len()!=count as usize || unsafe{folder_view.ItemCount(SVGIO_SELECTION)}? != count {return Err(failure(zsdesk_core::i18n::text("菜单选区在读取期间已改变")));}
         let focused=unsafe{folder_view.GetFocusedItem()}.ok().filter(|index|*index>=0)
             .and_then(|index|unsafe{folder_view.Item(index)}.ok()).and_then(|item|ChildPidl(item).bytes().ok())
             .filter(|item|children.contains(item));
-        Ok(Self{folder:root,children,focused})
+        Ok((Self{folder:root,children,focused},absolute))
     }
     fn restore_if_cleared(&self,view:&IShellView,expected:&[Vec<u8>],permit:&dyn Fn()->bool)->bool{
         let restore=(||->windows::core::Result<bool>{
@@ -478,6 +471,15 @@ pub(super) fn poll(owner:HWND){
                 Err(error)=>zsdesk_core::tr_format!("文件操作未完成：{}", file_transfer::error_message(&error)),
             };
             super::pane_input::post(owner,identity,super::pane_input::Intent::TransferMessage(message));
+        },
+        Some(Ok(action @ (MenuOutcome::Share|MenuOutcome::ChooseApplication))) if valid=>{
+            if let Err(error)=zsdesk_windows::shell::file_dialogs::show(owner,action,&session.pidls){
+                if !file_transfer::is_cancelled(error.code()){
+                    let phase=if action==MenuOutcome::Share{"share-failed"}else{"open-with-failed"};
+                    super::diagnostics::record("context-menu",phase,Some(error.code().0));
+                    super::pane_input::post(owner,identity,super::pane_input::Intent::TransferMessage(error.to_string()));
+                }
+            }
         },
         Some(Ok(MenuOutcome::Rename)) if valid=>{
             let exact=if session.pidls.len()==1{file_transfer::paths_from_pidls(&session.pidls).ok().and_then(|paths|paths.into_iter().next())}else{None};

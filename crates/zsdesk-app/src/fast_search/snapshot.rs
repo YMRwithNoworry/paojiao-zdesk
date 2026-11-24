@@ -3,12 +3,13 @@ use std::{fs::{self,File,OpenOptions},io::{self,Read,Write,BufReader,BufWriter},
 use anyhow::{Result,ensure,Context};
 use sha2::{Digest,Sha256};
 use super::metadata::{Index,Names,Attributes,VolumeIndex,MAX_ROWS};
-const MAGIC:&[u8;8]=b"ZSDIDX01";
+pub(super) const LEGACY_MAGIC:&[u8;8]=b"ZSDIDX01";
+pub(super) const MAGIC:&[u8;8]=b"ZSDIDX02";
 // Increment when the built-in exclusion policy changes without a format change.
 const FILTER_REVISION:u32=1;
 const MAX_BYTES:u64=2*1024*1024*1024;
 pub struct Policy{pub development:bool,pub metadata:bool}
-impl Policy{fn bits(&self)->u32{u32::from(self.development)|(u32::from(self.metadata)<<1)|(FILTER_REVISION<<8)}}
+impl Policy{pub(super) fn bits(&self)->u32{u32::from(self.development)|(u32::from(self.metadata)<<1)|(FILTER_REVISION<<8)}}
 struct HashWriter{file:File,hash:Sha256,bytes:u64}
 impl Write for HashWriter{
     fn write(&mut self,bytes:&[u8])->io::Result<usize>{if self.bytes+bytes.len()as u64>MAX_BYTES{return Err(io::Error::other("索引快照超过 2 GiB 容量"));}
@@ -53,7 +54,20 @@ pub fn save(path:&Path,policy:&Policy,volumes:&[VolumeIndex],cancel:&impl Fn()->
         scalar(&mut writer,u32::from(volume.has_journal)|(u32::from(volume.mft)<<1)|if volume.pending_dirs.is_empty(){0}else{4})?;scalar(&mut writer,volume.denied)?;
         let index=&volume.index;
         column(&mut writer,&index.ids,cancel)?;column(&mut writer,&index.parent,cancel)?;column(&mut writer,&index.name,cancel)?;bytes(&mut writer,&index.flags)?;
-        column(&mut writer,&index.names.units,cancel)?;column(&mut writer,&index.names.starts,cancel)?;bytes(&mut writer,&index.names.folded)?;column(&mut writer,&index.names.folded_starts,cancel)?;
+        let names=&index.names;
+        bytes(&mut writer,names.folded.as_bytes())?;
+        column(&mut writer,&names.folded_starts,cancel)?;
+        let mut encoded=[0u8;512];
+        for id in 0..names.len() as u32 {
+            if id%4096==0 {ensure!(!cancel(),"快照保存已取消");}
+            let name=names.get(id);
+            let mut length=2;
+            if name!=std::ffi::OsStr::new(names.folded(id)) {
+                for unit in name.encode_wide(){encoded[length..length+2].copy_from_slice(&unit.to_le_bytes());length+=2;}
+            }
+            encoded[..2].copy_from_slice(&(((length-2)/2) as u16).to_le_bytes());
+            writer.write_all(&encoded[..length])?;
+        }
         ensure!(index.attributes.is_some()==policy.metadata,"快照属性选项不一致");
         if let Some(attrs)=&index.attributes{column(&mut writer,&attrs.size,cancel)?;column(&mut writer,&attrs.modified,cancel)?;}
         if !volume.pending_dirs.is_empty(){column(&mut writer,&volume.pending_dirs,cancel)?;}
@@ -69,7 +83,7 @@ pub fn load(path:&Path,policy:&Policy,cancel:&impl Fn()->bool)->Result<Vec<Volum
     let metadata=fs::symlink_metadata(path)?;ensure!(metadata.is_file()&&metadata.file_attributes()&0x400==0,"快照必须为普通文件");
     let size=metadata.len();ensure!((48..=MAX_BYTES+32).contains(&size),"快照大小无效");let file=File::open(path)?;
     let mut reader=BufReader::with_capacity(1024*1024,HashReader{input:file.take(size-32),hash:Sha256::new()});
-    let mut magic=[0u8;8];reader.read_exact(&mut magic)?;ensure!(&magic==MAGIC,"快照版本不兼容");ensure!(read_scalar::<u32>(&mut reader)?==policy.bits(),"索引选项已改变，需要重新建立");
+    let mut magic=[0u8;8];reader.read_exact(&mut magic)?;let legacy=&magic==LEGACY_MAGIC;ensure!(legacy||&magic==MAGIC,"快照版本不兼容");ensure!(read_scalar::<u32>(&mut reader)?==policy.bits(),"索引选项已改变，需要重新建立");
     let count=read_scalar::<u32>(&mut reader)?;ensure!(count<=128,"快照卷数量无效");let mut remaining=size-32;let mut volumes=Vec::new();let mut total=0;
     for _ in 0..count{
         let root=std::path::PathBuf::from(OsString::from_wide(&read_column::<u16>(&mut reader,&mut remaining,32768,cancel)?));ensure!(root.is_absolute(),"快照根目录必须为绝对路径");
@@ -79,12 +93,33 @@ pub fn load(path:&Path,policy:&Policy,cancel:&impl Fn()->bool)->Result<Vec<Volum
         index.ids=read_column(&mut reader,&mut remaining,MAX_ROWS,cancel)?;total+=index.ids.len();ensure!(total<=MAX_ROWS,"快照总项目数超出容量");
         index.parent=read_column(&mut reader,&mut remaining,index.ids.len(),cancel)?;index.name=read_column(&mut reader,&mut remaining,index.ids.len(),cancel)?;
         index.flags=read_bytes(&mut reader,&mut remaining,index.ids.len())?;
-        let mut names=Names::new();names.units=read_column(&mut reader,&mut remaining,MAX_BYTES as usize/2,cancel)?;
-        names.starts=read_column(&mut reader,&mut remaining,MAX_ROWS+1,cancel)?;names.folded=read_bytes(&mut reader,&mut remaining,MAX_BYTES as usize)?;
-        names.folded_starts=read_column(&mut reader,&mut remaining,MAX_ROWS+1,cancel)?;index.names=names;
+        index.names=if legacy {
+            let units=read_column(&mut reader,&mut remaining,MAX_BYTES as usize/2,cancel)?;
+            let starts=read_column(&mut reader,&mut remaining,MAX_ROWS+1,cancel)?;
+            let folded=read_bytes(&mut reader,&mut remaining,MAX_BYTES as usize)?;
+            let folded_starts=read_column(&mut reader,&mut remaining,MAX_ROWS+1,cancel)?;
+            Names::restore(units,starts,folded,folded_starts,cancel)?
+        } else {
+            let folded=read_bytes(&mut reader,&mut remaining,MAX_BYTES as usize)?;
+            let starts=read_column(&mut reader,&mut remaining,MAX_ROWS+1,cancel)?;
+            let mut encoded=[0u8;510];
+            let mut units=[0u16;255];
+            Names::restore_compact(folded,starts,||{
+                let mut len=[0u8;2];reader.read_exact(&mut len)?;
+                let n=usize::from(u16::from_le_bytes(len));
+                ensure!(n<=255 && remaining>=(2+n*2) as u64,"快照名称长度无效");
+                remaining-=(2+n*2) as u64;
+                if n==0{return Ok(None);}
+                reader.read_exact(&mut encoded[..2*n])?;
+                for (unit,bytes) in units[..n].iter_mut().zip(encoded[..2*n].chunks_exact(2)){
+                    *unit=u16::from_le_bytes([bytes[0],bytes[1]]);
+                }
+                Ok(Some(OsString::from_wide(&units[..n])))
+            },cancel)?
+        };
         if policy.metadata{index.attributes=Some(Attributes{size:read_column(&mut reader,&mut remaining,index.ids.len(),cancel)?,modified:read_column(&mut reader,&mut remaining,index.ids.len(),cancel)?});}
         let pending_dirs=if flags&4!=0{read_column::<u64>(&mut reader,&mut remaining,MAX_ROWS,cancel)?}else{Vec::new()};
-        index.validate()?;volumes.push(VolumeIndex{root,serial,journal_id,checkpoint,has_journal:flags&1!=0,mft:flags&2!=0,denied,index,pending_dirs});
+        index.validate()?;volumes.push(VolumeIndex{root,serial,journal_id,checkpoint,has_journal:flags&1!=0,mft:flags&2!=0,denied,read_issue:None,index,pending_dirs});
     }
     let mut extra=[0];ensure!(reader.read(&mut extra)?==0,"快照存在未识别数据");let reader=reader.into_inner();let digest=reader.hash.finalize();let mut file=reader.input.into_inner();
     let mut expected=[0u8;32];file.read_exact(&mut expected)?;ensure!(digest.as_slice()==expected,"快照校验失败，需要重新建立");Ok(volumes)
@@ -92,10 +127,59 @@ pub fn load(path:&Path,policy:&Policy,cancel:&impl Fn()->bool)->Result<Vec<Volum
 
 #[cfg(test)]mod tests{
     use super::*;
+    #[test]
+    fn mapped_legacy_spelling_and_atomic_replacement()->Result<()>{
+        use crate::fast_search::{self as search,everything::SearchSort};
+        let dir=std::env::temp_dir().join(format!("zsdesk-legacy-map-{}",std::process::id()));
+        fs::create_dir_all(&dir)?;let path=dir.join("index.zsi");
+        let mut raw=Vec::new();raw.extend_from_slice(LEGACY_MAGIC);
+        let policy=Policy{development:false,metadata:false};scalar(&mut raw,policy.bits())?;scalar(&mut raw,1u32)?;
+        let write=|s:&str|s.encode_utf16().collect::<Vec<_>>();
+        let cancel=||false;
+        column(&mut raw,&write(r"C:\"),&cancel)?;scalar(&mut raw,1u32)?;scalar(&mut raw,0u64)?;scalar(&mut raw,0i64)?;
+        scalar(&mut raw,0u32)?;scalar(&mut raw,0u64)?;column(&mut raw,&[5u64,8,9],&cancel)?;
+        column(&mut raw,&[u32::MAX,0,0],&cancel)?;column(&mut raw,&[0u32,1,2],&cancel)?;
+        bytes(&mut raw,&[1,0,0])?;let mut spell=write("K");spell.push(0xd800);
+        column(&mut raw,&spell,&cancel)?;column(&mut raw,&[0u32,0,1,2],&cancel)?;bytes(&mut raw,"k�".as_bytes())?;
+        column(&mut raw,&[0u32,0,1,4],&cancel)?;raw.extend_from_slice(&Sha256::digest(&raw));fs::write(&path,&raw)?;
+        let options=search::SearchOptions::default();
+        let req=search::Request{generation:1,query:"*".into(),preferred:None,invalid:None,offset:0,limit:10,sort:SearchSort::NameAsc};
+        for _ in 0..2{
+            search::mapped::prime(&path,&options,&cancel);
+            let page=search::mapped::search(&path,&options,&req,&cancel)?;
+            assert_eq!(page.total,2);assert_eq!(page.paths[0],Path::new(r"C:\K"));
+            assert_eq!(page.paths[1].file_name().unwrap().encode_wide().collect::<Vec<_>>(),[0xd800]);
+            let volumes=load(&path,&policy,&cancel)?;save(&path,&policy,&volumes,&cancel)?;
+        }
+        let mut damaged=fs::read(&path)?;damaged[20]^=1;fs::write(&path,damaged)?;
+        assert!(search::mapped::search(&path,&options,&req,&cancel).is_err());
+        search::mapped::invalidate(&path);fs::remove_file(path)?;fs::remove_dir(dir)?;Ok(())
+    }
+    #[test]
+    fn original_spellings_survive_snapshot_and_incremental_updates()->Result<()>{
+        let root=std::env::temp_dir().join(format!("zsdesk-original-spellings-{}",std::process::id()));
+        fs::create_dir_all(&root)?;let path=root.join("names.zsi");
+        let words=vec![OsString::from("readme"),OsString::from("README"),OsString::from("İß中📁"),
+            OsString::from_wide(&[0xd801,0x78]),OsString::from_wide(&[0xd802,0x78]),OsString::from("�x")];
+        let mut index=Index::new(5,false);
+        for (n,word) in words.iter().enumerate(){index.append(n as u64+10,0,word,0)?;}
+        let policy=Policy{development:false,metadata:false};
+        let vol=VolumeIndex{root:Path::new(r"C:\").into(),serial:1,journal_id:0,checkpoint:0,has_journal:false,mft:false,denied:0,read_issue:None,index,pending_dirs:Vec::new()};
+        save(&path,&policy,&[vol],&||false)?;
+        let mut restored=load(&path,&policy,&||false)?;
+        let index=&mut restored[0].index;
+        for (n,word) in words.iter().enumerate(){
+            let id=index.name[n+1];assert_eq!(index.names.get(id),word.as_os_str());
+            assert_eq!(index.names.folded(id),word.to_string_lossy().to_lowercase());
+            assert_eq!(index.names.intern(word)?,id);
+        }
+        index.upsert_child(11,0,&words[1],0)?;assert_eq!(index.len(),words.len()+1);
+        fs::remove_file(path)?;fs::remove_dir(root)?;Ok(())
+    }
     #[test]fn snapshot_roundtrip_checksum_and_policy()->Result<()>{
         let root=std::env::temp_dir().join(format!("zsdesk-column-snapshot-{}",std::process::id()));fs::create_dir_all(&root)?;
         let path=root.join("index.zsi");let mut index=Index::new(5,true);index.append(7,0,std::ffi::OsStr::new("中文.txt"),0)?;index.reindex();index.set_attributes(1,Some(0),Some(42));
-        let volumes=vec![VolumeIndex{root:Path::new(r"C:\").into(),serial:1,journal_id:7,checkpoint:99,has_journal:true,mft:true,denied:0,index,pending_dirs:vec![5]}];let policy=Policy{development:false,metadata:true};
+        let volumes=vec![VolumeIndex{root:Path::new(r"C:\").into(),serial:1,journal_id:7,checkpoint:99,has_journal:true,mft:true,denied:0,read_issue:None,index,pending_dirs:vec![5]}];let policy=Policy{development:false,metadata:true};
         save(&path,&policy,&volumes,&||false)?;let restored=load(&path,&policy,&||false)?;assert_eq!(restored[0].checkpoint,99);assert_eq!(restored[0].index.attributes.as_ref().unwrap().size[1],0);assert_eq!(restored[0].pending_dirs,[5]);
         assert!(load(&path,&Policy{development:true,metadata:true},&||false).is_err());
         let mut data=fs::read(&path)?;let end=data.len()-1;data[end]^=1;fs::write(&path,&data)?;assert!(load(&path,&policy,&||false).is_err());

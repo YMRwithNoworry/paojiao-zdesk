@@ -23,12 +23,13 @@ pub(super) struct Request{
     pub fence:u64,pub owner:isize,pub point:POINT,pub profile:PathBuf,pub items:Vec<MenuItemSpec>,pub target:Target,pub extended:bool,
     pub generation:u64,pub queued:Instant,pub input_started:Instant,pub ui_thread:u32,pub foreground:isize,
     pub mode:crate::context_menu_process::Mode,
+    pub highlight:Option<u64>,
     pub layout:Option<zsdesk_core::model::explorer::ShellViewState>,
     #[cfg(test)] pub probe:Option<Probe>,
 }
 impl Request{
     pub fn new(fence:u64,owner:HWND,point:POINT,profile:PathBuf,items:Vec<MenuItemSpec>,target:Target,extended:bool)->Self{
-        let now=Instant::now();Self{fence,owner:owner.0 as isize,point,profile,items,target,extended,generation:0,queued:now,input_started:now,ui_thread:unsafe{GetCurrentThreadId()},foreground:unsafe{GetForegroundWindow()}.0 as isize,mode:crate::context_menu_process::Mode::More,layout:None,#[cfg(test)]probe:None}
+        let now=Instant::now();Self{fence,owner:owner.0 as isize,point,profile,items,target,extended,generation:0,queued:now,input_started:now,ui_thread:unsafe{GetCurrentThreadId()},foreground:unsafe{GetForegroundWindow()}.0 as isize,mode:crate::context_menu_process::Mode::More,highlight:None,layout:None,#[cfg(test)]probe:None}
     }
 }
 #[derive(Clone,Debug,Default,serde::Serialize)]

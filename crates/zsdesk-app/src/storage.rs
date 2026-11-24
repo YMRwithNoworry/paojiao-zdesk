@@ -107,10 +107,20 @@ pub fn save_explorer_tray(path:&Path,enabled:bool)->Result<()>{
     let _write=SAVE_LOCK.lock().map_err(|_|anyhow::anyhow!("会话保存锁异常"))?;
     let mut session=if path.try_exists()?{load(path)?}else{default_session()};session.ui.explorer_tray=enabled;save_unlocked(path,&session)
 }
-pub fn save_tab_selection_emphasis(path:&Path,enabled:bool)->Result<()>{
+pub fn toggle_tab_preference(path: &Path, field: fn(&mut zsdesk_core::model::explorer::ExplorerUi) -> &mut bool) -> Result<bool> {
+    update_shared_ui(path, |ui| {
+        let value = field(ui);
+        *value = !*value;
+        *value
+    })
+}
+
+pub fn update_shared_ui<T>(path: &Path, edit: impl FnOnce(&mut zsdesk_core::model::explorer::ExplorerUi) -> T) -> Result<T> {
     let _write=SAVE_LOCK.lock().map_err(|_|anyhow::anyhow!("会话保存锁异常"))?;
     let mut session=if path.try_exists()?{load(path)?}else{default_session()};
-    session.ui.tab_selection_emphasis=enabled;save_unlocked(path,&session)
+    let value = edit(&mut session.ui);
+    save_unlocked(path, &session)?;
+    Ok(value)
 }
 pub fn save_context_menu(path:&Path,options:&zsdesk_core::model::explorer::ContextMenuPreferences)->Result<()> {
     let _write=SAVE_LOCK.lock().map_err(|_|anyhow::anyhow!("会话保存锁异常"))?;
@@ -133,17 +143,26 @@ pub fn save_window(path: &Path, session: &ExplorerSession, secondary: bool) -> R
 }
 
 fn save_unlocked(path: &Path, session: &ExplorerSession) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
+    Ok(write_atomic(path,&serde_json::to_vec_pretty(session)?)?)
+}
 
-    let temporary = path.with_extension(format!("{}-{}.json.tmp",std::process::id(),SAVE_SERIAL.fetch_add(1,Ordering::Relaxed)));
-    let data = serde_json::to_vec_pretty(session)?;
-    if let Err(error) = fs::write(&temporary, data).and_then(|_|replace_file(&temporary, path)) {
-        let _ = fs::remove_file(&temporary);
-        return Err(error.into());
-    }
-    Ok(())
+/// Each writer publishes only its own completed file. A failed write leaves
+/// the previous destination intact and releases its temporary file.
+pub(crate) fn write_atomic(path:&Path,bytes:&[u8])->io::Result<()>{
+    use std::io::Write;
+    if let Some(parent)=path.parent(){fs::create_dir_all(parent)?;}
+    let (temporary,mut file)=loop{
+        let tmp=path.with_extension(format!("{}-{}.tmp",std::process::id(),SAVE_SERIAL.fetch_add(1,Ordering::Relaxed)));
+        match fs::File::create_new(&tmp){
+            Ok(file)=>break (tmp,file),
+            Err(e) if e.kind()==io::ErrorKind::AlreadyExists=>continue,
+            Err(e)=>return Err(e),
+        }
+    };
+    let write=file.write_all(bytes);drop(file);
+    let result=write.and_then(|_|replace_file(&temporary,path));
+    if result.is_err(){let _=fs::remove_file(&temporary);}
+    result
 }
 
 /// A navigation/session save must not restore a stale window's search backend.
@@ -163,19 +182,24 @@ pub fn save_window_with_shared_preferences(path:&Path,session:&ExplorerSession,s
 fn save_window_preferences(path:&Path,session:&ExplorerSession,secondary:bool,
     baseline:&SearchPreferences,baseline_bookmarks:Option<&[Bookmark]>)->Result<(SearchPreferences,Vec<Bookmark>)>{
     let _write=SAVE_LOCK.lock().map_err(|_|anyhow::anyhow!("会话保存锁异常"))?;
-    let saved=load(path).ok();let mut next=session.clone();
-    if let Some(saved)=&saved {next.ui.explorer_tray=saved.ui.explorer_tray;next.ui.language=saved.ui.language;
-        next.ui.startup_location=saved.ui.startup_location.clone();next.ui.new_tab_location=saved.ui.new_tab_location.clone();next.ui.context_menu=saved.ui.context_menu.clone();next.ui.forward_unhandled_windows=saved.ui.forward_unhandled_windows;next.ui.forward_while_running=saved.ui.forward_while_running;next.ui.tab_selection_emphasis=saved.ui.tab_selection_emphasis;}
+    let saved=if path.try_exists()?{Some(load(path)?)}else{None};let mut next=session.clone();
+    if let Some(saved)=&saved {next.ui.folder_layouts.clone_from(&saved.ui.folder_layouts);next.ui.explorer_tray=saved.ui.explorer_tray;next.ui.language=saved.ui.language;
+        next.ui.startup_location=saved.ui.startup_location.clone();next.ui.new_tab_location=saved.ui.new_tab_location.clone();next.ui.context_menu=saved.ui.context_menu.clone();next.ui.forward_unhandled_windows=saved.ui.forward_unhandled_windows;next.ui.forward_while_running=saved.ui.forward_while_running;next.ui.tab_selection_emphasis=saved.ui.tab_selection_emphasis;
+        next.ui.bookmark_display=saved.ui.bookmark_display;next.ui.navigation_divider=saved.ui.navigation_divider;next.ui.interface_text_percent=saved.ui.interface_text_percent;
+        next.ui.right_click_close_tab=saved.ui.right_click_close_tab;
+        next.ui.single_click_blank_up=saved.ui.single_click_blank_up;
+        next.ui.double_click_blank_up=saved.ui.double_click_blank_up;}
     if next.ui.search_preferences()==*baseline{if let Some(saved)=&saved{next.ui.apply_search_preferences(&saved.ui.search_preferences());}}
     if let (Some(baseline),Some(saved))=(baseline_bookmarks,&saved){
-        next.bookmarks=merge_bookmarks(baseline,&next.bookmarks,&saved.bookmarks,next.next_id.max(saved.next_id));
+        if baseline==next.bookmarks{next.bookmarks.clone_from(&saved.bookmarks);}
+        else{next.bookmarks=merge_bookmarks(baseline,&next.bookmarks,&saved.bookmarks,next.next_id.max(saved.next_id));}
         next.normalize_bookmarks();
     }
     let bookmark_next=next.bookmarks.iter().map(|bookmark|bookmark.id).max().unwrap_or(0).saturating_add(1);
     next.next_id=next.next_id.max(bookmark_next).max(saved.as_ref().map_or(0,|saved|saved.next_id));
-    let preferences=next.ui.search_preferences();let bookmarks=next.bookmarks.clone();
-    if secondary{let mut primary=saved.context("主窗口会话尚未保存")?;primary.ui=next.ui;primary.bookmarks=next.bookmarks;primary.next_id=primary.next_id.max(next.next_id);save_unlocked(path,&primary)?;}
-    else{save_unlocked(path,&next)?;}Ok((preferences,bookmarks))
+    let preferences=next.ui.search_preferences();
+    if secondary{let mut primary=saved.context("主窗口会话尚未保存")?;primary.ui=next.ui;primary.bookmarks=next.bookmarks;primary.next_id=primary.next_id.max(next.next_id);save_unlocked(path,&primary)?;Ok((preferences,primary.bookmarks))}
+    else{save_unlocked(path,&next)?;Ok((preferences,next.bookmarks))}
 }
 
 /// Field-wise edits preserve other windows' changes; deletion wins over a
@@ -253,6 +277,43 @@ mod tests {
         assert_eq!(load(&path).unwrap().ui.new_tab_location,new_tab);
         fs::remove_file(path).unwrap();fs::remove_dir(root).unwrap();
     }
+    #[test]fn damaged_session_is_not_replaced_by_a_stale_writer()->Result<()>{
+        let dir=std::env::temp_dir().join(format!("zsdesk-invalid-session-{}-{}",std::process::id(),SAVE_SERIAL.fetch_add(1,Ordering::Relaxed)));
+        fs::create_dir(&dir)?;let path=dir.join("session.json");fs::write(&path,b"{broken")?;
+        let old=default_session();
+        assert!(save_window_with_shared_preferences(&path,&old,false,&old.ui.search_preferences(),&old.bookmarks).is_err());
+        assert_eq!(fs::read(&path)?,b"{broken");fs::remove_file(path)?;fs::remove_dir(dir)?;Ok(())
+    }
+    #[test]fn concurrent_atomic_writers_publish_whole_records()->Result<()>{
+        let dir=std::env::temp_dir().join(format!("zsdesk-atomic-{}-{}",std::process::id(),SAVE_SERIAL.fetch_add(1,Ordering::Relaxed)));
+        fs::create_dir(&dir)?;let path=dir.join("file.json");let gate=std::sync::Barrier::new(5);
+        std::thread::scope(|scope|{for byte in 1..=4u8{let path=&path;let gate=&gate;scope.spawn(move||{
+            let payload=vec![byte;32768];gate.wait();for _ in 0..6{write_atomic(path,&payload).unwrap();}
+        });}gate.wait();});
+        let bytes=fs::read(&path)?;assert_eq!(bytes.len(),32768);assert!(bytes.iter().all(|b|*b==bytes[0]));
+        assert_eq!(fs::read_dir(&dir)?.count(),1);fs::remove_file(path)?;fs::remove_dir(dir)?;Ok(())
+    }
+    #[test]fn bookmark_display_divider_and_text_scale_survive_stale_saves()->Result<()>{
+        use zsdesk_core::model::explorer::{BookmarkDisplay,NavigationDivider};
+        let dir=std::env::temp_dir().join(format!("zsdesk-shared-layout-{}-{}",std::process::id(),SAVE_SERIAL.fetch_add(1,Ordering::Relaxed)));
+        fs::create_dir_all(&dir)?;let path=dir.join("session.json");let old=default_session();save(&path,&old)?;
+        update_shared_ui(&path,|ui|{ui.bookmark_display=BookmarkDisplay::Dropdown;ui.navigation_divider=NavigationDivider::Always;ui.interface_text_percent=150;})?;
+        for secondary in [false,true]{save_window_with_shared_preferences(&path,&old,secondary,&old.ui.search_preferences(),&old.bookmarks)?;}
+        let ui=load(&path)?.ui;assert_eq!((ui.bookmark_display,ui.navigation_divider,ui.interface_dpi(144)),(BookmarkDisplay::Dropdown,NavigationDivider::Always,216));
+        fs::remove_file(path)?;fs::remove_dir(dir)?;Ok(())
+    }
+    #[test]fn remembered_folder_layouts_survive_stale_saves_and_restart()->Result<()> {
+        use zsdesk_core::model::explorer::FolderLayout;
+        let root=std::env::temp_dir().join(format!("zsdesk-layout-memory-{}-{}",std::process::id(),SAVE_SERIAL.fetch_add(1,Ordering::Relaxed)));
+        fs::create_dir(&root)?;let path=root.join("profile.json");let stale=default_session();save(&path,&stale)?;
+        update_shared_ui(&path,|ui|ui.folder_layouts.insert(root.join("A"),FolderLayout::Dual))?;
+        update_shared_ui(&path,|ui|ui.folder_layouts.insert(root.join("B"),FolderLayout::Columns))?;
+        update_shared_ui(&path,|ui|ui.folder_layouts.insert(root.join("C"),FolderLayout::Single))?;
+        for secondary in [true,false] { save_window_with_shared_preferences(&path,&stale,secondary,&stale.ui.search_preferences(),&stale.bookmarks)?; }
+        let loaded=load(&path)?;assert_eq!(loaded.ui.folder_layouts.len(),3);
+        for (name,layout) in [("A",FolderLayout::Dual),("B",FolderLayout::Columns),("C",FolderLayout::Single)] {assert_eq!(loaded.ui.folder_layouts[&root.join(name)],layout);}
+        fs::remove_file(path)?;fs::remove_dir(root)?;Ok(())
+    }
     #[test]fn first_launch_can_save_tab_defaults_before_a_session_exists(){
         let root=std::env::temp_dir().join(format!("zsdesk-first-tab-{}-{}",std::process::id(),SAVE_SERIAL.fetch_add(1,Ordering::Relaxed)));
         fs::create_dir(&root).unwrap();let path=root.join("session.json");
@@ -328,10 +389,14 @@ mod tests {
         assert!(!original.ui.tab_selection_emphasis);save(&path,&original).unwrap();
         let mut legacy=serde_json::to_value(&original).unwrap();legacy["ui"].as_object_mut().unwrap().remove("tab_selection_emphasis");
         fs::write(&path,serde_json::to_vec(&legacy).unwrap()).unwrap();assert!(!load(&path).unwrap().ui.tab_selection_emphasis);
-        save_tab_selection_emphasis(&path,true).unwrap();
+        assert!(toggle_tab_preference(&path, |ui| &mut ui.tab_selection_emphasis).unwrap());
+        assert!(toggle_tab_preference(&path, |ui| &mut ui.right_click_close_tab).unwrap());
         save_window_with_search(&path,&original,false,&original.ui.search_preferences()).unwrap();
         let saved=load(&path).unwrap();assert!(saved.ui.tab_selection_emphasis);assert_eq!(saved.tabs,original.tabs);
-        save_tab_selection_emphasis(&path,false).unwrap();assert!(!load(&path).unwrap().ui.tab_selection_emphasis);
+        assert!(saved.ui.right_click_close_tab);
+        assert!(!toggle_tab_preference(&path, |ui| &mut ui.tab_selection_emphasis).unwrap());
+        assert!(load(&path).unwrap().ui.right_click_close_tab);
+        assert!(!toggle_tab_preference(&path, |ui| &mut ui.right_click_close_tab).unwrap());
         fs::remove_file(path).unwrap();fs::remove_dir(root).unwrap();
     }
 
@@ -371,8 +436,25 @@ fn replace_file(temporary: &Path, destination: &Path) -> io::Result<()> {
         use windows::{core::PCWSTR,Win32::Storage::FileSystem::{MoveFileExW,MOVEFILE_REPLACE_EXISTING,MOVEFILE_WRITE_THROUGH}};
         let source:Vec<u16>=temporary.as_os_str().encode_wide().chain(Some(0)).collect();
         let target:Vec<u16>=destination.as_os_str().encode_wide().chain(Some(0)).collect();
-        unsafe {MoveFileExW(PCWSTR(source.as_ptr()),PCWSTR(target.as_ptr()),MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH)}
-            .map_err(|e|io::Error::other(e.to_string()))
+        // NTFS can report a transient sharing or access error while another
+        // writer is finishing a rename at the same destination.
+        let mut delays = [1, 2, 4, 8, 16, 32].into_iter();
+        loop {
+            match unsafe { MoveFileExW(PCWSTR(source.as_ptr()), PCWSTR(target.as_ptr()),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) } {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    let error = io::Error::from_raw_os_error((error.code().0 & 0xffff) as i32);
+                    if matches!(error.raw_os_error(), Some(5 | 32 | 33)) {
+                        if let Some(ms) = delays.next() {
+                            std::thread::sleep(std::time::Duration::from_millis(ms));
+                            continue;
+                        }
+                    }
+                    return Err(error);
+                }
+            }
+        }
     }
     #[cfg(not(windows))] { fs::rename(temporary,destination) }
 }

@@ -1,5 +1,5 @@
 use super::*;
-use zsdesk_core::model::explorer::{Bookmark, path_title};
+use zsdesk_core::model::explorer::{Bookmark, BookmarkDisplay, path_title};
 use zsdesk_ui::menus::{entry, menu, submenu, MenuItemSpec};
 use zsdesk_windows::shell::open_path;
 use super::navigation::window_text;
@@ -10,16 +10,59 @@ fn chrono_like_now()->String{
     format!("{:04}-{:02}-{:02} {:02}:{:02}",time.wYear,time.wMonth,time.wDay,time.wHour,time.wMinute)
 }
 
+/// Menus carry bookmark IDs so a reorder cannot redirect a command to another entry.
+fn dropdown_items(bookmarks:&[Bookmark],root:Option<u64>)->Vec<MenuItemSpec>{
+    use std::collections::HashMap;
+    let mut children:HashMap<Option<u64>,Vec<&Bookmark>>=HashMap::new();
+    for b in bookmarks{children.entry(b.parent_id).or_default().push(b);}
+    fn level(children:&HashMap<Option<u64>,Vec<&Bookmark>>,parent:Option<u64>,depth:usize)->Vec<MenuItemSpec>{
+        let mut items=Vec::new();
+        for b in children.get(&parent).into_iter().flatten(){
+            let label=b.display_name.replace('&',"&&");
+            if !b.is_folder{items.push(entry(&label,&format!("link-{}",b.id),true,false));}
+            else if depth==6{items.push(entry(&label,&format!("level-{}",b.id),true,false));}
+            else{items.push(submenu(&label,level(children,Some(b.id),depth+1)));}
+        }
+        if items.is_empty(){items.push(entry(zsdesk_core::i18n::text("此分类为空"),"empty",false,false));}
+        items.push(MenuItemSpec::Separator);
+        if let Some(id)=parent{
+            items.push(entry(zsdesk_core::i18n::text("收藏当前文件夹到此分类"),&format!("add-{id}"),true,false));
+            items.push(entry(zsdesk_core::i18n::text("管理此分类"),&format!("edit-{id}"),true,false));
+        }else{
+            items.push(entry(zsdesk_core::i18n::text("收藏当前文件夹\tCtrl+D"),"add",true,false));
+            items.push(entry(zsdesk_core::i18n::text("新建分类目录"),"new-folder",true,false));
+            items.push(entry(zsdesk_core::i18n::text("将所有标签页保存为新分类"),"save-tabs",true,false));
+        }
+        if children.get(&parent).is_some_and(|c|!c.is_empty()){
+            items.push(entry(zsdesk_core::i18n::text("管理收藏项"),&parent.map_or_else(||"manage".into(),|id|format!("manage-{id}")),true,false));
+        }
+        items
+    }
+    level(&children,root,0)
+}
+
 impl WindowState {
     pub(super) fn renamed_bookmark_index(&self)->Option<usize>{self.rename_id.and_then(|id|self.session.bookmarks.iter().position(|b|b.id==id))}
     pub(super) fn bookmark_index(&self,slot:usize)->Option<usize>{self.bookmark_order.get(slot).copied()}
     pub(super) fn bookmark_label(&self,index:usize)->String{
-        let item=&self.session.bookmarks[index];let depth=self.session.bookmark_depth(index);
+        let item=&self.session.bookmarks[index];
+        if self.session.ui.bookmark_display!=BookmarkDisplay::Expanded{return item.display_name.clone();}
+        let depth=self.session.bookmark_depth(index);
         format!("{}{}{}","› ".repeat(depth.min(4)),if item.is_folder{if item.collapsed{"▸ "}else{"▾ "}}else{""},item.display_name)
     }
+    fn row_of_bookmarks(&self)->LayoutRect{
+        if self.layout.bookmarks_row.is_empty(){self.layout.nav_row}else{self.layout.bookmarks_row}
+    }
     pub(super) fn bookmark_rect(&self,index:usize)->LayoutRect{
-        self.bookmark_order.iter().position(|&i|i==index).and_then(|slot|self.layout.bookmarks.get(slot).copied())
-            .unwrap_or_else(||{if self.layout.bookmarks_vertical&&!self.layout.bookmark_overflow.is_empty(){return self.layout.bookmark_overflow;}
+        let mut anchor=index;
+        if self.session.ui.bookmark_display==BookmarkDisplay::Categories{
+            for _ in 0..self.session.bookmarks.len(){
+                let Some(parent)=self.session.bookmarks.get(anchor).and_then(|b|b.parent_id)else{break;};
+                let Some(i)=self.session.bookmarks.iter().position(|b|b.id==parent)else{break;};anchor=i;
+            }
+        }
+        self.bookmark_order.iter().position(|&i|i==anchor).and_then(|slot|self.layout.bookmarks.get(slot).copied())
+            .unwrap_or_else(||{if !self.layout.bookmark_overflow.is_empty()&&(self.layout.bookmarks_vertical||self.session.ui.bookmark_display!=BookmarkDisplay::Expanded){return self.layout.bookmark_overflow;}
                 let row=self.layout.bookmarks_row;LayoutRect::new(row.x+self.s(8),row.y+self.s(2),self.s(220).min((row.width-self.s(16)).max(0)),self.s(28).min((row.height-self.s(4)).max(0)))})
     }
     pub(super) fn add_current_bookmark(&mut self) {
@@ -51,6 +94,9 @@ impl WindowState {
     }
     unsafe fn open_bookmark_index(&mut self,index:usize,new_tab:bool){
         let Some(bookmark) = self.session.bookmarks.get(index).cloned() else { return };
+        if bookmark.is_folder && self.session.ui.bookmark_display!=BookmarkDisplay::Expanded {
+            if new_tab{unsafe{self.open_bookmark_folder_tabs(index);}}else{unsafe{self.bookmark_dropdown(Some(bookmark.id),self.bookmark_rect(index));}}return;
+        }
         if bookmark.is_folder{self.session.bookmarks[index].collapsed=!bookmark.collapsed;self.save();unsafe{self.rebuild_bookmarks();}return;}
         if let ShellLocation::Path(path) = &bookmark.target {
             if path.is_file() { unsafe { open_path(self.hwnd, path); } return; }
@@ -81,6 +127,7 @@ impl WindowState {
     pub(super) unsafe fn bookmark_double_click(&mut self,slot:usize)->bool{
         let Some(index)=self.bookmark_index(slot)else{return false;};
         if !self.session.bookmarks[index].is_folder{return false;}
+        if self.session.ui.bookmark_display!=BookmarkDisplay::Expanded{return true;}
         // The first click of the pair already toggled it; restore the state.
         self.session.bookmarks[index].collapsed=!self.session.bookmarks[index].collapsed;
         unsafe{self.open_bookmark_folder_tabs(index);self.rebuild_bookmarks();}true
@@ -96,7 +143,7 @@ impl WindowState {
         destinations.extend(self.session.bookmarks.iter().filter(|b|b.is_folder&&b.id!=bookmark.id).map(|b|
             entry(&b.display_name.replace('&',"&&"),&format!("move-{}",b.id),bookmark.parent_id!=Some(b.id)&&self.session.can_move_bookmark_to(bookmark.id,Some(b.id)),false)));
         let spec = menu(vec![
-            entry(if bookmark.is_folder{if bookmark.collapsed{zsdesk_core::i18n::text("展开分类")}else{zsdesk_core::i18n::text("折叠分类")}}else{zsdesk_core::i18n::text("打开")}, "open", true, false),
+            entry(if bookmark.is_folder&&self.session.ui.bookmark_display==BookmarkDisplay::Expanded{if bookmark.collapsed{zsdesk_core::i18n::text("展开分类")}else{zsdesk_core::i18n::text("折叠分类")}}else{zsdesk_core::i18n::text("打开")}, "open", true, false),
             entry(if bookmark.is_folder{zsdesk_core::i18n::text("打开分类中的全部文件夹\t双击")}else{zsdesk_core::i18n::text("在新标签页中打开")}, "open-tab", true, false),
             entry(zsdesk_core::i18n::text("收藏当前文件夹到此分类"),"add-here",bookmark.is_folder,false),
             entry(zsdesk_core::i18n::text("将所有标签页保存到此分类"),"save-tabs-here",bookmark.is_folder,false),
@@ -132,7 +179,36 @@ impl WindowState {
             _ => {}
         }
     }
+    unsafe fn bookmark_dropdown(&mut self,mut root:Option<u64>,anchor:LayoutRect){
+        loop {
+            let spec=menu(dropdown_items(&self.session.bookmarks,root));
+            let Some(action)=input::popup(self.hwnd,&spec,Some(anchor))else{return;};
+            let parse=|prefix:&str|action.strip_prefix(prefix).and_then(|n|n.parse::<u64>().ok());
+            if let Some(id)=parse("level-"){root=Some(id);continue;}
+            if action=="manage" || parse("manage-").is_some(){
+                let parent=parse("manage-");
+                let items=self.session.bookmarks.iter().filter(|b|b.parent_id==parent).map(|b|
+                    entry(&b.display_name.replace('&',"&&"),&b.id.to_string(),true,false)).collect();
+                if let Some(id)=input::popup(self.hwnd,&menu(items),Some(anchor)).and_then(|n|n.parse::<u64>().ok()){
+                    if let Some(i)=self.session.bookmarks.iter().position(|b|b.id==id){unsafe{self.bookmark_menu_index(i);}}
+                }
+            }else if let Some(id)=parse("link-"){
+                if let Some(i)=self.session.bookmarks.iter().position(|b|b.id==id&&!b.is_folder){unsafe{self.open_bookmark_index(i,false);}}
+            }else if let Some(id)=parse("edit-"){
+                if let Some(i)=self.session.bookmarks.iter().position(|b|b.id==id){unsafe{self.bookmark_menu_index(i);}}
+            }else if let Some(id)=parse("add-"){
+                if self.session.bookmarks.iter().any(|b|b.id==id&&b.is_folder){
+                    let target=self.current_location().clone();self.add_bookmark_to(target.title(),target,Some(id));
+                }
+            }else{match action.as_str(){
+                "add"=>self.add_current_bookmark(),"new-folder"=>unsafe{self.new_bookmark_folder(None)},
+                "save-tabs"=>unsafe{self.save_tabs_to_category(None)},_=>{}
+            }}
+            return;
+        }
+    }
     pub(super) unsafe fn bookmarks_overflow(&mut self) {
+        if self.session.ui.bookmark_display==BookmarkDisplay::Dropdown{unsafe{self.bookmark_dropdown(None,self.layout.bookmark_overflow);}return;}
         let hidden = self.layout.bookmarks.len();
         let mut items: Vec<MenuItemSpec> = self.bookmark_order.iter().copied().skip(hidden)
             .map(|i| submenu(&self.bookmark_label(i).replace('&',"&&"),vec![
@@ -161,7 +237,7 @@ impl WindowState {
             Some("add") => self.add_current_bookmark(),
             Some("new-folder")=>unsafe{self.new_bookmark_folder(None);},
             Some("save-tabs")=>unsafe{self.save_tabs_to_category(None);},
-            Some("toggle") => { self.session.ui.show_bookmarks = !self.session.ui.show_bookmarks; self.save(); unsafe { self.resize(); } }
+            Some("toggle") => { self.session.ui.show_bookmarks = !self.session.ui.show_bookmarks; self.save(); unsafe { self.rebuild_bookmarks(); } }
             _ => {}
         }
     }
@@ -191,7 +267,7 @@ impl WindowState {
             SendMessageW(self.rename_hwnd, EM_SETSEL, Some(WPARAM(0)), Some(LPARAM(-1)));
             let _ = SetFocus(Some(self.rename_hwnd));
         }
-        self.invalidate_rect(self.layout.bookmarks_row);
+        self.invalidate_rect(self.row_of_bookmarks());
     }
     pub(super) unsafe fn commit_bookmark_rename(&mut self) {
         let Some(id) = self.rename_id.take() else { return };
@@ -206,7 +282,7 @@ impl WindowState {
     pub(super) unsafe fn cancel_rename(&mut self) {
         self.rename_id = None;
         if !self.rename_hwnd.0.is_null() { let _ = unsafe { DestroyWindow(self.rename_hwnd) }; self.rename_hwnd = HWND::default(); }
-        self.invalidate_rect(self.layout.bookmarks_row);
+        self.invalidate_rect(self.row_of_bookmarks());
     }
     pub(super) fn move_bookmark_to(&mut self,id:u64,parent:Option<u64>,before:Option<u64>){
         if self.session.move_bookmark_to(id,parent,before){
@@ -232,5 +308,21 @@ impl WindowState {
             Hit::BookmarksBar|Hit::BookmarkOverflow=>self.move_bookmark_to(id,None,None),
             _=>{},
         }
+    }
+}
+
+#[cfg(test)]
+mod dropdown_tests{
+    use super::*;
+    #[test]
+    fn dropdown_keeps_order_real_ids_and_collapsed_children(){
+        let mut folder=Bookmark::folder(15,"A&B".into(),None);folder.collapsed=true;
+        let bookmarks=vec![folder,Bookmark::folder(27,"内部".into(),Some(15)),Bookmark::link(90,"file".into(),ShellLocation::ThisPc,Some(27)),Bookmark::link(42,"同名".into(),ShellLocation::ThisPc,None)];
+        let items=dropdown_items(&bookmarks,None);
+        let MenuItemSpec::Submenu{label,menu,..}=&items[0]else{panic!("category")};assert_eq!(label,"A&&B");
+        let MenuItemSpec::Submenu{menu:inner,..}=&menu.items[0]else{panic!("nested category")};
+        assert!(matches!(&inner.items[0],MenuItemSpec::Command{command:zsdesk_ui::menus::UiCommand::Custom{id,..},..} if id=="link-90"));
+        assert!(matches!(&items[1],MenuItemSpec::Command{command:zsdesk_ui::menus::UiCommand::Custom{id,..},..} if id=="link-42"));
+        assert!(matches!(&dropdown_items(&[],None)[0],MenuItemSpec::Command{enabled:false,..}));
     }
 }

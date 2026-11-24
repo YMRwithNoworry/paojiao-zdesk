@@ -158,7 +158,7 @@ extern "C" { fn zs_menu_shared_host(enabled:i32); fn zs_menu_set_working_directo
 const CMIC_MASK_UNICODE: u32 = 0x4000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum MenuOutcome { Dismissed, Application(u32), Rename, Open, Explore, ShellInvoked, NativeHandled, Copy, Cut, Paste, PinInExplorer, Delete{permanent:bool} }
+pub enum MenuOutcome { Dismissed, Application(u32), Rename, Open, Explore, ShellInvoked, NativeHandled, CompressZip, Copy, Cut, Paste, PinInExplorer, ChooseApplication, Share, Delete{permanent:bool} }
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct MenuInterceptions { pub rename: bool, pub open: bool, pub file_actions:bool }
@@ -179,9 +179,12 @@ fn application_ids(count: usize) -> Result<Vec<u32>> {
 }
 fn intercepted_verb(verb: Option<&str>, intercept: MenuInterceptions,shift:bool) -> Option<MenuOutcome> {
     match verb {
+        Some(verb) if intercept.file_actions && verb == "zsdesk.compresszip" => Some(MenuOutcome::CompressZip),
         Some(verb) if intercept.rename && verb.eq_ignore_ascii_case("rename") => Some(MenuOutcome::Rename),
         Some(verb) if intercept.open && verb.eq_ignore_ascii_case("open") => Some(MenuOutcome::Open),
         Some(verb) if intercept.open && verb.eq_ignore_ascii_case("explore") => Some(MenuOutcome::Explore),
+        Some(verb) if intercept.file_actions && verb.eq_ignore_ascii_case("windows.modernshare") => Some(MenuOutcome::Share),
+        Some(verb) if intercept.file_actions && verb.eq_ignore_ascii_case("openas") => Some(MenuOutcome::ChooseApplication),
         Some(verb) if intercept.file_actions&&(verb.eq_ignore_ascii_case("copy")||verb.eq_ignore_ascii_case("windows.copy"))=>Some(MenuOutcome::Copy),
         Some(verb) if intercept.file_actions&&(verb.eq_ignore_ascii_case("cut")||verb.eq_ignore_ascii_case("windows.cut"))=>Some(MenuOutcome::Cut),
         Some(verb) if intercept.file_actions&&(verb.eq_ignore_ascii_case("paste")||verb.eq_ignore_ascii_case("windows.paste"))=>Some(MenuOutcome::Paste),
@@ -348,15 +351,20 @@ fn file_sha256(path: &std::path::Path) -> Option<String> {
     Some(hasher.finalize().iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
-fn presentation(modern:bool,_drawn:bool,_build:u32,_verified_native:bool)->(bool,bool){
+fn presentation(modern:bool,drawn:bool,build:u32,_verified_native:bool)->(bool,bool){
+    // The private Windows 11 presenter is unavailable on Windows 10. The public HMENU renderer is independent.
+    if (10240..22000).contains(&build) { return (false,drawn); }
     (modern,modern)
 }
 pub fn presentation_name()->&'static str{
     let options=context_menu_options();if options.drawn{"public-windows11"}else if options.modern{"verified-native-windows11"}else{"native-classic"}
 }
-pub fn set_context_menu_options(mut options: ContextMenuOptions) {
-    let build=crate::theme::os_build();
-    (options.modern,options.drawn)=presentation(options.modern,options.drawn,build,false);
+pub fn resolve_presentation(mut options: ContextMenuOptions) -> ContextMenuOptions {
+    (options.modern,options.drawn)=presentation(options.modern,options.drawn,crate::theme::os_build(),false);
+    options
+}
+pub fn set_context_menu_options(options: ContextMenuOptions) {
+    let mut options=resolve_presentation(options);
     for rules in [&mut options.hidden_verbs,&mut options.shown_verbs]{
         rules.retain(|v| !v.is_empty() && v.len() <= 512 && !v.contains('\0'));
         for verb in rules.iter_mut(){verb.make_ascii_lowercase();}
@@ -929,8 +937,11 @@ fn legacy_should_hide(verb: Option<&str>, label: &str, options: &ContextMenuOpti
 
 pub(super) fn canonical_verb(context: &IContextMenu, id: u32) -> Option<String> {
     if !ShellMenu::is_shell_id(id) { return None; }
+    canonical_verb_at_offset(context, id - SHELL_FIRST)
+}
+pub(super) fn canonical_verb_at_offset(context: &IContextMenu, offset: u32) -> Option<String> {
     let mut buffer = [0u16; 128];
-    unsafe { context.GetCommandString((id - SHELL_FIRST) as usize, GCS_VERBW, None, PSTR(buffer.as_mut_ptr().cast()), buffer.len() as u32) }.ok()?;
+    unsafe { context.GetCommandString(offset as usize, GCS_VERBW, None, PSTR(buffer.as_mut_ptr().cast()), buffer.len() as u32) }.ok()?;
     let end = buffer.iter().position(|&c| c == 0)?;
     if end==0{return None;}String::from_utf16(&buffer[..end]).ok()
 }
@@ -1431,14 +1442,26 @@ mod runtime_tests;
 
 #[cfg(test)]mod presentation_tests{
     use super::*;
+    #[test]fn file_dialog_commands_require_host_file_actions(){
+        let enabled=MenuInterceptions{file_actions:true,..Default::default()};
+        for (verb,outcome) in [("Windows.ModernShare",MenuOutcome::Share),("openas",MenuOutcome::ChooseApplication)] {
+            assert_eq!(intercepted_verb(Some(verb),enabled,false),Some(outcome));
+            assert_eq!(intercepted_verb(Some(verb),MenuInterceptions::default(),false),None);
+        }
+        assert_eq!(intercepted_verb(Some("sharewith"),enabled,false),None);
+    }
     #[test]fn menu_style_routes_by_platform_capability_not_one_machine(){
-        for build in [17763,19041,19045]{assert_eq!(presentation(true,false,build,false),(true,true));}
+        for build in [17763,19041,19045]{assert_eq!(presentation(true,false,build,false),(false,false));}
         for build in [22000,22621,26100,26300,30000]{
             assert_eq!(presentation(true,false,build,false),(true,true));
             assert_eq!(presentation(true,false,build,true),(true,true));
             assert_eq!(presentation(false,false,build,true),(false,false));
         }
-        assert_eq!(presentation(true,true,19045,false),(true,true));
+        for build in [18362,19041,19045]{
+            assert_eq!(presentation(true,true,build,false),(false,true));
+            assert_eq!(presentation(false,true,build,false),(false,true)); // resolved again in the worker
+            assert_eq!(presentation(false,false,build,false),(false,false));
+        }
         assert_eq!(presentation(true,false,0,false),(true,true));
     }
 }

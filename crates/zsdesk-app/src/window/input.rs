@@ -3,7 +3,27 @@ use zsdesk_ui::{chrome::{CommandId, SearchPanelHit}, menus::{self, MenuItemSpec,
 use zsdesk_windows::shell::commands::{folder_settings, set_folder_settings, Column};
 
 #[derive(Clone,Copy,PartialEq,Eq)]
-pub(super) enum TabRightAction { Menu(u64), Close(u64) }
+pub(super) enum TabRightAction { Menu(u64), Close(u64), CloseFromEmptyStrip(u64) }
+
+impl TabRightAction {
+    fn on_tab(id: u64, direct_close: bool, locked: bool, shift: bool) -> Self {
+        if direct_close && !locked && !shift { Self::Close(id) } else { Self::Menu(id) }
+    }
+}
+
+#[cfg(test)]
+mod right_click_tests {
+    use super::TabRightAction;
+    #[test]
+    fn direct_close_respects_tab_identity_locks_and_menu_override() {
+        use TabRightAction::*;
+        assert!(TabRightAction::on_tab(7, false, false, false) == Menu(7));
+        assert!(TabRightAction::on_tab(7, true, false, false) == Close(7));
+        assert!(TabRightAction::on_tab(7, true, true, false) == Menu(7));
+        assert!(TabRightAction::on_tab(7, true, false, true) == Menu(7));
+        assert!(Close(7) != CloseFromEmptyStrip(7));
+    }
+}
 
 impl WindowState {
     unsafe fn new_default_tab(&mut self){
@@ -59,6 +79,7 @@ impl WindowState {
             Command::Up => unsafe { self.go_up() },
             Command::FocusAddress => unsafe { self.focus_address() },
             Command::Refresh => unsafe {
+                if self.columns.active{self.columns.invalidate();self.restore_folder_layout();}
                 if matches!(self.current_location(), ShellLocation::Search { .. }) {
                     self.cancel_fast_search();
                     self.request_integrated_search(false);
@@ -72,7 +93,11 @@ impl WindowState {
             Command::FocusSearch => unsafe { self.open_integrated_search() },
             Command::NewFolder => self.shell_result(self.browser.as_ref().map(|b| b.invoke_background(self.hwnd, "NewFolder"))),
             Command::CopyPath => self.copy_paths(),
-            Command::TogglePreview => { let d = self.session.ui.show_details; self.set_panes(!self.session.ui.show_preview, d && self.session.ui.show_preview); }
+            Command::TogglePreview => {
+                let d=self.session.ui.show_details;
+                if self.columns.active {self.choose_folder_layout(zsdesk_core::model::explorer::FolderLayout::Single);self.set_panes(false,d);}
+                else{self.set_panes(!self.session.ui.show_preview,d && self.session.ui.show_preview);}
+            }
             Command::ToggleDetails => { let p = self.session.ui.show_preview; self.set_panes(p && self.session.ui.show_details, !self.session.ui.show_details); }
             Command::ToggleDualPane => self.toggle_dual_pane(),
             Command::SwitchPane => {self.activate_pane(!self.active_pane_right);self.focus_view();},
@@ -111,6 +136,8 @@ impl WindowState {
             let touches = |h: Hit| self.row_of(h) == Some(row);
             if touches(old) || touches(hit) { self.invalidate_rect(row); }
         }
+        for h in [old,hit]{if let Hit::ColumnDivider(i)=h{self.invalidate_rect(self.column_divider(i));}}
+        if old==Hit::PaneSplitter||hit==Hit::PaneSplitter{self.invalidate_rect(self.layout.pane_splitter);}
         if matches!(old, Hit::Splitter) || matches!(hit, Hit::Splitter) { self.invalidate_rect(self.layout.splitter); }
         if matches!(old,Hit::BookmarkSplitter)||matches!(hit,Hit::BookmarkSplitter){self.invalidate_rect(self.layout.bookmark_splitter);}
         if matches!(old,Hit::TabSplitter)||matches!(hit,Hit::TabSplitter){self.invalidate_rect(self.layout.tab_splitter);}
@@ -118,6 +145,7 @@ impl WindowState {
 
     fn row_of(&self, hit: Hit) -> Option<LayoutRect> {
         Some(match hit {
+            Hit::ColumnDivider(i)=>self.column_divider(i),
             Hit::None | Hit::Splitter | Hit::PaneSplitter | Hit::TabSplitter | Hit::BookmarkSplitter => return None,
             Hit::TabScrollbar=>self.layout.tab_panel,
             Hit::PaneHeader(index)=>self.layout.pane_headers[index],
@@ -127,8 +155,10 @@ impl WindowState {
             Hit::SearchPanel(_) => self.layout.search,
             Hit::Back | Hit::Forward | Hit::Up | Hit::Refresh | Hit::ToggleCommandBar | Hit::Address | Hit::Search => self.layout.nav_row,
             Hit::Command(_) => self.layout.command_row,
-            Hit::Bookmark(_) | Hit::BookmarkOverflow | Hit::BookmarksBar => self.layout.bookmarks_row,
-            Hit::StatusDetails | Hit::StatusTiles | Hit::StatusDualPane | Hit::Status => self.layout.status,
+            Hit::BookmarkOverflow if self.layout.bookmarks_row.is_empty()=>self.layout.nav_row,
+            Hit::BookmarkOverflow=>self.layout.bookmarks_row,
+            Hit::Bookmark(_) | Hit::BookmarksBar => self.layout.bookmarks_row,
+            Hit::StatusDetails | Hit::StatusTiles | Hit::StatusDualPane | Hit::StatusColumns | Hit::Status => self.layout.status,
         })
     }
 
@@ -171,9 +201,11 @@ impl WindowState {
                 }
             }
             Hit::Command(id) => (id.tooltip().into(), self.layout.command_rect(id).unwrap_or_default()),
-            Hit::Bookmark(i) => (self.bookmark_index(i).and_then(|index|self.session.bookmarks.get(index)).map(|b|if b.is_folder{zsdesk_core::tr_format!("{}：点击展开或折叠，拖入项目可分类", b.display_name)}else{b.target.address()}).unwrap_or_default(), self.layout.bookmarks.get(i).copied().unwrap_or_default()),
+            Hit::BookmarkOverflow=>(zsdesk_core::i18n::text("收藏夹").into(),self.layout.bookmark_overflow),
+            Hit::Bookmark(i) => (self.bookmark_index(i).and_then(|index|self.session.bookmarks.get(index)).map(|b|if b.is_folder{if self.session.ui.bookmark_display==zsdesk_core::model::explorer::BookmarkDisplay::Categories{b.display_name.clone()}else{zsdesk_core::tr_format!("{}：点击展开或折叠，拖入项目可分类", b.display_name)}}else{b.target.address()}).unwrap_or_default(), self.layout.bookmarks.get(i).copied().unwrap_or_default()),
             Hit::StatusDetails => (zsdesk_core::i18n::text("在窗口中显示每一项的相关信息 (Ctrl+Shift+6)").into(), self.layout.status_details),
             Hit::StatusTiles => (zsdesk_core::i18n::text("使用大缩略图显示项 (Ctrl+Shift+2)").into(), self.layout.status_tiles),
+            Hit::StatusColumns => (zsdesk_core::i18n::text("多栏显示（父文件夹、当前文件夹、预览）").into(),self.layout.status_columns),
             Hit::StatusDualPane => (zsdesk_core::i18n::text("开启或关闭双栏布局").into(),self.layout.status_dual_pane),
             Hit::PaneHeader(index) => (self.pane_title(index==1),self.layout.pane_headers[index]),
             _ => (String::new(), LayoutRect::default()),
@@ -197,7 +229,7 @@ impl WindowState {
         }
         if let Some((start_x,start_width))=self.bookmark_resize {
             let width=(start_width+start_x-p.x).max(self.s(120));
-            self.session.ui.bookmarks_width=((i64::from(width)*96/i64::from(self.dpi))as i32).clamp(120,600);
+            self.session.ui.bookmarks_width=((i64::from(width)*96/i64::from(self.interface_dpi()))as i32).clamp(120,600);
             self.relayout();self.position_children();self.invalidate();return;
         }
         if let Some((start_x,ratio))=self.pane_splitter_drag {
@@ -214,7 +246,7 @@ impl WindowState {
         }
         if let Some((start_x, start_w)) = self.splitter_drag {
             let width = (start_w + p.x - start_x).max(self.s(zsdesk_ui::chrome::MIN_TREE_W));
-            let dip = (width as i64 * 96 / self.dpi as i64) as i32;
+            let dip = (width as i64 * 96 / self.interface_dpi() as i64) as i32;
             if dip != self.session.ui.tree_width {
                 self.session.ui.tree_width = dip.clamp(120, 800);
                 self.relayout();
@@ -321,6 +353,7 @@ impl WindowState {
             Hit::BookmarkOverflow => unsafe { self.bookmarks_overflow() },
             Hit::StatusDetails => self.set_view(menus::view_choice("details")),
             Hit::StatusTiles => self.set_view(menus::view_choice("large")),
+            Hit::StatusColumns => self.toggle_columns(),
             Hit::StatusDualPane => self.toggle_dual_pane(),
             _ => {}
         }
@@ -358,8 +391,11 @@ impl WindowState {
 
     pub(super) fn tab_strip_right_button(&mut self,p:POINT,down:bool)->bool {
         let tab=match self.layout.tab_strip_right_hit(p.x,p.y,screen_edge_window(self.hwnd)){
-            Some(Hit::Tab(i))=>self.session.tabs.get(i).map(|tab|(i,TabRightAction::Menu(tab.id))),
-            Some(Hit::Caption)=>self.session.tabs.get(self.session.active_tab).map(|tab|(self.session.active_tab,TabRightAction::Close(tab.id))),
+            Some(Hit::Tab(i))=>self.session.tabs.get(i).map(|tab| {
+                let shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
+                (i, TabRightAction::on_tab(tab.id, self.session.ui.right_click_close_tab, tab.locked, shift))
+            }),
+            Some(Hit::Caption)=>self.session.tabs.get(self.session.active_tab).map(|tab|(self.session.active_tab,TabRightAction::CloseFromEmptyStrip(tab.id))),
             _=>None,
         };
         if down{
@@ -373,7 +409,7 @@ impl WindowState {
             if pressed==action && (start.x-p.x).abs()<dx && (start.y-p.y).abs()<dy {
                 match action{
                     TabRightAction::Menu(_)=>unsafe{self.tab_menu(index)},
-                    TabRightAction::Close(_)=>unsafe{self.close_tab(index)},
+                    TabRightAction::Close(_) | TabRightAction::CloseFromEmptyStrip(_)=>unsafe{self.close_tab(index)},
                 }
             }
         }
@@ -394,7 +430,11 @@ impl WindowState {
                 ]);
                 match popup(self.hwnd, &spec, None).as_deref() {
                     Some("open-tab") => unsafe { self.new_tab(target) },
-                    Some("copy") => set_clipboard_text(self.hwnd, &target.address()),
+                    Some("copy") => {
+                        if let Err(error) = zsdesk_windows::shell::file_transfer::set_text(self.hwnd, &target.address()) {
+                            self.show_message(error.to_string());
+                        }
+                    }
                     Some("edit") => unsafe { self.focus_address() },
                     _ => {}
                 }
@@ -442,13 +482,15 @@ impl WindowState {
     // ---- command bar ----------------------------------------------------
 
     pub(super) unsafe fn command(&mut self, id: CommandId) {
-        if (self.pending.is_some()||self.queued.is_some())&&matches!(id,CommandId::New|CommandId::Cut|CommandId::Copy|CommandId::Paste|CommandId::Rename|CommandId::Share|CommandId::Delete){
+        if (self.pending.is_some()||self.queued.is_some())&&matches!(id,CommandId::ExtractHere|CommandId::New|CommandId::NewFolder|CommandId::Cut|CommandId::Copy|CommandId::Paste|CommandId::Rename|CommandId::Share|CommandId::Delete){
             self.show_message(zsdesk_core::i18n::text("文件夹正在加载，请完成后再操作").into());return;
         }
         zsdesk_windows::shell::file_transfer::note_user_input(self.view_hwnd);
         let shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
         let hwnd = self.hwnd;
         match id {
+            CommandId::ExtractHere => self.extract_selected_archives(),
+            CommandId::NewFolder => unsafe { self.execute(Command::NewFolder); },
             CommandId::New => {
                 let rect = self.layout.command_rect(id).unwrap_or_default();
                 let point = self.screen_point(rect.x, rect.bottom());
@@ -484,6 +526,7 @@ impl WindowState {
     }
 
     pub(super) fn set_panes(&mut self, preview: bool, details: bool) {
+        if self.columns.active && (!preview || details){self.choose_folder_layout(zsdesk_core::model::explorer::FolderLayout::Single);}
         self.set_panes_with_rebuild(preview,details,false);
     }
     pub(super) fn set_panes_with_rebuild(&mut self,preview:bool,details:bool,force:bool){
@@ -524,7 +567,7 @@ impl WindowState {
         let (mode, icon) = self.browser.as_ref().and_then(|b| b.view_mode()).unwrap_or((0, 0));
         let (hidden, extensions) = folder_settings();
         let show = ShowState {
-            navigation: self.session.ui.show_tree, preview: self.session.ui.show_preview, details: self.session.ui.show_details,
+            navigation: self.session.ui.show_tree, preview: self.session.ui.show_preview || self.columns.active, details: self.session.ui.show_details,
             bookmarks: self.session.ui.show_bookmarks, checkboxes: self.browser.as_ref().is_some_and(|b| b.checkboxes()),
             extensions, hidden,
         };
@@ -541,7 +584,7 @@ impl WindowState {
             }
             Some("show-preview") => self.set_panes(!show.preview, false),
             Some("show-details") => self.set_panes(false, !show.details),
-            Some("show-bookmarks") => { self.session.ui.show_bookmarks = !show.bookmarks; self.save(); unsafe { self.resize(); } }
+            Some("show-bookmarks") => { self.session.ui.show_bookmarks = !show.bookmarks; self.save(); unsafe { self.rebuild_bookmarks(); } }
             Some("show-checkboxes") => { if let Some(b) = &self.browser { let _ = b.set_checkboxes(!show.checkboxes); } }
             Some("show-extensions") => { set_folder_settings(None, Some(!show.extensions)); unsafe { self.execute(Command::Refresh); } }
             Some("show-hidden") => { set_folder_settings(Some(!show.hidden), None); unsafe { self.execute(Command::Refresh); } }
@@ -658,8 +701,10 @@ impl WindowState {
         let mut paths = self.browser.as_ref().map(|b| b.selection_paths()).unwrap_or_default();
         if paths.is_empty() { paths.push(self.current_location().address()); }
         let text = paths.iter().map(|p| if p.contains(' ') { format!("\"{p}\"") } else { p.clone() }).collect::<Vec<_>>().join("\r\n");
-        set_clipboard_text(self.hwnd, &text);
-        self.show_message(zsdesk_core::tr_format!("已复制 {} 个路径", paths.len()));
+        match zsdesk_windows::shell::file_transfer::set_text(self.hwnd, &text) {
+            Ok(()) => self.show_message(zsdesk_core::tr_format!("已复制 {} 个路径", paths.len())),
+            Err(error) => self.show_message(error.to_string()),
+        }
     }
 
     fn open_terminal(&mut self) {
@@ -714,7 +759,9 @@ impl WindowState {
 
     unsafe fn app_menu(&mut self) {
         self.sync_search_preferences();
-        if let Ok(saved)=storage::load(&self.config_path){self.session.ui.tab_selection_emphasis=saved.ui.tab_selection_emphasis;self.session.ui.startup_location=saved.ui.startup_location;
+        if let Ok(saved)=storage::load(&self.config_path){self.session.ui.tab_selection_emphasis=saved.ui.tab_selection_emphasis;self.session.ui.right_click_close_tab=saved.ui.right_click_close_tab;self.session.ui.startup_location=saved.ui.startup_location;
+            self.session.ui.single_click_blank_up=saved.ui.single_click_blank_up;
+            self.session.ui.double_click_blank_up=saved.ui.double_click_blank_up;
             self.session.ui.context_menu=saved.ui.context_menu;crate::context_preferences::publish(&self.config_path,&self.session.ui.context_menu);}
         let anchor = Some(self.layout.app_menu);
         let spec=self.app_menu_spec();let hwnd=self.hwnd;
@@ -739,6 +786,13 @@ impl WindowState {
                 Err(error)=>self.show_message(error.to_string()),
             },
             Some("diagnostics")=>if let Err(error)=diagnostics::show(self.hwnd){self.show_message(zsdesk_core::tr_format!("无法打开诊断日志：{error}", error=error));},
+            Some("quick-search-shortcut") => match crate::quick_search::shortcut::edit(self.hwnd,&self.config_path) {
+                Ok(Some(message))=>self.show_message(message), Err(error)=>self.show_message(error.to_string()), _=>{}
+            },
+            Some("system-text-size")=>{
+                let result=unsafe{windows::Win32::UI::Shell::ShellExecuteW(Some(self.hwnd),windows::core::w!("open"),windows::core::w!("ms-settings:easeofaccess-display"),None,None,SW_SHOWNORMAL)};
+                if result.0 as isize<=32{self.show_message(zsdesk_core::i18n::text("无法打开 Windows 文字大小设置").into());}
+            },
             Some("quick-search-settings") => unsafe { self.search_settings_menu(); },
             Some("quick-search-open")=>if let Err(error)=crate::quick_search::launch(&self.config_path,false){self.show_message(zsdesk_core::tr_format!("无法打开快速搜索：{error:#}", error=error));},
             Some("manage-context-commands")=>self.load_context_catalog(),
@@ -872,23 +926,50 @@ impl WindowState {
     }
 
     /// Applies an interface preference chosen in ≡ and refreshes what it affects.
-    fn publish_tab_emphasis(&self){
+    fn publish_input_preferences(&self){
         struct Target{pid:u32,key:Vec<u16>}
         unsafe extern "system" fn each(window:HWND,parameter:LPARAM)->windows::core::BOOL{
             let target=unsafe{&*(parameter.0 as*const Target)};let mut pid=0;
             unsafe{GetWindowThreadProcessId(window,Some(&mut pid));}
             if pid==target.pid&&unsafe{GetPropW(window,PCWSTR(target.key.as_ptr()))}.0 as usize==1{
-                let _=unsafe{PostMessageW(Some(window),WM_TAB_EMPHASIS_CHANGED,WPARAM(0),LPARAM(0))};
+                let _=unsafe{PostMessageW(Some(window),WM_INPUT_PREFERENCES_CHANGED,WPARAM(0),LPARAM(0))};
             }true.into()
         }
         let target=Target{pid:std::process::id(),key:crate::instance::property(&self.config_path)};
         let _=unsafe{EnumWindows(Some(each),LPARAM(&target as*const Target as isize))};
     }
     pub(super) fn apply_interface_choice(&mut self, id: &str) {
-        if id=="tab-selection-emphasis"{
-            let current=storage::load(&self.config_path).map(|saved|saved.ui.tab_selection_emphasis).unwrap_or(self.session.ui.tab_selection_emphasis);
-            match storage::save_tab_selection_emphasis(&self.config_path,!current){
-                Ok(())=>{self.session.ui.tab_selection_emphasis=!current;self.invalidate();self.publish_tab_emphasis();},
+        if id.starts_with("bookmarks-display-")||id.starts_with("navigation-divider-")||id.starts_with("interface-text-"){
+            match storage::update_shared_ui(&self.config_path,|ui|{menus::apply_interface_setting(ui,id);(ui.bookmark_display,ui.navigation_divider,ui.interface_text_percent)}){
+                Ok((display,divider,percent))=>{
+                    unsafe{self.commit_bookmark_rename();}self.session.ui.bookmark_display=display;self.session.ui.navigation_divider=divider;
+                    if self.session.ui.interface_text_percent!=percent{self.session.ui.interface_text_percent=percent;unsafe{self.update_font();}self.crumbs_for=None;}
+                    self.measure_bookmarks();unsafe{self.resize();}self.invalidate();self.publish_input_preferences();
+                },
+                Err(e)=>self.show_message(zsdesk_core::tr_format!("保存会话失败：{e}",e=e)),
+            }
+            return;
+        }
+        if matches!(id, "single-click-blank-up" | "double-click-blank-up") {
+            match storage::update_shared_ui(&self.config_path, |ui| {
+                menus::apply_interface_setting(ui, id);
+                (ui.single_click_blank_up, ui.double_click_blank_up)
+            }) {
+                Ok((single, double)) => {
+                    self.session.ui.single_click_blank_up = single;
+                    self.session.ui.double_click_blank_up = double;
+                    pane_input::invalidate_blank_clicks(self.hwnd);
+                    self.publish_input_preferences();
+                }
+                Err(error) => self.show_message(error.to_string()),
+            }
+            return;
+        }
+        if matches!(id, "tab-selection-emphasis" | "right-click-close-tab") {
+            let field: fn(&mut zsdesk_core::model::explorer::ExplorerUi) -> &mut bool =
+                if id == "right-click-close-tab" { |ui| &mut ui.right_click_close_tab } else { |ui| &mut ui.tab_selection_emphasis };
+            match storage::toggle_tab_preference(&self.config_path, field) {
+                Ok(enabled) => { *field(&mut self.session.ui) = enabled; self.invalidate(); self.publish_input_preferences(); },
                 Err(error)=>self.show_message(zsdesk_core::tr_format!("无法保存标签显示设置：{error:#}", error=error)),
             }return;
         }
@@ -1037,7 +1118,7 @@ impl WindowState {
 
 }
 
-pub(super) const SHORTCUTS: &str = "文件管理器\nCtrl+T 新建标签　Ctrl+W / Ctrl+F4 关闭标签　Ctrl+Shift+T 恢复标签\nCtrl+Tab / Ctrl+Shift+Tab 切换标签　Ctrl+1…9 第 N 个标签\nAlt+← / Backspace 后退　Alt+→ 前进　Alt+↑ 上一级　F5 刷新\nCtrl+L / Alt+D / F4 地址栏　Ctrl+F / Ctrl+E / F3 搜索（输入即搜）\nCtrl+Shift+N 新建文件夹　Ctrl+Shift+C 复制路径　Ctrl+D 收藏\nAlt+P 预览窗格　Alt+Shift+P 详细信息窗格　Ctrl+F1 展开/收起命令栏\nF2 重命名　Del 删除　Shift+Del 永久删除　Alt+Enter 属性　Ctrl+A 全选\n右键标签打开菜单，右键标签栏空白处关闭当前标签\n标签中键关闭，拖动排序；收藏中键在新标签打开\n\n桌面格子\n鼠标悬停 展开折叠的格子　双击标题 折叠/展开　拖动标题 移动　拖动边缘 调整大小\nEnter 打开　F2 重命名　Del 删除　Ctrl+A / C / X / V 全选/复制/剪切/粘贴\n方向键 选择　Backspace 返回上一级（文件夹格子）　F5 刷新\n双击桌面空白处 隐藏/显示全部格子";
+pub(super) const SHORTCUTS: &str = "文件管理器\nCtrl+T 新建标签　Ctrl+W / Ctrl+F4 关闭标签　Ctrl+Shift+T 恢复标签\nCtrl+Tab / Ctrl+Shift+Tab 切换标签　Ctrl+1…9 第 N 个标签\nAlt+← / Backspace 后退　Alt+→ 前进　Alt+↑ 上一级　F5 刷新\nCtrl+L / Alt+D / F4 地址栏　Ctrl+F / Ctrl+E / F3 搜索（输入即搜）\nCtrl+Shift+N 新建文件夹　Ctrl+Shift+C 复制路径　Ctrl+D 收藏\nAlt+P 预览窗格　Alt+Shift+P 详细信息窗格　Ctrl+F1 展开/收起命令栏\nF2 重命名　Del 删除　Shift+Del 永久删除　Alt+Enter 属性　Ctrl+A 全选\n右键标签打开菜单；启用右键关闭后，Shift+右键打开菜单。右键标签栏空白处关闭当前标签\n标签中键关闭，拖动排序；收藏中键在新标签打开\n\n桌面格子\n鼠标悬停 展开折叠的格子　双击标题 折叠/展开　拖动标题 移动　拖动边缘 调整大小\nEnter 打开　F2 重命名　Del 删除　Ctrl+A / C / X / V 全选/复制/剪切/粘贴\n方向键 选择　Backspace 返回上一级（文件夹格子）　F5 刷新\n双击桌面空白处 隐藏/显示全部格子";
 
 fn desktop_host_running() -> bool {
     unsafe { FindWindowW(windows::core::w!("ZSDesk.Native.DesktopHost"), PCWSTR::null()) }.is_ok_and(|h| !h.0.is_null())
@@ -1045,25 +1126,6 @@ fn desktop_host_running() -> bool {
 
 fn open_folder_options() {
     let _ = std::process::Command::new("rundll32.exe").args(["shell32.dll,Options_RunDLL", "0"]).spawn();
-}
-
-pub(super) fn set_clipboard_text(owner: HWND, text: &str) {
-    use windows::Win32::{Foundation::HANDLE, System::{DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData},
-        Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE}, Ole::CF_UNICODETEXT}};
-    let data: Vec<u16> = text.encode_utf16().chain(Some(0)).collect();
-    unsafe {
-        if OpenClipboard(Some(owner)).is_err() { return; }
-        let _ = EmptyClipboard();
-        if let Ok(memory) = GlobalAlloc(GMEM_MOVEABLE, data.len() * 2) {
-            let target = GlobalLock(memory) as *mut u16;
-            if !target.is_null() {
-                std::ptr::copy_nonoverlapping(data.as_ptr(), target, data.len());
-                let _ = GlobalUnlock(memory);
-                let _ = SetClipboardData(CF_UNICODETEXT.0 as u32, Some(HANDLE(memory.0)));
-            }
-        }
-        let _ = CloseClipboard();
-    }
 }
 
 /// Shows a ZSUI menu spec as a Windows 11 style flyout. `anchor` (client

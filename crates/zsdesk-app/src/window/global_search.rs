@@ -110,7 +110,8 @@ impl WindowState{
         let paths=self.browser.as_ref().map(|b|b.item_paths_limit(128)).unwrap_or_default();
         let selected=self.browser.as_ref().map(|b|b.selection_paths_limit(128)).unwrap_or_default();
         let status=self.browser.as_ref().map(|b|b.status()).unwrap_or_default();
-        let value=serde_json::json!({"schema":"ZSDesk.Diagnostics.v1","request_id":request.request_id,
+        let button_geometry=self.caption_buttons().map(|[min,max,close]|[self.layout.tab_list,self.layout.app_menu,min,max,close].map(|r|[r.x,r.y,r.width,r.height]));
+        let value=serde_json::json!({"quick_search_timing":crate::quick_search::timing::snapshot(),"caption_buttons":button_geometry,"quick_search_layout":crate::fast_search::mapped::diagnostics(),"schema":"ZSDesk.Diagnostics.v1","request_id":request.request_id,
             "pid":std::process::id(),"hwnd":self.hwnd.0 as usize,"version":env!("CARGO_PKG_VERSION"),"location":self.current_location(),
             "native_view":self.browser.as_ref().and_then(|b|b.view_mode()),"fullscreen":self.fullscreen_restore.is_some(),
             "navigation_pending":self.pending.is_some(),"items":status.items,"selected":status.selected,
@@ -416,7 +417,7 @@ fn progress_text(event:&crate::fast_search::SearchEvent,found:usize)->String{
             if warning.chars().count()>72{text.push('…');}
         }
     }
-    if event.denied>0{text.push_str(&zsdesk_core::tr_format!(" · 跳过 {} 处受限位置", event.denied));}
+    if event.denied>0{text.push_str(&zsdesk_core::tr_format!(" · 跳过 {} 次读取", event.denied));}
     if event.skipped_reparse>0{text.push_str(&zsdesk_core::tr_format!(" · {} 处目录链接未跟随", event.skipped_reparse));}
     text
 }

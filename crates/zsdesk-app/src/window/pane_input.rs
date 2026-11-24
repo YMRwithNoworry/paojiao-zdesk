@@ -49,6 +49,12 @@ pub(super) fn invalidate_blank_clicks(owner:HWND){
 }
 
 #[derive(Clone,Copy)]struct BlankClick{owner:isize,identity:Identity,context:usize,point:POINT,time:u32,released:bool,fired:bool}
+impl BlankClick {
+    fn same_release(&self, owner: HWND, identity: Identity, point: POINT, context: Option<usize>) -> bool {
+        self.owner == owner.0 as isize && self.identity == identity && Some(self.context) == context
+            && BlankClicks::near(self.point, point)
+    }
+}
 #[derive(Default)]pub(super) struct BlankClicks{last:Option<BlankClick>}
 impl BlankClicks{
     fn near(first:POINT,second:POINT)->bool{
@@ -85,21 +91,52 @@ pub(super) fn blank_double_click(slot:&Slot,message:&MSG,clicks:&mut BlankClicks
     if text_input_window(message.hwnd){clicks.last=None;return false;}
     let captured=(||{
         let guard=slot.try_borrow().ok()?;let state=guard.as_ref()?;
-        if !state.session.ui.double_click_blank_up{return None;}
-        let(view,source)=state.file_view_for_input(message.hwnd)?;Some((state.hwnd,view,state.identity_for_source(source)?))
+        let single = state.session.ui.single_click_blank_up && state.picker.is_none()
+            && state.current_location().as_path().is_some();
+        if !single && !state.session.ui.double_click_blank_up{return None;}
+        let(view,source)=state.file_view_for_input(message.hwnd)?;Some((state.hwnd,view,state.identity_for_source(source)?,single))
     })();
-    let Some((owner,view,identity))=captured else{clicks.last=None;return false;};
-    if message.message==WM_LBUTTONUP{clicks.release(owner,identity);return false;}
+    let Some((owner,view,identity,single))=captured else{clicks.last=None;return false;};
+    if !single && message.message==WM_LBUTTONUP{clicks.release(owner,identity);return false;}
     let mut point=POINT{x:message.lParam.0 as i16 as i32,y:(message.lParam.0>>16)as i16 as i32};
     if !unsafe{windows::Win32::Graphics::Gdi::ClientToScreen(message.hwnd,&mut point)}.as_bool(){clicks.last=None;return false;}
-    let Some(first)=clicks.pair(owner,identity,point,message.time,message.message==WM_LBUTTONDBLCLK)else{return false;};
     let background=|point:POINT|{
         let position=LPARAM(((point.x as u16 as u32)|((point.y as u16 as u32)<<16))as isize);
         zsdesk_windows::shell::menu::classify_view_menu_point(view,message.hwnd,position)==zsdesk_windows::shell::menu::ViewMenuTarget::Background
     };
+    if single {
+        let before = clicks.last.take();
+        if unsafe { GetKeyState(VK_MENU.0 as i32) } < 0 { return false; }
+        if message.message == WM_LBUTTONDOWN {
+            if let Some(context) = blank_context(owner) {
+                if background(point) && current_blank_context(owner) == Some(context) {
+                    clicks.last = Some(BlankClick {owner:owner.0 as isize,identity,context,point,time:message.time,released:false,fired:false});
+                }
+            }
+        } else if message.message == WM_LBUTTONUP && before.is_some_and(|press|
+            press.same_release(owner,identity,point,current_blank_context(owner))
+            && background(point) && current_blank_context(owner) == Some(press.context)) {
+            post(owner,identity,Intent::Action(Command::Up.id() as usize));
+        }
+        // Let the native selection control receive its release and finish capture.
+        return false;
+    }
+    let Some(first)=clicks.pair(owner,identity,point,message.time,message.message==WM_LBUTTONDBLCLK)else{return false;};
     if !background(first)||!background(point){clicks.last=None;return false;}
     if !clicks.last.as_ref().is_some_and(|last|current_blank_context(owner)==Some(last.context)){clicks.last=None;return false;}
     post(owner,identity,Intent::Action(Command::Up.id()as usize))
+}
+
+#[test]
+fn single_blank_release_requires_same_folder_context_and_point() {
+    let owner = HWND::default();
+    let id = Identity { source: 2, tab: 3, epoch: 4 };
+    let point = POINT {x:100,y:100};
+    let press = BlankClick {owner:0, identity:id, context:7, point, time:0, released:false, fired:false};
+    assert!(press.same_release(owner,id,point,Some(7)));
+    assert!(!press.same_release(owner,Identity{epoch:5,..id},point,Some(7)));
+    assert!(!press.same_release(owner,id,point,Some(8)));
+    assert!(!press.same_release(owner,id,POINT{x:1000,y:1000},Some(7)));
 }
 
 #[cfg(test)]pub(super) fn native_blank_double_click(slot:&Slot,root:&std::path::Path,pump:fn(u64))->Result<()>{

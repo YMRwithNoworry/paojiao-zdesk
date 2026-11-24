@@ -35,6 +35,37 @@ fn collect(service:&FastSearch,generation:u64)->Result<(Vec<PathBuf>,SearchEvent
         ensure!(Instant::now()<deadline,"native search timeout");thread::sleep(Duration::from_millis(5));}
 }
 
+#[test]
+fn opening_search_only_warms_existing_rows_and_historical_skips_stay_in_diagnostics()->Result<()>{
+    let fixture=Fixture::new(&std::env::temp_dir())?;
+    let core=native::shared(&fixture.index);
+    let state=shared();
+    let options=SearchOptions::default();
+    mapped::prime(&fixture.index,&options,&||false);
+    assert!(!fixture.index.exists());
+    assert_eq!(native::inspect(&core).0,0);
+    let expected=fixture.write("warm-marker.txt",b"ok")?;
+    direct(&core,&fixture,options,"warm-marker",0,20,everything::SearchSort::NameAsc)?;
+    native::evict_if_idle(&core,0);
+    let policy=snapshot::Policy{development:false,metadata:false};
+    let mut data=snapshot::load(&fixture.index,&policy,&||false)?;
+    let root=data[0].index.ids[0];
+    data[0].note_read_error(root,&anyhow::anyhow!("fixture read error"));
+    assert!(data[0].read_issue.as_ref().unwrap().1.contains("fixture read error"));
+    snapshot::save(&fixture.index,&policy,&data,&||false)?;
+    mapped::prime(&fixture.index,&options,&||false);
+    assert_eq!(native::inspect(&core).0,0);
+    let(sender,receiver)=mpsc::sync_channel(128);
+    let request=Request{generation:1,query:"warm-marker".into(),preferred:None,invalid:None,offset:0,limit:20,sort:everything::SearchSort::NameAsc};
+    let preview=mapped::search(&fixture.index,&options,&request,&||false)?;
+    assert_eq!(preview.paths,[expected.clone()]);assert_eq!(preview.total,1);
+    native::execute_cached(&core,&options,Some(std::slice::from_ref(&fixture.files)),&state,&sender,&request)?;
+    let event=receiver.try_iter().find(|e|e.finished).unwrap();
+    assert_eq!(event.paths,[expected]);assert_eq!(event.denied,0);
+    assert!(event.volumes.iter().all(|v|v.warning.as_ref().is_none_or(|s|!s.contains("fixture read error"))));
+    Ok(())
+}
+
 #[test]fn cancelled_partial_catalog_is_saved_and_resumed_without_bootstrap()->Result<()>{
     let fixture=Fixture::new(&std::env::temp_dir())?;
     for index in 0..96{fixture.write(&format!("dir-{index}/resume-marker.txt"),b"resumable")?;}
@@ -261,7 +292,7 @@ fn native_compact_million_rows_snapshot_and_eviction()->Result<()>{
     let dirs:Vec<_>=(0..1000).map(|n|index.append(100+n,0,OsStr::new(&format!("目录{n}")),DIRECTORY)).collect::<Result<_>>()?;
     for row in 0..1_000_000u64{index.append(10_000+row,dirs[(row/1000)as usize],OsStr::new(&format!("文件-{:06}.txt",row%300_000)),0)?;}
     index.reindex();index.compact()?;index.validate()?;let heap=index.heap_bytes();ensure!(heap<160*1024*1024,"compact synthetic catalog exceeded reviewed memory budget");
-    let count=index.len();let volumes=vec![VolumeIndex{root:fixture.files.clone(),serial:1,journal_id:7,checkpoint:99,has_journal:true,mft:true,denied:0,index,pending_dirs:Vec::new()}];
+    let count=index.len();let volumes=vec![VolumeIndex{root:fixture.files.clone(),serial:1,journal_id:7,checkpoint:99,has_journal:true,mft:true,denied:0,read_issue:None,index,pending_dirs:Vec::new()}];
     let policy=snapshot::Policy{development:false,metadata:false};snapshot::save(&fixture.index,&policy,&volumes,&||false)?;let bytes=fs::metadata(&fixture.index)?.len();drop(volumes);
     let loaded=snapshot::load(&fixture.index,&policy,&||false)?;ensure!(loaded[0].index.len()==count&&loaded[0].index.attributes.is_none(),"scale roundtrip mismatch");drop(loaded);
     let report=json!({"state":"passed","synthetic_files":1000000,"directories":1000,"resident_column_estimate_bytes":heap,"snapshot_bytes":bytes,
@@ -360,7 +391,7 @@ fn broad_queries_keep_the_correct_page_after_pruning() -> Result<()> {
     }
     index.reindex();
     let volumes=[VolumeIndex{root:fixture.files.clone(),serial:1,journal_id:0,checkpoint:0,
-        has_journal:false,mft:false,denied:0,index,pending_dirs:Vec::new()}];
+        has_journal:false,mft:false,denied:0,read_issue:None,index,pending_dirs:Vec::new()}];
     snapshot::save(&fixture.index,&snapshot::Policy{development:false,metadata:true},&volumes,&||false)?;
     let core=native::shared(&fixture.index);
     let options=SearchOptions{index_metadata:true,..Default::default()};
@@ -375,4 +406,89 @@ fn broad_queries_keep_the_correct_page_after_pruning() -> Result<()> {
         assert!(event.truncated);
     }
     Ok(())
+}
+
+thread_local! {static MATCH_DIGEST:std::cell::RefCell<Option<sha2::Sha256>>=const{std::cell::RefCell::new(None)};}
+pub(super) fn observe_hit(volume:usize,row:usize){
+    use sha2::Digest;
+    MATCH_DIGEST.with(|h|if let Some(h)=h.borrow_mut().as_mut(){h.update((volume as u32).to_le_bytes());h.update((row as u32).to_le_bytes());});
+}
+
+#[test]
+#[ignore="Read-only comparison on an explicitly supplied snapshot with an isolated output directory"]
+fn mapped_snapshot_latency_and_membership()->Result<()>{
+    use sha2::{Digest,Sha256};
+    let input=PathBuf::from(std::env::var_os("ZSDESK_BENCH_SNAPSHOT").context("snapshot required")?);
+    let output=PathBuf::from(std::env::var_os("ZSDESK_NATIVE_TEST_OUTPUT").context("output required")?);
+    let fixture=Fixture::new(&output)?;
+    let options=SearchOptions::default();
+    let state=shared();
+    let mut report=Vec::new();
+    let policy=snapshot::Policy{development:false,metadata:false};
+    let volumes=snapshot::load(&input,&policy,&||false)?;
+    snapshot::save(&fixture.index,&policy,&volumes,&||false)?;
+    drop(volumes);
+    for path in [&input,&fixture.index]{
+        mapped::invalidate(path);
+        let cold=Instant::now();mapped::prime(path,&options,&||false);
+        let prime=cold.elapsed().as_millis();
+        let core=native::shared(path);
+        let mut request=Request{generation:1,query:"标准".into(),preferred:None,invalid:None,offset:0,limit:200,sort:everything::SearchSort::NameAsc};
+        let t=Instant::now();let first=mapped::search(path,&options,&request,&||false)?;
+        let first_ms=t.elapsed().as_millis();
+        assert_eq!(native::inspect(&core).0,0);
+        let layout=mapped::diagnostics();
+        let t=Instant::now();native::warm_existing(&core,&options,&state);
+        let loaded=t.elapsed().as_millis();
+        ensure!(native::inspect(&core).0>0,"canonical snapshot could not be loaded; no scan permitted");
+        let mut cases=Vec::new();
+        for (i,term) in ["标准","ext:pdf","*.rs","folder: src","ext:pdf path:资料","file: <png | jpg> !cache","bz"].iter().enumerate(){
+            let o=SearchOptions{pinyin_initials:i==6,..options};
+            request.query=term.to_string();request.offset=0;request.sort=everything::SearchSort::NameAsc;
+            let mut times=Vec::new();
+            let mut count=0;
+            for _ in 0..5{
+                let t=Instant::now();let page=mapped::search(path,&o,&request,&||false)?;times.push(t.elapsed().as_micros());
+                count=page.total;
+            }
+            for (offset,sort) in [(0,everything::SearchSort::NameAsc),(count.saturating_sub(199) as u32,everything::SearchSort::NameDesc)]{
+                request.offset=offset;request.sort=sort;state.clear_page();
+                let begin=||MATCH_DIGEST.with(|d|*d.borrow_mut()=Some(Sha256::new()));
+                let digest=||MATCH_DIGEST.with(|d|format!("{:x}",d.borrow_mut().take().unwrap().finalize()));
+                begin();let page=mapped::search(path,&o,&request,&||false)?;let expected=digest();
+                begin();let(tx,rx)=mpsc::sync_channel(32);
+                native::execute_cached(&core,&o,None,&state,&tx,&request)?;
+                let events=rx.try_iter().collect::<Vec<_>>();assert_eq!(digest(),expected);
+                assert_eq!(events.last().unwrap().indexed,page.total);
+                assert_eq!(events.into_iter().flat_map(|e|e.paths).collect::<Vec<_>>(),page.paths);
+            }
+            times.sort();cases.push(json!({"query":term,"count":count,"median_us":times[2]}));
+        }
+        report.push(json!({"format":if path==&input{"installed_snapshot"}else{"compact_snapshot"},"prime_ms":prime,
+            "first_ms":first_ms,"first_total":first.total,"canonical_load_ms":loaded,"layout":layout,"cases":cases}));
+        mapped::invalidate(path);
+    }
+    fs::write(output.join("first-result.json"),serde_json::to_vec_pretty(&report)?)?;
+    Ok(())
+}
+
+#[test]
+fn mapped_first_page_reconciles_creates_deletes_and_releases_when_hidden()->Result<()>{
+    let fixture=Fixture::new(&std::env::temp_dir())?;
+    let removed=fixture.write("signal-old.txt",b"old")?;
+    let options=SearchOptions::default();let core=native::shared(&fixture.index);
+    direct(&core,&fixture,options,"signal",0,200,everything::SearchSort::NameAsc)?;
+    native::evict_if_idle(&core,0);assert_eq!(native::inspect(&core).0,0);
+    fs::remove_file(&removed)?;let added=fixture.write("signal-new.txt",b"new")?;
+    let service=FastSearch::new_with_roots_for_test(fixture.index.clone(),vec![fixture.files.clone()])?;
+    service.warm_snapshot();service.start_page("signal",None,0,200,everything::SearchSort::NameAsc);
+    let limit=Instant::now()+Duration::from_secs(12);let mut preview=false;let mut paths=Vec::new();
+    'read:loop{for e in service.poll(){if e.reset{paths.clear();}paths.extend(e.paths);
+        if e.read_only && e.scanning{assert!(paths.contains(&removed));preview=true;}
+        if e.finished{assert_eq!(paths,[added.clone()]);break 'read;}}
+        ensure!(Instant::now()<limit,"refresh timeout");thread::sleep(Duration::from_millis(5));
+    }
+    assert!(preview);service.hide_popup();
+    while native::inspect(&core).0!=0 {ensure!(Instant::now()<limit,"idle catalog retained");thread::sleep(Duration::from_millis(10));}
+    stop(service);Ok(())
 }

@@ -14,7 +14,7 @@ pub(crate) const USE_NATIVE:usize=7305;
 #[cfg(test)]pub(crate) const TEST_ACCEPT_EDIT:usize=7306;
 const FOOTER_H:i32=76;
 pub(crate) const WM_NATIVE_REPLY:u32=WM_APP+147;
-#[derive(Clone,Copy)]pub(crate) enum NativeReply{Accepted=1,Cancelled=2,Rejected=3,Waiting=4,Fallback=5}
+#[derive(Clone,Copy)]pub(crate) enum NativeReply{Accepted=1,Cancelled=2,Rejected=3,Waiting=4,Fallback=5,MobileUpload=6}
 pub(crate) fn native_reply(window:isize,token:u64,reply:NativeReply)->bool{
     let window=HWND(window as*mut _);
     if unsafe{GetPropW(window,MARKER)}.0 as usize!=token as usize{return false;}
@@ -50,7 +50,7 @@ impl Submission{
             NativeReply::Accepted=>{self.confirmed=true;self.waiting=false;self.selected.take()},
             NativeReply::Cancelled|NativeReply::Fallback=>{self.confirmed=true;self.waiting=false;Some(Outcome::Cancelled)},
             NativeReply::Rejected=>{self.waiting=false;self.cancel_requested=false;self.selected=None;None},
-            NativeReply::Waiting=>None,
+            NativeReply::Waiting|NativeReply::MobileUpload=>None,
         }
     }
 }
@@ -103,8 +103,11 @@ impl WindowState{
         self.show_message(zsdesk_core::i18n::text("正在等待原程序确认选择…").into());
     }
     pub(super) fn picker_native_reply(&mut self,token:u64,code:isize){
-        let reply=match code{1=>NativeReply::Accepted,2=>NativeReply::Cancelled,3=>NativeReply::Rejected,4=>NativeReply::Waiting,5=>NativeReply::Fallback,_=>return};
+        let reply=match code{1=>NativeReply::Accepted,2=>NativeReply::Cancelled,3=>NativeReply::Rejected,4=>NativeReply::Waiting,5=>NativeReply::Fallback,6=>NativeReply::MobileUpload,_=>return};
         let Some(picker)=self.picker.as_mut().filter(|picker|picker.options.token==token)else{return;};
+        if matches!(reply,NativeReply::MobileUpload){
+            unsafe{let _=ShowWindow(picker.original,SW_SHOWNA);}return;
+        }
         if let Some(outcome)=picker.submission.reply(reply){*picker.result.borrow_mut()=outcome;post(self.hwnd,WM_CLOSE,0,0);return;}
         unsafe{let _=EnableWindow(picker.accept,!picker.submission.waiting);}
         if !picker.use_native.0.is_null(){unsafe{let _=EnableWindow(picker.use_native,!picker.submission.waiting);}}

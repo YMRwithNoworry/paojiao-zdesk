@@ -258,8 +258,10 @@ pub(super) fn sync_pane(owner:HWND,slot:&super::Slot,pane:&mut Option<PreviewPro
     let identity=snapshot.as_ref().map(|snapshot|snapshot.identity.clone());
     // The 100 ms supervision timer must not continuously enter Shell to fetch
     // the same selection. The native selection revision invalidates this cache.
-    let unchanged=pane.as_ref().is_some_and(|pane|pane.selection==identity);
-    let path=if unchanged{pane.as_ref().unwrap().request.path.clone()}
+    let unchanged=identity.is_some() && pane.as_ref().is_some_and(|pane|pane.selection==identity);
+    let parent_file=slot.try_borrow().ok().and_then(|s|s.as_ref().and_then(|state|state.columns.preview_file.clone()));
+    let from_parent=parent_file.is_some();
+    let path=if let Some(file)=parent_file {file} else if unchanged {pane.as_ref().unwrap().request.path.clone()}
         else{snapshot.as_ref().and_then(|snapshot|snapshot.selected_path(slot)).unwrap_or_default()};
     // A COM callback may have switched tabs, moved a pane or closed the window.
     if snapshot.as_ref().is_some_and(|snapshot|!snapshot.current(slot,true))||pane_context(slot)!=context{return;}
@@ -271,7 +273,7 @@ pub(super) fn sync_pane(owner:HWND,slot:&super::Slot,pane:&mut Option<PreviewPro
         }
     }
     if let Some(pane)=pane.as_mut(){
-        if pane.update(&path).is_ok(){pane.selection=identity;}
+        if pane.update(&path).is_ok(){pane.selection=if from_parent{None}else{identity};}
         let _=pane.set_dark(dark);pane.layout(bounds);
     }
 }

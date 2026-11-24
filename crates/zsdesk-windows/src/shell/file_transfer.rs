@@ -161,13 +161,7 @@ fn hdrop_bytes(paths:&[PathBuf])->Result<Vec<u8>>{
     bytes.extend([0,0]);Ok(bytes)
 }
 pub fn copy_paths(owner:HWND,paths:&[PathBuf],cut:bool)->Result<()>{
-    publish_paths(owner,paths,cut,None)
-}
-fn publish_paths(owner:HWND,paths:&[PathBuf],cut:bool,expected:Option<u32>)->Result<()>{
     let data=file_data_object(owner,paths,cut)?;
-    if expected.is_some_and(|seq|seq!=unsafe{GetClipboardSequenceNumber()}){
-        return Err(invalid(zsdesk_core::i18n::text("剪贴板已改变，请重新剪切")));
-    }
     unsafe{windows::Win32::System::Ole::OleSetClipboard(&data)}
 }
 fn file_data_object(owner:HWND,paths:&[PathBuf],cut:bool)->Result<windows::Win32::System::Com::IDataObject>{
@@ -177,6 +171,11 @@ fn file_data_object(owner:HWND,paths:&[PathBuf],cut:bool)->Result<windows::Win32
     let pidls=paths.iter().map(|path|super::pidl::location_pidl(&zsdesk_core::model::explorer::ShellLocation::Path(path.clone()))
         .ok_or_else(||invalid(zsdesk_core::i18n::text("无法读取文件标识")))).collect::<Result<Vec<_>>>()?;
     let data=crate::desktop::data_object(owner,&pidls)?;
+    set_drop_effect(&data, cut)?;
+    Ok(data)
+}
+
+fn set_drop_effect(data: &windows::Win32::System::Com::IDataObject, cut: bool) -> Result<()> {
     let format=unsafe{RegisterClipboardFormatW(w!("Preferred DropEffect"))};if format==0{return Err(Error::from_thread());}
     let mut memory=Memory::new(&(if cut{2u32}else{1u32}).to_le_bytes())?;
     let descriptor=windows::Win32::System::Com::FORMATETC{cfFormat:format as u16,ptd:std::ptr::null_mut(),
@@ -184,7 +183,7 @@ fn file_data_object(owner:HWND,paths:&[PathBuf],cut:bool)->Result<windows::Win32
     let medium=windows::Win32::System::Com::STGMEDIUM{tymed:windows::Win32::System::Com::TYMED_HGLOBAL.0 as u32,
         u:windows::Win32::System::Com::STGMEDIUM_0{hGlobal:memory.0},pUnkForRelease:std::mem::ManuallyDrop::new(None)};
     unsafe{data.SetData(&descriptor,&medium,true)?;}memory.0=HGLOBAL::default();
-    Ok(data)
+    Ok(())
 }
 pub fn set_text(owner:HWND,text:&str)->Result<()>{
     if text.contains('\0')||text.len()>MAX_PATH_BYTES{return Err(invalid("剪贴板文字过长或含无效字符"));}
@@ -227,7 +226,7 @@ pub fn filesystem_selection(view:&IShellView)->Result<bool>{
     let items:IShellItemArray=unsafe{folder.Items(SVGIO_SELECTION)?};
     Ok(unsafe{items.GetAttributes(SIATTRIBFLAGS_AND,SFGAO_FILESYSTEM)?}.0&SFGAO_FILESYSTEM.0!=0)
 }
-fn item_path(item:&IShellItem)->Result<PathBuf>{
+pub(super) fn item_path(item:&IShellItem)->Result<PathBuf>{
     let value=unsafe{item.GetDisplayName(SIGDN_FILESYSPATH)?};let text=unsafe{value.to_string()};unsafe{CoTaskMemFree(Some(value.0.cast()));}Ok(text.map(PathBuf::from)?)
 }
 pub(super) fn paste_folder(view:&IShellView)->Result<Option<IShellItem>>{
@@ -256,29 +255,58 @@ fn same_cut_selection(a:&[PathBuf],b:&[PathBuf])->bool{
     keys(a)==keys(b)
 }
 pub fn copy_view(view:&IShellView,owner:HWND,cut:bool)->Result<()>{
-    let paths=selected_paths(view)?;if paths.is_empty(){return Ok(());}
-    if cut{
-        if let Ok(folder)=view.cast::<IShellFolderView>(){
-            let before=unsafe{GetClipboardSequenceNumber()};
-            let native=unsafe{folder.SetClipboard(true)};
-            let after=unsafe{GetClipboardSequenceNumber()};
-            if after!=before{
-                // A different application may have taken the clipboard while
-                // Shell pumped messages. Never replace its newer selection.
-                if let Ok((published,effect,_))=clipboard_files(){
-                    if move_intent(effect)&&same_cut_selection(&published,&paths){return Ok(());}
-                }
-                if !owned_clipboard_on_current_thread()||unsafe{GetClipboardSequenceNumber()}!=after{
-                    native?;
-                    return Err(invalid(zsdesk_core::i18n::text("剪贴板已改变，请重新剪切")));
-                }
+    let sequence = unsafe { GetClipboardSequenceNumber() };
+    let paths = selected_paths(view)?;
+    if paths.is_empty() { return Ok(()); }
+    if !cut { return copy_paths(owner, &paths, false); }
+
+    // Keep the selected view's Shell formats (including its source identity).
+    // Publish MOVE before asking DefView to ghost the selection.
+    let data = match unsafe { view.GetItemObject(SVGIO_SELECTION) } {
+        Ok(data) if set_drop_effect(&data, true).is_ok() => data,
+        _ => file_data_object(owner, &paths, true)?,
+    };
+    let folder = view.cast::<IShellFolderView>();
+    let window = unsafe { view.GetWindow() }.ok();
+    publish_view_cut(&data, sequence, || Ok(same_cut_selection(&selected_paths(view)?, &paths)), || {
+        let marked = folder.is_ok_and(|folder| {
+            let status = unsafe { (folder.vtable().SetClipboard)(folder.as_raw(), true.into()) };
+            status == windows::Win32::Foundation::S_OK
+        });
+        if let Some(hwnd) = window {
+            if !marked {
+                // ShellFolderView_SetClipboard specifies DWORD(-2) for a cut.
+                const CUT_TO_CLIPBOARD: u32 = -2i32 as u32;
+                unsafe { SHShellFolderView_Message(hwnd, SFVM_SETCLIPBOARD, LPARAM(CUT_TO_CLIPBOARD as isize)); }
             }
-            // Some hosted views only mark the selection visually, or return
-            // E_NOTIMPL. Publish the actual paths and explicit MOVE intent.
-            return publish_paths(owner,&paths,true,Some(after));
+            use windows::Win32::Graphics::Gdi::{RedrawWindow, RDW_ALLCHILDREN, RDW_INVALIDATE};
+            let _ = unsafe { RedrawWindow(Some(hwnd), None, None, RDW_INVALIDATE | RDW_ALLCHILDREN) };
         }
+    })
+}
+
+// OleIsCurrentClipboard returns S_FALSE for a different object. Preserve that
+// distinction: the generated Result<()> binding maps both success codes to Ok.
+#[link(name = "ole32")]
+unsafe extern "system" {
+    #[link_name = "OleIsCurrentClipboard"]
+    fn clipboard_object_status(object: *mut core::ffi::c_void) -> HRESULT;
+}
+
+fn publish_view_cut(
+    data: &windows::Win32::System::Com::IDataObject,
+    sequence: u32,
+    same_selection: impl Fn() -> Result<bool>,
+    mark: impl FnOnce(),
+) -> Result<()> {
+    if !same_selection()? || unsafe { GetClipboardSequenceNumber() } != sequence {
+        return Err(invalid(zsdesk_core::i18n::text("剪贴板已改变，请重新剪切")));
     }
-    copy_paths(owner,&paths,cut)
+    unsafe { windows::Win32::System::Ole::OleSetClipboard(data)?; }
+    if same_selection().unwrap_or(false) && unsafe { clipboard_object_status(data.as_raw()) } == windows::Win32::Foundation::S_OK {
+        mark();
+    }
+    Ok(())
 }
 pub fn paths_from_pidls(pidls:&[Vec<u8>])->Result<Vec<PathBuf>>{
     if pidls.len()>MAX_ITEMS{return Err(invalid("选择超过 10000 项"));}

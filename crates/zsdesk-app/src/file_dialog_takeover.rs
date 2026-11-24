@@ -97,12 +97,21 @@ fn address_value(value:&str)->&str{
         ||if matches!(value,"地址:"|"Address:"){""}else{value},
         |(_,value)|value).trim()
 }
+fn profile_display_name()->Option<String>{
+    use windows::Win32::{System::Com::CoTaskMemFree,UI::Shell::{IShellItem,SHGetKnownFolderItem,FOLDERID_UsersFiles,KF_FLAG_DEFAULT,SIGDN_NORMALDISPLAY}};
+    let item:IShellItem=unsafe{SHGetKnownFolderItem(&FOLDERID_UsersFiles,KF_FLAG_DEFAULT,None)}.ok()?;
+    let raw=unsafe{item.GetDisplayName(SIGDN_NORMALDISPLAY)}.ok()?;
+    let result=unsafe{raw.to_string()}.ok();
+    unsafe{CoTaskMemFree(Some(raw.0.cast()));}
+    result.filter(|name|!name.trim().is_empty())
+}
 fn initial_location(value:&str)->Option<zsdesk_core::model::explorer::ShellLocation>{
     use zsdesk_core::model::explorer::ShellLocation;
     let value=address_value(value);
     if Path::new(value).is_absolute(){return Some(ShellLocation::Path(value.into()));}
     match value.to_lowercase().as_str(){"桌面"|"desktop"=>zsdesk_windows::desktop::user_desktop().map(ShellLocation::Path),"此电脑"|"this pc"=>Some(ShellLocation::ThisPc),
-        "主文件夹"|"home"=>Some(ShellLocation::Shell{pidl:None,parsing_name:"shell:HomeFolder".into(),title:zsdesk_core::i18n::text("主文件夹").into()}),_=>None}
+        "主文件夹"|"home"=>Some(ShellLocation::Shell{pidl:None,parsing_name:"shell:HomeFolder".into(),title:zsdesk_core::i18n::text("主文件夹").into()}),
+        _=>profile_display_name().filter(|name|name.eq_ignore_ascii_case(value)).and_then(|_|dirs::home_dir()).map(ShellLocation::Path)}
 }
 fn known_location(value:&str)->Option<zsdesk_core::model::explorer::ShellLocation>{
     use windows::Win32::{System::Com::CoTaskMemFree,UI::Shell::*};
@@ -316,6 +325,11 @@ fn run_with_watcher(profile:&Path,stop:&AtomicBool,mut spawn_watcher:impl FnMut(
                     last_kind=Some("native");last_error=None;
                 }
             },
+            Event::UseOriginal{token}=>if let Some(session)=sessions.iter_mut().find(|session|session.token==token){
+                if !returning.contains_key(&token) && !session.fallback{
+                    session.close_picker();last_kind=Some("native");last_preservation=Some("user-requested-native");
+                }
+            },
             Event::Submit{token,outcome}=>if let Some(session)=sessions.iter_mut().find(|session|session.token==token){
                 if session.fallback||!session.source.matches()||session.early.as_ref().is_some_and(|claim|!claim.active()){continue;}
                 if returning.contains_key(&token)&&!matches!(outcome,Outcome::Cancelled){continue;}
@@ -446,6 +460,14 @@ fn run_with_watcher(profile:&Path,stop:&AtomicBool,mut spawn_watcher:impl FnMut(
 
 #[cfg(test)]mod tests{
     use super::*;
+    #[test]fn profile_breadcrumb_resolves_the_localized_shell_display_name()->Result<()>{
+        unsafe{CoInitializeEx(None,COINIT_MULTITHREADED)}.ok()?;
+        struct Apartment;impl Drop for Apartment{fn drop(&mut self){unsafe{CoUninitialize();}}}
+        let _apartment=Apartment;
+        let label=profile_display_name().context("current user shell folder")?;
+        assert_eq!(initial_location(&format!("地址: {label}")),dirs::home_dir().map(zsdesk_core::model::explorer::ShellLocation::Path));
+        Ok(())
+    }
     #[test]fn folder_followup_requires_confirmed_navigation_and_consumed_input(){
         use zsdesk_core::model::explorer::ShellLocation;
         let target=PathBuf::from(r"E:\selected folder");let selected=Outcome::Selected{paths:vec![target.clone()],filter:0};

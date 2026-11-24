@@ -6,6 +6,8 @@ pub mod enumerate;
 pub mod flyout_layout;
 
 #[cfg(windows)]
+pub mod archive;
+#[cfg(windows)]
 pub mod desktop;
 #[cfg(windows)]
 pub mod gfx;

@@ -48,6 +48,8 @@ impl Ord for Hit{fn cmp(&self,other:&Self)->Cmp{
     let name=||self.name.cmp(&other.name).then_with(||self.path.cmp(&other.path));
     match self.sort{everything::SearchSort::NameAsc=>name(),everything::SearchSort::NameDesc=>name().reverse(),
         everything::SearchSort::ModifiedDesc=>other.modified.cmp(&self.modified).then_with(name),
+        everything::SearchSort::ModifiedAsc=>self.modified.cmp(&other.modified).then_with(name),
+        everything::SearchSort::SizeAsc=>self.size.cmp(&other.size).then_with(name),
         everything::SearchSort::SizeDesc=>other.size.cmp(&self.size).then_with(name)}
 }}
 impl PartialOrd for Hit{fn partial_cmp(&self,other:&Self)->Option<Cmp>{Some(self.cmp(other))}}
@@ -106,11 +108,11 @@ pub(super) fn execute(shared:&Shared,sender:&SyncSender<SearchEvent>,request:&Re
         assert!(!remote_kind(Path::new(r"C:\folder"),3));assert!(!remote_kind(Path::new(r"Z:relative"),DRIVE_REMOTE));
     }
     #[test]fn bounded_heap_returns_the_requested_sorted_page(){
-        for sort in [everything::SearchSort::NameAsc,everything::SearchSort::NameDesc,everything::SearchSort::SizeDesc,everything::SearchSort::ModifiedDesc]{
+        for sort in [everything::SearchSort::NameAsc,everything::SearchSort::NameDesc,everything::SearchSort::SizeAsc,everything::SearchSort::SizeDesc,everything::SearchSort::ModifiedAsc,everything::SearchSort::ModifiedDesc]{
             let mut heap=BinaryHeap::new();for index in (0..100).rev(){let hit=Hit{path:format!(r"Z:\{index:03}.txt").into(),name:format!("{index:03}"),size:index,modified:index,sort};
                 if heap.len()<7{heap.push(hit);}else if hit<*heap.peek().unwrap(){heap.pop();heap.push(hit);}}
             let rows=heap.into_sorted_vec().into_iter().skip(5).map(|hit|hit.size).collect::<Vec<_>>();
-            assert_eq!(rows,if sort==everything::SearchSort::NameAsc{vec![5,6]}else{vec![94,93]});
+            assert_eq!(rows,if matches!(sort,everything::SearchSort::NameAsc|everything::SearchSort::SizeAsc|everything::SearchSort::ModifiedAsc){vec![5,6]}else{vec![94,93]});
         }
     }
 }

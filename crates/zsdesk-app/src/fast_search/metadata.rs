@@ -1,6 +1,6 @@
 //! Compact filename columns; only result rows materialize full paths.
 use std::{collections::HashMap,hash::{Hash,Hasher},ffi::{OsStr,OsString},os::windows::ffi::{OsStrExt,OsStringExt},path::{Path,PathBuf}};
-use anyhow::{Result,ensure};
+use anyhow::{Result,ensure,Context};
 pub const NONE:u32=u32::MAX;
 pub const DIRECTORY:u8=1;
 pub const REPARSE:u8=2;
@@ -26,64 +26,214 @@ fn reserve_column<T>(column:&mut Vec<T>,additional:usize)->Result<()>{
 pub struct VolumeIndex {
     pub root:PathBuf,pub serial:u32,pub journal_id:u64,pub checkpoint:i64,pub has_journal:bool,
     pub mft:bool,pub denied:u64,pub index:Index,
+    /// Most recent maintenance pass only. Historical totals in snapshots have no path or error code.
+    pub read_issue:Option<(u64,String)>,
     /// Directory identities still needing enumeration; identities survive compaction.
     pub pending_dirs:Vec<u64>,
 }
 
+impl VolumeIndex {
+    pub fn note_read_error(&mut self, id:u64, error:&anyhow::Error) {
+        self.denied = self.denied.saturating_add(1);
+        let count = self.read_issue.as_ref().map_or(1, |(n,_)|n.saturating_add(1));
+        let location=self.index.rows_for_id(id).into_iter().find_map(|row|self.index.path(&self.root,row))
+            .map_or_else(||format!("ID {id}"),|path|path.display().to_string());
+        self.read_issue=Some((count,format!("{location} ({error:#})")));
+    }
+}
+
 #[derive(Default)]
 pub struct Names {
-    pub units:Vec<u16>,pub starts:Vec<u32>,pub folded:Vec<u8>,pub folded_starts:Vec<u32>,
-    slots:HashMap<u64,u32>,
+    // Names that already equal the search spelling reuse its bytes.
+    originals: Vec<u8>,
+    original_ends: Vec<u32>,
+    pub folded: String,
+    pub folded_starts: Vec<u32>,
+    // Snapshot queries use only the packed columns. Allocate the mutation table on the first journal edit.
+    slots: Vec<u32>,
 }
 impl Names {
-    pub fn new()->Self{Self{starts:vec![0],folded_starts:vec![0],..Default::default()}}
-    pub fn len(&self)->usize{self.starts.len().saturating_sub(1)}
-    pub fn get(&self,id:u32)->&[u16]{let id=id as usize;&self.units[self.starts[id]as usize..self.starts[id+1]as usize]}
-    pub fn folded(&self,id:u32)->&str{let id=id as usize;std::str::from_utf8(&self.folded[self.folded_starts[id]as usize..self.folded_starts[id+1]as usize]).unwrap()}
-    fn hash(units:&[u16])->u64{let mut hash=std::collections::hash_map::DefaultHasher::new();units.hash(&mut hash);hash.finish()}
-    pub fn intern(&mut self,name:&OsStr)->Result<u32>{let units:Vec<_>=name.encode_wide().collect();self.intern_units(&units)}
-    pub fn intern_units(&mut self,units:&[u16])->Result<u32>{
-        ensure!(units.len()<=255&&!units.iter().any(|u|matches!(*u,0|47|92))&&units!=[46]&&units!=[46,46],"索引名称无效");let mut key=Self::hash(units);
-        loop{match self.slots.get(&key).copied(){Some(id)if self.get(id)==units=>return Ok(id),Some(_)=>key=key.wrapping_add(1),None=>break}}
-        ensure!(self.len()<MAX_ROWS&&self.units.len()+units.len()<u32::MAX as usize,"文件名索引超出容量");
-        let id=self.len()as u32;let folded=String::from_utf16_lossy(units).to_lowercase();
-        ensure!(self.folded.len()+folded.len()<u32::MAX as usize,"文件名索引超出容量");
-        reserve_column(&mut self.units,units.len())?;reserve_column(&mut self.starts,1)?;reserve_column(&mut self.folded,folded.len())?;reserve_column(&mut self.folded_starts,1)?;self.slots.try_reserve(1)?;
-        self.units.extend_from_slice(units);self.starts.push(self.units.len()as u32);
-        self.folded.extend_from_slice(folded.as_bytes());self.folded_starts.push(self.folded.len()as u32);self.slots.insert(key,id);Ok(id)
+    pub fn new() -> Self { Self { folded_starts:vec![0], ..Default::default() } }
+    pub fn len(&self) -> usize { self.original_ends.len() }
+    pub fn folded(&self,id:u32) -> &str {
+        let id=id as usize;
+        &self.folded[self.folded_starts[id] as usize..self.folded_starts[id+1] as usize]
     }
-    pub fn validate(&mut self)->Result<()>{
-        ensure!(self.starts.first()==Some(&0)&&self.folded_starts.first()==Some(&0)&&self.starts.len()==self.folded_starts.len()
-            &&self.starts.last().copied()==Some(self.units.len()as u32)&&self.folded_starts.last().copied()==Some(self.folded.len()as u32),"快照名称列长度不一致");
-        ensure!(self.starts.windows(2).all(|w|w[0]<=w[1])&&self.folded_starts.windows(2).all(|w|w[0]<=w[1]),"快照名称偏移无效");
-        std::str::from_utf8(&self.folded)?;self.slots.clear();
-        for id in 0..self.len()as u32{
-            let units=self.get(id);ensure!(units.len()<=255&&!units.iter().any(|u|matches!(*u,0|47|92))&&units!=[46]&&units!=[46,46],"快照名称无效");
-            let expected=String::from_utf16_lossy(units).to_lowercase();
-            let a=self.folded_starts[id as usize]as usize;let b=self.folded_starts[id as usize+1]as usize;
-            ensure!(self.folded.get(a..b)==Some(expected.as_bytes()),"快照名称规范化不一致");
-            let mut key=Self::hash(units);while self.slots.contains_key(&key){key=key.wrapping_add(1);}self.slots.insert(key,id);
-        }Ok(())
+    pub fn get(&self,id:u32) -> &OsStr {
+        let i=id as usize;
+        let start=i.checked_sub(1).map_or(0,|prev|self.original_ends[prev]) as usize;
+        let raw=&self.originals[start..self.original_ends[i] as usize];
+        if raw.is_empty() { return OsStr::new(self.folded(id)); }
+        // Every complete slice was copied from one OsStr::as_encoded_bytes in
+        // this process. On-disk UTF-16 is converted through OsString::from_wide.
+        unsafe { OsStr::from_encoded_bytes_unchecked(raw) }
     }
-    pub fn bytes(&self)->usize{self.units.capacity()*2+self.starts.capacity()*4+self.folded.capacity()+self.folded_starts.capacity()*4+self.slots.capacity()*24}
-    pub fn shrink(&mut self){self.units.shrink_to_fit();self.starts.shrink_to_fit();self.folded.shrink_to_fit();self.folded_starts.shrink_to_fit();self.slots.shrink_to_fit();}
+    fn hash(name:&OsStr)->u64 {
+        let mut hash=std::collections::hash_map::DefaultHasher::new();name.hash(&mut hash);hash.finish()
+    }
+    fn reserve_slots(&mut self) -> Result<()> {
+        let needed=self.len().checked_add(1).context("文件名索引超出容量")?;
+        if needed <= self.slots.len()/4*3 {return Ok(());}
+        let size=(needed+needed.div_ceil(3)).next_power_of_two().max(16);
+        let mut slots=Vec::new();
+        slots.try_reserve_exact(size)?;
+        slots.resize(size,NONE);
+        for id in 0..self.len() as u32 {
+            let mut at=Self::hash(self.get(id)) as usize & (size-1);
+            while slots[at]!=NONE {at=(at+1)&(size-1);}
+            slots[at]=id;
+        }
+        self.slots=slots;
+        Ok(())
+    }
+    fn push_original(&mut self,name:&OsStr,folded:&str)->Result<()> {
+        let bytes=name.as_encoded_bytes();
+        if bytes!=folded.as_bytes() {
+            ensure!(self.originals.len()+bytes.len()<u32::MAX as usize,"文件名索引超出容量");
+            reserve_column(&mut self.originals,bytes.len())?;
+            self.originals.extend_from_slice(bytes);
+        }
+        self.original_ends.push(self.originals.len() as u32);
+        Ok(())
+    }
+    pub fn intern(&mut self,name:&OsStr)->Result<u32>{
+        self.reserve_slots()?;
+        let mask=self.slots.len()-1;
+        let mut at=Self::hash(name) as usize & mask;
+        while self.slots[at]!=NONE {
+            let id=self.slots[at];
+            if self.get(id)==name {return Ok(id);}
+            at=(at+1)&mask;
+        }
+        let count=name.encode_wide().count();
+        ensure!(count<=255&&!name.as_encoded_bytes().iter().any(|b|matches!(*b,0|47|92))&&name!="."&&name!="..","索引名称无效");
+        let folded=name.to_string_lossy().to_lowercase();
+        ensure!(self.len()<MAX_ROWS && self.folded.len()+folded.len()<u32::MAX as usize,"文件名索引超出容量");
+        reserve_column(&mut self.original_ends,1)?;reserve_column(&mut self.folded_starts,1)?;
+        if self.folded.capacity()-self.folded.len()<folded.len(){
+            let growth=(self.folded.capacity()/8).clamp(4096,1024*1024);
+            self.folded.try_reserve_exact(folded.len().max(growth))?;
+        }
+        let id=self.len() as u32;self.push_original(name,&folded)?;
+        self.folded.push_str(&folded);self.folded_starts.push(self.folded.len() as u32);
+        self.slots[at]=id;Ok(id)
+    }
+    pub fn restore(units:Vec<u16>,starts:Vec<u32>,folded:Vec<u8>,folded_starts:Vec<u32>,cancel:&impl Fn()->bool)->Result<Self>{
+        ensure!(starts.first()==Some(&0)&&folded_starts.first()==Some(&0)&&starts.len()==folded_starts.len()
+            &&starts.last().copied()==Some(units.len() as u32)&&folded_starts.last().copied()==Some(folded.len() as u32),"快照名称列长度不一致");
+        let folded=String::from_utf8(folded)?;
+        let mut names=Self::default();
+        names.original_ends.try_reserve_exact(starts.len()-1)?;
+        for (i,pair) in starts.windows(2).enumerate(){
+            if i%4096==0 {ensure!(!cancel(),"快照读取已取消");}
+            let wide=units.get(pair[0] as usize..pair[1] as usize).context("快照名称偏移无效")?;
+            ensure!(wide.len()<=255&&!wide.iter().any(|u|matches!(*u,0|47|92))&&wide!=[46]&&wide!=[46,46],"快照名称无效");
+            let lower=folded.get(folded_starts[i] as usize..folded_starts[i+1] as usize).context("快照名称偏移无效")?;
+            if lower.len()==wide.len() && lower.is_ascii() && lower.bytes().zip(wide).all(|(b,&u)|u==u16::from(b) && !b.is_ascii_uppercase()) {
+                names.original_ends.push(names.originals.len() as u32);
+            } else {
+                let name=OsString::from_wide(wide);
+                ensure!(name.to_string_lossy().to_lowercase()==lower,"快照名称规范化不一致");
+                names.push_original(&name,lower)?;
+            }
+        }
+        names.folded=folded;names.folded_starts=folded_starts;Ok(names)
+    }
+    pub fn restore_compact(folded:Vec<u8>,starts:Vec<u32>,mut spelling:impl FnMut()->Result<Option<OsString>>,cancel:&impl Fn()->bool)->Result<Self>{
+        ensure!(starts.first()==Some(&0)&&starts.last().copied()==Some(folded.len() as u32),"快照名称列长度不一致");
+        let folded=String::from_utf8(folded)?;
+        let mut names=Self::default();
+        names.original_ends.try_reserve_exact(starts.len()-1)?;
+        for (id,pair) in starts.windows(2).enumerate() {
+            if id%4096==0 {ensure!(!cancel(),"快照读取已取消");}
+            let lower=folded.get(pair[0] as usize..pair[1] as usize).context("快照名称偏移无效")?;
+            ensure!(!lower.bytes().any(|b|matches!(b,0|47|92))&&lower!="."&&lower!="..","快照名称无效");
+            if let Some(name)=spelling()? {
+                ensure!(name.to_string_lossy().to_lowercase()==lower,"快照名称规范化不一致");
+                names.push_original(&name,lower)?;
+            } else {
+                let valid=if lower.is_ascii(){lower.len()<=255&&!lower.bytes().any(|b|b.is_ascii_uppercase())}
+                    else{lower.encode_utf16().count()<=255 && lower.to_lowercase()==lower};
+                ensure!(valid,"快照名称规范化不一致");
+                names.original_ends.push(names.originals.len() as u32);
+            }
+        }
+        names.folded=folded;
+        names.folded_starts=starts;
+        Ok(names)
+    }
+    pub fn bytes(&self)->usize{self.originals.capacity()+self.original_ends.capacity()*4+self.folded.capacity()+self.folded_starts.capacity()*4+self.slots.capacity()*4}
+    pub fn shrink(&mut self){self.originals.shrink_to_fit();self.original_ends.shrink_to_fit();self.folded.shrink_to_fit();self.folded_starts.shrink_to_fit();self.slots.shrink_to_fit();}
 }
 pub struct Attributes {pub size:Vec<u64>,pub modified:Vec<u64>}
+/// One child-list head per directory. Each 64-row block records which rows
+/// are directories and the offset of its first entry in heads.
+#[derive(Default)]
+struct DirectoryHeads {
+    bitmap: Vec<u64>,
+    base: Vec<u32>,
+    heads: Vec<u32>,
+}
+impl DirectoryHeads {
+    fn reserve(&mut self,row:usize,directory:bool)->Result<()> {
+        if row%64==0 {reserve_column(&mut self.bitmap,1)?;reserve_column(&mut self.base,1)?;}
+        if directory{reserve_column(&mut self.heads,1)?;}
+        Ok(())
+    }
+    fn push(&mut self,row:usize,directory:bool){
+        if row%64==0{self.base.push(self.heads.len() as u32);self.bitmap.push(0);}
+        if directory{self.bitmap[row/64]|=1u64<<(row%64);self.heads.push(NONE);}
+    }
+    fn slot(&self,row:u32)->Option<usize>{
+        let block=row as usize/64;let mask=1u64<<(row%64);
+        let bits=*self.bitmap.get(block)?;
+        (bits&mask!=0).then(||(self.base[block]+(bits&(mask-1)).count_ones()) as usize)
+    }
+    fn get(&self,row:u32)->u32{self.slot(row).map_or(NONE,|at|self.heads[at])}
+    fn replace(&mut self,row:u32,head:u32)->u32{
+        self.slot(row).map_or(NONE,|at|std::mem::replace(&mut self.heads[at],head))
+    }
+    fn rebuild(&mut self,flags:&[u8]){
+        self.bitmap.clear();self.base.clear();self.heads.clear();
+        let blocks=flags.len().div_ceil(64);
+        self.bitmap.reserve_exact(blocks);self.base.reserve_exact(blocks);
+        self.heads.reserve_exact(flags.iter().filter(|f|**f&DIRECTORY!=0).count());
+        for (row,flag) in flags.iter().enumerate(){self.push(row,flag&DIRECTORY!=0);}
+        self.bitmap.shrink_to_fit();self.base.shrink_to_fit();self.heads.shrink_to_fit();
+    }
+    fn bytes(&self)->usize{self.bitmap.capacity()*8+(self.base.capacity()+self.heads.capacity())*4}
+}
 pub struct Index {
     pub ids:Vec<u64>,pub parent:Vec<u32>,pub name:Vec<u32>,pub flags:Vec<u8>,pub names:Names,
-    pub attributes:Option<Attributes>,order:Vec<u32>,delta:HashMap<u64,Vec<u32>>,building:bool,first:Vec<u32>,next:Vec<u32>,
+    pub attributes:Option<Attributes>,order:Vec<u32>,delta:HashMap<u64,Vec<u32>>,building:bool,first:DirectoryHeads,next:Vec<u32>,
 }
 impl Index {
     pub fn new(root_id:u64,metadata:bool)->Self{
         let mut value=Self{ids:Vec::new(),parent:Vec::new(),name:Vec::new(),flags:Vec::new(),names:Names::new(),
-            attributes:metadata.then(||Attributes{size:Vec::new(),modified:Vec::new()}),order:Vec::new(),delta:HashMap::new(),building:true,first:Vec::new(),next:Vec::new()};
+            attributes:metadata.then(||Attributes{size:Vec::new(),modified:Vec::new()}),order:Vec::new(),delta:HashMap::new(),building:true,first:DirectoryHeads::default(),next:Vec::new()};
         value.append(root_id,NONE,OsStr::new(""),DIRECTORY).unwrap();value.reindex();value
     }
     pub fn len(&self)->usize{self.ids.len()}
     pub fn live(&self,row:u32)->bool{self.flags.get(row as usize).is_some_and(|f|f&DEAD==0)}
-    pub fn searchable(&self,row:u32)->bool{
-        let mut at=row;for _ in 0..1024{let Some(&flags)=self.flags.get(at as usize)else{return false;};
-            if flags&(DEAD|BLOCKED)!=0||(flags&EXCLUDED!=0&&at!=row){return false;}if at==0{return row!=0;}at=self.parent[at as usize];}false
+    pub fn searchable(&self,row:u32)->bool {
+        self.searchable_with_parent(row,&mut None)
+    }
+    /// Sibling rows often follow one another. Their ancestor visibility is identical
+    /// for this scan, including the 1024-level limit and excluded directory rule.
+    pub fn searchable_with_parent(&self,row:u32,last:&mut Option<(u32,bool)>)->bool {
+        let Some(&flags)=self.flags.get(row as usize) else {return false;};
+        if row==0 || flags&(DEAD|BLOCKED)!=0 {return false;}
+        let parent=self.parent[row as usize];
+        if let Some((id,visible))=*last {if id==parent{return visible;}}
+        let mut at=parent;
+        let mut visible=false;
+        for _ in 1..1024 {
+            let Some(&flags)=self.flags.get(at as usize) else {break;};
+            if flags&(DEAD|BLOCKED|EXCLUDED)!=0 {break;}
+            if at==0 {visible=true;break;}
+            at=self.parent[at as usize];
+        }
+        *last=Some((parent,visible));visible
     }
     pub fn is_dir(&self,row:u32)->bool{self.flags[row as usize]&DIRECTORY!=0}
     pub fn rows_for_id(&self,id:u64)->Vec<u32>{
@@ -103,39 +253,43 @@ impl Index {
     }
     pub fn begin_build(&mut self){self.building=true;}
     pub fn children(&self,parent:u32)->Vec<u32>{
-        let mut rows=Vec::new();let mut row=self.first.get(parent as usize).copied().unwrap_or(NONE);
+        let mut rows=Vec::new();let mut row=self.first.get(parent);
         while row!=NONE&&rows.len()<=self.len(){if self.live(row){rows.push(row);}row=self.next[row as usize];}rows
     }
     pub fn append(&mut self,id:u64,parent:u32,name:&OsStr,flags:u8)->Result<u32>{
         ensure!(self.len()<MAX_ROWS,"索引项目数量超过上限");
         if self.len()%4096==0{ensure!(self.heap_bytes()<MAX_HEAP_BYTES,"自带索引超过内存预算，请启用开发目录排除或关闭属性索引");}
-        reserve_column(&mut self.ids,1)?;reserve_column(&mut self.parent,1)?;reserve_column(&mut self.name,1)?;reserve_column(&mut self.flags,1)?;reserve_column(&mut self.first,1)?;reserve_column(&mut self.next,1)?;
+        reserve_column(&mut self.ids,1)?;reserve_column(&mut self.parent,1)?;reserve_column(&mut self.name,1)?;reserve_column(&mut self.flags,1)?;self.first.reserve(self.len(),flags&DIRECTORY!=0)?;reserve_column(&mut self.next,1)?;
         if let Some(attrs)=&mut self.attributes{reserve_column(&mut attrs.size,1)?;reserve_column(&mut attrs.modified,1)?;}
         if !self.building{self.delta.try_reserve(1)?;self.delta.entry(id).or_default().try_reserve(1)?;}
         let name=self.names.intern(name)?;let row=self.len()as u32;
-        self.ids.push(id);self.parent.push(parent);self.name.push(name);self.flags.push(flags);self.first.push(NONE);self.next.push(NONE);
+        self.ids.push(id);self.parent.push(parent);self.name.push(name);self.flags.push(flags);self.first.push(row as usize,flags&DIRECTORY!=0);self.next.push(NONE);
         if let Some(attrs)=&mut self.attributes{attrs.size.push(UNKNOWN);attrs.modified.push(UNKNOWN);}
-        if (parent as usize)<self.first.len(){self.next[row as usize]=self.first[parent as usize];self.first[parent as usize]=row;}
+        self.next[row as usize]=self.first.replace(parent,row);
         if !self.building{self.delta.entry(id).or_default().push(row);}Ok(row)
     }
     pub fn upsert_child(&mut self,id:u64,parent:u32,name:&OsStr,flags:u8)->Result<u32>{
-        let units:Vec<_>=name.encode_wide().collect();
+        ensure!(self.live(parent)&&self.is_dir(parent),"索引父目录无效");
         if flags&DIRECTORY!=0{
             let start=self.order.partition_point(|row|self.ids[*row as usize]<id);
             let existing=self.order[start..].iter().take_while(|row|self.ids[**row as usize]==id).chain(self.delta.get(&id).into_iter().flatten()).copied().find(|row|self.is_dir(*row));
             if let Some(row)=existing{
                 ensure!(row!=0,"不能移动索引根目录");let mut ancestor=parent;
                 for _ in 0..1024{ensure!(ancestor!=row,"目录父节点形成循环");if ancestor==NONE||ancestor==0{break;}ancestor=self.parent[ancestor as usize];}
+                let name_id=self.names.intern(name)?;
                 let old=self.parent[row as usize];
                 if old!=parent{
-                    if old!=NONE{let mut current=self.first[old as usize];let mut previous=NONE;
-                        while current!=NONE{if current==row{if previous==NONE{self.first[old as usize]=self.next[row as usize];}else{self.next[previous as usize]=self.next[row as usize];}break;}previous=current;current=self.next[current as usize];}}
-                    self.parent[row as usize]=parent;self.next[row as usize]=self.first[parent as usize];self.first[parent as usize]=row;
+                    if old!=NONE{let mut current=self.first.get(old);let mut previous=NONE;
+                        while current!=NONE{if current==row{if previous==NONE{self.first.replace(old,self.next[row as usize]);}else{self.next[previous as usize]=self.next[row as usize];}break;}previous=current;current=self.next[current as usize];}}
+                    self.parent[row as usize]=parent;self.next[row as usize]=self.first.replace(parent,row);
                 }
-                self.name[row as usize]=self.names.intern_units(&units)?;self.flags[row as usize]=flags;return Ok(row);
+                self.name[row as usize]=name_id;self.flags[row as usize]=flags;return Ok(row);
             }
         }
-        if let Some(row)=self.rows_for_id(id).into_iter().find(|row|self.parent[*row as usize]==parent&&self.names.get(self.name[*row as usize])==units){self.flags[row as usize]=flags;return Ok(row);}
+        if let Some(row)=self.rows_for_id(id).into_iter().find(|row|self.parent[*row as usize]==parent&&self.names.get(self.name[*row as usize])==name){
+            if self.is_dir(row)==(flags&DIRECTORY!=0){self.flags[row as usize]=flags;return Ok(row);}
+            let replacement=self.append(id,parent,name,flags)?;self.delete(row);return Ok(replacement);
+        }
         self.append(id,parent,name,flags)
     }
     pub fn delete(&mut self,row:u32){if row!=0{self.flags[row as usize]|=DEAD;}}
@@ -152,12 +306,14 @@ impl Index {
         self.rebuild_children();Ok(())
     }
     pub fn rebuild_children(&mut self){
-        self.first=vec![NONE;self.len()];self.next=vec![NONE;self.len()];
-        for row in 1..self.len(){let parent=self.parent[row]as usize;if parent<self.len(){self.next[row]=self.first[parent];self.first[parent]=row as u32;}}
+        let rows=self.len();
+        self.first.rebuild(&self.flags);
+        self.next.clear();self.next.reserve_exact(rows);self.next.resize(rows,NONE);self.next.shrink_to_fit();
+        for row in 1..rows{self.next[row]=self.first.replace(self.parent[row],row as u32);}
     }
     pub fn path(&self,root:&Path,row:u32)->Option<PathBuf>{
         if row==0{return Some(root.into());}let mut names=Vec::new();let mut at=row;
-        for _ in 0..1024{if at==0{let mut path=root.to_path_buf();for name in names.into_iter().rev(){path.push(OsString::from_wide(self.names.get(name)));}return Some(path);}
+        for _ in 0..1024{if at==0{let mut path=root.to_path_buf();for name in names.into_iter().rev(){path.push(self.names.get(name));}return Some(path);}
             if !self.live(at){return None;}names.push(self.name[at as usize]);at=self.parent[at as usize];if at==NONE{return None;}}None
     }
     pub fn set_attributes(&mut self,row:u32,size:Option<u64>,modified:Option<u64>){if let Some(attrs)=&mut self.attributes{attrs.size[row as usize]=size.unwrap_or(UNKNOWN);attrs.modified[row as usize]=modified.unwrap_or(UNKNOWN);}}
@@ -181,7 +337,7 @@ impl Index {
         let keep:Vec<_>=(0..first).chain((first.saturating_add(1)..end).filter(|row|self.searchable(*row))).collect();
         let mut remap=vec![NONE;self.len()];for (next,old) in keep.iter().enumerate(){remap[*old as usize]=next as u32;}
         let mut names=Names::new();let mut name_ids=Vec::with_capacity(keep.len());
-        for row in &keep{name_ids.push(names.intern_units(self.names.get(self.name[*row as usize]))?);}
+        for row in &keep{name_ids.push(names.intern(self.names.get(self.name[*row as usize]))?);}
         for (next,old) in keep.iter().enumerate(){let old=*old as usize;self.ids[next]=self.ids[old];self.flags[next]=self.flags[old];
             self.parent[next]=self.parent.get(old).filter(|p|**p!=NONE).map_or(NONE,|p|remap[*p as usize]);
             if let Some(attrs)=&mut self.attributes{attrs.size[next]=attrs.size[old];attrs.modified[next]=attrs.modified[old];}}
@@ -196,19 +352,26 @@ impl Index {
     }
     pub fn validate(&mut self)->Result<()>{
         let n=self.len();ensure!(n>0&&n<=MAX_ROWS&&self.parent.len()==n&&self.name.len()==n&&self.flags.len()==n,"快照索引列长度无效");
-        ensure!(self.parent[0]==NONE&&self.flags[0]==DIRECTORY,"快照根节点无效");self.names.validate()?;
+        ensure!(self.parent[0]==NONE&&self.flags[0]==DIRECTORY,"快照根节点无效");
         ensure!(self.name.iter().all(|id|(*id as usize)<self.names.len()),"快照名称引用无效");
         ensure!(self.names.get(self.name[0]).is_empty()&&self.name.iter().skip(1).all(|id|!self.names.get(*id).is_empty()),"快照空名称无效");
         ensure!(self.flags.iter().all(|f|f&!(DIRECTORY|REPARSE|DEAD|EXCLUDED|BLOCKED)==0),"快照属性无效");
         ensure!(self.parent.iter().enumerate().skip(1).all(|(i,p)|(*p as usize)<n&&*p as usize!=i&&self.flags[*p as usize]&DIRECTORY!=0),"快照父节点无效");
         let mut seen=vec![0u8;n];seen[0]=2;
-        for start in 1..n{let mut at=start;let mut trail=Vec::new();while seen[at]==0{seen[at]=1;trail.push(at);at=self.parent[at]as usize;}
-            ensure!(seen[at]==2,"快照目录循环");for row in trail{seen[row]=2;}}
+        for start in 1..n {
+            let mut at=start;
+            while seen[at]==0 {seen[at]=1;at=self.parent[at] as usize;}
+            ensure!(seen[at]==2,"快照目录循环");
+            // Walk the same parent links to mark completion without allocating a path per row.
+            at=start;
+            while seen[at]==1 {seen[at]=2;at=self.parent[at] as usize;}
+        }
+        drop(seen);
         if let Some(attrs)=&self.attributes{ensure!(attrs.size.len()==n&&attrs.modified.len()==n,"快照属性列长度无效");}
         self.reindex();self.rebuild_children();Ok(())
     }
     pub fn heap_bytes(&self)->usize{self.ids.capacity()*8+self.parent.capacity()*4+self.name.capacity()*4+self.flags.capacity()+
-        (self.order.capacity()+self.first.capacity()+self.next.capacity())*4+self.delta.capacity()*40+self.delta.values().map(|v|v.capacity()*4).sum::<usize>()+
+        self.first.bytes()+(self.order.capacity()+self.next.capacity())*4+self.delta.capacity()*40+self.delta.values().map(|v|v.capacity()*4).sum::<usize>()+
         self.names.bytes()+self.attributes.as_ref().map_or(0,|a|(a.size.capacity()+a.modified.capacity())*8)}
 }
 pub fn excluded_name(name:&str)->bool{matches!(name,".git"|".hg"|".svn"|"node_modules"|"target"|".cache"|"cache"|"caches"|"__pycache__"|".venv"|"venv"|".next"|".nuxt"|".gradle"|".cargo"|".rustup"|".npm"|".pnpm-store"|".yarn"|".m2"|".ivy2"|".tox"|".turbo"|".vs"|"cmakefiles"|"temp"|"tmp")}
@@ -233,6 +396,31 @@ pub fn excluded_name(name:&str)->bool{matches!(name,".git"|".hg"|".svn"|"node_mo
         assert_eq!(index.path(Path::new(r"C:\"),a).unwrap(),PathBuf::from(r"C:\移动后\甲.txt"));
         index.delete(dir);assert!(!index.searchable(a));assert!(index.searchable(b));index.compact().unwrap();assert_eq!(index.len(),2);index.validate().unwrap();
     }
+    #[test]fn failed_directory_rename_preserves_both_parent_chains(){
+        let mut index=Index::new(5,false);
+        let a=index.append(10,0,OsStr::new("A"),DIRECTORY).unwrap();
+        let b=index.append(11,0,OsStr::new("B"),DIRECTORY).unwrap();index.reindex();
+        assert!(index.upsert_child(10,b,OsStr::new("../bad"),DIRECTORY).is_err());
+        assert!(index.upsert_child(10,NONE,OsStr::new("A"),DIRECTORY).is_err());
+        assert_eq!(index.parent[a as usize],0);assert!(index.children(0).contains(&a));assert!(index.children(b).is_empty());
+    }
+    #[test]fn directory_heads_match_dense_links_after_append_move_and_compaction(){
+        let mut index=Index::new(5,false);let mut dirs=vec![0];
+        for i in 1..258u32{
+            let dir=i%16==0||i%64==63||i%64==1;
+            let parent=*dirs.last().unwrap();
+            let r=index.append(100+i as u64,parent,OsStr::new(&i.to_string()),if dir{DIRECTORY}else{0}).unwrap();
+            if dir{dirs.push(r);}
+        }
+        let check=|index:&Index|{for row in 0..index.len() as u32{
+            let mut expected:Vec<_>=(1..index.len() as u32).filter(|child|index.parent[*child as usize]==row&&index.live(*child)).collect();
+            let mut actual=index.children(row);expected.sort_unstable();actual.sort_unstable();assert_eq!(actual,expected);
+        }};
+        index.reindex();check(&index);
+        index.upsert_child(100+65,0,OsStr::new("moved"),DIRECTORY).unwrap();check(&index);
+        index.compact().unwrap();check(&index);index.validate().unwrap();check(&index);
+        assert!(index.first.bytes()<index.len()*4);
+    }
     #[test]fn ancestor_aliases_are_recognized_by_identity(){
         let mut index=Index::new(5,false);let a=index.append(8,0,OsStr::new("a"),DIRECTORY).unwrap();let b=index.append(9,a,OsStr::new("b"),DIRECTORY).unwrap();index.reindex();
         for id in [5,8,9]{assert!(index.aliases_ancestor(b,id),"{id}");}
@@ -246,5 +434,16 @@ pub fn excluded_name(name:&str)->bool{matches!(name,".git"|".hg"|".svn"|"node_mo
     #[test]fn snapshot_graph_validation_rejects_cycles_and_bad_names(){
         let mut index=Index::new(5,false);index.append(6,0,OsStr::new("a"),DIRECTORY).unwrap();index.append(7,1,OsStr::new("b"),DIRECTORY).unwrap();
         index.parent[1]=2;assert!(index.validate().is_err());assert!(index.names.intern(OsStr::new("../bad")).is_err());
+    }
+    #[test]fn snapshot_accepts_forward_parent_chains_and_reuses_child_links(){
+        let mut index=Index::new(5,false);
+        for row in 1..=512 {index.append(5+row,0,OsStr::new("folder"),DIRECTORY).unwrap();}
+        for row in 1..512 {index.parent[row]=(row+1) as u32;}
+        index.validate().unwrap();
+        let buffers=(index.first.heads.as_ptr(),index.next.as_ptr());
+        index.rebuild_children();
+        assert_eq!(buffers,(index.first.heads.as_ptr(),index.next.as_ptr()));
+        assert_eq!(index.children(0),[512]);
+        assert_eq!(index.children(512),[511]);
     }
 }

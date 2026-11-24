@@ -39,15 +39,7 @@ pub fn load(profile: &Path) -> Result<Configuration> {
 }
 
 pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH};
-    fs::create_dir_all(path.parent().context(zsdesk_core::i18n::text("配置目录缺失"))?)?;
-    let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
-    fs::write(&temporary, bytes)?;
-    let from: Vec<u16> = temporary.as_os_str().encode_wide().chain(Some(0)).collect();
-    let to: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-    unsafe { MoveFileExW(PCWSTR(from.as_ptr()), PCWSTR(to.as_ptr()), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)?; }
-    Ok(())
+    Ok(crate::storage::write_atomic(path,bytes)?)
 }
 
 pub fn quote_argument(value: &str) -> String {
@@ -89,20 +81,39 @@ fn write_startup(profile: &Path, value: Option<&str>) -> Result<()> {
     let _ = unsafe { RegCloseKey(key) }; result?; Ok(())
 }
 
+// Physical OEM and numpad keys have distinct Win32 virtual-key codes.
+const EXTRA_KEYS: &[(&str,u32)] = &[
+    ("Semicolon",0xba),("Plus",0xbb),("Comma",0xbc),("Minus",0xbd),("Period",0xbe),
+    ("Slash",0xbf),("Grave",0xc0),("LeftBracket",0xdb),("Backslash",0xdc),("RightBracket",0xdd),("Quote",0xde),
+    ("Insert",0x2d),("Num0",0x60),("Num1",0x61),("Num2",0x62),("Num3",0x63),("Num4",0x64),
+    ("Num5",0x65),("Num6",0x66),("Num7",0x67),("Num8",0x68),("Num9",0x69),("NumMultiply",0x6a),
+    ("NumAdd",0x6b),("NumSubtract",0x6d),("NumDecimal",0x6e),("NumDivide",0x6f)
+];
+pub(super) fn extra_key(vk:u32)->Option<&'static str>{EXTRA_KEYS.iter().find(|(_,code)|*code==vk).map(|(s,_)|*s)}
+fn extra_chord(value:&str)->Option<(String,&'static str,u32)>{
+    let (mods,last)=value.trim().rsplit_once('+')?;
+    let name=match last.trim(){"/"=>"Slash","."=>"Period",","=>"Comma","-"=>"Minus","="=>"Plus",";"=>"Semicolon","["=>"LeftBracket","]"=>"RightBracket","\\"=>"Backslash","'"=>"Quote","`"=>"Grave",v=>v};
+    EXTRA_KEYS.iter().find(|(key,_)|key.eq_ignore_ascii_case(name)).map(|(key,vk)|(format!("{mods}+A"),*key,*vk))
+}
+
 pub fn validate_hotkey(value: &str) -> Result<String> {
     if value.len() > 128 { bail!("{}", zsdesk_core::tr_format!("快捷键过长")); }
-    let chord: ZsAccelerator = value.trim().parse().map_err(|error| anyhow::anyhow!("{error}"))?;
+    let extra=extra_chord(value);
+    let chord: ZsAccelerator = extra.as_ref().map_or(value.trim(),|(base,_,_)|base.as_str()).parse().map_err(|error| anyhow::anyhow!("{error}"))?;
     if chord.key() == ZsAcceleratorKey::Function(12) { bail!("{}", zsdesk_core::tr_format!("F12 为系统调试器保留，请选择其它快捷键")); }
     if !chord.uses_primary() && !chord.uses_alt() && !chord.uses_super() && !matches!(chord.key(), ZsAcceleratorKey::Function(_)) {
         bail!("{}", zsdesk_core::tr_format!("全局快捷键需包含 Ctrl、Alt、Win，或使用功能键"));
     }
-    Ok(chord.to_string().replace("Primary", "Ctrl").replace("Super", "Win"))
+    let normalized=chord.to_string().replace("Primary","Ctrl").replace("Super","Win");
+    if let Some((_,key,_))=extra{let mods=normalized.strip_suffix("+A").context("Invalid shortcut")?;return Ok(format!("{mods}+{key}"));}
+    Ok(normalized)
 }
 
 pub(super) fn native_hotkey(value:&str)->Result<(windows::Win32::UI::Input::KeyboardAndMouse::HOT_KEY_MODIFIERS,u32)>{
     use windows::Win32::UI::Input::KeyboardAndMouse::*;
     let normalized=validate_hotkey(value)?;
-    let chord:ZsAccelerator=normalized.parse().map_err(|error|anyhow::anyhow!("{error}"))?;
+    let extra=extra_chord(&normalized);
+    let chord:ZsAccelerator=extra.as_ref().map_or(normalized.as_str(),|(base,_,_)|base.as_str()).parse().map_err(|error|anyhow::anyhow!("{error}"))?;
     let mut mods=MOD_NOREPEAT;
     if chord.uses_primary(){mods|=MOD_CONTROL;}if chord.uses_alt(){mods|=MOD_ALT;}
     if chord.uses_shift(){mods|=MOD_SHIFT;}if chord.uses_super(){mods|=MOD_WIN;}
@@ -116,10 +127,33 @@ pub(super) fn native_hotkey(value:&str)->Result<(windows::Win32::UI::Input::Keyb
         ZsAcceleratorKey::Left=>VK_LEFT.0 as u32,ZsAcceleratorKey::Right=>VK_RIGHT.0 as u32,
         ZsAcceleratorKey::Home=>VK_HOME.0 as u32,ZsAcceleratorKey::End=>VK_END.0 as u32,
         ZsAcceleratorKey::PageUp=>VK_PRIOR.0 as u32,ZsAcceleratorKey::PageDown=>VK_NEXT.0 as u32,
-    };Ok((mods,key))
+    };Ok((mods,extra.map_or(key,|(_,_,vk)|vk)))
 }
 
-pub fn apply(profile: &Path, mut preferences: QuickSearchPreferences) -> Result<Configuration> {
+static PREF_WRITE:std::sync::Mutex<()>=std::sync::Mutex::new(());
+pub fn apply(profile: &Path, preferences: QuickSearchPreferences) -> Result<Configuration> {
+    let _lock=PREF_WRITE.lock().unwrap_or_else(|e|e.into_inner());
+    apply_locked(profile,preferences)
+}
+pub(super) fn save_shortcut(profile:&Path,hotkey:String,enabled:bool)->Result<Configuration>{
+    let _lock=PREF_WRITE.lock().unwrap_or_else(|e|e.into_inner());
+    let mut config=load(profile)?;let previous_enabled=config.preferences.enabled;
+    config.preferences.hotkey=validate_hotkey(&hotkey)?;
+    config.preferences.enabled=enabled;
+    if enabled==previous_enabled {
+        atomic_write(&config_path(profile),&serde_json::to_vec_pretty(&config)?)?;Ok(config)
+    }else{apply_locked(profile,config.preferences)}
+}
+pub(super) fn restore_rejected_chord(profile:&Path,rejected:&str,active:&str)->Result<()>{
+    let _lock=PREF_WRITE.lock().unwrap_or_else(|e|e.into_inner());
+    let mut config=load(profile)?;
+    if config.preferences.enabled && config.preferences.hotkey==rejected{
+        config.preferences.hotkey=active.into();
+        atomic_write(&config_path(profile),&serde_json::to_vec_pretty(&config)?)?;
+    }
+    Ok(())
+}
+fn apply_locked(profile: &Path, mut preferences: QuickSearchPreferences) -> Result<Configuration> {
     preferences.hotkey = validate_hotkey(&preferences.hotkey)?;
     if !preferences.enabled { preferences.start_with_windows = false; }
     let previous = load(profile)?; let before = read_startup(profile)?;
@@ -325,6 +359,23 @@ pub fn status(profile: &Path) -> serde_json::Value {
 
 #[cfg(test)] mod tests {
     use super::*;
+    #[test]
+    fn custom_shortcut_persists_and_a_stale_registration_error_cannot_revert_a_new_choice()->Result<()> {
+        let temp=std::env::temp_dir().join(format!("zsdesk-custom-hotkey-{}",std::process::id()));
+        fs::create_dir(&temp)?;
+        struct Fixture(PathBuf);impl Drop for Fixture{fn drop(&mut self){let _=fs::remove_file(self.0.join("quick-search.json"));let _=fs::remove_dir(&self.0);}}
+        let _fixture=Fixture(temp.clone());let profile=temp.join("explorer-session.json");
+        let initial=Configuration{preferences:QuickSearchPreferences{enabled:true,hotkey:"Alt+F11".into(),start_with_windows:true},startup_command:Some("retained startup".into())};
+        fs::write(config_path(&profile),serde_json::to_vec(&initial)?)?;
+        save_shortcut(&profile,"Ctrl+Shift+K".into(),true)?;
+        restore_rejected_chord(&profile,"Ctrl+Shift+X","Alt+F11")?;
+        let prefs=load(&profile)?;assert_eq!(prefs.preferences.hotkey,"Ctrl+Shift+K");assert!(prefs.preferences.start_with_windows);
+        assert_eq!(prefs.startup_command,initial.startup_command);
+        restore_rejected_chord(&profile,"Ctrl+Shift+K","Alt+F11")?;
+        assert_eq!(load(&profile)?.preferences.hotkey,"Alt+F11");
+        assert!(save_shortcut(&profile,"F12".into(),true).is_err());assert_eq!(load(&profile)?.preferences.hotkey,"Alt+F11");
+        Ok(())
+    }
     #[test] fn global_shortcuts_require_deliberate_modifiers() {
         assert!(validate_hotkey("a").is_err()); assert!(validate_hotkey("Ctrl+Alt+Space").is_ok());
         assert!(validate_hotkey("F12").is_err()); assert!(validate_hotkey("F11").is_ok()); assert!(validate_hotkey("Ctrl+UnknownKey").is_err());

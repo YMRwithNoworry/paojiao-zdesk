@@ -56,17 +56,76 @@ fn zoom_icon_size(current: IconSize, steps: i32) -> IconSize {
     let index = match current { IconSize::Small => 0i32, IconSize::Medium => 1, IconSize::Large => 2 };
     match (index + steps).clamp(0, 2) { 0 => IconSize::Small, 2 => IconSize::Large, _ => IconSize::Medium }
 }
-fn desktop_item_position(origin:Bounds,width:i32,height:i32,occupied:&[Bounds])->Option<Bounds> {
-    if origin.w<=0||origin.h<=0||origin.w>width||origin.h>height{return None;}
-    let candidate=Bounds::new(origin.x.clamp(0,(width-origin.w).max(0)),origin.y.clamp(0,(height-origin.h).max(0)),origin.w,origin.h);
-    let free=|cell:Bounds|occupied.iter().all(|other|cell.right()<=other.x||cell.x>=other.right()||cell.bottom()<=other.y||cell.y>=other.bottom());
-    if free(candidate) { return Some(candidate); }
-    for x in (candidate.x.rem_euclid(origin.w)..=(width-origin.w).max(0)).step_by(origin.w as usize) {
-        for y in (candidate.y.rem_euclid(origin.h)..=(height-origin.h).max(0)).step_by(origin.h as usize) {
-            let cell=Bounds::new(x,y,origin.w,origin.h); if free(cell) { return Some(cell); }
-        }
+fn arrival_cell(preferred: Option<(i32,i32)>, area: (i32,i32), grid: super::drag_placement::Grid, occupied: &[Bounds]) -> Option<Bounds> {
+    let (w,h) = (96,104);
+    if area.0 < w || area.1 < h { return None; }
+    let free = |x,y| {
+        let cell = Bounds::new(x,y,w,h);
+        occupied.iter().all(|other| cell.right()<=other.x || cell.x>=other.right() || cell.bottom()<=other.y || cell.y>=other.bottom()).then_some(cell)
+    };
+    if let Some((x,y)) = preferred {
+        if let Some(cell) = free(x.clamp(0,area.0-w),y.clamp(0,area.1-h)) { return Some(cell); }
+    }
+    let dx = grid.spacing.0.max(w);
+    let dy = grid.spacing.1.max(h);
+    let left = grid.origin.0.rem_euclid(dx).min(area.0-w);
+    let top = grid.origin.1.rem_euclid(dy).min(area.1-h);
+    let rows=(area.1-h-top)/dy+1;
+    let columns=(area.0-w-left)/dx+1;
+    let (x,y)=preferred.unwrap_or((left,top));
+    let column=((x-left+dx/2).div_euclid(dx)).clamp(0,columns-1);
+    let row=((y-top+dy/2).div_euclid(dy)).clamp(0,rows-1);
+    let start=column*rows+row;
+    let count=rows*columns;
+    // Continue down from Explorer's assigned cell; wrap after the last column.
+    for offset in 0..count {
+        let index=(start+offset)%count;
+        if let Some(cell)=free(left+(index/rows)*dx,top+(index%rows)*dy) { return Some(cell); }
     }
     None
+}
+
+struct ArrivalMonitor {
+    monitor: Monitor,
+    grid: std::cell::OnceCell<super::drag_placement::Grid>,
+    occupied: Vec<Bounds>,
+}
+impl ArrivalMonitor {
+    fn capture(config:&DesktopConfig, entries:&[ShellEntry]) -> Vec<Self> {
+        let live:HashSet<_>=entries.iter().map(|entry|entry.key.to_lowercase()).collect();
+        let mut displays=monitors();
+        if displays.is_empty() { displays.push(primary_monitor()); }
+        displays.sort_by_key(|m| !m.primary);
+        let primary = displays[0].name.clone();
+        let names:HashSet<_>=displays.iter().map(|m|m.name.clone()).collect();
+        displays.into_iter().map(|monitor| {
+            let groups=config.fences.iter().filter(|f|!config.settings.hidden&&!f.is_hidden_tab());
+            let loose=config.released_items.iter().filter(|f|f.members.iter().any(|key|live.contains(&key.to_lowercase())));
+            let area=(unscale(monitor.work.right-monitor.work.left,monitor.dpi), unscale(monitor.work.bottom-monitor.work.top,monitor.dpi));
+            let occupied=groups.chain(loose).filter(|f|f.placement.monitor==monitor.name ||
+                (monitor.name==primary&&!names.contains(&f.placement.monitor))).map(|f|{
+                    let p=&f.placement;
+                    let w=p.width.min(area.0);
+                    let h=(if f.collapsed {TITLE_H} else {p.height}).min(area.1);
+                    let x=p.x.clamp(0,area.0-w);let y=p.y.clamp(0,(area.1-TITLE_H).max(0));
+                    if f.collapsed||config.is_released(f.id){Bounds::new(x,p.y.clamp(0,area.1-h),w,h)}
+                    else{let (r,_)=expand_from_title(RECT{left:x,top:y,right:x+w,bottom:y+TITLE_H.min(h)},RECT{left:0,top:0,right:area.0,bottom:area.1},h);
+                        Bounds::new(x,r.top,w,r.bottom-r.top)}
+                }).collect();
+            Self {monitor,grid:Default::default(),occupied}
+        }).collect()
+    }
+    fn place(&mut self, point:Option<POINT>) -> Option<Placement> {
+        let m=&self.monitor;
+        let grid=*self.grid.get_or_init(||desktop::icon_grid(m.work).ok().map(|g|super::drag_placement::Grid {
+            origin:(unscale(g.origin.x-m.work.left,m.dpi),unscale(g.origin.y-m.work.top,m.dpi)),
+            spacing:(unscale(g.spacing.x,g.dpi),unscale(g.spacing.y,g.dpi))
+        }).unwrap_or(super::drag_placement::Grid{origin:(0,0),spacing:(96,104)}));
+        let preferred=point.map(|p|(unscale(p.x-m.work.left,m.dpi),unscale(p.y-m.work.top,m.dpi)));
+        let cell=arrival_cell(preferred,(unscale(m.work.right-m.work.left,m.dpi),unscale(m.work.bottom-m.work.top,m.dpi)),grid,&self.occupied)?;
+        self.occupied.push(cell);
+        Some(Placement{monitor:m.name.clone(),x:cell.x,y:cell.y,width:cell.w,height:cell.h})
+    }
 }
 
 pub const WM_TRAY: u32 = super::protocol::Message::Tray as u32;
@@ -89,7 +148,7 @@ pub(super) const TRAY_ID:u32=1;
 /// Work that must run outside the host borrow (modal menus, Shell UI, drag loops).
 pub enum After {
     Nothing,
-    ItemMenu { fence: u64, point: POINT },
+    ItemMenu { fence: u64, point: POINT, highlight: Option<u64> },
     FenceMenu { fence: u64, point: POINT },
     FolderSystemMenu { fence: u64, point: POINT },
     TrayMenu(POINT),
@@ -344,8 +403,7 @@ impl DesktopHost {
         self.add_tray();
         // A previous crash may have left icons hidden while organize mode is off.
         if self.config.settings.icons_hidden_by_zsdesk && !self.config.settings.organize {
-            desktop::set_icons_visible(true);
-            self.config.settings.icons_hidden_by_zsdesk = false;
+            self.config.settings.icons_hidden_by_zsdesk = !desktop::set_icons_visible(true);
             self.save_now();
         }
         if self.config.settings.organize && !self.hide_icons() {
@@ -411,6 +469,12 @@ impl DesktopHost {
         zsdesk_windows::flyout::refresh_system();
         self.palette = FencePalette::new(if dark { Mode::Dark } else { Mode::Light }, self.config.settings.opacity);
         if let Some(accent) = zsdesk_windows::theme::system_accent(dark) { self.palette = self.palette.with_accent(accent); }
+        if let Some(colors)=zsdesk_windows::theme::explorer_selection_colors(dark) {
+            let color=|[r,g,b]:[u8;3]| zsdesk_ui::theme::Color::rgb(r,g,b);
+            self.palette.selected=color(colors.fill);
+            self.palette.selected_border=color(colors.border);
+            self.palette.selected_text=color(colors.text);
+        }
     }
 
     pub fn schedule_save(&self) { unsafe { SetTimer(Some(self.hwnd), TIMER_SAVE, 400, None); } }
@@ -714,7 +778,7 @@ impl DesktopHost {
             let shown = unsafe { IsWindowVisible(hwnd) }.as_bool();
             if !fence.is_hidden_tab() && !shown {
                 self.fences[i].peek = false;
-                let r = if self.fences[i].standalone { item_screen_rect(&fence.placement) } else { to_screen(&fence.placement, fence.collapsed) };
+                let (r,up)=screen_frame(&fence.placement,fence.collapsed,self.fences[i].standalone);self.fences[i].title_bottom=up;
                 let _ = unsafe { SetWindowPos(hwnd, None, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOZORDER | SWP_NOACTIVATE) };
                 self.fences[i].dpi = unsafe { windows::Win32::UI::HiDpi::GetDpiForWindow(hwnd) }.max(96);
                 self.render(id);
@@ -757,6 +821,7 @@ impl DesktopHost {
         let rect = self.fences[fi].window_rect();
         let (old, new) = (self.fences[fi].hwnd, self.fences[ti].hwnd);
         let peek = std::mem::replace(&mut self.fences[fi].peek, false);
+        let title_bottom=self.fences[fi].title_bottom;
         self.fences[fi].pending_selection=None;let _=unsafe{KillTimer(Some(old),TIMER_SELECTION)};
         let blocked = self.fences[fi].peek_blocked;
         let focused = unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetFocus() } == old;
@@ -769,7 +834,7 @@ impl DesktopHost {
         {
             let win = &mut self.fences[ti];
             win.dpi = dpi;
-            win.peek = peek;
+            win.peek = peek;win.title_bottom=title_bottom;
             win.peek_blocked = blocked;
             win.tracking = false;
             win.interaction = None;
@@ -840,7 +905,7 @@ impl DesktopHost {
         self.config.split_tab(tab, placement);
         self.save_now();
         if let (Some(i), Some(fence)) = (self.win_index(tab), self.config.fence(tab).cloned()) {
-            let r = to_screen(&fence.placement, fence.collapsed);
+            let (r,up)=screen_frame(&fence.placement,fence.collapsed,false);self.fences[i].title_bottom=up;
             let win = &mut self.fences[i];
             win.peek = false;
             win.interaction = None;
@@ -864,7 +929,7 @@ impl DesktopHost {
         if !self.config.merge_into(source, target) { return; }
         self.save_now();
         if let (Some(i), Some(fence)) = (self.win_index(source), self.config.fence(source).cloned()) {
-            let r = to_screen(&fence.placement, fence.collapsed);
+            let (r,up)=screen_frame(&fence.placement,fence.collapsed,false);self.fences[i].title_bottom=up;
             let hwnd = self.fences[i].hwnd;
             self.fences[i].peek = false;
             let _ = unsafe { SetWindowPos(hwnd, None, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOZORDER | SWP_NOACTIVATE) };
@@ -915,7 +980,7 @@ impl DesktopHost {
 
     fn create_window(&mut self, id: u64, require_item:bool) -> Result<(),String> {
         let Some(fence) = self.config.fence(id) else { return Err(zsdesk_core::i18n::text("桌面项目配置不存在").into()) };
-        let rect = if self.config.is_released(id) { item_screen_rect(&fence.placement) } else { to_screen(&fence.placement, fence.collapsed) };
+        let (rect,title_bottom)=screen_frame(&fence.placement,fence.collapsed,self.config.is_released(id));
         let class: Vec<u16> = FENCE_CLASS.encode_utf16().chain(Some(0)).collect();
         let title: Vec<u16> = fence.title.encode_utf16().chain(Some(0)).collect();
         let owner = desktop::progman();
@@ -923,7 +988,7 @@ impl DesktopHost {
         let hwnd = unsafe { CreateWindowExW(WS_EX_LAYERED | WS_EX_TOOLWINDOW, PCWSTR(class.as_ptr()), PCWSTR(title.as_ptr()), WS_POPUP,
             rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top, owner, None, instance, None) }.map_err(|error|error.to_string())?;
         unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, id as isize); }
-        let mut win = FenceWin::new(id);
+        let mut win = FenceWin::new(id);win.title_bottom=title_bottom;
         win.hwnd = hwnd;
         win.standalone = self.config.is_released(id);
         if win.standalone { win.entries = fence.members.iter().filter_map(|key| desktop::entry_from_parsing_name(key)).collect(); }
@@ -998,7 +1063,14 @@ impl DesktopHost {
         // A screenshot/menu overlay may temporarily cover that desktop, but it
         // must never turn a background desktop into the exposed desktop.
         if self.desktop_exposed&&transient {
-            if let Some(anchor)=anchor {self.place_above_desktop(anchor.hwnd);return;}
+            if let Some(anchor)=anchor {
+                // During overlay dismissal the Shell transiently reorders its owner.
+                // Retain the existing band until an actual desktop/fence takes focus.
+                if foreground == anchor.hwnd || self.fences.iter().any(|f| f.hwnd == foreground) {
+                    self.place_above_desktop(anchor.hwnd);
+                }
+                return;
+            }
         }
         self.desktop_exposed=false;
         self.place_below_applications(anchor);
@@ -1053,13 +1125,7 @@ impl DesktopHost {
         let anchor = self.desktop_anchor.filter(|value| value.valid())
             .or_else(DesktopAnchor::current);
         let foreground = unsafe { GetForegroundWindow() };
-        let class = super::class_name(foreground);
         self.desktop_anchor=anchor;
-        if matches!(class.as_str(),"WorkerW"|"Progman") {
-            // Screenshot and task-switching windows can briefly activate the
-            // shell while closing. Wait for the foreground to settle first.
-            super::schedule_desktop_raise(self.hwnd);
-        }
         self.lower_all(foreground);
     }
 
@@ -1077,7 +1143,7 @@ impl DesktopHost {
         for i in 0..self.fences.len() {
             let id = self.fences[i].id;
             let Some(fence) = self.config.fence(id) else { continue };
-            let r = if self.fences[i].standalone { item_screen_rect(&fence.placement) } else { to_screen(&fence.placement, self.fences[i].collapsed(fence)) };
+            let (r,up)=screen_frame(&fence.placement,self.fences[i].collapsed(fence),self.fences[i].standalone);self.fences[i].title_bottom=up;
             let _ = unsafe { SetWindowPos(self.fences[i].hwnd, None, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOZORDER | SWP_NOACTIVATE) };
             self.fences[i].dpi = unsafe { windows::Win32::UI::HiDpi::GetDpiForWindow(self.fences[i].hwnd) }.max(96);
         }
@@ -1327,14 +1393,17 @@ impl DesktopHost {
         }
         let infos: Vec<ItemInfo> = self.desktop_entries.iter().map(item_info).collect();
         if self.config.settings.organize {
-            let monitor=primary_monitor();let width=unscale(monitor.work.right-monitor.work.left,monitor.dpi);let height=unscale(monitor.work.bottom-monitor.work.top,monitor.dpi);
-            if width<96||height<104{return;}
-            let mut occupied:Vec<_>=self.config.fences.iter().chain(&self.config.released_items).filter(|item|item.placement.monitor==monitor.name&&!item.is_hidden_tab())
-                .map(|item|Bounds::new(item.placement.x,item.placement.y,item.placement.width,if item.collapsed{TITLE_H}else{item.placement.height})).collect();
             let mut planned=self.config.clone();
-            let changed=planned.try_reconcile_uncollected(&infos,|_|{
-                let cell=desktop_item_position(Bounds::new(24,24,96,104),width,height,&occupied).ok_or(())?;occupied.push(cell);
-                Ok::<Placement,()>(Placement{monitor:monitor.name.clone(),x:cell.x,y:cell.y,width:cell.w,height:cell.h})
+            let mut layout=None;
+            let changed=planned.try_reconcile_uncollected(&infos,|key|{
+                let (screens,positions)=layout.get_or_insert_with(||(ArrivalMonitor::capture(&self.config,&self.desktop_entries),desktop::DesktopPositions::read()));
+                let point=positions.as_ref().and_then(|p|self.desktop_entries.iter().find(|e|e.key==key).and_then(|e|p.position(e)));
+                if let Some(point)=point {
+                    if let Some(screen)=screens.iter_mut().find(|s| {
+                        let r=s.monitor.work;point.x>=r.left&&point.x<r.right&&point.y>=r.top&&point.y<r.bottom
+                    }) { if let Some(p)=screen.place(Some(point)) { return Ok(p); } }
+                }
+                screens.iter_mut().find_map(|s|s.place(None)).ok_or(())
             });
             let Ok(changed)=changed else{
                 if self.config.settings.icons_hidden_by_zsdesk{self.restore_desktop();self.notify_error(zsdesk_core::i18n::text("桌面空间不足，已恢复系统桌面图标；原格子布局仍保留。"));}
@@ -1394,7 +1463,7 @@ impl DesktopHost {
             let mut rect=window.window_rect();
             // A hover-expanded, collapsed fence rolls back up after the drag;
             // its temporary preview must not push a loose icon far away.
-            if !window.standalone&&self.config.fence(window.id).is_some_and(|fence|fence.collapsed){rect.bottom=rect.top+scale(TITLE_H,window.dpi);}
+            if !window.standalone&&self.config.fence(window.id).is_some_and(|fence|fence.collapsed){if window.title_bottom{rect.top=rect.bottom-scale(TITLE_H,window.dpi);}else{rect.bottom=rect.top+scale(TITLE_H,window.dpi);}}
             super::drag_placement::visible_obstacle(Bounds::new(rect.left,rect.top,rect.right-rect.left,rect.bottom-rect.top),work,monitor.dpi,visible,dragged)
         }).collect();
         let offsets:Vec<_>=keys.iter().enumerate().map(|(index,key)|self.drag_geometry.iter().find(|(name,_)|name==key)
@@ -1532,7 +1601,12 @@ impl DesktopHost {
         let Some(fence) = self.config.fence_mut(id) else { return };
         let peeking = self.fences.iter().any(|w| w.id == id && w.peek);
         let keep_height = (fence.collapsed && (!peeking || !resized)).then_some(fence.placement.height);
-        fence.placement = from_screen(rect, keep_height);
+        let mut placement=from_screen(rect,keep_height);
+        if let Some(win)=self.fences.iter().find(|w|w.id==id && w.title_bottom){
+            let title=RECT{top:(rect.bottom-scale(TITLE_H,win.dpi)).max(rect.top),..rect};
+            let anchor=from_screen(title,Some(placement.height));placement=anchor;
+        }
+        fence.placement=placement;
         self.config.sync_group(id);
         self.schedule_save();
     }
@@ -1590,7 +1664,7 @@ impl DesktopHost {
             Some(Interaction::TabDrag { tab, .. }) => {
                 let g = win.geometry(&fence);
                 let margin = scale(24, win.dpi);
-                let torn = point.x < -margin || point.x > g.width + margin || point.y < -margin || point.y > g.title.height + margin;
+                let torn = point.x < -margin || point.x > g.width + margin || point.y < g.title.y-margin || point.y > g.title.bottom()+margin;
                 if !torn {
                     let before = g.tabs.iter().find(|(_, r)| point.x < r.x + r.width / 2).map(|(i, _)| win.tabs[*i].id);
                     let order = self.config.tab_ids(id);
@@ -1601,7 +1675,7 @@ impl DesktopHost {
                 self.render(id);
                 return After::Nothing;
             }
-            Some(Interaction::Press { key, cursor }) => {
+            Some(Interaction::Press { key, cursor, .. }) => {
                 let Some(item)=win.entries.iter().position(|entry|entry.key==key)else{win.interaction=None;return After::Nothing;};
                 let threshold = unsafe { GetSystemMetrics(SM_CXDRAG) };
                 if (point.x - cursor.x).abs() > threshold || (point.y - cursor.y).abs() > threshold {
@@ -1703,14 +1777,10 @@ impl DesktopHost {
         let win = &mut self.fences[index];
         if !fence.collapsed { win.peek = false; return; }
         if win.peek == open { return; }
-        let rect = win.window_rect();
-        let height = if open {
-            let monitor = monitor_from_point(POINT { x: rect.left, y: rect.top });
-            scale(fence.placement.height, win.dpi).min(monitor.work.bottom - rect.top).max(scale(TITLE_H, win.dpi))
-        } else { scale(TITLE_H, win.dpi) };
-        win.peek = open;
-        let hwnd = win.hwnd;
-        let _ = unsafe { SetWindowPos(hwnd, None, rect.left, rect.top, rect.right - rect.left, height, SWP_NOZORDER | SWP_NOACTIVATE) };
+        let (rect,up)=screen_frame(&fence.placement,!open,false);
+        win.peek=open;win.title_bottom=up;
+        let hwnd=win.hwnd;
+        let _=unsafe{SetWindowPos(hwnd,None,rect.left,rect.top,rect.right-rect.left,rect.bottom-rect.top,SWP_NOZORDER|SWP_NOACTIVATE)};
         // Poll instead of WM_MOUSELEAVE so menus and drags keep the fence open.
         if open { unsafe { SetTimer(Some(hwnd), TIMER_PEEK, 250, None); } } else { let _ = unsafe { KillTimer(Some(hwnd), TIMER_PEEK) }; }
         self.render(id);
@@ -1741,8 +1811,18 @@ impl DesktopHost {
     pub(super) fn begin_modal(&mut self,id:u64){*self.modal_holds.entry(id).or_default()+=1;}
     pub(super) fn end_modal(&mut self,id:u64){if let Some(count)=self.modal_holds.get_mut(&id){*count=count.saturating_sub(1);if *count==0{self.modal_holds.remove(&id);}}}
     pub(super) fn menu_started(&mut self,id:u64,generation:u64){self.pending_menu=Some((id,generation));}
-    pub(super) fn menu_finished(&mut self,id:u64,generation:u64){if self.pending_menu==Some((id,generation)){self.pending_menu=None;}}
-    pub(super) fn menu_cancelled(&mut self){self.pending_menu=None;}
+    pub(super) fn menu_finished(&mut self,id:u64,generation:u64){
+        if self.pending_menu==Some((id,generation)){self.menu_cancelled();}
+    }
+    pub(super) fn menu_cancelled(&mut self){
+        self.pending_menu=None;
+        self.clear_other_menu_highlights(None);
+    }
+    pub(super) fn clear_other_menu_highlights(&mut self, keep:Option<u64>) {
+        let changed: Vec<_> = self.fences.iter_mut().filter_map(|window|
+            window.clear_other_menu_highlight(keep).then_some(window.id)).collect();
+        for id in changed { self.render(id); }
+    }
     pub(super) fn can_start_desktop_selection(&self)->bool{
         self.config.settings.organize&&self.config.settings.icons_hidden_by_zsdesk&&self.internal_drag.is_none()&&self.incoming_drag.is_none()
             &&self.pending_menu.is_none()&&self.modal_holds.values().all(|count|*count==0)
@@ -1765,6 +1845,7 @@ impl DesktopHost {
     }
 
     pub fn mouse_down(&mut self, id: u64, point: POINT, double: bool) -> After {
+        self.clear_other_menu_highlights(None);
         let Some(index) = self.win_index(id) else { return After::Nothing };
         let Some(fence) = self.config.fence(id).cloned() else { return After::Nothing };
         self.commit_rename_if_any(id);
@@ -1775,6 +1856,8 @@ impl DesktopHost {
         let win = &self.fences[index];
         let g = win.geometry(&fence);
         let hit = g.hit(point.x, point.y, win.dpi, fence.locked, win.collapsed(&fence));
+        let mut screen = point;
+        let _ = unsafe { windows::Win32::Graphics::Gdi::ClientToScreen(win.hwnd, &mut screen) };
         // A hover preview is not the size being moved. Keep the title under
         // the pointer and allow a collapsed fence to reach the bottom edge.
         if hit == FenceHit::Title && !double && !fence.locked && fence.collapsed && win.peek {
@@ -1784,8 +1867,6 @@ impl DesktopHost {
         let win = &mut self.fences[index];
         let ctrl = unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0;
         let shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
-        let mut screen = point;
-        let _ = unsafe { windows::Win32::Graphics::Gdi::ClientToScreen(win.hwnd, &mut screen) };
         let _ = unsafe { windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(Some(win.hwnd)) };
         match hit {
             FenceHit::Title if double => { self.toggle_collapse(id); return After::Nothing; }
@@ -1813,6 +1894,7 @@ impl DesktopHost {
             FenceHit::Item(i) => {
                 if double { return After::Open { fence: id, index: i, explorer: ctrl }; }
                 let key = win.entries[i].key.clone();
+                let deselect_on_release = !ctrl && !shift && win.toggles_on_plain_click(&key);
                 if shift {
                     let anchor = win.anchor.unwrap_or(i);
                     let (a, b) = (anchor.min(i), anchor.max(i));
@@ -1826,7 +1908,7 @@ impl DesktopHost {
                     win.anchor = Some(i);
                 }
                 win.focus = Some(i);
-                win.interaction = Some(Interaction::Press { key:win.entries[i].key.clone(), cursor: point });
+                win.interaction = Some(Interaction::Press { key:win.entries[i].key.clone(), cursor: point, deselect_on_release });
                 unsafe { windows::Win32::UI::Input::KeyboardAndMouse::SetCapture(win.hwnd); }
             }
             FenceHit::Empty => {
@@ -1876,10 +1958,17 @@ impl DesktopHost {
                 }
                 self.schedule_save();
             }
-            Some(Interaction::Press { key, .. }) => {
+            Some(Interaction::Press { key, deselect_on_release, .. }) => {
                 let ctrl = unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0;
                 let shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
-                if !ctrl && !shift &&win.entries.iter().any(|entry|entry.key==key){ win.selection = HashSet::from([key]); }
+                if !ctrl && !shift && win.entries.iter().any(|entry|entry.key==key) {
+                    if deselect_on_release && self.config.fence(id).is_some_and(|f| {
+                        matches!(win.geometry(f).hit(point.x,point.y,win.dpi,f.locked,win.collapsed(f)),FenceHit::Item(i)
+                            if win.entries.get(i).is_some_and(|entry|entry.key==key))
+                    }) {
+                        win.change_selection(SelectionChange::Clear);
+                    } else { win.selection = HashSet::from([key]); }
+                }
             }
             _ => {}
         }
@@ -1907,6 +1996,7 @@ impl DesktopHost {
     }
 
     pub fn right_click(&mut self, id: u64, point: POINT) -> After {
+        self.menu_cancelled();
         self.menu_input_started=Some((id,Instant::now()));
         let Some(index) = self.win_index(id) else { return After::Nothing };
         let Some(fence) = self.config.fence(id).cloned() else { return After::Nothing };
@@ -1922,18 +2012,17 @@ impl DesktopHost {
                 .map(|window|{window.selection.clear();window.focus=None;window.id}).collect();
             for other in changed {self.render(other);}
         }
+        let multiple = self.fences[index].standalone && !clear_others && self.fences.iter()
+            .filter(|w| w.standalone).flat_map(|w| &w.selection).take(2).count() == 2;
         let win = &mut self.fences[index];
         let g = win.geometry(&fence);
         let mut screen = point;
         let _ = unsafe { windows::Win32::Graphics::Gdi::ClientToScreen(win.hwnd, &mut screen) };
         match g.hit(point.x, point.y, win.dpi, true, win.collapsed(&fence)) {
             FenceHit::Item(i) => {
-                let key = win.entries[i].key.clone();
-                let changed=!win.selection.contains(&key)||win.focus!=Some(i);
-                if !win.selection.contains(&key) { win.selection = HashSet::from([key]); }
-                win.focus = Some(i);
+                let (highlight,changed)=win.select_for_pointer_menu(i,multiple);
                 if changed { self.render(id); }
-                After::ItemMenu { fence: id, point: screen }
+                After::ItemMenu { fence: id, point: screen, highlight }
             }
             FenceHit::Tab(i) => {
                 let tab = win.tabs[i].id;
@@ -1974,7 +2063,7 @@ impl DesktopHost {
             self.schedule_save(); self.render(id); return;
         }
         win.zoom_remainder = 0;
-        if win.tabbed() && client.y >= 0 && client.y < g.title.height {
+        if win.tabbed() && g.title.contains(client.x,client.y) {
             if delta != 0 { self.cycle_tab(id, if delta < 0 { 1 } else { -1 }); }
             return;
         }
@@ -2000,7 +2089,7 @@ impl DesktopHost {
             let window=&self.fences[index];let geometry=window.geometry(&fence);
             let mut point=keyboard_menu_anchor(window,&geometry);
             let _=unsafe{windows::Win32::Graphics::Gdi::ClientToScreen(window.hwnd,&mut point)};
-            return if !window.selection.is_empty(){After::ItemMenu{fence:id,point}}
+            return if !window.selection.is_empty(){After::ItemMenu{fence:id,point,highlight:None}}
                 else if window.collapsed(&fence)||window.standalone{After::FenceMenu{fence:id,point}}
                 else{After::FolderSystemMenu{fence:id,point}};
         }
@@ -2027,7 +2116,7 @@ impl DesktopHost {
             VK_DELETE => return After::Verb { fence: id, verb: "delete", background: false },
             VK_F2 => if let Some(f) = selected_focus_index(win) { let key = win.entries[f].key.clone(); self.begin_rename(id, RenameTarget::Item(key)); },
             VK_F5 => if fence.is_desktop() { self.refresh_desktop(); } else { self.refresh_folder(id); },
-            VK_ESCAPE => { win.selection.clear(); self.render(id); }
+            VK_ESCAPE => { win.change_selection(SelectionChange::Clear); self.render(id); }
             VK_BACK => if fence.browse.is_some() { self.browse_up(id); },
             _ if ctrl && !alt && k == VK_A => { win.change_selection(if shift { SelectionChange::Invert } else { SelectionChange::All }); self.render(id); }
             _ if ctrl && k == VK_C => return After::Verb { fence: id, verb: "copy", background: false },
@@ -2077,10 +2166,8 @@ impl DesktopHost {
         let placement = fence.placement.clone();
         let collapsed = fence.collapsed;
         if let Some(index) = self.win_index(id) {
-            let current = self.fences[index].window_rect();
-            let dpi = self.fences[index].dpi;
-            let height = if collapsed { scale(TITLE_H, dpi) } else { scale(placement.height, dpi) };
-            let _ = unsafe { SetWindowPos(self.fences[index].hwnd, None, current.left, current.top, current.right - current.left, height, SWP_NOZORDER | SWP_NOACTIVATE) };
+            let (rect,up)=screen_frame(&placement,collapsed,false);self.fences[index].title_bottom=up;
+            let _=unsafe{SetWindowPos(self.fences[index].hwnd,None,rect.left,rect.top,rect.right-rect.left,rect.bottom-rect.top,SWP_NOZORDER|SWP_NOACTIVATE)};
         }
         self.schedule_save();
         self.render(id);
@@ -2121,7 +2208,7 @@ impl DesktopHost {
                 let width = chip.width.max(scale(120, win.dpi)).min((g.width - chip.x - scale(4, win.dpi)).max(scale(60, win.dpi)));
                 (zsdesk_ui::chrome::Rect::new(chip.x, chip.y, width, chip.height), fence.title.clone(), false)
             }
-            RenameTarget::Title => (zsdesk_ui::chrome::Rect::new(scale(36, win.dpi), scale(4, win.dpi), (g.width - scale(72, win.dpi)).max(scale(60, win.dpi)), g.title.height - scale(8, win.dpi)), fence.title.clone(), false),
+            RenameTarget::Title => (zsdesk_ui::chrome::Rect::new(scale(36, win.dpi), g.title.y+scale(4, win.dpi), (g.width - scale(72, win.dpi)).max(scale(60, win.dpi)), g.title.height - scale(8, win.dpi)), fence.title.clone(), false),
             RenameTarget::Item(key) => {
                 let Some(i) = win.entries.iter().position(|e| &e.key == key) else { return };
                 let name = desktop::editing_name(&win.entries[i].pidl).unwrap_or_else(|| win.entries[i].name.clone());
@@ -2906,19 +2993,28 @@ fn monitor_from_point(point: POINT) -> Monitor {
 fn unscale(v: i32, dpi: u32) -> i32 { super::drag_placement::signed_scale(v,96,dpi) }
 
 /// Placement (DIP relative to a monitor work area) → screen rectangle.
-pub fn to_screen(p: &Placement, collapsed: bool) -> RECT {
-    screen_rect(p, collapsed, false)
+pub fn to_screen(p:&Placement,collapsed:bool)->RECT{screen_frame(p,collapsed,false).0}
+pub(super) fn item_screen_rect(p:&Placement)->RECT{screen_frame(p,false,true).0}
+
+/// The saved Y coordinate is the rolled-up title. Prefer downward opening;
+/// near the taskbar keep the title fixed and use the larger space above it.
+fn expand_from_title(anchor:RECT,work:RECT,wanted:i32)->(RECT,bool){
+    let down=(work.bottom-anchor.top).max(1);
+    let up=(anchor.bottom-work.top).max(1);
+    if wanted>down && up>down{
+        (RECT{top:anchor.bottom-wanted.min(up),..anchor},true)
+    }else{(RECT{bottom:anchor.top+wanted.max(1).min(down),..anchor},false)}
 }
-pub(super) fn item_screen_rect(p: &Placement) -> RECT { screen_rect(p, false, true) }
-fn screen_rect(p: &Placement, collapsed: bool, item: bool) -> RECT {
-    let list = monitors();
-    let m = list.iter().find(|m| m.name == p.monitor).cloned().unwrap_or_else(primary_monitor);
-    let s = |v: i32| scale(v, m.dpi);
-    let w = s(p.width.max(if item { 72 } else { MIN_FENCE_W })).min(m.work.right - m.work.left);
-    let h = if collapsed { s(TITLE_H) } else { s(p.height.max(if item { 84 } else { MIN_FENCE_H })).min(m.work.bottom - m.work.top) };
-    let x = (m.work.left + s(p.x)).clamp(m.work.left, (m.work.right - w).max(m.work.left));
-    let y = (m.work.top + s(p.y)).clamp(m.work.top, (m.work.bottom - h).max(m.work.top));
-    RECT { left: x, top: y, right: x + w, bottom: y + h }
+fn screen_frame(p:&Placement,collapsed:bool,item:bool)->(RECT,bool){
+    let list=monitors();let m=list.iter().find(|m|m.name==p.monitor).cloned().unwrap_or_else(primary_monitor);
+    let s=|v:i32|scale(v,m.dpi);
+    let width=s(p.width.max(if item{72}else{MIN_FENCE_W})).min((m.work.right-m.work.left).max(1));
+    let height=s(p.height.max(if item{84}else{MIN_FENCE_H})).min((m.work.bottom-m.work.top).max(1));
+    let title_h=if item{height}else{s(TITLE_H).min(height)};
+    let left=(m.work.left.saturating_add(s(p.x))).clamp(m.work.left,(m.work.right-width).max(m.work.left));
+    let top=(m.work.top.saturating_add(s(p.y))).clamp(m.work.top,(m.work.bottom-title_h).max(m.work.top));
+    let anchor=RECT{left,top,right:left+width,bottom:top+title_h};
+    if item||collapsed{(anchor,false)}else{expand_from_title(anchor,m.work,height)}
 }
 
 pub fn from_screen(rect: RECT, keep_height: Option<i32>) -> Placement {
@@ -2930,28 +3026,77 @@ pub fn from_screen(rect: RECT, keep_height: Option<i32>) -> Placement {
     }
 }
 
-pub fn load_config(path: &Path) -> DesktopConfig {
-    let mut config: DesktopConfig = std::fs::read_to_string(path).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+pub fn load_config(path: &Path) -> std::io::Result<DesktopConfig> {
+    let mut config: DesktopConfig = match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(std::io::Error::other)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => DesktopConfig::default(),
+        Err(error) => return Err(error),
+    };
     config.normalize();
-    config
+    Ok(config)
 }
 
 pub fn save_config(path: &Path, config: &DesktopConfig) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() { std::fs::create_dir_all(parent)?; }
-    let temporary = path.with_extension("json.tmp");
-    std::fs::write(&temporary, serde_json::to_vec_pretty(config).map_err(std::io::Error::other)?)?;
-    std::fs::rename(&temporary, path)
+    crate::storage::write_atomic(path,&serde_json::to_vec_pretty(config).map_err(std::io::Error::other)?)
 }
 
 #[cfg(test)]
 mod shortcut_tests {
     use super::*;
     use windows::Win32::UI::Input::KeyboardAndMouse::{VK_C, VK_Y, VK_Z};
+    #[test]
+    fn expanding_a_fence_uses_the_work_area_and_keeps_the_title_anchored(){
+        let work=RECT{left:-1920,top:-160,right:0,bottom:880};
+        for mul in [1,2]{
+            let title=36*mul;
+            for (y,expected_up) in [(work.top,false),(work.bottom-title,true),(work.bottom-title-20,true)]{
+                let anchor=RECT{left:-1300,top:y,right:-1000,bottom:y+title};
+                let (r,up)=expand_from_title(anchor,work,310*mul);
+                assert_eq!(up,expected_up);assert!(r.top>=work.top&&r.bottom<=work.bottom);
+                assert_eq!((r.left,r.right,r.bottom-r.top),(-1300,-1000,310*mul));
+                assert_eq!(if up{r.bottom}else{r.top},if up{anchor.bottom}else{anchor.top});
+            }
+        }
+    }
+    #[test]
+    fn damaged_desktop_layout_is_preserved() -> anyhow::Result<()> {
+        let path = std::env::temp_dir().join(format!("zsdesk-layout-invalid-{}.json",std::process::id()));
+        let mut file = std::fs::File::create_new(&path)?;
+        use std::io::Write;
+        file.write_all(b"{")?;
+        drop(file);
+        let result=load_config(&path);
+        let contents=std::fs::read(&path)?;
+        std::fs::remove_file(&path)?;
+        assert!(result.is_err());
+        assert_eq!(contents,b"{");
+        assert!(load_config(&path)?.fences.is_empty());
+        Ok(())
+    }
     fn keyboard_selection()->FenceWin{
         let mut window=FenceWin::new(1);
         window.entries=["A","B"].into_iter().map(|name|ShellEntry{key:name.into(),name:name.into(),pidl:vec![0,0],
             is_folder:false,is_file_system:true,is_link:false,is_stream:false,can_drop:false,ghosted:false,path:None,size:None,modified:None}).collect();
         window
+    }
+    #[test]
+    fn desktop_menu_finish_releases_only_its_own_icon_target() -> anyhow::Result<()> {
+        let mut host=DesktopHost::new(HWND::default(),PathBuf::new(),PathBuf::new(),DesktopConfig::default(),Gfx::new("Segoe UI")?);
+        let mut window=keyboard_selection();
+        window.standalone=true;
+        host.fences.push(window);
+        let first=host.fences[0].select_for_pointer_menu(0,false).0.unwrap();
+        host.menu_started(1,17);
+        assert_eq!(host.fences[0].menu_entry(first).unwrap().key,"A");
+        host.menu_cancelled();
+        let next=host.fences[0].select_for_pointer_menu(1,false).0.unwrap();
+        host.menu_started(1,18);
+        host.menu_finished(1,17);
+        assert!(host.fences[0].menu_entry(first).is_none());
+        assert_eq!(host.fences[0].menu_entry(next).unwrap().key,"B");
+        host.menu_finished(1,18);
+        assert!(host.fences[0].menu_entry(next).is_none() && host.fences[0].selection.is_empty());
+        Ok(())
     }
     #[test]
     fn ctrl_deselected_focus_is_not_an_open_rename_or_menu_target(){
@@ -2995,17 +3140,37 @@ mod shortcut_tests {
     }
     #[test]
     fn loose_desktop_icon_placement_avoids_fences_and_stays_on_monitor() {
-        let origin=Bounds::new(100,100,96,104);
-        let occupied=vec![Bounds::new(0,0,192,208)];
-        let cell=desktop_item_position(origin,800,600,&occupied).unwrap();
-        assert!(cell.x>=192||cell.y>=208);
-        assert!(cell.x>=0&&cell.y>=0&&cell.right()<=800&&cell.bottom()<=600);
-        let outside=desktop_item_position(Bounds::new(-500,900,96,104),800,600,&[]).unwrap();
-        assert_eq!((outside.x,outside.y),(0,496));
-        let first=desktop_item_position(Bounds::new(24,24,96,104),800,600,&[]).unwrap();
-        let second=desktop_item_position(Bounds::new(24,24,96,104),800,600,&[first]).unwrap();
-        assert_eq!((second.x,second.y),(first.x,first.y+104));
-        assert!(desktop_item_position(origin,800,600,&[Bounds::new(0,0,800,600)]).is_none());
+        let grid=super::super::drag_placement::Grid{origin:(7,11),spacing:(100,112)};
+        let area=(800,600);
+        assert_eq!(arrival_cell(Some((302,113)),area,grid,&[]),Some(Bounds::new(302,113,96,104)));
+        let first=arrival_cell(None,area,grid,&[]).unwrap();
+        assert_eq!(first,Bounds::new(7,11,96,104));
+        let second=arrival_cell(Some((7,11)),area,grid,&[first]).unwrap();
+        assert_eq!(second,Bounds::new(7,123,96,104));
+        let blocked=Bounds::new(307,123,96,104);
+        assert_eq!(arrival_cell(Some((307,123)),area,grid,&[blocked]),Some(Bounds::new(307,235,96,104)));
+        assert_eq!(arrival_cell(None,area,grid,&[Bounds::new(0,0,103,600)]),Some(Bounds::new(107,11,96,104)));
+        assert!(arrival_cell(None,area,grid,&[Bounds::new(0,0,800,600)]).is_none());
+    }
+    #[test]
+    fn download_on_secondary_monitor_uses_its_work_origin_and_scale() {
+        let mut screen = ArrivalMonitor {
+            monitor:Monitor{name:"secondary".into(), work:RECT{left:-1920,top:45,right:0,bottom:1125},dpi:144,primary:false},
+            grid:Default::default(),occupied:Vec::new(),
+        };
+        screen.grid.set(super::super::drag_placement::Grid{origin:(0,0),spacing:(100,112)}).unwrap();
+        let p=screen.place(Some(POINT{x:-1470,y:495})).unwrap();
+        assert_eq!(p.monitor,"secondary");assert_eq!((p.x,p.y),(300,300));
+    }
+    #[test]
+    fn repeated_click_can_clear_a_single_fence_selection_without_changing_a_drag_group() {
+        let mut win=keyboard_selection();
+        win.selection=HashSet::from(["A".to_owned()]);
+        assert!(win.toggles_on_plain_click("A") && !win.toggles_on_plain_click("B"));
+        win.selection.insert("B".to_owned());
+        assert!(!win.toggles_on_plain_click("A"));
+        win.focus=Some(1); win.anchor=Some(0); win.change_selection(SelectionChange::Clear);
+        assert!(win.selection.is_empty() && win.focus.is_none() && win.anchor.is_none());
     }
     #[test]
     fn fence_startup_command_binds_the_exact_profile() {

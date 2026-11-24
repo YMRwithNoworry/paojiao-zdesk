@@ -166,6 +166,7 @@ pub struct FencePalette {
     pub chip: Color,
     pub selected: Color,
     pub selected_border: Color,
+    pub selected_text: Color,
     pub accent: Color,
 }
 
@@ -175,11 +176,9 @@ fn luminance(r: u8, g: u8, b: u8) -> f32 {
 }
 
 impl FencePalette {
-    /// Selection and drop highlights follow the user's accent color.
+    /// Drop targets use the application accent independently of item selection.
     pub fn with_accent(mut self, [r, g, b]: [u8; 3]) -> Self {
         self.accent = Color::rgb(r, g, b);
-        self.selected = Color::rgba(r, g, b, self.selected.a);
-        self.selected_border = Color::rgba(r, g, b, self.selected_border.a);
         self
     }
 
@@ -190,7 +189,7 @@ impl FencePalette {
             return Self{background:role(ColorRole::Surface),title:role(ColorRole::SurfaceRaised),border:role(ColorRole::StrongStroke),
                 text:role(ColorRole::PrimaryText),text_secondary:role(ColorRole::SecondaryText),text_shadow:Color::rgba(0,0,0,0),
                 hover:role(ColorRole::Control),chip:role(ColorRole::Control),selected:role(ColorRole::Surface),
-                selected_border:role(ColorRole::Accent),accent:role(ColorRole::Accent)};
+                selected_border:role(ColorRole::Accent),selected_text:role(ColorRole::PrimaryText),accent:role(ColorRole::Accent)};
         }
         Self::configured(mode,opacity)
     }
@@ -206,8 +205,9 @@ impl FencePalette {
                 text_shadow: Color::rgba(0, 0, 0, 0xA0),
                 hover: Color::rgba(0xFF, 0xFF, 0xFF, 0x18),
                 chip: Color::rgba(0xFF, 0xFF, 0xFF, 0x29),
-                selected: Color::rgba(0x60, 0xCD, 0xFF, 0x40),
-                selected_border: Color::rgba(0x60, 0xCD, 0xFF, 0x90),
+                selected: Color::rgb(0x43,0x43,0x43),
+                selected_border: Color::rgb(0x61,0x61,0x61),
+                selected_text: Color::rgb(0xFF,0xFF,0xFF),
                 accent: Color::rgb(0x60, 0xCD, 0xFF),
             },
             Mode::Light => Self {
@@ -219,8 +219,9 @@ impl FencePalette {
                 text_shadow: Color::rgba(0xFF, 0xFF, 0xFF, 0x00),
                 hover: Color::rgba(0, 0, 0, 0x0D),
                 chip: Color::rgba(0, 0, 0, 0x14),
-                selected: Color::rgba(0x00, 0x5F, 0xB8, 0x30),
-                selected_border: Color::rgba(0x00, 0x5F, 0xB8, 0x80),
+                selected: Color::rgb(0xCC,0xE8,0xFF),
+                selected_border: Color::rgb(0x99,0xD1,0xFF),
+                selected_text: Color::rgb(0,0,0),
                 accent: Color::rgb(0x00, 0x5F, 0xB8),
             },
         }
@@ -314,8 +315,8 @@ mod tests {
         assert_eq!(dark.accent_text, Color::rgb(0, 0, 0));
         let fence = FencePalette::configured(Mode::Light, 80);
         let tinted = fence.with_accent([0xE7, 0x48, 0x56]);
-        assert_eq!((tinted.selected.r, tinted.selected.a), (0xE7, fence.selected.a));
-        assert_eq!(tinted.selected_border.a, fence.selected_border.a);
+        assert_eq!(tinted.selected, fence.selected);
+        assert_eq!(tinted.selected_border, fence.selected_border);
     }
     #[test]
     fn fence_opacity_is_clamped() {

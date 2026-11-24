@@ -32,6 +32,7 @@ mod update_shutdown;
 mod installer_startup;
 mod context_menu_process;
 mod utility_panel;
+mod report_list;
 mod update_check;
 
 #[cfg(test)]

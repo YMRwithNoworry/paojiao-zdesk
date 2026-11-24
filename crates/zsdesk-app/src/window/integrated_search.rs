@@ -187,7 +187,7 @@ impl WindowState{
         if let Some(browser)=&self.browser{
             let (column,ascending)=match self.search_controls().sort{
                 SearchSort::NameAsc=>(Column::Name,true),SearchSort::NameDesc=>(Column::Name,false),
-                SearchSort::ModifiedDesc=>(Column::Modified,false),SearchSort::SizeDesc=>(Column::Size,false),
+                SearchSort::ModifiedAsc=>(Column::Modified,true),SearchSort::SizeAsc=>(Column::Size,true),SearchSort::ModifiedDesc=>(Column::Modified,false),SearchSort::SizeDesc=>(Column::Size,false),
             };
             let _=browser.set_sort(column,ascending);
         }

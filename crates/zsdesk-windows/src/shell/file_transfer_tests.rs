@@ -428,20 +428,33 @@ fn exercise(root:&Path)->anyhow::Result<serde_json::Value>{
 fn native_file_transfers_are_batched_bounded_and_clipboard_safe()->anyhow::Result<()>{
     let root=PathBuf::from(std::env::var_os("ZSDESK_NATIVE_TEST_OUTPUT").context("isolated output required")?).join("file-transfer");
     ensure!(root.is_absolute(),"absolute output required");fs::create_dir_all(&root)?;
+    let destination=root.clone();
+    let mut cleanup = [false; 3];
+    let result=with_private_transfer_station(&mut cleanup, move || exercise(&destination));
+    let [restored, desktop_closed, station_closed] = cleanup;
+    let report=serde_json::json!({"state":if result.is_ok(){"passed"}else{"failed"},
+        "checks":result.as_ref().map_err(|error|format!("{error:#}")),"station_restored":restored,"desktop_closed":desktop_closed,"station_closed":station_closed});
+    fs::write(root.join("verification.current.json"),serde_json::to_vec_pretty(&report)?)?;println!("{report}");
+    result.map(|_| ())
+}
+
+fn with_private_transfer_station<T: Send + 'static>(
+    cleanup: &mut [bool; 3],
+    run: impl FnOnce() -> anyhow::Result<T> + Send + 'static,
+) -> anyhow::Result<T> {
     let original=unsafe{GetProcessWindowStation()};ensure!(!original.is_null(),"current window station missing");
     let station_name=wide(Path::new(&format!("ZSDeskTransfer{}",std::process::id())));
     let station=unsafe{CreateWindowStationW(station_name.as_ptr(),0,0x000f037f,std::ptr::null())};ensure!(!station.is_null(),"isolated window station creation failed");
     if unsafe{SetProcessWindowStation(station)}==0{let _=unsafe{CloseWindowStation(station)};anyhow::bail!("SetProcessWindowStation failed");}
     let name=wide(Path::new("Default"));let desktop=unsafe{CreateDesktopW(name.as_ptr(),std::ptr::null(),std::ptr::null(),0,0x000f00ff,std::ptr::null())};
     if desktop.is_null(){let _=unsafe{SetProcessWindowStation(original)};let _=unsafe{CloseWindowStation(station)};anyhow::bail!("private desktop creation failed");}
-    let handle=desktop as usize;let destination=root.clone();
-    let result=thread::spawn(move||->anyhow::Result<serde_json::Value>{ensure!(unsafe{SetThreadDesktop(handle as*mut _)}!=0,"SetThreadDesktop failed");exercise(&destination)})
+    let handle=desktop as usize;
+    let result=thread::spawn(move||{ensure!(unsafe{SetThreadDesktop(handle as*mut _)}!=0,"SetThreadDesktop failed");run()})
         .join().map_err(|_|anyhow::anyhow!("file transfer native test panicked")).and_then(|value|value);
     let restored=unsafe{SetProcessWindowStation(original)}!=0;let desktop_closed=unsafe{CloseDesktop(desktop)}!=0;let station_closed=unsafe{CloseWindowStation(station)}!=0;
-    let report=serde_json::json!({"state":if result.is_ok()&&restored&&desktop_closed&&station_closed{"passed"}else{"failed"},
-        "checks":result.as_ref().map_err(|error|format!("{error:#}")),"station_restored":restored,"desktop_closed":desktop_closed,"station_closed":station_closed});
-    fs::write(root.join("verification.current.json"),serde_json::to_vec_pretty(&report)?)?;println!("{report}");
-    result?;ensure!(restored&&desktop_closed&&station_closed,"window station cleanup failed");Ok(())
+    *cleanup = [restored, desktop_closed, station_closed];
+    ensure!(restored&&desktop_closed&&station_closed,"window station cleanup failed");
+    result
 }
 
 #[test]
@@ -468,4 +481,45 @@ fn ordinary_fence_copy_and_move_preserve_the_expected_source() -> anyhow::Result
     let a=PathBuf::from(r"C:\first");let b=PathBuf::from(r"C:\second");
     assert!(same_cut_selection(&[a.clone(),b.clone()],&[b.clone(),a.clone()]));
     assert!(!same_cut_selection(&[a.clone(),b.clone()],&[a.clone(),a]));
+}
+
+#[test]
+#[ignore = "Run alone. Uses an isolated OLE clipboard without interacting with a file window."]
+fn filesystem_cut_publishes_move_before_marking_the_source() -> anyhow::Result<()> {
+    with_private_transfer_station(&mut [false; 3], || {
+        use std::cell::Cell;
+        unsafe { OleInitialize(None)?; }
+        let _apartment = Apartment;
+        let dir = std::env::temp_dir().join(format!("zsdesk-cut-object-{}", std::process::id()));
+        fs::create_dir(&dir)?;
+        let paths = [dir.join("first.txt"), dir.join("second.txt")];
+        struct Fixture(PathBuf);
+        impl Drop for Fixture { fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); } }
+        let _fixture = Fixture(dir);
+        for path in &paths { fs::write(path, b"cut fixture")?; }
+        let cut = file_data_object(HWND::default(), &paths, true)?;
+        let copy = file_data_object(HWND::default(), &paths, false)?;
+        let sequence = || unsafe { GetClipboardSequenceNumber() };
+        let marked = Cell::new(false);
+        publish_view_cut(&cut, sequence(), || Ok(true), || {
+            let (actual, effect, _) = clipboard_files().unwrap();
+            assert!(same_cut_selection(&actual, &paths) && move_intent(effect));
+            marked.set(true);
+        })?;
+        ensure!(marked.get(), "published the cut without notifying the source view");
+        for replace_object in [false, true] {
+            let first = Cell::new(true);
+            publish_view_cut(&cut, sequence(), || {
+                if first.replace(false) { return Ok(true); }
+                if replace_object { unsafe { windows::Win32::System::Ole::OleSetClipboard(&copy)?; } }
+                Ok(replace_object)
+            }, || panic!("marked a changed selection or superseded clipboard"))?;
+        }
+        ensure!(cut_clipboard_paths()?.is_empty(), "copy retained move intent");
+        let before = sequence();
+        ensure!(publish_view_cut(&cut, before, || Ok(false), || panic!("stale cut marked")).is_err());
+        ensure!(sequence() == before, "stale cut replaced the clipboard");
+        unsafe { windows::Win32::System::Ole::OleSetClipboard(None::<&windows::Win32::System::Com::IDataObject>)?; }
+        Ok(())
+    })
 }

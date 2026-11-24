@@ -166,7 +166,7 @@ fn exercise(root:&Path)->Result<serde_json::Value>{
     ensure!(with_host(|host|{let win=&host.fences[host.win_index(2).unwrap()];win.focus.is_some_and(|index|win.entries[index].key==focused)&&win.anchor.is_some_and(|index|win.entries[index].key==focused)&&win.selection.contains(&focused)})==Some(true),"sort changed selected/focused identity");
     with_host(|host|{host.menu_command(Some(1),"rule-none",POINT::default());host.menu_command(Some(2),"rule-none",POINT::default());host.delete_fence(1);});
     ensure!(with_host(|host|host.config.fences.iter().filter(|fence|fence.is_desktop()).all(|fence|fence.rule.is_none()&&!fence.catch_all))==Some(true),"deletion silently re-enabled auto collection");
-    let saved=with_host(|host|{host.save_now();host.config_path.clone()}).unwrap();let restored=load_config(&saved);
+    let saved=with_host(|host|{host.save_now();host.config_path.clone()}).unwrap();let restored=load_config(&saved)?;
     ensure!(restored.fences.iter().filter(|fence|fence.is_desktop()).all(|fence|fence.rule.is_none()&&!fence.catch_all),"restart changed disabled collection");
 
     // A real asynchronous menu constructs and tracks on a separate STA while
