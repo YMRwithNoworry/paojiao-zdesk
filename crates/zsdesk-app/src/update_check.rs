@@ -7,6 +7,7 @@ use std::os::windows::fs::OpenOptionsExt;
 use windows::{core::{w,PCWSTR},Win32::{Foundation::{HWND,LPARAM,WPARAM},Networking::WinHttp::*,UI::WindowsAndMessaging::PostMessageW}};
 
 const REPOSITORY:&str="https://github.com/YMRwithNoworry/paojiao-zdesk/releases/download/";
+const LATEST_RELEASE:&str="https://api.github.com/repos/YMRwithNoworry/paojiao-zdesk/releases/latest";
 pub(crate) const NOTICE:u32=0x8000+180;
 const MAX_PACKAGE:u64=512*1024*1024;
 #[path="update_lanzou.rs"] mod lanzou;
@@ -124,8 +125,7 @@ fn portable()->bool{
     })
 }
 pub(crate) fn check()->Result<Outcome>{
-    let value=serde_json::from_slice(&bytes("https://api.github.com/repos/YMRwithNoworry/paojiao-zdesk/releases/latest")?)?;
-    select(&value,version(env!("CARGO_PKG_VERSION")).context(zsdesk_core::i18n::text("当前版本号无效"))?,crate::edition::key(),portable())
+    check_with(version(env!("CARGO_PKG_VERSION")).context(zsdesk_core::i18n::text("当前版本号无效"))?,crate::edition::key(),portable(),||bytes(&mirror_url(lanzou::MANIFEST)?),||bytes(LATEST_RELEASE))
 }
 fn checksum(manifest:&str,name:&str)->Result<String>{
     let values:Vec<_>=manifest.lines().filter_map(|line|{
@@ -310,7 +310,7 @@ pub(crate) fn start_daily(profile:&Path,window:HWND){
     fn live_github_fallback_download(){
         let actual=(||->Result<()>{
             let current=[0,0,0];
-            let result=check_with(current,"full",false,||anyhow::bail!("test: folder unavailable"),||bytes("https://api.github.com/repos/qiu7824/zsdesk/releases/latest"))?;
+            let result=check_with(current,"full",false,||anyhow::bail!("test: folder unavailable"),||bytes(LATEST_RELEASE))?;
             let Outcome::Available(release)=result else{anyhow::bail!("official release missing")};
             ensure!(release.mirror.is_none(),"expected official source");
             let root=std::env::temp_dir();

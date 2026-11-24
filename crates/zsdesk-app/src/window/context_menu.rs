@@ -202,8 +202,9 @@ fn start(owner:HWND,window:HWND,view:&IShellView,identity:super::pane_input::Ide
     // that the visible selection still agrees with the command.
     let mut input=super::global_search::InputWatch::new();
     if input.is_none(){return Ok(());}
-    let pidls=if new||background_click{Vec::new()}else{snapshot(view)?};
-    let visual=if !pidls.is_empty()&&input.is_some(){VisualSelection::capture(view,&pidls).ok()}else{None};
+    let (visual,pidls)=if new||background_click{(None,Vec::new())}
+        else if let Ok((saved,items))=VisualSelection::capture(view){(Some(saved),items)}
+        else{(None,snapshot(view)?)};
     let background=if pidls.is_empty(){Some(background_pidl(view)?)}else{None};
     let folder=file_transfer::folder_path(view).ok();
     let filesystem_folder=if pidls.is_empty(){file_transfer::filesystem_folder_path(view).ok().flatten()}else{None};
@@ -323,7 +324,7 @@ fn start(owner:HWND,window:HWND,view:&IShellView,identity:super::pane_input::Ide
     }
     let targets=if pidls.is_empty(){background.clone().into_iter().collect()}else{pidls.clone()};
     let full_menu=matches!(mode,WorkerMode::More|WorkerMode::Background|WorkerMode::New|WorkerMode::CatalogSelection|WorkerMode::CatalogBackground);
-    let layout=full_menu.then(||zsdesk_windows::shell::capture_view_layout(view)).flatten();
+    let layout=if !full_menu{None}else if pidls.is_empty(){zsdesk_windows::shell::capture_background_layout(view)}else{zsdesk_windows::shell::capture_view_layout(view)};
     let quick_first=options.quick_first;
     let pointer=unsafe{GetWindowLongPtrW(owner,GWLP_USERDATA)}as*const Slot;
     let results=if full_menu{Some(captured.as_ref().map(|(results,_)|*results).or_else(||if pointer.is_null(){None}else{unsafe{&*pointer}.try_borrow().ok().and_then(|slot|slot.as_ref().and_then(|state|state.menu_source_is_results(identity.source)))})
@@ -405,7 +406,7 @@ pub(super) fn poll(owner:HWND){
     let created=session.client.take_created();
     let catalog=session.client.take_catalog();
     let created_any=!created.is_empty();
-    let valid=if layout.is_some()||!created.is_empty()||matches!(&result,Some(Ok(MenuOutcome::Rename|MenuOutcome::Open|MenuOutcome::Explore|MenuOutcome::Copy|MenuOutcome::Cut|MenuOutcome::Paste|MenuOutcome::PinInExplorer|MenuOutcome::Delete{..}))){
+    let valid=if layout.is_some()||created_any||matches!(&result,Some(Ok(MenuOutcome::Rename|MenuOutcome::Open|MenuOutcome::Explore|MenuOutcome::Copy|MenuOutcome::Cut|MenuOutcome::Paste|MenuOutcome::PinInExplorer|MenuOutcome::Share|MenuOutcome::ChooseApplication|MenuOutcome::Delete{..}))){
         same_selection(&session.view,&session.pidls,&session.folder,&session.background,session.input.as_ref())
             &&current(owner,generation)&&live_source(owner,window,identity)
     }else{true};

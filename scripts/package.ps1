@@ -23,8 +23,8 @@ $WorkDir = [IO.Path]::GetFullPath($WorkDir)
 if (-not $TargetDir) { $TargetDir = Join-Path $WorkDir 'target' }
 $TargetDir = [IO.Path]::GetFullPath($TargetDir)
 $version = [regex]::Match((Get-Content -LiteralPath (Join-Path $root 'Cargo.toml') -Raw), '(?m)^version\s*=\s*"([^"]+)"').Groups[1].Value
-$updateFolder=(Get-Content -LiteralPath (Join-Path $root 'packaging\lanzou-folder.txt') -Raw).Trim()
-if ($updateFolder -notmatch '^https://(www\.)?ilanzou\.com/s/[A-Za-z0-9_-]{1,128}$') {throw 'A public ZSDesk update folder is required for packaging'}
+$updateFolder=([string]$env:ZSDESK_UPDATE_FOLDER).Trim()
+if ($updateFolder -and $updateFolder -notmatch '^https://(www\.)?ilanzou\.com/s/[A-Za-z0-9_-]{1,128}$') {throw 'ZSDESK_UPDATE_FOLDER must be a public Lanzou folder URL'}
 if ($version -notmatch '^\d+\.\d+\.\d+([+-][A-Za-z0-9.-]+)?$') { throw 'Workspace version is invalid' }
 if (-not $OutputDir) { $OutputDir = Join-Path $root "releases\$version" }
 $OutputDir = [IO.Path]::GetFullPath($OutputDir)
@@ -252,7 +252,7 @@ try {
         $searchBackends=@();if(-not $definition.DesktopOnly){$searchBackends=@('native_ntfs','everything')}
         $manifest=[ordered]@{product='ZSDesk';version=$version;edition=$edition;edition_name=$definition.Name;platform='windows-x64';features=$definition.Features;desktop_only=[bool]$definition.DesktopOnly;
             search_engine=$searchEngine;search_default_backend=$defaultSearchBackend;search_backends=@($searchBackends);files=$files}
-        $manifest.update_folder=$updateFolder
+        if ($updateFolder) { $manifest.update_folder=$updateFolder }
         Write-Json (Join-Path $stage 'manifest.json') $manifest
         Assert-Payload $stage $manifest
         $zip=Join-Path $WorkDir "$name.zip"

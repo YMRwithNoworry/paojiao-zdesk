@@ -215,7 +215,7 @@ Listary 7.1 可使用随附 `integrations/listary/Prepare-Listary7.ps1` 生成�
 
 音视频速览支持 Windows 媒体组件可解码的格式，并提供播放、暂停和进度定位；不支持的编码可用默认播放器打开。快速搜索窗格可从应用菜单打开，也可在搜索设置中启用全局快捷键，支持 Enter 打开结果、打开文件位置及 Esc 关闭。“关于 ZSDesk”提供检查更新和正式发布页入口。
 
-“检查更新”优先查询 [ZSDesk 蓝奏发布目录](https://www.ilanzou.com/s/KuVyHor8O)。蓝奏目录读取失败、文件不可用或校验失败时，程序自动使用官方 GitHub Releases。安装版下载相同版本类型的安装器，便携版下载对应 ZIP；下载完成后校验 SHA-256。
+“检查更新”默认查询 [paojiao-zdesk GitHub Releases](https://github.com/YMRwithNoworry/paojiao-zdesk/releases)。打包时可通过 `ZSDESK_UPDATE_FOLDER` 指定本分支的公开蓝奏镜像；配置后优先查询镜像，读取或校验失败时回退到 GitHub。安装版下载同版本类型的安装器，便携版下载对应 ZIP；下载完成后校验 SHA-256。
 
 普通文件拖到桌面格子或映射文件夹时，来源允许移动便默认移动，跨盘同样适用。按住 Ctrl 请求复制，已在桌面的项目加入桌面格子时只调整归属。支持 Windows 文件拖放的网盘客户端可以接收文件；网盘提供虚拟文件时，由目标文件夹和客户端协商可用操作。仅允许复制的下载来源保留其原有文件。
 

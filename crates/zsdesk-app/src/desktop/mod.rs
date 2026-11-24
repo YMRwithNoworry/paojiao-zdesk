@@ -803,8 +803,9 @@ fn add_shell_menu_entry(spec: &mut MenuSpec) {
     spec.items.insert(1, MenuItemSpec::Separator);
 }
 
-fn item_menu(fence: u64, point: POINT) {
-    if fast_context_menu_enabled() { fast_item_menu(fence, point); } else { item_menu_native(fence, point); }
+fn item_menu(fence: u64, point: POINT, highlight: Option<u64>) {
+    if highlight.is_none() && fast_context_menu_enabled() { fast_item_menu(fence, point); }
+    else { item_menu_native(fence, point, highlight); }
 }
 
 fn fast_item_menu(fence: u64, point: POINT) {
@@ -813,21 +814,26 @@ fn fast_item_menu(fence: u64, point: POINT) {
     let mut spec = MenuSpec { id: None, title: None, items };
     add_shell_menu_entry(&mut spec);
     if let Some(id) = popup(hwnd, &spec, point) {
-        if id == "windows-shell-menu" { item_menu_native(fence, point); }
+        if id == "windows-shell-menu" { item_menu_native(fence, point, None); }
         else if let Some(after) = with_host(|host| host.menu_command(Some(fence), &id, point)) { run_after(after); }
     }
 }
 
-fn item_menu_native(fence: u64, point: POINT) {
+fn item_menu_native(fence: u64, point: POINT, highlight: Option<u64>) {
     let input_started = with_host(|host| host.menu_input_started.take().filter(|(id, _)| *id == fence).map(|(_, time)| time)).flatten().unwrap_or_else(std::time::Instant::now);
-    let Some((hwnd, pidls, target_key, profile)) = with_host(|host| host.win_index(fence).map(|index| {
+    let Some((hwnd, pidls, target_key, profile)) = with_host(|host| host.win_index(fence).and_then(|index| {
         let window = &host.fences[index];
+        if let Some(token) = highlight {
+            let entry = window.menu_entry(token)?;
+            return Some((window.hwnd, vec![entry.pidl.clone()], Some(entry.key.clone()), host.explorer_config.clone()));
+        }
         let target = host.focused_entry(fence).filter(|entry| window.selection.contains(&entry.key))
             .or_else(|| window.entries.iter().find(|entry| window.selection.contains(&entry.key)));
-        (window.hwnd, host.selected_pidls(fence), target.map(|entry| entry.key.clone()), host.explorer_config.clone())
+        Some((window.hwnd, host.selected_pidls(fence), target.map(|entry| entry.key.clone()), host.explorer_config.clone()))
     })).flatten() else { return };
     if pidls.is_empty() { return fence_menu(fence, point); }
     let mut request = menu_worker::Request::new(fence, hwnd, point, profile, Vec::new(), menu_worker::Target::Items { pidls, key: target_key }, key_down(VK_SHIFT));
+    request.highlight = highlight;
     request.input_started = input_started;
     quick_fence_menu(request);
 }

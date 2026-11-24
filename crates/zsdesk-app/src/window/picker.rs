@@ -14,7 +14,7 @@ pub(crate) const USE_NATIVE:usize=7305;
 #[cfg(test)]pub(crate) const TEST_ACCEPT_EDIT:usize=7306;
 const FOOTER_H:i32=76;
 pub(crate) const WM_NATIVE_REPLY:u32=WM_APP+147;
-#[derive(Clone,Copy)]pub(crate) enum NativeReply{Accepted=1,Cancelled=2,Rejected=3,Waiting=4,Fallback=5,MobileUpload=6}
+#[derive(Clone,Copy)]pub(crate) enum NativeReply{Accepted=1,Cancelled=2,Rejected=3,Waiting=4,Fallback=5}
 pub(crate) fn native_reply(window:isize,token:u64,reply:NativeReply)->bool{
     let window=HWND(window as*mut _);
     if unsafe{GetPropW(window,MARKER)}.0 as usize!=token as usize{return false;}
@@ -50,7 +50,7 @@ impl Submission{
             NativeReply::Accepted=>{self.confirmed=true;self.waiting=false;self.selected.take()},
             NativeReply::Cancelled|NativeReply::Fallback=>{self.confirmed=true;self.waiting=false;Some(Outcome::Cancelled)},
             NativeReply::Rejected=>{self.waiting=false;self.cancel_requested=false;self.selected=None;None},
-            NativeReply::Waiting|NativeReply::MobileUpload=>None,
+            NativeReply::Waiting=>None,
         }
     }
 }
@@ -103,11 +103,8 @@ impl WindowState{
         self.show_message(zsdesk_core::i18n::text("正在等待原程序确认选择…").into());
     }
     pub(super) fn picker_native_reply(&mut self,token:u64,code:isize){
-        let reply=match code{1=>NativeReply::Accepted,2=>NativeReply::Cancelled,3=>NativeReply::Rejected,4=>NativeReply::Waiting,5=>NativeReply::Fallback,6=>NativeReply::MobileUpload,_=>return};
+        let reply=match code{1=>NativeReply::Accepted,2=>NativeReply::Cancelled,3=>NativeReply::Rejected,4=>NativeReply::Waiting,5=>NativeReply::Fallback,_=>return};
         let Some(picker)=self.picker.as_mut().filter(|picker|picker.options.token==token)else{return;};
-        if matches!(reply,NativeReply::MobileUpload){
-            unsafe{let _=ShowWindow(picker.original,SW_SHOWNA);}return;
-        }
         if let Some(outcome)=picker.submission.reply(reply){*picker.result.borrow_mut()=outcome;post(self.hwnd,WM_CLOSE,0,0);return;}
         unsafe{let _=EnableWindow(picker.accept,!picker.submission.waiting);}
         if !picker.use_native.0.is_null(){unsafe{let _=EnableWindow(picker.use_native,!picker.submission.waiting);}}
@@ -123,7 +120,7 @@ impl WindowState{
             picker.accept=child(self.hwnd,"BUTTON",picker.options.kind.title(),ACCEPT,BS_DEFPUSHBUTTON as u32,true)?;
             picker.cancel=child(self.hwnd,"BUTTON",zsdesk_core::i18n::text("取消"),CANCEL,BS_PUSHBUTTON as u32,true)?;
             if picker.options.use_native{
-                picker.use_native=child(self.hwnd,"BUTTON",zsdesk_core::i18n::text("使用原生窗口"),USE_NATIVE,BS_PUSHBUTTON as u32,true)?;
+                picker.use_native=child(self.hwnd,"BUTTON",zsdesk_core::i18n::text("其他上传方式…"),USE_NATIVE,BS_PUSHBUTTON as u32,true)?;
             }
             for value in &picker.options.types{SendMessageW(picker.filter,CB_ADDSTRING,Some(WPARAM(0)),Some(LPARAM(wide(&value.label).as_ptr()as isize)));}
             SendMessageW(picker.filter,CB_SETCURSEL,Some(WPARAM(picker.options.filter)),Some(LPARAM(0)));

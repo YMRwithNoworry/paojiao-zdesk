@@ -6,7 +6,7 @@ enum ActionKind { Files, Folders, Mixed, MobileUpload, Other }
 
 fn action_kind(label:&str)->ActionKind {
     let label=control_label(label);
-    if matches!(label.as_str(),"从移动设备上传"|"upload from mobile"|"upload from mobile device"|"upload from a mobile device"){
+    if matches!(label.as_str(),"从移动设备上传"|"從行動裝置上傳"|"从行动装置上传"|"upload from mobile"|"upload from mobile device"|"upload from a mobile device"){
         return ActionKind::MobileUpload;
     }
     if ["文件和文件夹","文件或文件夹","文件/文件夹","files and folders","files or folders","files/folders","file or folder"]
@@ -75,8 +75,7 @@ fn preserve(primary_kind:Option<SelectionKind>,actions:&[Action])->Option<Preser
 }
 
 fn supported(kind:Option<SelectionKind>,actions:&[Action])->std::result::Result<bool,Preservation>{
-    if let Some(reason)=preserve(kind,actions){return Err(reason);}
-    Ok(kind==Some(SelectionKind::Files) && actions.iter().any(|a|!a.primary && a.kind==ActionKind::MobileUpload))
+    preserve(kind,actions).map_or_else(||Ok(actions.iter().any(|action|mobile_alternative(kind,action))),Err)
 }
 
 /// The original dialog remains the authority for every extra button and
@@ -126,7 +125,7 @@ pub(super) fn inspect(dialog:HWND,part:&Parts,kind:Option<SelectionKind>,automat
                 dropdown:is_primary&&primary_dropdown});
         }
         if !actions.iter().any(|action|action.primary){return Ok(Err(Preservation::InspectionUnavailable));}
-        Ok(preserve(kind,&actions).map_or_else(||Ok(actions.iter().any(|action|mobile_alternative(kind,action))),Err))
+        Ok(supported(kind,&actions))
     })();
     inspect.unwrap_or(Err(Preservation::InspectionUnavailable))
 }

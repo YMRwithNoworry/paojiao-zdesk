@@ -325,11 +325,6 @@ fn run_with_watcher(profile:&Path,stop:&AtomicBool,mut spawn_watcher:impl FnMut(
                     last_kind=Some("native");last_error=None;
                 }
             },
-            Event::UseOriginal{token}=>if let Some(session)=sessions.iter_mut().find(|session|session.token==token){
-                if !returning.contains_key(&token) && !session.fallback{
-                    session.close_picker();last_kind=Some("native");last_preservation=Some("user-requested-native");
-                }
-            },
             Event::Submit{token,outcome}=>if let Some(session)=sessions.iter_mut().find(|session|session.token==token){
                 if session.fallback||!session.source.matches()||session.early.as_ref().is_some_and(|claim|!claim.active()){continue;}
                 if returning.contains_key(&token)&&!matches!(outcome,Outcome::Cancelled){continue;}
