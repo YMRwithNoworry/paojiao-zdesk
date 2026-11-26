@@ -65,9 +65,6 @@ pub fn same_item_identities(expected:&[Vec<u8>],current:&[Vec<u8>])->bool{
     a.iter().zip(&b).all(|((name,a),(other,b))|name==other&&unsafe{a.Compare(b,SICHINT_CANONICAL.0 as u32)}.is_ok_and(|order|order==0))
 }
 
-#[path="quick_menu.rs"]
-mod quick_menu;
-pub use quick_menu::{QuickAction,QuickMenu};
 #[path="menu_catalog.rs"]
 mod menu_catalog;
 pub use menu_catalog::{MenuCatalogItem,catalog_item_hidden};
@@ -295,7 +292,7 @@ pub struct ContextMenuOptions {
     pub show_wps: bool,
 }
 impl Default for ContextMenuOptions {
-    fn default() -> Self { Self { quick_first:false,native_first_page_apps:None,modern:true,drawn:true,hidden_verbs:Vec::new(),shown_verbs:Vec::new(),show_seven_zip:true,show_wps:true } }
+    fn default() -> Self { Self { quick_first:false,native_first_page_apps:None,modern:true,drawn:false,hidden_verbs:Vec::new(),shown_verbs:Vec::new(),show_seven_zip:true,show_wps:true } }
 }
 /// SHA-256 of the only `Windows.UI.FileExplorer.dll` build whose private
 /// presenter ABI `native/shell_menu.cpp` supports (`kExpectedMenuSha256`).
@@ -351,16 +348,16 @@ fn file_sha256(path: &std::path::Path) -> Option<String> {
     Some(hasher.finalize().iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
-fn presentation(modern:bool,drawn:bool,build:u32,_verified_native:bool)->(bool,bool){
-    // The private Windows 11 presenter is unavailable on Windows 10. The public HMENU renderer is independent.
-    if (10240..22000).contains(&build) { return (false,drawn); }
-    (modern,modern)
+fn presentation(modern:bool,drawn:bool,build:u32,verified_native:bool)->(bool,bool){
+    (modern && !drawn && build>=22000 && verified_native, drawn)
 }
 pub fn presentation_name()->&'static str{
     let options=context_menu_options();if options.drawn{"public-windows11"}else if options.modern{"verified-native-windows11"}else{"native-classic"}
 }
 pub fn resolve_presentation(mut options: ContextMenuOptions) -> ContextMenuOptions {
-    (options.modern,options.drawn)=presentation(options.modern,options.drawn,crate::theme::os_build(),false);
+    let build=crate::theme::os_build();
+    let verified_native=options.modern && !options.drawn && build>=22000 && modern_presenter_supported()==Some(true);
+    (options.modern,options.drawn)=presentation(options.modern,options.drawn,build,verified_native);
     options
 }
 pub fn set_context_menu_options(options: ContextMenuOptions) {
@@ -1453,8 +1450,9 @@ mod runtime_tests;
     #[test]fn menu_style_routes_by_platform_capability_not_one_machine(){
         for build in [17763,19041,19045]{assert_eq!(presentation(true,false,build,false),(false,false));}
         for build in [22000,22621,26100,26300,30000]{
-            assert_eq!(presentation(true,false,build,false),(true,true));
-            assert_eq!(presentation(true,false,build,true),(true,true));
+            assert_eq!(presentation(true,false,build,false),(false,false));
+            assert_eq!(presentation(true,false,build,true),(true,false));
+            assert_eq!(presentation(true,true,build,true),(false,true));
             assert_eq!(presentation(false,false,build,true),(false,false));
         }
         for build in [18362,19041,19045]{
@@ -1462,6 +1460,6 @@ mod runtime_tests;
             assert_eq!(presentation(false,true,build,false),(false,true)); // resolved again in the worker
             assert_eq!(presentation(false,false,build,false),(false,false));
         }
-        assert_eq!(presentation(true,false,0,false),(true,true));
+        assert_eq!(presentation(true,false,0,false),(false,false));
     }
 }

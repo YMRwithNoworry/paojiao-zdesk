@@ -718,7 +718,6 @@ impl WindowState {
             desktop_running: crate::edition::DESKTOP.then(desktop_host_running),
             integration: match integration::current() { Integration::Off => 0, Integration::ContextMenu => 1, Integration::Default => 2 },
             win_e_agent: zsdesk_windows::desktop::win_e_agent_command().is_some(),
-            modern_menu_unavailable: zsdesk_windows::shell::menu::modern_presenter_supported()==Some(false),
         };
         // The menu shows the effective navigation expansion (system default included).
         let mut menu_ui=self.session.ui.clone();

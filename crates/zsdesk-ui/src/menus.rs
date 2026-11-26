@@ -392,18 +392,16 @@ pub fn apply_interface_setting(ui: &mut ExplorerUi, choice: &str) -> bool {
 }
 
 pub fn context_menu_settings_menu(options: &ContextMenuPreferences) -> MenuSpec {
-    context_menu_settings_menu_for(options, true)
-}
-
-/// Both visual styles retain the same registered command sources and rules.
-pub fn context_menu_settings_menu_for(options: &ContextMenuPreferences, _modern_available: bool) -> MenuSpec {
-    let original = options.mode == ContextMenuMode::Original;
-    let modern = entry(zsdesk_core::i18n::text("自绘 Windows 11"), "context-menu-windows11", true, !original);
-    menu(vec![
-        modern,
-        entry(zsdesk_core::i18n::text("Windows 10 经典风格"), "context-menu-original", true, original),
+    let mut items=vec![
+        entry(zsdesk_core::i18n::text("Windows 系统菜单"), "context-menu-windows11", true, options.mode==ContextMenuMode::Windows11),
+        entry(zsdesk_core::i18n::text("Windows 10 经典风格"), "context-menu-original", true, options.mode==ContextMenuMode::Original),
+        entry(zsdesk_core::i18n::text("自绘 Windows 11"), "context-menu-drawn-windows11", true, options.mode==ContextMenuMode::DrawnWindows11),
         entry(zsdesk_core::i18n::text("优先显示常用命令"), "context-menu-quick-first", true, options.quick_first),
-        item(zsdesk_core::i18n::text("管理应用扩展…"),"manage-native-first-page"),
+    ];
+    if options.mode==ContextMenuMode::DrawnWindows11{
+        items.push(item(zsdesk_core::i18n::text("管理应用扩展…"),"manage-native-first-page"));
+    }
+    items.extend([
         MenuItemSpec::Separator,
         submenu(zsdesk_core::i18n::text("显示的命令"), vec![
             entry(zsdesk_core::i18n::text("剪切、复制和粘贴"), "context-action-cut-copy-paste", true, options.show_cut_copy_paste),
@@ -415,7 +413,8 @@ pub fn context_menu_settings_menu_for(options: &ContextMenuPreferences, _modern_
             entry(zsdesk_core::i18n::text("新建"), "context-action-new", true, options.show_new),
         ]),
         item(zsdesk_core::i18n::text("恢复默认"), "context-menu-defaults"),
-    ])
+    ]);
+    menu(items)
 }
 
 pub fn apply_context_menu_setting(options: &mut ContextMenuPreferences, choice: &str) -> bool {
@@ -449,8 +448,6 @@ pub struct AppMenuState {
     pub integration: u8,
     /// Whether a background login agent is registered to intercept Win+E.
     pub win_e_agent: bool,
-    /// The Windows 11 menu presenter cannot run on this system.
-    pub modern_menu_unavailable: bool,
 }
 
 /// Application menu (≡) next to the window buttons.
@@ -474,7 +471,7 @@ pub fn app_menu_with_capabilities(state: AppMenuState, ui: &ExplorerUi, themed: 
         item(zsdesk_core::i18n::text("恢复默认配置目录"),"profile-default"),
     ]));
     items.push(group(zsdesk_core::i18n::text("右键菜单"), "settings-context-menu",
-        context_menu_settings_menu_for(&ui.context_menu, !state.modern_menu_unavailable).items));
+        context_menu_settings_menu(&ui.context_menu).items));
     if themed { items.push(group(zsdesk_core::i18n::text("主题与材质"), "settings-appearance", appearance_menu(&ui.appearance).items)); }
     if let Some(running) = state.desktop_running {
         items.push(group(zsdesk_core::i18n::text("桌面格子"), "settings-desktop", vec![
@@ -808,20 +805,22 @@ mod tests {
     }
 
     #[test]
-    fn native_windows11_default_and_optional_styles_keep_distinct_preferences() {
-        let options = ContextMenuPreferences::default();
-        let spec = context_menu_settings_menu_for(&options, false);
+    fn system_menu_is_default_and_drawn_extensions_are_opt_in() {
+        let mut options=ContextMenuPreferences::default();
+        options.hidden_commands.push("keep-this-rule".into());
+        let spec=context_menu_settings_menu(&options);
         let checked: Vec<_> = spec.items.iter().filter_map(|item| match item {
             MenuItemSpec::Command { checked: true, command: UiCommand::Custom { id, .. }, .. } => Some(id.as_str()), _ => None }).collect();
-        assert_eq!(checked, ["context-menu-windows11"]);
-        assert_eq!(options.mode,ContextMenuMode::Windows11);
-        let available=nested_ids(&spec);
-        for style in ["context-menu-windows11","context-menu-original"]{assert!(available.contains(&style.to_string()));}
-        let mut customized=options.clone();customized.hidden_commands.push("keep-this-rule".into());
-        for (action,mode) in [("context-menu-drawn-windows11",ContextMenuMode::DrawnWindows11),("context-menu-original",ContextMenuMode::Original),("context-menu-windows11",ContextMenuMode::Windows11)]{
-            assert!(apply_context_menu_setting(&mut customized,action));assert_eq!(customized.mode,mode);assert_eq!(customized.hidden_commands,["keep-this-rule"]);
+        assert_eq!(checked,["context-menu-windows11"]);
+        assert!(!nested_ids(&spec).iter().any(|id|id=="manage-native-first-page"));
+        for (action,drawn) in [("context-menu-drawn-windows11",true),("context-menu-original",false),("context-menu-windows11",false)]{
+            assert!(nested_ids(&context_menu_settings_menu(&options)).iter().any(|id|id==action));
+            assert!(apply_context_menu_setting(&mut options,action));
+            let spec=context_menu_settings_menu(&options);
+            assert!(spec.items.iter().any(|item|matches!(item,MenuItemSpec::Command{checked:true,command:UiCommand::Custom{id,..},..}if id==action)));
+            assert_eq!(nested_ids(&spec).iter().any(|id|id=="manage-native-first-page"),drawn);
+            assert_eq!(options.hidden_commands,["keep-this-rule"]);
         }
-        assert!(nested_ids(&spec).contains(&"manage-native-first-page".to_string()), "extensions are configurable without opening a file menu");
     }
 
     #[test]

@@ -16,10 +16,26 @@ pub fn native(options:&ContextMenuPreferences)->ContextMenuOptions {
         (options.show_new,&["new"][..]),
     ] {if !show {hidden.extend(verbs.iter().map(|v|(*v).to_string()));}}
     hidden.extend(options.hidden_commands.iter().cloned());
-    ContextMenuOptions{quick_first:options.quick_first,native_first_page_apps:Some(options.native_first_page_apps.clone()),modern:modern(options),drawn:options.mode==ContextMenuMode::DrawnWindows11,hidden_verbs:hidden,shown_verbs:options.shown_commands.clone(),show_seven_zip:options.show_seven_zip,show_wps:options.show_wps}
+    let drawn=options.mode==ContextMenuMode::DrawnWindows11;
+    ContextMenuOptions{quick_first:options.quick_first,native_first_page_apps:drawn.then(||options.native_first_page_apps.clone()),modern:modern(options),drawn,hidden_verbs:hidden,shown_verbs:options.shown_commands.clone(),show_seven_zip:options.show_seven_zip,show_wps:options.show_wps}
 }
 /// Visual style is independent of registered commands and customization rules.
 pub fn modern(options:&ContextMenuPreferences)->bool{
     matches!(options.mode,ContextMenuMode::Windows11|ContextMenuMode::DrawnWindows11)
 }
 pub fn apply_from_profile(profile:&Path){if let Ok(session)=crate::storage::load(profile){set_context_menu_options(native(&session.ui.context_menu));}}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_preferences_use_the_windows_shell_presentation() {
+        let options = native(&ContextMenuPreferences::default());
+
+        assert!(options.modern);
+        assert!(!options.drawn);
+        assert!(options.native_first_page_apps.is_none());
+        assert!(options.hidden_verbs.is_empty());
+    }
+}

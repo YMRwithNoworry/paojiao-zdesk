@@ -4,7 +4,6 @@ use anyhow::ensure;
 use std::{ffi::c_void,fs,path::Path,time::{Duration,Instant},thread};
 use crate::context_menu_process::isolation_tests::{Environment,sparse};
 use zsdesk_core::model::desktop::{DesktopConfig,Fence,FenceSource,FenceView,Placement};
-use zsdesk_windows::shell::menu::QuickAction;
 use windows::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled;
 
 #[link(name="user32")]unsafe extern "system"{
@@ -13,11 +12,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled;
     fn CloseDesktop(desktop:*mut c_void)->i32;
 }
 const MENU_TIMER:usize=0x5a530921;
-const PROBE:usize=0x5a530922;
 thread_local!{
-    static MORE:Cell<bool>=const{Cell::new(false)};
-    static ENTERED:Cell<Option<Instant>>=const{Cell::new(None)};
-    static QUICK:Cell<bool>=const{Cell::new(false)};
     static DIALOGS:Cell<u32>=const{Cell::new(0)};
     static HEARTBEATS:Cell<u32>=const{Cell::new(0)};
 }
@@ -51,20 +46,6 @@ unsafe extern "system" fn test_host_proc(hwnd:HWND,msg:u32,wp:WPARAM,lp:LPARAM)-
     }
     unsafe{DefWindowProcW(hwnd,msg,wp,lp)}
 }
-unsafe extern "system" fn probe(window:HWND,msg:u32,wp:WPARAM,lp:LPARAM,_id:usize,_data:usize)->LRESULT{
-    if msg==WM_ENTERMENULOOP{ENTERED.with(|value|value.set(Some(Instant::now())));unsafe{SetTimer(Some(window),PROBE,40,None);}}
-    if msg==WM_INITMENUPOPUP{
-        let menu=HMENU(wp.0 as*mut _);let count=unsafe{GetMenuItemCount(Some(menu))};
-        QUICK.with(|value|value.set((0..count).any(|index|unsafe{GetMenuItemID(menu,index)}==QuickAction::More.id())));
-    }
-    if msg==WM_TIMER&&wp.0==PROBE{
-        let _=unsafe{KillTimer(Some(window),PROBE)};
-        if MORE.with(Cell::get){let _=unsafe{PostMessageW(Some(window),WM_CHAR,WPARAM(b'm' as usize),LPARAM(1))};}
-        else{zsdesk_windows::flyout::cancel();let _=unsafe{EndMenu()};}return LRESULT(0);
-    }
-    if msg==WM_NCDESTROY{let _=unsafe{windows::Win32::UI::Shell::RemoveWindowSubclass(window,Some(probe),PROBE)};}
-    unsafe{windows::Win32::UI::Shell::DefSubclassProc(window,msg,wp,lp)}
-}
 struct Apartment;impl Drop for Apartment{fn drop(&mut self){unsafe{OleUninitialize();}}}
 struct OwnedHost{hwnd:HWND,fence:HWND}
 impl Drop for OwnedHost{fn drop(&mut self){
@@ -93,7 +74,7 @@ fn setup(root:&Path,folder:&Path)->Result<(OwnedHost,HWND,POINT)>{
     let geometry=fence.geometry(host.config.fence(1).unwrap());let cell=geometry.cells.first().context("first fence cell")?.cell;
     let point=POINT{x:cell.x+20,y:cell.y+cell.height/2};host.fences.push(fence);
     HOST.with(|slot|*slot.borrow_mut()=Some(host));HOST_HWND.with(|slot|slot.set(hwnd.0 as isize));
-    unsafe{let _=ShowWindow(window,SW_SHOWNOACTIVATE);SetTimer(Some(hwnd),MENU_TIMER,20,None);windows::Win32::UI::Shell::SetWindowSubclass(window,Some(probe),PROBE,0)}.ok()?;
+    unsafe{let _=ShowWindow(window,SW_SHOWNOACTIVATE);SetTimer(Some(hwnd),MENU_TIMER,20,None);}
     Ok((owned,window,point))
 }
 fn right_click(window:HWND,point:POINT){let packed=((point.x as u32&0xffff)|((point.y as u32&0xffff)<<16))as isize;unsafe{SendMessageW(window,WM_RBUTTONUP,None,Some(LPARAM(packed)));}}

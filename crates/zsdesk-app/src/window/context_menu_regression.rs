@@ -473,6 +473,9 @@ fn selecting_files_prewarms_shell_without_showing_a_menu()->Result<()>{
         let folder=output.join("files");fs::create_dir_all(&folder)?;
         for name in ["one.txt","two.txt","three.txt"]{fs::write(folder.join(name),b"menu")?;}
         let runner=create(&output,&folder,true)?;
+        let profile=runner.slot.borrow().as_ref().unwrap().config_path.clone();
+        let prefs=zsdesk_core::model::explorer::ContextMenuPreferences{mode:zsdesk_core::model::explorer::ContextMenuMode::DrawnWindows11,..Default::default()};
+        crate::context_preferences::publish(&profile,&prefs);
         let (view,window)={
             let slot=runner.slot.borrow();let browser=slot.as_ref().unwrap().browser.as_ref().unwrap();
             browser.select_children(&["one.txt".into()])?;
@@ -513,9 +516,9 @@ fn create(root:&Path,folder:&Path,modern:bool)->Result<Runner>{
     session.ui.context_menu.mode=if modern{zsdesk_core::model::explorer::ContextMenuMode::Windows11}else{zsdesk_core::model::explorer::ContextMenuMode::Original};
     session.ui.show_preview=false;session.ui.hover_preview=false;session.ui.show_details=false;session.ui.show_tree=false;
     let slot=Box::new(RefCell::new(Some(WindowState::new(session,root.join("profile/explorer-session.json"),None,modern))));
-    let instance=HINSTANCE(unsafe{GetModuleHandleW(None)?}.0);let class=windows::core::w!("ZSDesk.Native.QuickMenuRegression");
+    let instance=HINSTANCE(unsafe{GetModuleHandleW(None)?}.0);let class=windows::core::w!("ZSDesk.Native.ContextMenuRegression");
     unsafe{RegisterClassW(&WNDCLASSW{hInstance:instance,lpfnWndProc:Some(window_proc),lpszClassName:class,..Default::default()});}
-    let hwnd=unsafe{CreateWindowExW(WS_EX_NOACTIVATE,class,windows::core::w!("Quick context menu regression"),WS_OVERLAPPEDWINDOW|WS_CLIPCHILDREN,100,100,1040,720,None,None,Some(instance),Some((&*slot as*const Slot).cast()))}?;
+    let hwnd=unsafe{CreateWindowExW(WS_EX_NOACTIVATE,class,windows::core::w!("Context menu regression"),WS_OVERLAPPEDWINDOW|WS_CLIPCHILDREN,100,100,1040,720,None,None,Some(instance),Some((&*slot as*const Slot).cast()))}?;
     let runner=Runner{hwnd,slot};unsafe{runner.slot.borrow_mut().as_mut().unwrap().create(hwnd)?;let _=ShowWindow(hwnd,SW_SHOWNOACTIVATE);}
     let deadline=Instant::now()+Duration::from_secs(12);
     loop{pump(25);if runner.slot.borrow().as_ref().is_some_and(|state|state.pending.is_none()&&state.browser.as_ref().is_some_and(|browser|browser.status().items==3)){break;}
@@ -676,49 +679,70 @@ fn exercise(root:&Path,desktop_name:&str)->Result<serde_json::Value>{
 }
 
 #[test]
-#[ignore="Native quick-menu first-display measurement and selection preservation on a private desktop; requires ZSDESK_NATIVE_TEST_OUTPUT"]
-fn native_quick_menu_is_displayed_without_a_shell_worker()->Result<()>{
-    let output=PathBuf::from(std::env::var_os("ZSDESK_NATIVE_TEST_OUTPUT").context("output")?).join("quick-menu-latency");
-    ensure!(output.is_absolute(),"absolute output required");fs::create_dir_all(&output)?;
-    let name=format!("ZSDesk.QuickMenuLatency.{}",std::process::id());let before=unsafe{GetForegroundWindow()};
+#[ignore="Opens real Windows Shell popups on a private desktop; requires ZSDESK_NATIVE_TEST_OUTPUT"]
+fn default_context_menu_opens_the_windows_shell_popup()->Result<()> {
+    use crate::context_menu_process as worker;
+    use zsdesk_windows::shell::menu::{same_item_identities,ViewMenuTarget};
+
+    let output=PathBuf::from(std::env::var_os("ZSDESK_NATIVE_TEST_OUTPUT").context("output")?)
+        .join(format!("system-context-menu-{}",std::process::id()));
+    ensure!(output.is_absolute(),"absolute output required");
+    let name=format!("ZSDesk.SystemContextMenu.{}",std::process::id());
+    let before=unsafe{GetForegroundWindow()};
     let desktop=unsafe{CreateDesktopW(wide(&name).as_ptr(),std::ptr::null(),std::ptr::null(),0,0x000f00ff,std::ptr::null())};
-    ensure!(!desktop.is_null(),"CreateDesktop failed");let raw=desktop as usize;let destination=output.clone();
-    let result=thread::spawn(move||->Result<serde_json::Value>{
-        ensure!(unsafe{SetThreadDesktop(raw as*mut c_void)}!=0,"SetThreadDesktop failed");unsafe{OleInitialize(None)}?;let _apartment=Apartment;
-        let _desktop=Environment::set("ZSDESK_MENU_TEST_DESKTOP",&name);let _probe=Environment::set("ZSDESK_MENU_TEST_PROBE","quick-dismiss");
-        let root=destination.join(format!("run-{}-{}",std::process::id(),unsafe{windows::Win32::System::Threading::GetCurrentThreadId()}));
-        let folder=root.join("files");fs::create_dir_all(&folder)?;
-        struct Fixture(PathBuf);impl Drop for Fixture{fn drop(&mut self){let _=fs::remove_dir_all(&self.0);}}let _fixture=Fixture(root.clone());
-        for item in ["one.txt","two.txt","three.txt"]{fs::write(folder.join(item),b"quick menu latency fixture")?;}
-        let runner=create(&root,&folder,true)?;let mut rows=Vec::new();
-        for selected in [false,true]{
-            let (view,window,expected)={let slot=runner.slot.borrow();let browser=slot.as_ref().unwrap().browser.as_ref().unwrap();
-                browser.select_all(false);if selected{browser.select_children(&[std::ffi::OsString::from("one.txt")])?;}
-                let view=unsafe{browser.current_view()}?;let window=browser.view_window().context("quick-menu source view")?;
-                let expected=super::context_menu::selected_identities(&view)?;(view,window,expected)};
-            pump(25);let mut bounds=RECT::default();unsafe{GetWindowRect(window,&mut bounds)?;}
-            let point=POINT{x:bounds.left+65,y:bounds.top+45};super::QUICK_MENU_ENTERED.with(|entered|entered.set(None));
-            let started=Instant::now();super::context_menu::show(window,&view,window,
-                LPARAM(((point.x as u32&0xffff)|((point.y as u32&0xffff)<<16))as isize),
-                if selected{zsdesk_windows::shell::menu::ViewMenuTarget::Selection}else{zsdesk_windows::shell::menu::ViewMenuTarget::Background})?;
-            let elapsed=started.elapsed();let displayed=super::QUICK_MENU_ENTERED.with(|value|value.get());
-            ensure!(elapsed>=Duration::from_millis(50)&&elapsed<Duration::from_secs(2),"quick popup did not complete its bounded tracking loop: {elapsed:?}");
-            let displayed=displayed.context("quick popup never entered the native menu loop")?;
-            ensure!(!super::context_menu::request_active(runner.hwnd),"quick menu dismissal started a Shell worker");
-            let actual=super::context_menu::selected_identities(&view)?;
-            ensure!(zsdesk_windows::shell::menu::same_item_identities(&expected,&actual),"quick popup changed the visible selection");
-            rows.push(serde_json::json!({"target":if selected{"filesystem-selection"}else{"filesystem-background"},
-                "time_to_native_menu_loop_microseconds":displayed.duration_since(started).as_micros()as u64,
-                "popup_dismissed_microseconds":elapsed.as_micros()as u64,"worker_started":false,"selection_unchanged":true}));
+    ensure!(!desktop.is_null(),"CreateDesktop failed");
+    let raw=desktop as usize;
+    let result=thread::spawn(move||->Result<()> {
+        ensure!(unsafe{SetThreadDesktop(raw as*mut c_void)}!=0,"SetThreadDesktop failed");
+        unsafe{OleInitialize(None)}?;
+        let _apartment=Apartment;
+        let _desktop=Environment::set("ZSDESK_MENU_TEST_DESKTOP",&name);
+        let _root=Environment::set("ZSDESK_MENU_ROOT",output.join("workers"));
+        let _probe=Environment::set("ZSDESK_MENU_TEST_PROBE","menu-dismiss");
+        struct Pool;
+        impl Drop for Pool { fn drop(&mut self){worker::shutdown_idle_worker();} }
+        let _pool=Pool;
+        let folder=output.join("files");
+        fs::create_dir_all(&folder)?;
+        for file in ["one.txt","two.txt","three.txt"]{fs::write(folder.join(file),b"context menu fixture")?;}
+        let runner=create(&output,&folder,true)?;
+        for (selected,target) in [(false,ViewMenuTarget::Background),(true,ViewMenuTarget::Selection)] {
+            let (view,window)={
+                let slot=runner.slot.borrow();
+                let browser=slot.as_ref().unwrap().browser.as_ref().unwrap();
+                if selected{browser.select_children(&["one.txt".into()])?;}
+                (unsafe{browser.current_view()?},browser.view_window().context("source view")?)
+            };
+            pump(25);
+            let expected=super::context_menu::selected_identities(&view)?;
+            ensure!(expected.len()==usize::from(selected),"incorrect fixture selection");
+            let mut bounds=RECT::default();
+            unsafe{GetWindowRect(window,&mut bounds)}?;
+            let position=LPARAM((((bounds.left+50) as u16 as u32)|(((bounds.top+50) as u16 as u32)<<16)) as isize);
+            super::context_menu::show(window,&view,window,position,target)?;
+            ensure!(super::context_menu::request_active(runner.hwnd),"right-click bypassed the Shell worker");
+            let deadline=Instant::now()+Duration::from_secs(8);
+            while super::context_menu::request_active(runner.hwnd){
+                ensure!(Instant::now()<deadline,"Shell popup did not close");pump(10);
+            }
+            let report=worker::read_recent_diagnostics()["current"].clone();
+            let observation=report["timing"]["menu_open_observation"].as_str();
+            ensure!(report["error"].is_null()&&report["committed"]==false&&matches!(observation,Some("visible-classic-menu"|"native-presenter-open")),"expected a Windows Shell popup without invoking a command: {report}");
+            ensure!(same_item_identities(&expected,&super::context_menu::selected_identities(&view)?),"right-click changed the source selection");
+            println!("{}: {}",if selected{"selection"}else{"background"},observation.unwrap());
         }
-        drop(runner);pump(30);Ok(serde_json::json!({"state":"passed","checks":rows}))
-    }).join().map_err(|_|anyhow::anyhow!("native quick menu test panicked")).and_then(|value|value);
-    let deadline=Instant::now()+Duration::from_secs(3);let closed=loop{if unsafe{CloseDesktop(desktop)}!=0{break true;}if Instant::now()>=deadline{break false;}thread::sleep(Duration::from_millis(20));};
-    let foreground_unchanged=before==unsafe{GetForegroundWindow()};
-    let report=serde_json::json!({"state":if result.is_ok()&&closed&&foreground_unchanged{"passed"}else{"failed"},
-        "checks":result.as_ref().map_err(|error|format!("{error:#}")),"desktop_closed":closed,"foreground_unchanged":foreground_unchanged});
-    fs::write(output.join("verification.current.json"),serde_json::to_vec_pretty(&report)?)?;println!("{report}");
-    result?;ensure!(closed&&foreground_unchanged,"quick menu desktop/focus cleanup failed");Ok(())
+        drop(runner);
+        worker::shutdown_idle_worker();
+        let deadline=Instant::now()+Duration::from_secs(3);
+        while worker::pending_workers()>0&&Instant::now()<deadline{pump(10);}
+        ensure!(worker::pending_workers()==0,"menu worker retained");
+        Ok(())
+    }).join().map_err(|_|anyhow::anyhow!("native Shell menu test panicked")).and_then(|result|result);
+    let deadline=Instant::now()+Duration::from_secs(3);
+    let closed=loop{if unsafe{CloseDesktop(desktop)}!=0{break true;}if Instant::now()>=deadline{break false;}thread::sleep(Duration::from_millis(20));};
+    result?;
+    ensure!(closed&&before==unsafe{GetForegroundWindow()},"private desktop cleanup or source foreground changed");
+    Ok(())
 }
 
 #[test]

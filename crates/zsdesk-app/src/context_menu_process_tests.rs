@@ -1,6 +1,5 @@
 use super::*;
 use std::{ffi::c_void,os::windows::io::AsRawHandle};
-use zsdesk_windows::shell::menu::QuickMenu;
 use windows::Win32::{System::{IO::DeviceIoControl,Ioctl::FSCTL_SET_SPARSE},Storage::FileSystem::GetCompressedFileSizeW};
 #[link(name="user32")]unsafe extern "system"{
     fn CreateDesktopW(name:*const u16,device:*const u16,mode:*const c_void,flags:u32,access:u32,attributes:*const c_void)->*mut c_void;
@@ -59,10 +58,7 @@ fn clipboard_paths_with_evidence()->Result<(Vec<PathBuf>,serde_json::Value)>{
         "final_sequence":unsafe{GetClipboardSequenceNumber()}});
     Ok((paths,evidence))
 }
-thread_local!{static ENTERED:std::cell::Cell<bool>=const{std::cell::Cell::new(false)};}
 unsafe extern "system" fn owner_proc(hwnd:HWND,msg:u32,wp:WPARAM,lp:LPARAM)->LRESULT{
-    if msg==WM_ENTERMENULOOP{ENTERED.with(|value|value.set(true));unsafe{SetTimer(Some(hwnd),2,40,None);}}
-    if msg==WM_TIMER&&wp.0==2{let _=unsafe{KillTimer(Some(hwnd),2)};let _=unsafe{EndMenu()};return LRESULT(0);}
     unsafe{DefWindowProcW(hwnd,msg,wp,lp)}
 }
 struct Owner(HWND);impl Drop for Owner{fn drop(&mut self){let _=unsafe{DestroyWindow(self.0)};}}
@@ -157,7 +153,7 @@ fn prepared_worker_queries_file_commands_without_display() -> Result<()> {
     let pidl=|path:PathBuf| zsdesk_windows::shell::pidl::location_pidl(&zsdesk_core::model::explorer::ShellLocation::Path(path)).context("item identity");
     let parent=pidl(folder.clone())?;
     let view=MenuViewContext{folder:Some(parent.clone()),..Default::default()};
-    let mut options=ContextMenuOptions::default();
+    let mut options=ContextMenuOptions{drawn:true,..Default::default()};
     if let Ok(app)=std::env::var("ZSDESK_MENU_TEST_FIRST_PAGE_APP"){ options.native_first_page_apps=Some(vec![app]); }
     let query=||->Result<(u32,bool,u64)> {
         let _probe=Environment::set("ZSDESK_MENU_TEST_PROBE","query-compact-catalog");
@@ -197,8 +193,6 @@ fn exercise(root:&Path,desktop_name:&str)->Result<serde_json::Value>{
     let owner=Owner(unsafe{CreateWindowExW(WS_EX_NOACTIVATE,class,w!("Menu isolation test"),WS_OVERLAPPEDWINDOW,20,20,640,480,None,None,Some(module),None)}?);
     unsafe{let _=ShowWindow(owner.0,SW_SHOWNOACTIVATE);}
     let options=ContextMenuOptions{modern:false,..Default::default()};let point=POINT{x:70,y:100};
-    let started=Instant::now();let quick=QuickMenu::new(pidls.len(),false,&options)?;let construction=started.elapsed().as_micros()as u64;
-    let picked=quick.track_raw(owner.0,point);ensure!(picked.is_none()&&ENTERED.with(std::cell::Cell::get),"immediate popup did not open/dismiss");drop(quick);
     let mut workers=Vec::new();
     let mut reusable_pid=None;
     for probe in ["crash","memory-limit","dismiss","menu-dismiss"]{
@@ -259,7 +253,7 @@ fn exercise(root:&Path,desktop_name:&str)->Result<serde_json::Value>{
     let end=Instant::now()+Duration::from_secs(5);while pending_workers()>0&&Instant::now()<end{pump(10);}ensure!(pending_workers()==0,"menu worker did not exit");
     for (path,record) in files.0.iter().zip(&fixtures){ensure!(fs::metadata(path)?.len()==record["logical_bytes"].as_u64().unwrap(),"fixture content length changed");}
     drop(owner);drop(files);
-    Ok(serde_json::json!({"fixtures":fixtures,"logical_total_bytes":24u64*1024*1024*1024,"quick_menu_construct_microseconds":construction,"quick_menu_native_popup":true,"workers":workers,"reuse_rotation":rotations,"idle_expiry_verified":true,"idle_limit_seconds":IDLE_TIMEOUT.as_secs(),"all_workers_exited":true,"fixtures_removed":true,"fault_injection":"unhandled noncontinuable SEH access violation 0xc0000005 before extension invocation"}))
+    Ok(serde_json::json!({"fixtures":fixtures,"logical_total_bytes":24u64*1024*1024*1024,"workers":workers,"reuse_rotation":rotations,"idle_expiry_verified":true,"idle_limit_seconds":IDLE_TIMEOUT.as_secs(),"all_workers_exited":true,"fixtures_removed":true,"fault_injection":"unhandled noncontinuable SEH access violation 0xc0000005 before extension invocation"}))
 }
 fn ensure_not_invoking(before:bool){assert!(!before,"dismiss-only probe attempted an invocation");}
 

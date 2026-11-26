@@ -220,7 +220,7 @@ fn redacted_error(value:&str)->String{
 }
 #[link(name="user32")]unsafe extern "system"{fn GetThreadDesktop(thread:u32)->*mut core::ffi::c_void;}
 #[derive(Clone,Copy,Debug,Serialize,Deserialize,PartialEq,Eq)]
-pub enum Mode{More,Properties,Open,Copy,Cut,Delete,Paste,PasteBackground,Background,New,CatalogSelection,CatalogBackground,PrepareSelection,PrepareBackground}
+pub enum Mode{More,Open,Paste,PasteBackground,Background,New,CatalogSelection,CatalogBackground,PrepareSelection,PrepareBackground}
 impl Mode {
     fn prewarm(self)->bool { matches!(self,Self::PrepareSelection|Self::PrepareBackground) }
 }
@@ -968,7 +968,6 @@ fn run_request(path:&Path,request:Request,events:&EventSet,com_us:u64,fault_repo
             state.allow(false)?;state.allow(true)?;
             return Ok(MenuOutcome::NativeHandled);
         }
-        let mut properties=request.mode==Mode::Properties;
         if common::enabled(&request){
             let first=common::specification(&request);
             state.allow(false)?;
@@ -979,7 +978,12 @@ fn run_request(path:&Path,request:Request,events:&EventSet,com_us:u64,fault_repo
             let choice=crate::flyout_menu::show(window,&first,anchor,zsdesk_windows::theme::menus_dark());
             match choice.as_deref(){
                 Some("more")=>{},
-                Some("properties")=>properties=true,
+                Some("properties")=>{
+                    state.allow(true)?;
+                    let data=zsdesk_windows::desktop::data_object(window,&request.pidls)?;
+                    unsafe{windows::Win32::UI::Shell::SHMultiFileProperties(&data,0)}?;
+                    return Ok(MenuOutcome::ShellInvoked);
+                },
                 Some(id)=>{
                     if let Some(action)=common::outcome(id){
                         state.allow(true)?;
@@ -989,13 +993,6 @@ fn run_request(path:&Path,request:Request,events:&EventSet,com_us:u64,fault_repo
                 },
                 None=>return Ok(MenuOutcome::Dismissed),
             }
-        }
-        if properties{
-            state.allow(true)?;
-            let pidls=if request.pidls.is_empty(){vec![zsdesk_windows::shell::pidl::location_pidl(&zsdesk_core::model::explorer::ShellLocation::Path(request.folder.clone().context("目录缺失")?)).context("目录标识无效")?]}else{request.pidls.clone()};
-            let data=zsdesk_windows::desktop::data_object(window,&pidls)?;
-            unsafe{windows::Win32::UI::Shell::SHMultiFileProperties(&data,0)}?;
-            return Ok(MenuOutcome::ShellInvoked);
         }
         state.state("binding")?;let started=Instant::now();
         let is_background=matches!(request.mode,Mode::Background|Mode::New|Mode::CatalogBackground|Mode::PasteBackground|Mode::PrepareBackground)||(request.mode==Mode::Paste&&request.pidls.is_empty());
@@ -1010,26 +1007,26 @@ fn run_request(path:&Path,request:Request,events:&EventSet,com_us:u64,fault_repo
         }
         let effective_options=zsdesk_windows::shell::menu::context_menu_options();
         let legacy_shell=zsdesk_windows::theme::windows10_shell(zsdesk_windows::theme::os_build());
-        let classic_selection=legacy_shell
-            &&!request.pidls.is_empty()&&!is_background;
+        let catalog=matches!(request.mode,Mode::CatalogSelection|Mode::CatalogBackground);
+        let full_context=catalog||matches!(request.mode,Mode::More|Mode::Background);
         let compact_selection=if legacy_shell {None}else{background_view::compact_selection(window,&request,&effective_options)?};
         let background_view=if compact_selection.is_some(){None}
             else if let Some(item)=&background{Some(background_view::BackgroundView::create(item,&request,events)?)}
-            else if !request.pidls.is_empty()&&!classic_selection{
+            else if !request.pidls.is_empty()&&(!legacy_shell||full_context){
                 let origin=background_view::selection_origin(&request);
                 Some(background_view::for_selection(&request.pidls,origin,&request,events)?)
             }else{None};
         state.status.timing.background_view_reused=is_background&&background_view.is_some()&&background_view::reused();
         if is_background{if let (Some(host),Some(layout))=(&background_view,&request.layout){zsdesk_windows::shell::restore_view_layout(&host.view,layout);}}
         let initial_layout=background_view.as_ref().filter(|_|is_background).and_then(|host|zsdesk_windows::shell::capture_background_layout(&host.view));
-        let full_context=matches!(request.mode,Mode::More|Mode::Background|Mode::CatalogSelection|Mode::CatalogBackground);
-        let packaged=full_context&&(effective_options.drawn||!effective_options.modern||classic_gesture||matches!(request.mode,Mode::CatalogSelection|Mode::CatalogBackground));
         let menu=if let Some(menu)=compact_selection{menu}else if let Some(host)=&background_view{
             if request.mode==Mode::New{zsdesk_windows::shell::new_menu::for_view(&host.view)?}
             else if !legacy_shell&&effective_options.drawn&&!classic_gesture&&matches!(request.mode,Mode::More|Mode::Background){
                 ShellMenu::for_compact_view(&host.view,&host.browser,window,!is_background,&effective_options)?
             }
-            else if packaged&&!legacy_shell{ShellMenu::for_view_with_packages(&host.view,&host.browser,window,!is_background)?}
+            else if !legacy_shell&&((effective_options.drawn&&full_context)||(effective_options.modern&&catalog)){
+                ShellMenu::for_view_with_packages(&host.view,&host.browser,window,!is_background)?
+            }
             else{ShellMenu::for_view(&host.view,!is_background)?}
         }else if request.pidls.is_empty(){let folder=zsdesk_windows::desktop::folder_for_path(request.folder.as_deref().context("目录缺失")?)?;ShellMenu::for_folder_background(window,&folder)?}else{ShellMenu::for_items(window,&request.pidls)?};
         menu.set_directory(request.folder.as_deref());
@@ -1044,9 +1041,9 @@ fn run_request(path:&Path,request:Request,events:&EventSet,com_us:u64,fault_repo
             }
         }else{None};
         state.status.bind_microseconds=started.elapsed().as_micros()as u64;state.state("populating")?;let started=Instant::now();
-        if matches!(request.mode,Mode::Open|Mode::Copy|Mode::Cut|Mode::Delete|Mode::Paste|Mode::PasteBackground){
+        if matches!(request.mode,Mode::Open|Mode::Paste|Mode::PasteBackground){
             menu.populate_for_invoke(request.extended)?;state.status.populate_microseconds=started.elapsed().as_micros()as u64;
-            let verb=match request.mode{Mode::Open=>"open",Mode::Copy=>"copy",Mode::Cut=>"cut",Mode::Delete=>"delete",Mode::Paste|Mode::PasteBackground=>"paste",_=>unreachable!()};
+            let verb=if request.mode==Mode::Open{"open"}else{"paste"};
             state.allow(true)?;menu.invoke_verb(window,verb,false)?;return Ok(MenuOutcome::ShellInvoked);
         }
         menu.populate(request.rename,request.extended)?;
@@ -1055,7 +1052,7 @@ fn run_request(path:&Path,request:Request,events:&EventSet,com_us:u64,fault_repo
         #[cfg(test)]if request.probe.as_deref()==Some("query-compact-catalog"){
             state.allow(false)?;state.status.catalog=menu.catalog();return Ok(MenuOutcome::Dismissed);
         }
-        if matches!(request.mode,Mode::CatalogSelection|Mode::CatalogBackground){
+        if catalog{
             state.allow(false)?;state.status.catalog=menu.catalog();return Ok(MenuOutcome::Dismissed);
         }
         state.allow(false)?;

@@ -2,21 +2,19 @@ use super::*;
 use std::collections::HashSet;
 
 thread_local! {
-    static INPUT_WATCH: RefCell<Vec<(u64,std::rc::Weak<Cell<bool>>,Option<isize>)>> = const { RefCell::new(Vec::new()) };
+    static INPUT_WATCH: RefCell<Vec<(u64,std::rc::Weak<Cell<bool>>)>> = const { RefCell::new(Vec::new()) };
     static NEXT_INPUT_WATCH: Cell<u64> = const { Cell::new(1) };
 }
 
 pub(super) struct InputWatch { id:u64, hook:HHOOK, cancelled:Rc<Cell<bool>> }
 impl InputWatch {
-    pub(super) fn new()->Option<Self>{Self::install(None)}
-    pub(super) fn new_for(view:HWND)->Option<Self>{Self::install(Some(view.0 as isize))}
-    fn install(view:Option<isize>)->Option<Self>{
+    pub(super) fn new()->Option<Self>{
         let hook=unsafe{SetWindowsHookExW(WH_GETMESSAGE,Some(search_input_hook),None,
             windows::Win32::System::Threading::GetCurrentThreadId())}.ok()?;
         let id=NEXT_INPUT_WATCH.with(|next|{let value=next.get();next.set(value.wrapping_add(1).max(1));value});
         let cancelled=Rc::new(Cell::new(false));
         let installed=INPUT_WATCH.with(|slot|slot.try_borrow_mut().map(|mut slot|{
-            if slot.len()>=32{return false;}slot.push((id,Rc::downgrade(&cancelled),view));true
+            if slot.len()>=32{return false;}slot.push((id,Rc::downgrade(&cancelled)));true
         }).unwrap_or(false));
         if !installed {let _=unsafe{UnhookWindowsHookEx(hook)};return None;}
         Some(Self{id,hook,cancelled})
@@ -25,7 +23,7 @@ impl InputWatch {
 }
 impl Drop for InputWatch {
     fn drop(&mut self){
-        INPUT_WATCH.with(|slot|{if let Ok(mut slot)=slot.try_borrow_mut(){slot.retain(|(id,_,_)|*id!=self.id);}});
+        INPUT_WATCH.with(|slot|{if let Ok(mut slot)=slot.try_borrow_mut(){slot.retain(|(id,_)|*id!=self.id);}});
         let _=unsafe{UnhookWindowsHookEx(self.hook)};
     }
 }
@@ -38,15 +36,11 @@ unsafe extern "system" fn search_input_hook(code:i32,wp:WPARAM,lp:LPARAM)->LRESU
     if code>=0 && lp.0!=0 {
         let message=unsafe{&*(lp.0 as *const MSG)};
         if selection_input(message.message){
-            INPUT_WATCH.with(|slot|{if let Ok(slot)=slot.try_borrow(){for (_,flag,view) in slot.iter(){
-                let target_matches=view.is_none_or(|view|{
-                    let target=HWND(view as*mut _);
-                    message.hwnd==target||unsafe{IsChild(target,message.hwnd)}.as_bool()
-                });
-                if target_matches{if let Some(flag)=flag.upgrade(){
+            INPUT_WATCH.with(|slot|{if let Ok(slot)=slot.try_borrow(){for (_,flag) in slot.iter(){
+                if let Some(flag)=flag.upgrade(){
                     #[cfg(test)]if !flag.get(){eprintln!("search restore input observed: message=0x{:04X}",message.message);}
                     flag.set(true);
-                }}
+                }
             }}});
         }
     }
@@ -448,16 +442,6 @@ fn phase_text(phase:crate::fast_search::IndexPhase)->&'static str{
     #[test]fn data_and_paint_notifications_do_not_count_as_user_input(){
         assert!(selection_input(WM_LBUTTONDOWN));assert!(selection_input(WM_KEYDOWN));
         assert!(!selection_input(WM_PAINT));assert!(!selection_input(WM_FAST_SEARCH));assert!(!selection_input(WM_SHELL_SELECTION_CHANGED));
-    }
-    #[test]fn view_scoped_input_watch_ignores_popup_owner_and_catches_view_input(){
-        struct Window(HWND);impl Drop for Window{fn drop(&mut self){let _=unsafe{DestroyWindow(self.0)};}}
-        let owner=Window(unsafe{CreateWindowExW(WINDOW_EX_STYLE::default(),windows::core::w!("STATIC"),None,WS_POPUP,0,0,8,8,None,None,None,None)}.unwrap());
-        let view=Window(unsafe{CreateWindowExW(WINDOW_EX_STYLE::default(),windows::core::w!("STATIC"),None,WS_CHILD,0,0,8,8,Some(owner.0),None,None,None)}.unwrap());
-        let watch=InputWatch::new_for(view.0).unwrap();let mut message=MSG::default();
-        unsafe{PostMessageW(Some(owner.0),WM_LBUTTONDOWN,WPARAM(1),LPARAM(0)).unwrap();}
-        assert!(unsafe{PeekMessageW(&mut message,Some(owner.0),WM_LBUTTONDOWN,WM_LBUTTONDOWN,PM_REMOVE)}.as_bool());assert!(!watch.changed());
-        unsafe{PostMessageW(Some(view.0),WM_LBUTTONDOWN,WPARAM(1),LPARAM(0)).unwrap();}
-        assert!(unsafe{PeekMessageW(&mut message,Some(view.0),WM_LBUTTONDOWN,WM_LBUTTONDOWN,PM_REMOVE)}.as_bool());assert!(watch.changed());
     }
     #[test]fn clear_transition_only_accepts_old_selection_on_rows_still_present(){
         let a=PathBuf::from(r"C:\files\a.txt");let b=PathBuf::from(r"C:\files\b.txt");let c=PathBuf::from(r"C:\files\c.txt");

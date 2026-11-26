@@ -1048,16 +1048,7 @@ fn native_caption(hwnd:HWND)->bool{
     !window_actions::fullscreen(hwnd)&&!unsafe{GetPropW(hwnd,windows::core::w!("ZSDesk.NativeCaption"))}.0.is_null()
 }
 
-#[cfg(test)]const QUICK_MENU_DISMISS_TIMER:usize=0x5a72;
-#[cfg(test)]thread_local!{static QUICK_MENU_ENTERED:Cell<Option<std::time::Instant>>=const{Cell::new(None)};}
 unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
-    #[cfg(test)]if msg==WM_ENTERMENULOOP&&std::env::var_os("ZSDESK_MENU_TEST_PROBE").as_deref()==Some(std::ffi::OsStr::new("quick-dismiss")){
-        QUICK_MENU_ENTERED.with(|entered|entered.set(Some(std::time::Instant::now())));
-        unsafe{SetTimer(Some(hwnd),QUICK_MENU_DISMISS_TIMER,80,None);}
-    }
-    #[cfg(test)]if msg==WM_TIMER&&wp.0==QUICK_MENU_DISMISS_TIMER{
-        let _=unsafe{KillTimer(Some(hwnd),QUICK_MENU_DISMISS_TIMER)};let _=unsafe{EndMenu()};return LRESULT(0);
-    }
     if (msg==WM_ACTIVATE&&(wp.0&0xffff)==0)||(msg==WM_ACTIVATEAPP&&wp.0==0){pane_input::invalidate_blank_clicks(hwnd);}
     if msg==WM_NCDESTROY{zsdesk_windows::shell::file_dialogs::release(hwnd);release_window_properties(hwnd);}
     let native_caption = native_caption(hwnd);
