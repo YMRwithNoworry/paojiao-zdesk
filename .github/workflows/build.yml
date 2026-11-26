@@ -61,6 +61,7 @@ jobs:
               }
               return 0;
             };
+            // Versioning follows this repository's GitHub Releases, independently of upstream tags.
             let latest;
             try {
               latest = (await github.rest.repos.getLatestRelease({ owner, repo })).data;
@@ -82,7 +83,7 @@ jobs:
             const version = next.join('.');
             core.setOutput('version', version);
             core.setOutput('tag', `v${version}`);
-            core.info(`Preparing ${version} from ${sourceSha}`);
+            core.info(`Preparing ${version} from ${sourceSha} using ${owner}/${repo} releases`);
       - name: Apply release version
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         working-directory: zsdesk
